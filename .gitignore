@@ -1,0 +1,44 @@
+# 敏感配置
+config/config.yaml
+config/*.yaml
+
+# 数据文件
+data/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker
+.dockerignore
+
+# 日志
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.cache
+
+# 数据库
+*.db
+*.sqlite
+
+# 向量数据
+vectors/
+
+# 环境变量
+.env
+.env.local

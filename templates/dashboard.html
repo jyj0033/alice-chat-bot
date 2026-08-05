@@ -1,0 +1,1413 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>群聊Bot 管理面板</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #6366f1;
+            --primary-light: #818cf8;
+            --primary-dark: #4f46e5;
+            --success: #10b981;
+            --success-light: #d1fae5;
+            --danger: #ef4444;
+            --danger-light: #fee2e2;
+            --warning: #f59e0b;
+            --warning-light: #fef3c7;
+            --bg: #f3f4f6;
+            --card: #ffffff;
+            --text: #1f2937;
+            --text-secondary: #6b7280;
+            --border: #e5e7eb;
+            --shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+        .layout { display: flex; min-height: 100vh; }
+
+        /* 侧边栏 */
+        .sidebar {
+            width: 260px;
+            background: linear-gradient(180deg, #1e1e2e 0%, #2d2d44 100%);
+            color: white;
+            padding: 0;
+            position: fixed;
+            height: 100vh;
+            overflow-y: auto;
+            flex-shrink: 0;
+        }
+        .logo {
+            padding: 24px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            margin-bottom: 8px;
+        }
+        .logo h1 { font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 12px; }
+        .logo-icon { width: 36px; height: 36px; background: var(--primary); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; }
+
+        .nav-section { padding: 0 12px; margin-bottom: 8px; }
+        .nav-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: rgba(255,255,255,0.4); padding: 16px 12px 8px; }
+        .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 14px;
+            font-weight: 500;
+            color: rgba(255,255,255,0.7);
+        }
+        .nav-item:hover { background: rgba(255,255,255,0.1); color: white; }
+        .nav-item.active { background: var(--primary); color: white; }
+        .nav-item .icon { font-size: 18px; width: 24px; text-align: center; }
+
+        /* 主内容 */
+        .main {
+            flex: 1;
+            margin-left: 260px;
+            padding: 24px 32px;
+            max-width: 1400px;
+        }
+
+        /* 头部 */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 32px;
+        }
+        .header h2 { font-size: 28px; font-weight: 700; }
+        .header-status { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text-secondary); }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; }
+        .status-dot.online { background: var(--success); box-shadow: 0 0 8px var(--success); }
+        .status-dot.offline { background: var(--danger); }
+
+        /* 卡片网格 */
+        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 32px; }
+        .stat-card {
+            background: var(--card);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: var(--shadow);
+        }
+        .stat-card .label { font-size: 13px; color: var(--text-secondary); font-weight: 500; margin-bottom: 8px; }
+        .stat-card .value { font-size: 32px; font-weight: 700; }
+        .stat-card .change { font-size: 12px; margin-top: 8px; }
+        .stat-card .change.up { color: var(--success); }
+        .stat-card .change.down { color: var(--danger); }
+
+        /* 通用卡片 */
+        .card {
+            background: var(--card);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: var(--shadow);
+            margin-bottom: 24px;
+        }
+        .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .card-title { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+        .card-title .icon { font-size: 20px; }
+
+        /* 表单 */
+        .form-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+        .form-group { margin-bottom: 20px; }
+        .form-group.full { grid-column: 1 / -1; }
+        .form-group label { display: block; font-size: 14px; font-weight: 500; color: var(--text); margin-bottom: 8px; }
+        .form-group input, .form-group select, .form-group textarea {
+            width: 100%;
+            padding: 12px 16px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            font-size: 14px;
+            font-family: inherit;
+            transition: all 0.2s;
+            background: var(--card);
+        }
+        .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99,102,241,0.1);
+        }
+        .form-group textarea { resize: vertical; min-height: 100px; }
+        .form-group .hint { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+
+        /* 开关 */
+        .toggle { position: relative; width: 48px; height: 26px; }
+        .toggle input { opacity: 0; width: 0; height: 0; }
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            inset: 0;
+            background: #cbd5e1;
+            border-radius: 26px;
+            transition: 0.3s;
+        }
+        .toggle-slider::before {
+            content: '';
+            position: absolute;
+            height: 20px;
+            width: 20px;
+            left: 3px;
+            bottom: 3px;
+            background: white;
+            border-radius: 50%;
+            transition: 0.3s;
+        }
+        .toggle input:checked + .toggle-slider { background: var(--primary); }
+        .toggle input:checked + .toggle-slider::before { transform: translateX(22px); }
+
+        /* 按钮 */
+        .btn { padding: 10px 20px; border: none; border-radius: 10px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; gap: 8px; }
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-primary:hover { background: var(--primary-dark); }
+        .btn-success { background: var(--success); color: white; }
+        .btn-success:hover { background: #059669; }
+        .btn-danger { background: var(--danger); color: white; }
+        .btn-danger:hover { background: #dc2626; }
+        .btn-icon { background: none; border: none; font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 4px; }
+        .btn-icon:hover { background: var(--bg); }
+        .btn-secondary { background: var(--bg); color: var(--text); }
+        .btn-secondary:hover { background: #e5e7eb; }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .btn-group { display: flex; gap: 12px; }
+
+        /* 滑块 */
+        .slider-group { display: flex; align-items: center; gap: 16px; }
+        .slider-group input[type="range"] { flex: 1; height: 6px; -webkit-appearance: none; background: var(--border); border-radius: 3px; }
+        .slider-group input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; background: var(--primary); border-radius: 50%; cursor: pointer; }
+        .slider-group .value { min-width: 50px; text-align: right; font-weight: 600; }
+
+        /* Toast */
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            padding: 16px 24px;
+            border-radius: 12px;
+            color: white;
+            font-weight: 500;
+            z-index: 1000;
+            animation: slideIn 0.3s ease;
+        }
+        .toast.success { background: var(--success); }
+        .toast.error { background: var(--danger); }
+        .toast.warning { background: var(--warning); }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+        /* 表格 */
+        .table { width: 100%; border-collapse: collapse; }
+        .table th, .table td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+        .table th { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-secondary); }
+        .table tr:hover { background: var(--bg); }
+
+        /* 标签页 */
+        .tabs { display: flex; gap: 4px; background: var(--bg); padding: 4px; border-radius: 12px; margin-bottom: 24px; }
+        .tab { padding: 10px 20px; border: none; background: transparent; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s; color: var(--text-secondary); }
+        .tab:hover { color: var(--text); }
+        .tab.active { background: var(--card); color: var(--primary); box-shadow: var(--shadow); }
+
+        /* 页面隐藏 */
+        .page { display: none; }
+        .page.active { display: block; }
+
+        /* Big Five 特质图 */
+        .trait-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; }
+        .trait-card {
+            background: var(--bg);
+            border-radius: 12px;
+            padding: 16px;
+            text-align: center;
+        }
+        .trait-card .name { font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; }
+        .trait-card .bar {
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 8px;
+        }
+        .trait-card .bar-fill { height: 100%; background: linear-gradient(90deg, var(--primary), var(--primary-light)); border-radius: 4px; transition: width 0.5s; }
+        .trait-card .value { font-size: 18px; font-weight: 700; color: var(--primary); }
+
+        /* 情感仪表 */
+        .emotion-gauge { display: flex; align-items: center; gap: 24px; padding: 20px; background: var(--bg); border-radius: 12px; }
+        .gauge-item { flex: 1; text-align: center; }
+        .gauge-circle { width: 80px; height: 80px; margin: 0 auto 12px; position: relative; }
+        .gauge-circle svg { transform: rotate(-90deg); }
+        .gauge-circle circle { fill: none; stroke-width: 8; }
+        .gauge-circle .bg { stroke: var(--border); }
+        .gauge-circle .fg { stroke: var(--primary); stroke-linecap: round; transition: stroke-dashoffset 0.5s; }
+        .gauge-value { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; }
+        .gauge-label { font-size: 13px; color: var(--text-secondary); }
+
+        /* 聊天容器 */
+        .chat-container { height: 350px; overflow-y: auto; border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+        .chat-msg { margin-bottom: 16px; }
+        .chat-msg .meta { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+        .chat-msg .name { font-weight: 600; font-size: 13px; }
+        .chat-msg .time { font-size: 11px; color: var(--text-secondary); }
+        .chat-msg .content { padding: 12px 16px; border-radius: 12px; font-size: 14px; line-height: 1.5; }
+        .chat-msg.bot .content { background: linear-gradient(135deg, #e0e7ff 0%, #c7d2fe 100%); }
+        .chat-msg.user .content { background: var(--bg); }
+        .chat-msg.bot .name { color: var(--primary); }
+
+        /* 配置预览 */
+        .config-preview {
+            background: #1f2937;
+            color: #e5e7eb;
+            padding: 16px;
+            border-radius: 12px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 13px;
+            overflow-x: auto;
+            white-space: pre;
+        }
+
+        /* 人格卡片 */
+        .persona-card { display: flex; gap: 24px; padding: 24px; background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); border-radius: 16px; color: white; }
+        .persona-avatar { width: 100px; height: 100px; background: rgba(255,255,255,0.2); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 48px; flex-shrink: 0; }
+        .persona-info h3 { font-size: 24px; margin-bottom: 8px; }
+        .persona-info p { opacity: 0.9; font-size: 14px; line-height: 1.6; }
+
+        /* 响应式 */
+        @media (max-width: 1200px) {
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .form-grid { grid-template-columns: 1fr; }
+            .trait-grid { grid-template-columns: repeat(3, 1fr); }
+        }
+        @media (max-width: 768px) {
+            .sidebar { display: none; }
+            .main { margin-left: 0; padding: 16px; }
+            .stats-grid { grid-template-columns: 1fr; }
+            .trait-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div class="layout">
+        <!-- 侧边栏 -->
+        <nav class="sidebar">
+            <div class="logo">
+                <h1><span class="logo-icon">🤖</span> 群聊Bot</h1>
+            </div>
+            <div class="nav-section">
+                <div class="nav-title">概览</div>
+                <div class="nav-item active" data-page="dashboard"><span class="icon">📊</span> 仪表盘</div>
+                <div class="nav-item" data-page="personality"><span class="icon">👤</span> Bot人格</div>
+                <div class="nav-item" data-page="simulation"><span class="icon">🎭</span> 模拟系统</div>
+                <div class="nav-item" data-page="chat"><span class="icon">💬</span> 会话管理</div>
+            </div>
+            <div class="nav-section">
+                <div class="nav-title">配置</div>
+                <div class="nav-item" data-page="llm"><span class="icon">🧠</span> LLM设置</div>
+                <div class="nav-item" data-page="qq"><span class="icon">💬</span> QQ连接</div>
+                <div class="nav-item" data-page="speaking"><span class="icon">🎤</span> 发言设置</div>
+                <div class="nav-item" data-page="memory"><span class="icon">🧠</span> 记忆设置</div>
+            </div>
+            <div class="nav-section">
+                <div class="nav-title">工具</div>
+                <div class="nav-item" data-page="test"><span class="icon">🧪</span> 测试对话</div>
+                <div class="nav-item" data-page="logs"><span class="icon">📝</span> 日志</div>
+            </div>
+        </nav>
+
+        <!-- 主内容 -->
+        <main class="main">
+            <!-- 仪表盘 -->
+            <div id="page-dashboard" class="page active">
+                <div class="header">
+                    <h2>仪表盘</h2>
+                    <div class="header-status">
+                        <span class="status-dot offline" id="status-dot"></span>
+                        <span id="status-text">加载中...</span>
+                    </div>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="label">Bot状态</div>
+                        <div class="value" id="stat-running">-</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">已发送消息</div>
+                        <div class="value" id="stat-sent">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">已接收消息</div>
+                        <div class="value" id="stat-received">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">活跃会话</div>
+                        <div class="value" id="stat-sessions">0</div>
+                    </div>
+                </div>
+
+                <div class="persona-card" style="margin-bottom: 24px;">
+                    <div class="persona-avatar">🤖</div>
+                    <div class="persona-info">
+                        <h3 id="persona-name">加载中...</h3>
+                        <p id="persona-background">正在获取Bot人格信息...</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">💭</span> 情感状态</div>
+                    </div>
+                    <div class="emotion-gauge">
+                        <div class="gauge-item">
+                            <div class="gauge-circle">
+                                <svg width="80" height="80"><circle class="bg" cx="40" cy="40" r="34"/><circle class="fg" id="energy-circle" cx="40" cy="40" r="34" stroke-dasharray="213.6" stroke-dashoffset="213.6"/></svg>
+                                <div class="gauge-value" id="energy-value">0%</div>
+                            </div>
+                            <div class="gauge-label">精力值</div>
+                        </div>
+                        <div class="gauge-item">
+                            <div class="gauge-circle">
+                                <svg width="80" height="80"><circle class="bg" cx="40" cy="40" r="34"/><circle class="fg" id="engagement-circle" cx="40" cy="40" r="34" stroke-dasharray="213.6" stroke-dashoffset="213.6"/></svg>
+                                <div class="gauge-value" id="engagement-value">0%</div>
+                            </div>
+                            <div class="gauge-label">投入度</div>
+                        </div>
+                        <div class="gauge-item">
+                            <div class="gauge-circle">
+                                <svg width="80" height="80"><circle class="bg" cx="40" cy="40" r="34"/><circle class="fg" id="mood-circle" cx="40" cy="40" r="34" stroke-dasharray="213.6" stroke-dashoffset="213.6"/></svg>
+                                <div class="gauge-value" id="mood-value">-</div>
+                            </div>
+                            <div class="gauge-label">情绪</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Bot人格 -->
+            <div id="page-personality" class="page">
+                <div class="header">
+                    <h2>Bot人格</h2>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">🧠</span> Big Five 人格特质</div>
+                    </div>
+                    <div class="trait-grid" id="trait-grid">
+                        <!-- 动态生成 -->
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">📝</span> 人格配置</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>名字</label>
+                            <input type="text" id="personality-name" placeholder="Bot的名字">
+                        </div>
+                        <div class="form-group">
+                            <label>昵称</label>
+                            <input type="text" id="personality-nickname" placeholder="常用昵称">
+                        </div>
+                        <div class="form-group full">
+                            <label>背景设定</label>
+                            <textarea id="personality-background" placeholder="Bot的背景故事和设定..."></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label>感兴趣的话题</label>
+                            <textarea id="personality-interests" placeholder="每行一个话题"></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label>不感兴趣的话题</label>
+                            <textarea id="personality-bored" placeholder="每行一个话题"></textarea>
+                        </div>
+                    </div>
+                    <div class="btn-group">
+                        <button class="btn btn-primary" onclick="savePersonality()">保存人格</button>
+                        <button class="btn btn-secondary" onclick="resetPersonality()">重置</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 会话管理 -->
+            <div id="page-chat" class="page">
+                <div class="header">
+                    <h2>会话管理</h2>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">💬</span> 当前会话</div>
+                        <select id="session-select" onchange="loadSession()" style="padding: 8px 16px; border: 1px solid var(--border); border-radius: 8px;">
+                            <option value="">选择会话...</option>
+                        </select>
+                    </div>
+                    <div class="chat-container" id="chat-container">
+                        <p style="text-align: center; color: var(--text-secondary); padding: 40px;">选择一个会话查看聊天记录</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- LLM设置 -->
+            <div id="page-llm" class="page">
+                <div class="header">
+                    <h2>LLM 提供商管理</h2>
+                    <button class="btn btn-primary" onclick="showAddProviderModal()" style="margin-left: auto;">
+                        <span>➕</span> 添加提供商
+                    </button>
+                </div>
+
+                <div id="providers-list" style="display: flex; flex-direction: column; gap: 16px;">
+                    <!-- 动态加载的 providers -->
+                </div>
+
+                <div id="provider-form-template" style="display: none; margin-top: 24px;">
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title"><span class="icon">⚙️</span> <span id="form-provider-title">编辑提供商</span></div>
+                            <button class="btn-icon" onclick="hideProviderForm()" title="关闭">✕</button>
+                        </div>
+                        <div class="form-grid">
+                            <input type="hidden" id="edit-provider-name">
+                            <div class="form-group">
+                                <label>API Key</label>
+                                <input type="password" id="provider-api-key" placeholder="sk-...">
+                            </div>
+                            <div class="form-group">
+                                <label>Base URL</label>
+                                <input type="text" id="provider-base-url" placeholder="https://api.openai.com/v1">
+                            </div>
+                            <div class="form-group">
+                                <label>模型</label>
+                                <input type="text" id="provider-model" placeholder="gpt-4o">
+                            </div>
+                            <div class="form-group">
+                                <label>Provider 类型</label>
+                                <select id="provider-type">
+                                    <option value="openai_compatible">OpenAI 兼容</option>
+                                    <option value="anthropic">Anthropic (Claude)</option>
+                                    <option value="deepseek">Claude</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Timeout (秒)</label>
+                                <input type="number" id="provider-timeout" value="120" min="10" max="300">
+                            </div>
+                            <div class="form-group">
+                                <label>Temperature</label>
+                                <input type="number" id="provider-temperature" value="0.8" min="0" max="2" step="0.1">
+                            </div>
+                            <div class="form-group">
+                                <label>Max Tokens</label>
+                                <input type="number" id="provider-max-tokens" value="2000" min="50" max="8000">
+                            </div>
+                            <div class="form-group">
+                                <label>启用</label>
+                                <label class="toggle">
+                                    <input type="checkbox" id="provider-enabled" checked>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="btn-group">
+                            <button class="btn btn-primary" onclick="saveProvider()">💾 保存</button>
+                            <button class="btn btn-secondary" onclick="testProvider()">🧪 测试连接</button>
+                            <button class="btn btn-danger" id="delete-provider-btn" onclick="deleteProvider()" style="display: none;">🗑️ 删除</button>
+                        </div>
+                        <div id="test-result" style="margin-top: 12px; padding: 12px; border-radius: 8px; display: none;"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 模拟系统设置 -->
+            <div id="page-simulation" class="page">
+                <div class="header">
+                    <h2>模拟系统设置</h2>
+                    <p style="color: var(--text-secondary); margin-top: 8px;">配置Bot模拟真人发言的各种行为参数</p>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">💭</span> 思考延迟</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>基础延迟 (秒)</label>
+                            <input type="number" id="sim-thinking-base" value="2.0" step="0.5" min="0" max="30">
+                            <div class="hint">收到消息后等待的基础时间</div>
+                        </div>
+                        <div class="form-group">
+                            <label>最小随机延迟 (秒)</label>
+                            <input type="number" id="sim-thinking-min" value="0.5" step="0.1" min="0" max="5">
+                        </div>
+                        <div class="form-group">
+                            <label>最大随机延迟 (秒)</label>
+                            <input type="number" id="sim-thinking-max" value="10.0" step="0.5" min="1" max="60">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">💬</span> 发言概率</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>基础发言概率</label>
+                            <div class="slider-group">
+                                <input type="range" id="sim-speaking-prob" min="0" max="1" step="0.01" value="0.02" oninput="updateSlider(this)">
+                                <span class="value" id="sim-speaking-prob-value">0.02</span>
+                            </div>
+                            <div class="hint">看到群聊消息时主动发言的概率</div>
+                        </div>
+                        <div class="form-group">
+                            <label>回复后继续发言概率</label>
+                            <div class="slider-group">
+                                <input type="range" id="sim-after-reply-prob" min="0" max="1" step="0.01" value="0.8" oninput="updateSlider(this)">
+                                <span class="value" id="sim-after-reply-prob-value">0.8</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">😄</span> 情感系统</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>启用情感系统</label>
+                            <label class="toggle">
+                                <input type="checkbox" id="sim-emotion-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>正面情绪增幅</label>
+                            <input type="number" id="sim-emotion-positive" value="0.1" step="0.01" min="0" max="1">
+                        </div>
+                        <div class="form-group">
+                            <label>负面情绪降幅</label>
+                            <input type="number" id="sim-emotion-negative" value="0.15" step="0.01" min="0" max="1">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">⚡</span> 注意力系统</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>启用注意力系统</label>
+                            <label class="toggle">
+                                <input type="checkbox" id="sim-attention-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>初始注意力</label>
+                            <input type="number" id="sim-attention-initial" value="0.5" step="0.05" min="0" max="1">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">😴</span> 疲劳系统</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>启用疲劳系统</label>
+                            <label class="toggle">
+                                <input type="checkbox" id="sim-fatigue-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>轻度疲劳阈值</label>
+                            <input type="number" id="sim-fatigue-light" value="3" step="1" min="1" max="50">
+                        </div>
+                        <div class="form-group">
+                            <label>重度疲劳阈值</label>
+                            <input type="number" id="sim-fatigue-heavy" value="8" step="1" min="1" max="50">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">⌨️</span> 打字风格</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>模拟打字错误</label>
+                            <label class="toggle">
+                                <input type="checkbox" id="sim-typo-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>错字率</label>
+                            <div class="slider-group">
+                                <input type="range" id="sim-typo-rate" min="0" max="0.2" step="0.01" value="0.04" oninput="updateSlider(this)">
+                                <span class="value" id="sim-typo-rate-value">0.04</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="btn-group" style="margin-top: 20px;">
+                    <button class="btn btn-primary" onclick="saveAdvancedConfig()">保存所有设置</button>
+                </div>
+            </div>
+
+            <!-- QQ连接 -->
+            <div id="page-qq" class="page">
+                <div class="header">
+                    <h2>QQ 连接</h2>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">🔌</span> WebSocket 配置</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>WebSocket URL</label>
+                            <input type="text" id="qq-ws-url" placeholder="ws://127.0.0.1:3001">
+                        </div>
+                        <div class="form-group">
+                            <label>Access Token</label>
+                            <input type="password" id="qq-token" placeholder="可选的访问令牌">
+                        </div>
+                        <div class="form-group">
+                            <label>Bot QQ号</label>
+                            <input type="text" id="qq-self-id" placeholder="Bot的QQ号码">
+                        </div>
+                        <div class="form-group">
+                            <label>连接状态</label>
+                            <div style="padding: 12px 0;">
+                                <span class="status-dot offline" id="qq-status-dot"></span>
+                                <span id="qq-status-text">未连接</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="btn-group">
+                        <button class="btn btn-primary" onclick="saveQQ()">保存</button>
+                        <button class="btn btn-secondary" onclick="testQQ()">测试连接</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 发言设置 -->
+            <div id="page-speaking" class="page">
+                <div class="header">
+                    <h2>发言设置</h2>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">🎤</span> 基本设置</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>基础发言概率</label>
+                            <div class="slider-group">
+                                <input type="range" id="speaking-prob" min="0" max="1" step="0.05" value="0.4" oninput="updateSlider(this)">
+                                <span class="value" id="speaking-prob-value">40%</span>
+                            </div>
+                            <div class="hint">Bot主动发言的概率</div>
+                        </div>
+                        <div class="form-group">
+                            <label>触发关键词</label>
+                            <input type="text" id="speaking-keywords" placeholder="用逗号分隔">
+                            <div class="hint">包含这些关键词时更可能触发回复</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">⏱️</span> 思考延迟</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>基础延迟 (秒)</label>
+                            <div class="slider-group">
+                                <input type="range" id="delay-base" min="0" max="10" step="0.5" value="2" oninput="updateSlider(this)">
+                                <span class="value" id="delay-base-value">2.0s</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>最小延迟 (秒)</label>
+                            <input type="number" id="delay-min" value="0.5" step="0.1" min="0">
+                        </div>
+                        <div class="form-group">
+                            <label>最大延迟 (秒)</label>
+                            <input type="number" id="delay-max" value="10" step="0.5" min="1">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">👥</span> 群组设置</div>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table" id="group-table">
+                            <thead><tr><th>群号</th><th>启用</th><th>发言概率</th><th>操作</th></tr></thead>
+                            <tbody id="group-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div style="margin-top: 16px;">
+                        <button class="btn btn-secondary" onclick="addGroup()">+ 添加群组</button>
+                    </div>
+                    <div class="btn-group" style="margin-top: 20px;">
+                        <button class="btn btn-primary" onclick="saveSpeaking()">保存设置</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 记忆设置 -->
+            <div id="page-memory" class="page">
+                <div class="header">
+                    <h2>记忆设置</h2>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">🧠</span> 上下文设置</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>上下文窗口大小</label>
+                            <input type="number" id="memory-window" value="50" min="10" max="200">
+                            <div class="hint">保留的最近消息数量</div>
+                        </div>
+                        <div class="form-group">
+                            <label>上下文最大保留时间 (小时)</label>
+                            <input type="number" id="memory-age" value="2" min="0.5" max="24" step="0.5">
+                            <div class="hint">超过这个时间的消息会被遗忘</div>
+                        </div>
+                        <div class="form-group">
+                            <label>启用长期记忆</label>
+                            <label class="toggle">
+                                <input type="checkbox" id="memory-long-term" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">🔧</span> 数据库</div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group full">
+                            <label>数据库路径</label>
+                            <input type="text" id="memory-db-path" placeholder="data/memory.db">
+                        </div>
+                    </div>
+                    <div class="btn-group">
+                        <button class="btn btn-primary" onclick="saveMemory()">保存设置</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 测试对话 -->
+            <div id="page-test" class="page">
+                <div class="header">
+                    <h2>测试对话</h2>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">🧪</span> 发送测试消息</div>
+                    </div>
+                    <div style="display: flex; gap: 12px; margin-bottom: 16px;">
+                        <input type="text" id="test-input" placeholder="输入测试消息..." style="flex: 1; padding: 14px 18px; border: 2px solid var(--border); border-radius: 12px; font-size: 15px;">
+                        <button class="btn btn-primary" onclick="sendTest()" style="padding: 14px 28px; font-size: 15px;">发送</button>
+                    </div>
+                    <div id="test-response" style="display: none;"></div>
+                </div>
+            </div>
+
+            <!-- 日志 -->
+            <div id="page-logs" class="page">
+                <div class="header">
+                    <h2>运行日志</h2>
+                    <button class="btn btn-secondary" onclick="loadLogs()">🔄 刷新</button>
+                </div>
+
+                <div class="card">
+                    <pre id="log-content" style="background: #1f2937; color: #e5e7eb; padding: 20px; border-radius: 12px; font-family: 'Monaco', monospace; font-size: 12px; max-height: 500px; overflow: auto; white-space: pre-wrap; word-break: break-all;">加载中...</pre>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // API 基础路径
+        const API = '/api';
+
+        // Toast 提示
+        function showToast(message, type = 'success') {
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.textContent = message;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 3000);
+        }
+
+        // 导航
+        document.querySelectorAll('.nav-item').forEach(item => {
+            item.addEventListener('click', () => {
+                document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+                document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+                item.classList.add('active');
+                const pageId = 'page-' + item.dataset.page;
+                document.getElementById(pageId)?.classList.add('active');
+
+                // 加载页面数据
+                if (item.dataset.page === 'dashboard') loadDashboard();
+                if (item.dataset.page === 'llm') loadLLMConfig();
+                if (item.dataset.page === 'qq') loadQQConfig();
+                if (item.dataset.page === 'speaking') loadSpeakingConfig();
+                if (item.dataset.page === 'memory') loadMemoryConfig();
+                if (item.dataset.page === 'personality') loadPersonality();
+                if (item.dataset.page === 'simulation') loadAdvancedConfig();
+                if (item.dataset.page === 'chat') loadSessions();
+                if (item.dataset.page === 'logs') loadLogs();
+            });
+        });
+
+        // 滑块更新
+        function updateSlider(el) {
+            const value = el.nextElementSibling;
+            if (el.id === 'speaking-prob') {
+                value.textContent = Math.round(el.value * 100) + '%';
+            } else if (el.id === 'llm-temperature' || el.id === 'llm-top-p') {
+                value.textContent = el.value;
+            } else if (el.id === 'delay-base') {
+                value.textContent = parseFloat(el.value).toFixed(1) + 's';
+            } else {
+                value.textContent = el.value;
+            }
+        }
+
+        // 加载仪表盘
+        async function loadDashboard() {
+            try {
+                const [statusRes, personaRes, sessionRes] = await Promise.all([
+                    fetch(API + '/status'),
+                    fetch(API + '/personality'),
+                    fetch(API + '/sessions')
+                ]);
+
+                const status = await statusRes.json();
+                const persona = await personaRes.json();
+                const sessions = await sessionRes.json();
+
+                // 状态
+                const isRunning = status.running;
+                document.getElementById('status-dot').className = 'status-dot ' + (isRunning ? 'online' : 'offline');
+                document.getElementById('status-text').textContent = isRunning ? 'Bot运行中' : 'Bot已停止';
+                document.getElementById('stat-running').innerHTML = isRunning ? '<span style="color: var(--success)">● 在线</span>' : '<span style="color: var(--danger)">○ 离线</span>';
+                document.getElementById('stat-sent').textContent = status.qq?.messages_sent || 0;
+                document.getElementById('stat-received').textContent = status.qq?.messages_received || 0;
+                document.getElementById('stat-sessions').textContent = sessions.sessions?.length || 0;
+
+                // 人格
+                document.getElementById('persona-name').textContent = persona.name || '未知';
+                document.getElementById('persona-background').textContent = persona.background || '暂无背景设定';
+
+                // 情感
+                const emotion = persona.emotion || { energy: 0.8, engagement: 0.6, mood: 0.5 };
+                updateGauge('energy', emotion.energy);
+                updateGauge('engagement', emotion.engagement);
+                updateGauge('mood', emotion.mood);
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        function updateGauge(type, value) {
+            const circle = document.getElementById(type + '-circle');
+            const text = document.getElementById(type + '-value');
+            const circumference = 213.6;
+            const offset = circumference * (1 - value);
+            circle.style.strokeDashoffset = offset;
+            if (type === 'mood') {
+                const moods = ['😢 悲伤', '😕 不悦', '😐 中性', '🙂 愉快', '😄 开心'];
+                text.textContent = moods[Math.min(4, Math.max(0, Math.round(value * 4)))];
+            } else {
+                text.textContent = Math.round(value * 100) + '%';
+            }
+        }
+
+        // 加载LLM配置
+        // LLM Provider 管理
+        async function loadLLMConfig() {
+            const providers = await fetch(API + '/providers').then(r => r.json());
+            renderProviders(providers.providers || []);
+        }
+
+        function renderProviders(providers) {
+            const container = document.getElementById('providers-list');
+            if (!providers.length) {
+                container.innerHTML = '<div class="card"><p style="color: var(--text-secondary); text-align: center; padding: 24px;">暂无配置的提供商，点击上方按钮添加</p></div>';
+                return;
+            }
+            container.innerHTML = providers.map(p => `
+                <div class="card provider-card" data-name="${p.name}">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <span class="status-dot ${p.enabled ? 'online' : 'offline'}"></span>
+                            <span>${p.name}</span>
+                            ${p.name === 'primary' ? '<span style="font-size: 12px; color: var(--primary); margin-left: 8px;">主</span>' : ''}
+                        </div>
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <span style="color: var(--text-secondary); font-size: 13px;">${p.model || '未设置模型'}</span>
+                            <button class="btn-icon" onclick="editProvider('${p.name}')" title="编辑">✏️</button>
+                        </div>
+                    </div>
+                    <div style="padding: 12px 0; color: var(--text-secondary); font-size: 13px;">
+                        <div>🔗 ${p.base_url || '未设置'}</div>
+                        <div>🔑 ${p.has_key ? 'API Key 已配置' : '⚠️ 缺少 API Key'}</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function showAddProviderModal() {
+            document.getElementById('form-provider-title').textContent = '添加新提供商';
+            document.getElementById('edit-provider-name').value = '';
+            document.getElementById('provider-api-key').value = '';
+            document.getElementById('provider-base-url').value = 'https://api.openai.com/v1';
+            document.getElementById('provider-model').value = 'gpt-4o';
+            document.getElementById('provider-type').value = 'openai_compatible';
+            document.getElementById('provider-timeout').value = '120';
+            document.getElementById('provider-temperature').value = '0.8';
+            document.getElementById('provider-max-tokens').value = '2000';
+            document.getElementById('provider-enabled').checked = true;
+            document.getElementById('delete-provider-btn').style.display = 'none';
+            document.getElementById('test-result').style.display = 'none';
+            document.getElementById('provider-form-template').style.display = 'block';
+        }
+
+        async function editProvider(name) {
+            const config = await fetch(API + '/config').then(r => r.json());
+            const provider = config.llm?.[name];
+            if (!provider) return;
+
+            document.getElementById('form-provider-title').textContent = '编辑: ' + name;
+            document.getElementById('edit-provider-name').value = name;
+            document.getElementById('provider-api-key').value = '';
+            document.getElementById('provider-base-url').value = provider.base_url || '';
+            document.getElementById('provider-model').value = provider.model || '';
+            document.getElementById('provider-type').value = provider.provider_type || 'openai_compatible';
+            document.getElementById('provider-timeout').value = provider.timeout || 120;
+            document.getElementById('provider-temperature').value = provider.temperature || 0.8;
+            document.getElementById('provider-max-tokens').value = provider.max_tokens || 2000;
+            document.getElementById('provider-enabled').checked = provider.enabled !== false;
+            document.getElementById('delete-provider-btn').style.display = name !== 'primary' ? 'inline-block' : 'none';
+            document.getElementById('test-result').style.display = 'none';
+            document.getElementById('provider-form-template').style.display = 'block';
+        }
+
+        function hideProviderForm() {
+            document.getElementById('provider-form-template').style.display = 'none';
+        }
+
+        async function saveProvider() {
+            const name = document.getElementById('edit-provider-name').value || document.getElementById('provider-model').value.split('/')[0] || 'provider_' + Date.now();
+            const data = {
+                name: name,
+                api_key: document.getElementById('provider-api-key').value,
+                base_url: document.getElementById('provider-base-url').value,
+                model: document.getElementById('provider-model').value,
+                provider_type: document.getElementById('provider-type').value,
+                timeout: parseInt(document.getElementById('provider-timeout').value),
+                temperature: parseFloat(document.getElementById('provider-temperature').value),
+                max_tokens: parseInt(document.getElementById('provider-max-tokens').value),
+                enabled: document.getElementById('provider-enabled').checked,
+            };
+
+            const isNew = !document.getElementById('edit-provider-name').value;
+            const url = isNew ? API + '/providers' : API + '/config';
+            const method = isNew ? 'POST' : 'POST';
+
+            const res = await fetch(url, {
+                method: method,
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ llm: { [name]: data } })
+            });
+            const result = await res.json();
+            showToast(result.success ? `提供商 ${isNew ? '添加' : '更新'}成功` : '失败: ' + (result.error || ''), result.success ? 'success' : 'error');
+
+            if (result.success) {
+                hideProviderForm();
+                loadLLMConfig();
+            }
+        }
+
+        async function testProvider() {
+            const name = document.getElementById('edit-provider-name').value;
+            if (!name) {
+                showToast('请先保存提供商后再测试', 'error');
+                return;
+            }
+            const resultDiv = document.getElementById('test-result');
+            resultDiv.style.display = 'block';
+            resultDiv.style.background = 'var(--warning-light)';
+            resultDiv.textContent = '测试中...';
+
+            const res = await fetch(API + `/providers/${name}/test`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            const result = await res.json();
+
+            if (result.success) {
+                resultDiv.style.background = 'var(--success-light)';
+                resultDiv.textContent = '✅ 连接成功: ' + result.response;
+            } else {
+                resultDiv.style.background = 'var(--danger-light)';
+                resultDiv.textContent = '❌ 连接失败: ' + (result.error || '未知错误');
+            }
+        }
+
+        async function deleteProvider() {
+            const name = document.getElementById('edit-provider-name').value;
+            if (!name || name === 'primary') {
+                showToast('无法删除 primary 提供商', 'error');
+                return;
+            }
+            if (!confirm(`确定删除提供商 "${name}" 吗？`)) return;
+
+            const res = await fetch(API + `/providers/${name}`, { method: 'DELETE' });
+            const result = await res.json();
+            showToast(result.success ? '已删除' : '失败: ' + (result.error || ''), result.success ? 'success' : 'error');
+
+            if (result.success) {
+                hideProviderForm();
+                loadLLMConfig();
+            }
+        }
+
+        // 旧版兼容函数（保留但不使用）
+        async function saveLLM() {
+            showToast('请使用新的提供商管理界面', 'info');
+        }
+
+        // 加载QQ配置
+        async function loadQQConfig() {
+            const config = await fetch(API + '/config').then(r => r.json());
+            const qq = config.qq || {};
+            document.getElementById('qq-ws-url').value = qq.ws_url || 'ws://127.0.0.1:3001';
+            document.getElementById('qq-token').value = qq.access_token || '';
+            document.getElementById('qq-self-id').value = qq.self_id || '';
+            const status = await fetch(API + '/status').then(r => r.json());
+            const connected = status.qq?.connected;
+            document.getElementById('qq-status-dot').className = 'status-dot ' + (connected ? 'online' : 'offline');
+            document.getElementById('qq-status-text').textContent = connected ? '已连接' : '未连接';
+        }
+
+        async function saveQQ() {
+            const config = {
+                qq: {
+                    ws_url: document.getElementById('qq-ws-url').value,
+                    access_token: document.getElementById('qq-token').value,
+                    self_id: document.getElementById('qq-self-id').value
+                }
+            };
+            const res = await fetch(API + '/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) });
+            const data = await res.json();
+            showToast(data.success ? 'QQ设置已保存' : '保存失败', data.success ? 'success' : 'error');
+        }
+
+        function testQQ() {
+            const wsUrl = document.getElementById('qq-ws-url').value;
+            showToast('正在测试连接: ' + wsUrl, 'warning');
+
+            // 检查状态 API
+            fetch(API + '/status')
+                .then(r => r.json())
+                .then(status => {
+                    if (status.qq?.connected) {
+                        showToast('✓ QQ 已连接！', 'success');
+                    } else {
+                        showToast('✗ QQ 未连接，NapCat 可能未正确配置', 'error');
+                    }
+                })
+                .catch(err => {
+                    showToast('连接失败: ' + (err.message || '未知错误'), 'error');
+                });
+        }
+
+        // 加载发言设置
+        async function loadSpeakingConfig() {
+            const config = await fetch(API + '/config').then(r => r.json());
+            const sp = config.speaking || {};
+            const prob = sp.base_probability || 0.4;
+            document.getElementById('speaking-prob').value = prob;
+            document.getElementById('speaking-prob-value').textContent = Math.round(prob * 100) + '%';
+            document.getElementById('speaking-keywords').value = (sp.trigger_keywords || []).join(', ');
+            const delay = sp.thinking_delay || {};
+            document.getElementById('delay-base').value = delay.base || 2;
+            document.getElementById('delay-base-value').textContent = (delay.base || 2).toFixed(1) + 's';
+            document.getElementById('delay-min').value = delay.min || 0.5;
+            document.getElementById('delay-max').value = delay.max || 10;
+
+            // 群组
+            const groups = config.groups || {};
+            const tbody = document.getElementById('group-tbody');
+            tbody.innerHTML = '';
+            for (const [id, cfg] of Object.entries(groups)) {
+                tbody.innerHTML += '<tr><td>' + id + '</td><td>' + (cfg.enabled ? '✓' : '✗') + '</td><td>' + Math.round((cfg.speaking_probability || 0.4) * 100) + '%</td><td><button class="btn btn-danger" onclick="removeGroup(\'' + id + '\')">删除</button></td></tr>';
+            }
+        }
+
+        function addGroup() {
+            const id = prompt('输入群号:');
+            if (!id) return;
+            const tbody = document.getElementById('group-tbody');
+            tbody.innerHTML += '<tr><td>' + id + '</td><td>✓</td><td>40%</td><td><button class="btn btn-danger" onclick="removeGroup(\'' + id + '\')">删除</button></td></tr>';
+        }
+
+        function removeGroup(id) {
+            const row = event.target.closest('tr');
+            row.remove();
+        }
+
+        async function saveSpeaking() {
+            const keywords = document.getElementById('speaking-keywords').value.split(',').map(k => k.trim()).filter(k => k);
+            const config = {
+                speaking: {
+                    base_probability: parseFloat(document.getElementById('speaking-prob').value),
+                    trigger_keywords: keywords,
+                    thinking_delay: {
+                        base: parseFloat(document.getElementById('delay-base').value),
+                        min: parseFloat(document.getElementById('delay-min').value),
+                        max: parseFloat(document.getElementById('delay-max').value)
+                    }
+                }
+            };
+            const res = await fetch(API + '/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) });
+            const data = await res.json();
+            showToast(data.success ? '发言设置已保存' : '保存失败', data.success ? 'success' : 'error');
+        }
+
+        // 加载记忆设置
+        async function loadMemoryConfig() {
+            const config = await fetch(API + '/config').then(r => r.json());
+            const mem = config.memory || {};
+            document.getElementById('memory-window').value = mem.context_window_size || 50;
+            document.getElementById('memory-age').value = mem.context_max_age_hours || 2;
+            document.getElementById('memory-long-term').checked = mem.enable_long_term_memory !== false;
+            document.getElementById('memory-db-path').value = mem.db_path || 'data/memory.db';
+        }
+
+        async function saveMemory() {
+            const config = {
+                memory: {
+                    context_window_size: parseInt(document.getElementById('memory-window').value),
+                    context_max_age_hours: parseFloat(document.getElementById('memory-age').value),
+                    enable_long_term_memory: document.getElementById('memory-long-term').checked,
+                    db_path: document.getElementById('memory-db-path').value
+                }
+            };
+            const res = await fetch(API + '/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) });
+            const data = await res.json();
+            showToast(data.success ? '记忆设置已保存' : '保存失败', data.success ? 'success' : 'error');
+        }
+
+        // 加载人格
+        async function loadPersonality() {
+            const persona = await fetch(API + '/personality').then(r => r.json());
+
+            // 特质
+            const traitNames = {openness: '开放性', conscientiousness: '尽责性', extraversion: '外向性', agreeableness: '宜人性', neuroticism: '神经质'};
+            const traitGrid = document.getElementById('trait-grid');
+            traitGrid.innerHTML = '';
+            for (const [key, name] of Object.entries(traitNames)) {
+                const value = persona.traits?.[key] || 0.5;
+                traitGrid.innerHTML += '<div class="trait-card"><div class="name">' + name + '</div><div class="bar"><div class="bar-fill" style="width:' + (value*100) + '%"></div></div><div class="value">' + Math.round(value*100) + '%</div></div>';
+            }
+
+            // 表单
+            document.getElementById('personality-name').value = persona.name || '';
+            document.getElementById('personality-nickname').value = persona.nickname || '';
+            document.getElementById('personality-background').value = persona.background || '';
+            document.getElementById('personality-interests').value = (persona.interested_topics || []).join('\\n');
+            document.getElementById('personality-bored').value = (persona.bored_topics || []).join('\\n');
+        }
+
+        function resetPersonality() {
+            loadPersonality();
+        }
+
+        async function savePersonality() {
+            const interests = document.getElementById('personality-interests').value.split('\n').map(k => k.trim()).filter(k => k);
+            const bored = document.getElementById('personality-bored').value.split('\n').map(k => k.trim()).filter(k => k);
+            const config = {
+                personality: {
+                    name: document.getElementById('personality-name').value,
+                    nickname: document.getElementById('personality-nickname').value,
+                    background: document.getElementById('personality-background').value,
+                    description: document.getElementById('personality-background').value,
+                    interested_topics: interests,
+                    bored_topics: bored
+                },
+                bot: {
+                    name: document.getElementById('personality-name').value,
+                    nickname: document.getElementById('personality-nickname').value
+                }
+            };
+            const res = await fetch(API + '/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) });
+            const data = await res.json();
+            showToast(data.success ? '人格设置已保存' : '保存失败: ' + (data.error || ''), data.success ? 'success' : 'error');
+        }
+
+        // 加载高级配置
+        async function loadAdvancedConfig() {
+            const config = await fetch(API + '/config').then(r => r.json());
+
+            // 思考延迟
+            const thinking = config.thinking || {};
+            document.getElementById('sim-thinking-base').value = thinking.base_delay || 2.0;
+            document.getElementById('sim-thinking-min').value = thinking.random_delay?.min || 0.5;
+            document.getElementById('sim-thinking-max').value = thinking.random_delay?.max || 10.0;
+
+            // 发言概率
+            const speaking = config.speaking || {};
+            document.getElementById('sim-speaking-prob').value = speaking.base_probability || 0.02;
+            document.getElementById('sim-speaking-prob-value').textContent = speaking.base_probability || 0.02;
+            document.getElementById('sim-after-reply-prob').value = speaking.after_reply_probability || 0.8;
+            document.getElementById('sim-after-reply-prob-value').textContent = speaking.after_reply_probability || 0.8;
+
+            // 情感系统
+            const emotion = config.emotion || {};
+            document.getElementById('sim-emotion-enabled').checked = emotion.enabled !== false;
+            document.getElementById('sim-emotion-positive').value = emotion.positive_boost || 0.1;
+            document.getElementById('sim-emotion-negative').value = emotion.negative_decrease || 0.15;
+
+            // 注意力系统
+            const attention = config.attention || {};
+            document.getElementById('sim-attention-enabled').checked = attention.enabled !== false;
+            document.getElementById('sim-attention-initial').value = attention.initial_attention || 0.5;
+
+            // 疲劳系统
+            const fatigue = config.fatigue || {};
+            document.getElementById('sim-fatigue-enabled').checked = fatigue.enabled !== false;
+            document.getElementById('sim-fatigue-light').value = fatigue.threshold_light || 3;
+            document.getElementById('sim-fatigue-heavy').value = fatigue.threshold_heavy || 8;
+
+            // 打字风格
+            const typing = config.typing_style || {};
+            document.getElementById('sim-typo-enabled').checked = typing.enable_typo_generator !== false;
+            document.getElementById('sim-typo-rate').value = typing.typo_error_rate || 0.04;
+            document.getElementById('sim-typo-rate-value').textContent = typing.typo_error_rate || 0.04;
+        }
+
+        async function saveAdvancedConfig() {
+            const config = {
+                thinking: {
+                    base_delay: parseFloat(document.getElementById('sim-thinking-base').value),
+                    random_delay: {
+                        min: parseFloat(document.getElementById('sim-thinking-min').value),
+                        max: parseFloat(document.getElementById('sim-thinking-max').value)
+                    }
+                },
+                speaking: {
+                    base_probability: parseFloat(document.getElementById('sim-speaking-prob').value),
+                    after_reply_probability: parseFloat(document.getElementById('sim-after-reply-prob').value)
+                },
+                emotion: {
+                    enabled: document.getElementById('sim-emotion-enabled').checked,
+                    positive_boost: parseFloat(document.getElementById('sim-emotion-positive').value),
+                    negative_decrease: parseFloat(document.getElementById('sim-emotion-negative').value)
+                },
+                attention: {
+                    enabled: document.getElementById('sim-attention-enabled').checked,
+                    initial_attention: parseFloat(document.getElementById('sim-attention-initial').value)
+                },
+                fatigue: {
+                    enabled: document.getElementById('sim-fatigue-enabled').checked,
+                    threshold_light: parseInt(document.getElementById('sim-fatigue-light').value),
+                    threshold_heavy: parseInt(document.getElementById('sim-fatigue-heavy').value)
+                },
+                typing_style: {
+                    enable_typo_generator: document.getElementById('sim-typo-enabled').checked,
+                    typo_error_rate: parseFloat(document.getElementById('sim-typo-rate').value)
+                }
+            };
+            const res = await fetch(API + '/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) });
+            const data = await res.json();
+            showToast(data.success ? '模拟系统设置已保存' : '保存失败: ' + (data.error || ''), data.success ? 'success' : 'error');
+        }
+
+        // 会话
+        async function loadSessions() {
+            const data = await fetch(API + '/sessions').then(r => r.json());
+            const select = document.getElementById('session-select');
+            select.innerHTML = '<option value="">选择会话...</option>';
+            for (const s of data.sessions || []) {
+                select.innerHTML += '<option value="' + s + '">' + s + '</option>';
+            }
+        }
+
+        async function loadSession() {
+            const id = document.getElementById('session-select').value;
+            if (!id) return;
+            const data = await fetch(API + '/context/' + encodeURIComponent(id)).then(r => r.json());
+            const container = document.getElementById('chat-container');
+            if (!data.messages?.length) {
+                container.innerHTML = '<p style="text-align: center; color: var(--text-secondary);">暂无消息</p>';
+                return;
+            }
+            container.innerHTML = data.messages.map(m => '<div class="chat-msg ' + (m.is_bot ? 'bot' : 'user') + '"><div class="meta"><span class="name">' + m.sender + '</span><span class="time">' + new Date(m.timestamp).toLocaleString() + '</span></div><div class="content">' + m.content + '</div></div>').join('');
+        }
+
+        // 测试
+        async function sendTest() {
+            const input = document.getElementById('test-input');
+            const msg = input.value.trim();
+            if (!msg) return;
+            const response = document.getElementById('test-response');
+            response.style.display = 'block';
+            response.innerHTML = '<div style="padding: 16px; background: var(--bg); border-radius: 12px;"><strong>发送中...</strong></div>';
+            try {
+                const res = await fetch(API + '/test/generate', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({message: msg}) });
+                const data = await res.json();
+                if (data.success) {
+                    response.innerHTML = '<div style="padding: 16px; background: #d1fae5; border-radius: 12px;"><strong>Bot回复：</strong><br>' + data.reply + '</div>';
+                } else {
+                    response.innerHTML = '<div style="padding: 16px; background: #fee2e2; border-radius: 12px;"><strong>错误：</strong>' + data.error + '</div>';
+                }
+                input.value = '';
+            } catch (e) {
+                response.innerHTML = '<div style="padding: 16px; background: #fee2e2; border-radius: 12px;"><strong>错误：</strong>' + e + '</div>';
+            }
+        }
+
+        document.getElementById('test-input').addEventListener('keypress', e => { if (e.key === 'Enter') sendTest(); });
+
+        // 日志
+        async function loadLogs() {
+            const res = await fetch(API + '/logs');
+            const text = await res.text();
+            document.getElementById('log-content').textContent = text || '暂无日志';
+        }
+
+        // 初始化
+        loadDashboard();
+        setInterval(loadDashboard, 10000);
+    </script>
+</body>
+</html>

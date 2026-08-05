@@ -1,0 +1,19 @@
+services:
+  alice-chat-bot:
+    build: .
+    container_name: alice-chat-bot
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+    ports:
+      - "30080:30080"
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    external: true
