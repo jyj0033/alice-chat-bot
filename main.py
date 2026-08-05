@@ -232,7 +232,7 @@ class GroupChatBot:
         )
 
         # 说话风格
-        style_config = self.personality.to_dict().get("speaking_style", {})
+        style_config = self.config.get("personality", {}).get("speaking_style", {})
         speaking_style = SpeakingStyle.from_dict(style_config) if style_config else SpeakingStyle()
 
         self.speaking_style_manager = SpeakingStyleManager(
@@ -448,19 +448,33 @@ class GroupChatBot:
             return
 
         # === 10. 过滤回复 ===
-        reply = self.response_filter.filter(reply)
-
-        if not reply:
+        passed, result = self.response_filter.filter(reply)
+        if not passed:
+            logger.info(f"回复被过滤: {result}")
             return
+        reply = result
 
         # === 11. 应用错字生成 ===
         typing_config = self.config.get("typing_style", {})
         if typing_config.get("enable_typo_generator", True):
             reply = self.typo_generator.apply_typo(reply)
 
-        # === 12. 发送回复 ===
-        success = await self.qq_adapter.send_message(session_id, reply)
-        if success:
+        # === 12. 发送回复（拆成多条，模拟真人分段发送） ===
+        import random
+        from modules.reply.generator import split_reply_into_messages
+
+        segments = split_reply_into_messages(reply)
+        sent_any = False
+        for i, seg in enumerate(segments):
+            success = await self.qq_adapter.send_message(session_id, seg)
+            if success:
+                sent_any = True
+                logger.info(f"[回复段{i+1}/{len(segments)}] {self.personality.name}: {seg[:50]}")
+                # 段间延迟，模拟真人打字停顿
+                if i < len(segments) - 1:
+                    await asyncio.sleep(random.uniform(0.6, 2.0))
+
+        if sent_any:
             logger.info(f"[回复] {self.personality.name}: {reply[:50]}...")
 
             # === 13. Bot回复后状态更新 ===

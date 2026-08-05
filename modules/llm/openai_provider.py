@@ -149,13 +149,13 @@ def create_provider(provider_type: str, config: dict) -> LLMProvider:
     """创建 LLM Provider"""
     provider_type = provider_type.lower()
 
-    # Claude/minimax 兼容格式使用专门的 Provider
-    if provider_type in ("claude", "minimax", "anthropic"):
+    # Claude/anthropic 兼容格式使用专门的 Provider（请求 /v1/messages 端点）
+    if provider_type in ("claude", "anthropic"):
         from .claude_provider import ClaudeProvider
         return ClaudeProvider(config)
 
-    # OpenAI 兼容格式使用 OpenAIProvider
-    if provider_type in ("openai", "compatible", "openai_compatible", "siliconflow", "deepseek"):
+    # OpenAI 兼容格式使用 OpenAIProvider（包括 minimax/siliconflow/nvidia 等）
+    if provider_type in ("openai", "compatible", "openai_compatible", "siliconflow", "deepseek", "minimax", "nvidia"):
         return OpenAIProvider(config)
 
     raise ValueError(f"Unknown provider type: {provider_type}")

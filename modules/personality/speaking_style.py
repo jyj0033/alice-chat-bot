@@ -25,6 +25,9 @@ class SpeakingStyle:
     max_sentence_length: int = 50  # 最长句子
     avg_sentence_length_range: tuple[int, int] = (10, 30)  # 平均句长范围
 
+    # 回复长度
+    max_reply_length: int = 60     # 单条回复最大字符数（超长会被智能截断）
+
     # 标点与格式
     use_ellipsis: bool = True      # 是否使用省略号
     use_emoji: bool = True         # 是否使用emoji
@@ -42,8 +45,9 @@ class SpeakingStyle:
 
     @classmethod
     def from_dict(cls, data: dict) -> "SpeakingStyle":
-        """从字典加载"""
-        return cls(**data)
+        """从字典加载，忽略未知字段（避免配置中的多余键报错）"""
+        known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        return cls(**known)
 
     def to_dict(self) -> dict:
         """转换为字典"""
@@ -54,6 +58,7 @@ class SpeakingStyle:
             "min_sentence_length": self.min_sentence_length,
             "max_sentence_length": self.max_sentence_length,
             "avg_sentence_length_range": self.avg_sentence_length_range,
+            "max_reply_length": self.max_reply_length,
             "use_ellipsis": self.use_ellipsis,
             "use_emoji": self.use_emoji,
             "emoji_frequency": self.emoji_frequency,
@@ -169,11 +174,17 @@ class SpeakingStyleManager:
         return text
 
     def _apply_emoji(self, text: str) -> str:
-        """添加 emoji"""
+        """添加 emoji（低频，像真人偶尔发一个）"""
         if not self.style.use_emoji:
             return text
 
-        if random.random() < self.style.emoji_frequency:
+        # 兼容 0-1 概率与 0-10 刻度（配置文件里可能是面板刻度值）
+        freq = self.style.emoji_frequency
+        if freq > 1:
+            freq = freq / 10
+        freq = max(0.0, min(1.0, freq))
+
+        if random.random() < freq:
             emoji = random.choice(self.emoji_set)
             # 在句尾或合适位置添加
             if text.endswith(("。", ".", "！", "!")):
@@ -184,9 +195,29 @@ class SpeakingStyleManager:
         return text
 
     def _adjust_length(self, text: str) -> str:
-        """调整文本长度"""
-        # 简单实现：不做极端截断
-        return text
+        """调整文本长度 - 超长时按句子边界智能截断（兜底）"""
+        max_len = self.style.max_reply_length
+        if not text or len(text) <= max_len:
+            return text
+
+        # 按句子边界切分（中文/英文标点）
+        sentences = re.split(r'(?<=[。！？!?~…])', text)
+        result = ""
+        for sent in sentences:
+            if len(result) + len(sent) > max_len:
+                break
+            result += sent
+
+        # 单句就超长时硬截断
+        if not result.strip():
+            result = text[:max_len]
+
+        result = result.strip()
+        # 有内容被截掉时补省略号，读起来像"话说到一半"，更像真人
+        if result != text and not result.endswith(("…", "...")):
+            result = result.rstrip("。，,.!！ ") + "…"
+
+        return result
 
     def _remove_banned_words(self, text: str) -> str:
         """移除禁用词"""

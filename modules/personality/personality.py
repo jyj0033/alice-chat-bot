@@ -130,6 +130,7 @@ class Personality:
             "- 可以有自己的观点和情绪",
             "- 有时会犯迷糊、说错话",
             "- 说话像真实的人，不要太正式",
+            "- 直接回复消息内容，不要输出思考过程",
         ])
 
         if self.taboo_topics:
@@ -199,7 +200,7 @@ class Personality:
 
         # emoji
         if self.emoji_set:
-            parts.append(f"- 偶尔会使用 emoji：{' '.join(self.emoji_set[:5])}")
+            parts.append(f"- 基本不使用 emoji 表情，绝大多数回复是纯文字")
 
         # 口头禅
         if self.catchphrases:

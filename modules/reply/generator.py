@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import random
+import re
 from typing import Optional, Dict, Any
 
 from modules.llm.base import ChatRequest, ChatResponse
@@ -12,6 +13,70 @@ from modules.personality.speaking_style import SpeakingStyleManager, create_defa
 from modules.personality.emotional_state import EmotionalState
 
 logger = logging.getLogger(__name__)
+
+# 常见 emoji 的 Unicode 范围（涵盖主流表情）
+EMOJI_RE = re.compile(
+    r'[\U0001F000-\U0001FAFF☀-➿️‍⭐❤❣'
+    r'☮☯〰©®㊗㊙]'
+)
+
+
+def limit_emoji(text: str, max_emoji: int = 1) -> str:
+    """把回复中的 emoji 限制在 max_emoji 个以内。
+
+    LLM 即使被要求不用 emoji 也常会带一两个，这里做兜底：
+    超过上限时保留最后一个，其余去掉，避免满屏表情。
+    """
+    if not text:
+        return text
+    matches = list(EMOJI_RE.finditer(text))
+    if len(matches) <= max_emoji:
+        return text
+    # 只保留最后一个 emoji（连同它之后的文本），去掉它之前的全部 emoji
+    keep_start = matches[-1].start()
+    head = EMOJI_RE.sub('', text[:keep_start])
+    result = head + text[keep_start:]
+    result = re.sub(r'\s{2,}', ' ', result)
+    return result.strip()
+
+
+def split_reply_into_messages(
+    reply: str,
+    max_segments: int = 3,
+    min_split_length: int = 20,
+) -> list[str]:
+    """把回复拆成多条独立消息，模拟真人分段发送的习惯。
+
+    - 短回复（<= min_split_length）整条一条
+    - 长回复按逗号/句号等断句标点拆分，每条语义尽量完整
+    - 太短的碎片并入前一段，避免碎消息
+    - 最多拆 max_segments 条，超出则从后往前合并
+    """
+    reply = (reply or "").strip()
+    if not reply:
+        return []
+
+    if len(reply) <= min_split_length:
+        return [reply]
+
+    # 按断句标点切分（保留标点，中文英文都支持）
+    parts = re.split(r'(?<=[，。！？!?…~、；;])', reply)
+    parts = [p.strip() for p in parts if p.strip()]
+
+    # 太短的碎片（≤4字）并入前一段
+    segs = []
+    for p in parts:
+        if segs and len(p) <= 4:
+            segs[-1] += p
+        else:
+            segs.append(p)
+
+    # 超出条数上限：从后往前合并
+    while len(segs) > max_segments:
+        segs[-2] += segs[-1]
+        segs.pop()
+
+    return [s for s in segs if s.strip()]
 
 
 class ResponseFilter:
@@ -23,9 +88,9 @@ class ResponseFilter:
             "政治敏感词1", "政治敏感词2",  # 请根据实际情况添加
         ]
 
-        # 最小/最大回复长度
+        # 最小/最大回复长度（硬上限，人性化截断由 SpeakingStyleManager 处理）
         self.min_length = 1
-        self.max_length = 500
+        self.max_length = 200
 
     def filter(self, text: str) -> tuple[bool, str]:
         """
@@ -125,7 +190,10 @@ class ReplyGenerator:
             logger.error(f"LLM error: {e}", exc_info=True)
             reply = self._get_fallback_reply()
 
-        # 3. 过滤回复
+        # 3. 清理思考过程
+        reply = self._clean_thinking_process(reply)
+
+        # 4. 过滤回复
         passed, result = self.response_filter.filter(reply)
         if not passed:
             logger.info(f"Reply filtered: {result}")
@@ -136,6 +204,9 @@ class ReplyGenerator:
 
         # 4. 应用说话风格
         reply = self.style_manager.apply_style(result)
+
+        # 4.5 emoji 兜底：最多保留 1 个
+        reply = limit_emoji(reply, max_emoji=1)
 
         # 5. 添加随机延迟（模拟打字）
         delay = self._calculate_delay(emotional_state)
@@ -164,13 +235,22 @@ class ReplyGenerator:
 
         request = ChatRequest(
             temperature=temp,
-            max_tokens=500,
+            max_tokens=200,
             top_p=0.9,
         )
 
         # 系统提示 - 人格设定
         if self.personality_prompt:
             request.add_system(self.personality_prompt)
+
+        # 回复长度硬约束 - 群聊回复必须简短才像真人
+        request.add_system(
+            "回复长度要求：必须是简短的口语回复，一般1-2句话、不超过30个中文字符。"
+            "能用一句话说清就别用两句；不要分点、不要加解释、不要复述对方的话；"
+            "偶尔超短也行（几个字），但绝不能长篇大论。\n"
+            "回复中不要使用emoji表情符号，绝大多数消息应该是纯文字；"
+            "除非气氛真的很到位，否则不要加表情。"
+        )
 
         # 添加说话风格指导
         style_guide = self.style_manager.get_style_guide()
@@ -234,6 +314,20 @@ class ReplyGenerator:
                 guides.append("你心情不太好，回避沉重话题")
 
         return "，".join(guides) if guides else ""
+
+    def _clean_thinking_process(self, text: str) -> str:
+        """清理思考过程（如 DeepSeek 的 <think>...</think>）"""
+        import re
+        # 移除 <think>...</think> 标签
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        # 移除 (思考中...)、【思考】等模式
+        text = re.sub(r'【思考】.*?(?=【|$)', '', text, flags=re.DOTALL)
+        text = re.sub(r'\(思考中[^)]*\)', '', text)
+        # 移除 "让我想想" 等思考前置语
+        text = re.sub(r'^(让我想想|等我想想|等等我)[，,]', '', text)
+        # 清理多余空白
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
 
     def _calculate_delay(self, emotional_state: EmotionalState = None) -> float:
         """计算思考延迟（模拟真人打字前的思考）"""
