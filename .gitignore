@@ -1,6 +1,7 @@
 # 敏感配置
 config/config.yaml
 config/*.yaml
+config/*.bak
 
 # 数据文件
 data/
@@ -31,6 +32,7 @@ logs/
 # 临时文件
 *.tmp
 *.cache
+.playwright-mcp/
 
 # 数据库
 *.db

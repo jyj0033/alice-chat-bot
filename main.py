@@ -20,7 +20,7 @@ from core.adapter.qq_adapter import QQAdapter
 from core.adapter.base import Message
 
 from modules.llm.openai_provider import create_provider, LLMProvider
-from modules.memory.storage import MemoryStorage, AsyncMemoryStorage
+from modules.memory.storage import MemoryStorage, AsyncMemoryStorage, Memory
 from modules.memory.context import ContextManager
 
 from modules.personality.personality import Personality
@@ -214,10 +214,27 @@ class GroupChatBot:
             MemoryStorage(memory_config.get("db_path", "data/memory.db"))
         )
 
+        # 嵌入+重排服务（无 key 时自动回退 TF-IDF）
+        from modules.memory.embedding import EmbeddingRerankService
+        embed_config = memory_config.get("embedding", {}) or {}
+        embed_service = EmbeddingRerankService(embed_config)
+        self.memory_storage._storage.set_embedding_service(embed_service)
+        if embed_service.enabled:
+            logger.info(f"✓ 嵌入服务已启用: {embed_service.embed_model} + rerank {embed_service.rerank_model}")
+        else:
+            logger.info("嵌入服务未配置（无 api_key），记忆检索使用 TF-IDF 回退")
+
         self.context_manager = ContextManager(
             max_messages=memory_config.get("context_window_size", 30),
             max_age_hours=memory_config.get("context_max_age_hours", 2)
         )
+
+        # 记忆检索参数（向量检索 + 时间衰减）
+        self.memory_search_top_k = memory_config.get("retrieval_top_k", 5)
+        self.memory_half_life_days = memory_config.get("half_life_days", 30)
+        self.memory_similarity_weight = memory_config.get("similarity_weight", 0.85)
+        # 衰减清理任务的上次执行时间（初始为"从未"）
+        self._last_decay_run: float = 0.0
 
     def _init_personality(self) -> None:
         """初始化人格系统"""
@@ -373,12 +390,13 @@ class GroupChatBot:
         group_id = message.group_id or ""
 
         # === 1. 状态更新 ===
+        is_reply_to_bot = self._is_reply_to_bot(message)
         self.speaking_decider.on_message(
             session_id=session_id,
             group_id=group_id,
             user_id=message.sender_id,
             mentioned_bot=message.mentioned_me,
-            is_reply_to_bot=self._is_reply_to_bot(message),
+            is_reply_to_bot=is_reply_to_bot,
         )
 
         # === 2. 更新情感状态 ===
@@ -395,6 +413,7 @@ class GroupChatBot:
             group_id=group_id,
             session_id=session_id,
             mentioned_me=message.mentioned_me,
+            reply_to_me=is_reply_to_bot,
         )
 
         # === 4. 社交感知分析 ===
@@ -408,8 +427,13 @@ class GroupChatBot:
             sender_id=message.sender_id,
             sender_name=message.sender_name,
             content=message.content,
-            is_bot=False
+            is_bot=False,
+            message_id=message.message_id,
+            reply_to_qq=message.reply_to_qq,
         )
+
+        # === 5.5 写入长期记忆（有记忆价值的消息） ===
+        await self._store_long_term_memory(message, session_id)
 
         # === 6. 发言决策 ===
         should_speak, reason, probability = self.speaking_decider.should_speak(
@@ -422,11 +446,26 @@ class GroupChatBot:
         if not should_speak:
             return
 
-        # === 7. 构建上下文提示 ===
+        # === 6.5 判断消息指向（决定参与方式） ===
+        # 明确提到bot的信号：@、回复bot、提到昵称/触发词/紧急
+        # 只有这些才当"对我说"，否则归为群友互聊/对大家/自言自语，由LLM判断是否插嘴
+        trigger_reasons = context.extra.get("trigger", {}).get("reasons", [])
+        has_direct_signal = (
+            message.mentioned_me
+            or is_reply_to_bot
+            or any(r not in ("直接提问",) for r in trigger_reasons)
+        )
+        direction = "to_bot" if has_direct_signal else "group"
+        logger.debug(f"[指向] {direction} (触发: {trigger_reasons})")
+
+        # === 7. 构建上下文提示（含长期记忆检索） ===
+        memories = await self._retrieve_memories(message.content, session_id)
+
         context_prompt = self.context_manager.build_context_prompt(
             session_id=session_id,
             bot_name=self.personality.name,
-            persona_prompt=self.personality.build_persona_prompt()
+            persona_prompt=self.personality.build_persona_prompt(),
+            memories=memories
         )
 
         # === 8. 思考延迟 ===
@@ -436,15 +475,21 @@ class GroupChatBot:
             emotional_modifier=emotional_state.get_thinking_delay_multiplier()
         )
 
-        # === 9. 生成回复 ===
+        # === 9. 生成回复（direction 控制是否可沉默） ===
         try:
             reply = await self.reply_generator.generate(
                 context_prompt=context_prompt,
                 current_message=message.content,
-                emotional_state=emotional_state
+                emotional_state=emotional_state,
+                direction=direction,
             )
         except Exception as e:
             logger.error(f"Error generating reply: {e}", exc_info=True)
+            return
+
+        # LLM 选择沉默（群友互聊/自言自语时的正常行为）
+        if reply is None:
+            logger.info(f"[沉默] direction={direction}，不参与该条消息")
             return
 
         # === 10. 过滤回复 ===
@@ -486,7 +531,9 @@ class GroupChatBot:
                 sender_id=self.config.get("qq", {}).get("self_id", ""),
                 sender_name=self.personality.name,
                 content=reply,
-                is_bot=True
+                is_bot=True,
+                message_id="",
+                reply_to_qq=message.sender_id,  # bot 回复的是当前这条消息
             )
         else:
             logger.error("Failed to send reply")
@@ -498,10 +545,94 @@ class GroupChatBot:
             logger.info(f"[疲劳] {closing_msg}")
 
     def _is_reply_to_bot(self, message: Message) -> bool:
-        """检查是否回复了Bot"""
-        # 简单实现：检查消息内容是否提到Bot昵称
+        """检查是否回复了Bot：
+        1. 被回复消息的发送者是 bot 的 QQ 号（reply 段的 qq 字段）
+        2. 内容里提到 bot 昵称
+        """
+        if message.reply_to_qq:
+            self_id = str(self.config.get("qq", {}).get("self_id", ""))
+            if self_id and str(message.reply_to_qq) == self_id:
+                return True
         bot_name = self.personality.name
         return bot_name in message.content
+
+    # 个人信息关键词 - 出现时消息有较高记忆价值
+    _PERSONAL_KEYWORDS = [
+        "我叫", "我是", "我喜欢", "我爱", "我的生日", "我在", "我住", "我养",
+        "我家", "我的工作", "我今年", "我朋友", "我对象", "我男票", "我女票",
+        "我老婆", "我老公", "我同事", "我同学", "记得我", "我叫什么",
+    ]
+
+    def _store_long_term_memory(self, message: Message, session_id: str) -> None:
+        """把有记忆价值的消息写入 SQLite 情景记忆（异步后台执行）
+
+        打分规则：
+        - 提到 bot → +0.2
+        - 消息 > 20 字（分享/吐槽）→ +0.2
+        - 含个人信息关键词（我叫/我喜欢/我的生日…）→ +0.3
+        - 超过阈值 0.5 才值得长期记住
+        """
+        content = message.content.strip()
+        if not content or len(content) < 4:
+            return
+
+        importance = 0.3
+        if message.mentioned_me:
+            importance += 0.2
+        if len(content) > 20:
+            importance += 0.2
+        if any(kw in content for kw in self._PERSONAL_KEYWORDS):
+            importance += 0.3
+
+        if importance < 0.5:
+            return
+
+        memory = Memory(
+            content=f"{message.sender_name}：{content[:200]}",
+            memory_type="episodic",
+            importance=min(1.0, importance),
+            source_session=session_id,
+            metadata={
+                "sender_id": message.sender_id,
+                "sender_name": message.sender_name,
+                "mentioned_me": message.mentioned_me,
+            },
+        )
+
+        async def _save():
+            try:
+                await self.memory_storage.store(memory)
+                logger.debug(f"Saved long-term memory: importance={memory.importance:.2f}")
+            except Exception as e:
+                logger.error(f"Failed to save memory: {e}")
+
+        # 不阻塞消息处理主流程
+        asyncio.create_task(_save())
+
+    async def _retrieve_memories(self, query: str, session_id: str, limit: int = None) -> list:
+        """检索相关长期记忆：
+        优先向量语义检索（TF-IDF + 余弦），失败或空时退回该会话最近记忆。
+        """
+        limit = limit or self.memory_search_top_k
+        try:
+            memories = await self.memory_storage.semantic_search(
+                query=query,
+                session=session_id,
+                limit=limit,
+                half_life_days=self.memory_half_life_days,
+                similarity_weight=self.memory_similarity_weight,
+            )
+            if memories:
+                return memories
+        except Exception as e:
+            logger.error(f"Semantic search failed: {e}")
+
+        # 兜底：该会话最近的高价值记忆
+        try:
+            return await self.memory_storage.retrieve_session_recent(session_id, limit=limit)
+        except Exception as e:
+            logger.error(f"Failed to retrieve memories: {e}")
+            return []
 
     async def run(self) -> None:
         """运行 Bot"""
@@ -536,7 +667,28 @@ class GroupChatBot:
             await asyncio.sleep(300)  # 5分钟
             self.speaking_decider.cleanup()
             self.fatigue_manager.cleanup()
+            self.context_manager.cleanup_inactive(max_inactive_minutes=60)
+            await self._maybe_decay_memories()
             logger.debug("Cleaned up expired states")
+
+    async def _maybe_decay_memories(self) -> None:
+        """定期对长期记忆应用时间衰减（每6小时一次，避免频繁写库）"""
+        import time
+        now = time.time()
+        # 距上次执行不足6小时则跳过；进程内首次运行时直接执行一次
+        if self._last_decay_run and (now - self._last_decay_run) < 6 * 3600:
+            return
+        try:
+            self._last_decay_run = now
+            result = await self.memory_storage.apply_time_decay(
+                half_life_days=self.memory_half_life_days,
+                min_importance=0.1,
+                max_age_days=180,
+            )
+            if result["decayed"] or result["deleted"]:
+                logger.info(f"[记忆衰减] {result}")
+        except Exception as e:
+            logger.error(f"Memory decay failed: {e}")
 
     async def stop(self) -> None:
         """停止 Bot"""
@@ -554,6 +706,14 @@ class GroupChatBot:
         # 断开 QQ 连接
         if self.qq_adapter:
             await self.qq_adapter.disconnect()
+
+        # 关闭嵌入服务连接
+        try:
+            svc = self.memory_storage._storage._embedding_service
+            if svc:
+                await svc.close()
+        except Exception:
+            pass
 
         elapsed = time.time() - self._start_time
         logger.info(f"GroupChatBot stopped after {elapsed:.0f}s")

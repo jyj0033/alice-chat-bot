@@ -175,6 +175,19 @@
         .btn:disabled { opacity: 0.6; cursor: not-allowed; }
         .btn-group { display: flex; gap: 12px; }
 
+        /* 长期记忆列表 */
+        .memories-list { margin-top: 12px; max-height: 600px; overflow-y: auto; border-top: 1px solid var(--border); }
+        .memory-item { padding: 12px 4px; border-bottom: 1px solid var(--border); }
+        .memory-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+        .memory-imp { font-size: 12px; color: white; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
+        .memory-type { font-size: 11px; background: var(--bg); padding: 2px 8px; border-radius: 10px; color: var(--muted); }
+        .memory-session { font-size: 11px; color: var(--muted); font-family: monospace; }
+        .memory-time { font-size: 11px; color: var(--muted); margin-left: auto; }
+        .memory-content { font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+        .memory-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
+        .btn-sm { padding: 4px 10px; font-size: 12px; }
+        .badge { font-size: 12px; background: var(--primary); color: white; padding: 1px 8px; border-radius: 10px; }
+
         /* 滑块 */
         .slider-group { display: flex; align-items: center; gap: 16px; }
         .slider-group input[type="range"] { flex: 1; height: 6px; -webkit-appearance: none; background: var(--border); border-radius: 3px; }
@@ -817,6 +830,51 @@
                         <button class="btn btn-primary" onclick="saveMemory()">保存设置</button>
                     </div>
                 </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">🔮</span> 嵌入 + 重排 <span class="hint" id="embed-status" style="margin-left:8px"></span></div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group full">
+                            <label>API Key (SiliconFlow)</label>
+                            <input type="password" id="embed-api-key" placeholder="留空则回退 TF-IDF 检索">
+                        </div>
+                        <div class="form-group">
+                            <label>嵌入模型</label>
+                            <input type="text" id="embed-model" placeholder="Qwen/Qwen3-Embedding-8B">
+                        </div>
+                        <div class="form-group">
+                            <label>重排模型</label>
+                            <input type="text" id="rerank-model" placeholder="Qwen/Qwen3-Reranker-8B">
+                        </div>
+                    </div>
+                    <div class="btn-group">
+                        <button class="btn btn-primary" onclick="testEmbedding()">测试嵌入连接</button>
+                        <button class="btn btn-secondary" onclick="saveMemory()">保存设置</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="icon">💾</span> 长期记忆 <span class="hint" id="memory-count" style="margin-left:8px"></span></div>
+                        <div class="header-status">
+                            <input type="text" id="memory-search" placeholder="搜索记忆内容..." style="width:200px;margin-right:8px" oninput="loadMemories()">
+                            <button class="btn btn-primary" onclick="loadMemories()">刷新</button>
+                        </div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group full">
+                            <label>按会话筛选</label>
+                            <select id="memory-session-filter" onchange="loadMemories()">
+                                <option value="">全部会话</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div id="memories-list" class="memories-list">
+                        <div class="hint" style="padding:12px">加载中...</div>
+                    </div>
+                </div>
             </div>
 
             <!-- 测试对话 -->
@@ -1211,6 +1269,92 @@
             document.getElementById('memory-age').value = mem.context_max_age_hours || 2;
             document.getElementById('memory-long-term').checked = mem.enable_long_term_memory !== false;
             document.getElementById('memory-db-path').value = mem.db_path || 'data/memory.db';
+            const emb = mem.embedding || {};
+            document.getElementById('embed-api-key').value = emb.api_key || '';
+            document.getElementById('embed-model').value = emb.embed_model || 'Qwen/Qwen3-Embedding-8B';
+            document.getElementById('rerank-model').value = emb.rerank_model || 'Pro/BAAI/bge-reranker-v2-m3';
+            const st = document.getElementById('embed-status');
+            if (emb.api_key) {
+                st.textContent = '已配置';
+                st.style.color = '#059669';
+            } else {
+                st.textContent = '未配置（TF-IDF）';
+                st.style.color = '#95a5a6';
+            }
+            loadMemories();
+        }
+
+        // 加载长期记忆列表
+        async function loadMemories() {
+            const q = document.getElementById('memory-search').value.trim();
+            const session = document.getElementById('memory-session-filter').value;
+            const params = new URLSearchParams({ limit: '200' });
+            if (q) params.set('q', q);
+            if (session) params.set('session', session);
+
+            const data = await fetch(API + '/memories?' + params).then(r => r.json());
+            const list = document.getElementById('memories-list');
+            const count = document.getElementById('memory-count');
+            const mems = data.memories || [];
+
+            document.getElementById('memory-count').textContent = `共 ${mems.length} 条`;
+
+            // 填充会话过滤下拉（只建一次）
+            const sel = document.getElementById('memory-session-filter');
+            const sessions = [...new Set(mems.map(m => m.source_session).filter(Boolean))];
+            if (sel.options.length <= 1) {
+                sessions.forEach(s => {
+                    const opt = document.createElement('option');
+                    opt.value = s;
+                    opt.textContent = s;
+                    sel.appendChild(opt);
+                });
+            }
+
+            if (!mems.length) {
+                list.innerHTML = '<div class="hint" style="padding:12px">暂无长期记忆，等群里出现有价值的消息（提到Bot/个人信息/长吐槽）后会自动积累</div>';
+                return;
+            }
+
+            list.innerHTML = mems.map(m => {
+                const imp = (m.effective_importance * 100).toFixed(0);
+                const created = new Date(m.created_at).toLocaleString('zh-CN', {hour12:false});
+                const lastAcc = new Date(m.last_accessed).toLocaleString('zh-CN', {hour12:false});
+                const sender = m.sender_name ? `<span class="badge">${escapeHtml(m.sender_name)}</span> ` : '';
+                return `
+                    <div class="memory-item" id="mem-${m.id}">
+                        <div class="memory-head">
+                            <span class="memory-imp" style="background:${impColor(imp)}">${imp}%</span>
+                            ${sender}
+                            <span class="memory-type">${m.memory_type}</span>
+                            <span class="memory-session" title="${m.source_session}">${m.source_session}</span>
+                            <span class="memory-time">记于 ${created}</span>
+                        </div>
+                        <div class="memory-content">${escapeHtml(m.content)}</div>
+                        <div class="memory-foot">
+                            <span class="hint">最近想起 ${lastAcc} · 基础重要性 ${(m.importance*100).toFixed(0)}%</span>
+                            <button class="btn btn-danger btn-sm" onclick="deleteMemory(${m.id})">删除</button>
+                        </div>
+                    </div>`;
+            }).join('');
+        }
+
+        async function deleteMemory(id) {
+            if (!confirm('确定删除这条记忆？')) return;
+            const res = await fetch(API + '/memories/' + id, { method: 'DELETE' });
+            const data = await res.json();
+            showToast(data.message || (data.success ? '已删除' : '删除失败'), data.success ? 'success' : 'error');
+            loadMemories();
+        }
+
+        function impColor(p) {
+            if (p >= 60) return '#e74c3c';
+            if (p >= 30) return '#e67e22';
+            return '#95a5a6';
+        }
+
+        function escapeHtml(s) {
+            return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
         }
 
         async function saveMemory() {
@@ -1219,12 +1363,31 @@
                     context_window_size: parseInt(document.getElementById('memory-window').value),
                     context_max_age_hours: parseFloat(document.getElementById('memory-age').value),
                     enable_long_term_memory: document.getElementById('memory-long-term').checked,
-                    db_path: document.getElementById('memory-db-path').value
+                    db_path: document.getElementById('memory-db-path').value,
+                    embedding: {
+                        api_key: document.getElementById('embed-api-key').value.trim(),
+                        embed_model: document.getElementById('embed-model').value.trim(),
+                        rerank_model: document.getElementById('rerank-model').value.trim(),
+                    }
                 }
             };
             const res = await fetch(API + '/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) });
             const data = await res.json();
-            showToast(data.success ? '记忆设置已保存' : '保存失败', data.success ? 'success' : 'error');
+            showToast(data.success ? '记忆设置已保存（重启后生效）' : '保存失败', data.success ? 'success' : 'error');
+        }
+
+        async function testEmbedding() {
+            const key = document.getElementById('embed-api-key').value.trim();
+            const model = document.getElementById('embed-model').value.trim();
+            if (!key) { showToast('请先填写 API Key', 'error'); return; }
+            showToast('测试中...', 'info');
+            const res = await fetch(API + '/embedding/test', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ api_key: key, embed_model: model })
+            });
+            const data = await res.json();
+            showToast(data.success ? '✓ 嵌入连接成功' : '✗ ' + (data.error || '失败'), data.success ? 'success' : 'error');
         }
 
         // 加载人格

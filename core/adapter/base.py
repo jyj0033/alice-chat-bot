@@ -19,6 +19,7 @@ class Message:
     raw_content: str = ""  # 原始消息内容
     mentioned_me: bool = False
     reply_to_id: Optional[str] = None
+    reply_to_qq: Optional[str] = None  # 被回复消息的发送者 QQ 号（OneBot reply 段扩展字段）
 
     @property
     def session_id(self) -> str:

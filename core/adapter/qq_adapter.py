@@ -178,6 +178,22 @@ class QQAdapter(PlatformAdapter):
         # 消息可能是数组格式或字符串格式
         content = self._extract_text(raw_content)
 
+        # 解析被回复的对象（[CQ:reply] 消息段），两种格式都支持
+        reply_to_id, reply_to_qq = None, None
+        if isinstance(raw_content, str):
+            m = re.search(r'\[CQ:reply,id=(\d+)(?:,qq=([-\d]+))?\]', raw_content)
+            if m:
+                reply_to_id = m.group(1)
+                reply_to_qq = m.group(2)
+        elif isinstance(raw_content, list):
+            for seg in raw_content:
+                if isinstance(seg, dict) and seg.get("type") == "reply":
+                    rdata = seg.get("data", {}) or {}
+                    reply_to_id = str(rdata.get("id", "")) or None
+                    qq = rdata.get("qq")
+                    reply_to_qq = str(qq) if qq is not None else None
+                    break
+
         # 检查是否 @ 了 bot
         mentioned_me = False
         if isinstance(raw_content, str):
@@ -190,6 +206,10 @@ class QQAdapter(PlatformAdapter):
                         mentioned_me = True
                         break
 
+        # 回复了 bot 的消息，等同于 @（也算"提到我"）
+        if not mentioned_me and reply_to_qq and str(reply_to_qq) == str(self.self_id):
+            mentioned_me = True
+
         return Message(
             message_id=str(data.get("message_id", "")),
             message_type=data.get("message_type", "private"),
@@ -199,6 +219,8 @@ class QQAdapter(PlatformAdapter):
             content=content,
             raw_content=raw_content if isinstance(raw_content, str) else str(raw_content),
             mentioned_me=mentioned_me,
+            reply_to_id=reply_to_id,
+            reply_to_qq=reply_to_qq,
         )
 
     def _extract_text(self, content) -> str:

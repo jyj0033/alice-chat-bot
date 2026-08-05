@@ -159,7 +159,8 @@ class ReplyGenerator:
         current_message: str,
         emotional_state: EmotionalState = None,
         temperature: float = 0.8,
-        session_context: Dict[str, Any] = None
+        session_context: Dict[str, Any] = None,
+        direction: str = "to_bot",
     ) -> Optional[str]:
         """
         生成回复
@@ -170,16 +171,18 @@ class ReplyGenerator:
             emotional_state: 情感状态
             temperature: 生成温度
             session_context: 会话上下文（群ID、用户ID等）
+            direction: 消息指向 "to_bot"（明确对bot说） / "group"（群友互聊/对大家/自言自语）
 
         Returns:
-            str: 生成的回复，如果被过滤则返回 None
+            str: 生成的回复；如果 LLM 选择沉默或回复被过滤则返回 None
         """
         # 1. 构建请求
         request = self._build_request(
             context_prompt,
             current_message,
             emotional_state,
-            session_context
+            session_context,
+            direction,
         )
 
         # 2. 调用 LLM
@@ -188,12 +191,20 @@ class ReplyGenerator:
             reply = response.content.strip()
         except Exception as e:
             logger.error(f"LLM error: {e}", exc_info=True)
+            if direction == "group":
+                # 群友互聊场景 LLM 挂了 → 安静潜水，比说错话好
+                return None
             reply = self._get_fallback_reply()
 
         # 3. 清理思考过程
         reply = self._clean_thinking_process(reply)
 
-        # 4. 过滤回复
+        # 4. 参与决策：LLM 有权选择沉默（群友互聊/自言自语时）
+        if self._is_silent(reply):
+            logger.debug(f"LLM 选择沉默（direction={direction}）")
+            return None
+
+        # 5. 过滤回复
         passed, result = self.response_filter.filter(reply)
         if not passed:
             logger.info(f"Reply filtered: {result}")
@@ -202,24 +213,32 @@ class ReplyGenerator:
 
         self.replies_generated += 1
 
-        # 4. 应用说话风格
+        # 6. 应用说话风格
         reply = self.style_manager.apply_style(result)
 
-        # 4.5 emoji 兜底：最多保留 1 个
+        # 7. emoji 兜底：最多保留 1 个
         reply = limit_emoji(reply, max_emoji=1)
 
-        # 5. 添加随机延迟（模拟打字）
+        # 8. 添加随机延迟（模拟打字）
         delay = self._calculate_delay(emotional_state)
         await asyncio.sleep(delay)
 
         return reply
+
+    @staticmethod
+    def _is_silent(reply: str) -> bool:
+        """判断 LLM 是否选择沉默（输出了沉默标记或空回复）"""
+        r = (reply or "").strip().lower().strip("[]()（）")
+        silent_markers = {"<silent>", "silent", "沉默", "不参与", "不说话"}
+        return r in silent_markers or not r
 
     def _build_request(
         self,
         context_prompt: str,
         current_message: str,
         emotional_state: EmotionalState = None,
-        session_context: Dict[str, Any] = None
+        session_context: Dict[str, Any] = None,
+        direction: str = "to_bot",
     ) -> ChatRequest:
         """构建 LLM 请求"""
 
@@ -252,6 +271,9 @@ class ReplyGenerator:
             "除非气氛真的很到位，否则不要加表情。"
         )
 
+        # 参与规则 - 根据消息指向决定「该不该插嘴」
+        request.add_system(self._build_participation_guide(direction))
+
         # 添加说话风格指导
         style_guide = self.style_manager.get_style_guide()
         if style_guide:
@@ -273,12 +295,29 @@ class ReplyGenerator:
             request.add_user(
                 f"【对话历史】\n{context_prompt}\n\n"
                 f"【当前消息】{current_message}\n\n"
-                f"请以爱丽丝的身份自然回复。"
+                f"请以爱丽丝的身份回复。"
             )
         else:
             request.add_user(f"{current_message}")
 
         return request
+
+    def _build_participation_guide(self, direction: str) -> str:
+        """构建参与规则：告诉 LLM 当前消息是谁对谁说的，以及它有没有权保持沉默"""
+        if direction == "to_bot":
+            return (
+                "参与规则：当前这条消息是明确对你说的（提到了你、@了你或回复了你）。"
+                "你应该正常回应，自然说话即可，不用沉默。"
+            )
+        return (
+            "参与规则：当前这条消息是群友之间的话（可能是两人互聊、多人互聊，也可能是一个人自言自语），"
+            "不是明确对你说的。\n"
+            "你可以这样表现：\n"
+            "1. 自然插一句——像朋友搭话那样简短接一句，语气自然，不要用「被点名」的口吻；\n"
+            "2. 保持沉默——如果你觉得没话说、不该插嘴、或话题与你无关，"
+            "请只输出 <silent> 三个字符（必须是单独的，不能夹杂其他文字）。\n"
+            "大部分时候保持沉默很正常，但偶尔插一句更真实。"
+        )
 
     def _format_session_context(self, context: Dict[str, Any]) -> str:
         """格式化会话上下文"""

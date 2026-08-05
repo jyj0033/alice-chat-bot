@@ -57,6 +57,10 @@ async def get_config():
         for name, provider in config['llm'].items():
             if isinstance(provider, dict) and 'api_key' in provider:
                 provider['api_key'] = '********' if provider['api_key'] else ''
+    if 'memory' in config and isinstance(config.get('memory'), dict):
+        emb = config['memory'].get('embedding')
+        if isinstance(emb, dict) and emb.get('api_key'):
+            emb['api_key'] = '********'
     return config
 
 
@@ -91,7 +95,15 @@ async def update_config(request: Request):
 
         # 记忆设置
         if 'memory' in data:
-            current['memory'] = {**current.get('memory', {}), **data['memory']}
+            current_mem = current.get('memory', {})
+            # 深合并 embedding，保留未变动的 key
+            if isinstance(data['memory'].get('embedding'), dict):
+                new_emb = data['memory']['embedding'].copy()
+                if new_emb.get('api_key', '').startswith('*'):
+                    old_emb = current_mem.get('embedding', {})
+                    new_emb['api_key'] = old_emb.get('api_key', '')
+                data['memory']['embedding'] = new_emb
+            current['memory'] = {**current_mem, **data['memory']}
 
         # Bot 基本信息
         if 'bot' in data:
@@ -194,6 +206,90 @@ async def get_context(session_id: str):
     window = bot_instance.context_manager.get_window(session_id)
     messages = window.get_recent(100)
     return {"messages": [{"sender": m.sender_name, "content": m.content, "is_bot": m.is_bot, "timestamp": m.timestamp.isoformat()} for m in messages]}
+
+
+@app.get("/api/memories")
+async def get_memories(session: str = "", q: str = "", limit: int = 100):
+    """获取长期记忆列表（支持按会话/关键词过滤，含时间衰减后的有效重要性）"""
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"memories": [], "total": 0}
+
+    from datetime import datetime
+
+    try:
+        all_mem = await bot_instance.memory_storage.get_all(limit=1000)
+    except Exception as e:
+        logger.error(f"Failed to load memories: {e}")
+        return {"memories": [], "total": 0}
+
+    now = datetime.now()
+    result = []
+    q_lower = (q or "").strip().lower()
+    for m in all_mem:
+        if m.memory_type not in ("episodic", "semantic"):
+            continue
+        if session and m.source_session != session:
+            continue
+        if q_lower and q_lower not in m.content.lower():
+            continue
+        eff = bot_instance.memory_storage._storage._effective_importance(m, now, bot_instance.memory_half_life_days)
+        result.append({
+            "id": m.id,
+            "content": m.content,
+            "importance": round(m.importance, 3),
+            "effective_importance": round(eff, 3),
+            "memory_type": m.memory_type,
+            "created_at": m.created_at.isoformat(),
+            "last_accessed": m.last_accessed.isoformat(),
+            "source_session": m.source_session,
+            "sender_name": (m.metadata or {}).get("sender_name", ""),
+        })
+
+    # 默认按有效重要性排序
+    result.sort(key=lambda x: x["effective_importance"], reverse=True)
+    result = result[:limit]
+    return {"memories": result, "total": len(result)}
+
+
+@app.delete("/api/memories/{memory_id}")
+async def delete_memory(memory_id: int):
+    """删除一条长期记忆"""
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        ok = await bot_instance.memory_storage.delete(memory_id)
+        return {"success": ok, "message": "已删除" if ok else "记忆不存在"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/embedding/test")
+async def test_embedding(request: Request):
+    """测试嵌入模型连接"""
+    try:
+        data = await request.json()
+        api_key = (data.get("api_key") or "").strip()
+        if not api_key:
+            return {"success": False, "error": "API Key 不能为空"}
+        model = data.get("embed_model") or "Qwen/Qwen3-Embedding-8B"
+
+        from modules.memory.embedding import EmbeddingRerankService
+        svc = EmbeddingRerankService({
+            "api_key": api_key,
+            "embed_model": model,
+            "rerank_model": data.get("rerank_model") or "Pro/BAAI/bge-reranker-v2-m3",
+        })
+        try:
+            vecs = await svc.embed(["测试连接"])
+            if not vecs:
+                return {"success": False, "error": "嵌入服务无返回"}
+            dim = len(vecs[0])
+            return {"success": True, "model": model, "dim": dim,
+                    "message": f"连接成功，向量维度 {dim}"}
+        finally:
+            await svc.close()
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)}"}
 
 
 @app.get("/api/emotion/{session_id}")
