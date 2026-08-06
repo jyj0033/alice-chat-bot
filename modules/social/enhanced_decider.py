@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 
 from .awareness import SocialContext, SocialAwarenessManager
 from .attention import AttentionManager, AttentionKeywordsDetector
+from .conversation_floor import ActionType
 from .fatigue import FatigueManager
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,24 @@ class EnhancedSpeakingDecider:
                 modifiers={"private": True},
             )
 
+        action_plan = context.extra.get("action_plan")
+        if (
+            action_plan
+            and action_plan.action == ActionType.SILENT
+            and not context.mentioned_me
+            and not context.reply_to_me
+            and not context.is_emergency
+        ):
+            return SpeakingDecision(
+                should_speak=False,
+                probability=0.0,
+                reason=action_plan.reason,
+                modifiers={
+                    "action": action_plan.action.value,
+                    "interruption_cost": action_plan.interruption_cost,
+                },
+            )
+
         # === 3. 强制触发检查 ===
         trigger_result = context.extra.get("trigger", {})
         if trigger_result.get("forced_trigger", False):
@@ -242,6 +261,15 @@ class EnhancedSpeakingDecider:
             modifiers["群聊节奏"] = -0.08
         elif context.group_activity < 0.15:
             modifiers["群聊节奏"] = 0.03
+
+        # === E.6 发言权成本 ===
+        action_plan = context.extra.get("action_plan")
+        if action_plan and not action_plan.directed:
+            modifiers["插话成本"] = -action_plan.interruption_cost * 0.28
+            if action_plan.action == ActionType.ANSWER:
+                modifiers["群问题可回答"] = 0.08
+            elif action_plan.action == ActionType.REACT:
+                modifiers["仅适合短反应"] = -0.02
 
         # === F. 疲劳惩罚 ===
         fatigue_penalty = self.fatigue_manager.get_probability_penalty(session_id)
@@ -354,7 +382,11 @@ class EnhancedSpeakingDecider:
             reasons.append("回复后窗口期")
 
         if not reasons:
-            reasons.append("概率触发")
+            action_plan = context.extra.get("action_plan")
+            if action_plan:
+                reasons.append(action_plan.reason)
+            else:
+                reasons.append("概率触发")
 
         return " + ".join(reasons)
 

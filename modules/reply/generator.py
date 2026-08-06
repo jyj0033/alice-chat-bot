@@ -183,6 +183,7 @@ class ReplyGenerator:
         temperature: float = 0.8,
         session_context: Dict[str, Any] = None,
         direction: str = "to_bot",
+        action_plan: Dict[str, Any] = None,
     ) -> Optional[str]:
         """
         生成回复
@@ -194,6 +195,7 @@ class ReplyGenerator:
             temperature: 生成温度
             session_context: 会话上下文（群ID、用户ID等）
             direction: 消息指向 "to_bot"（明确对bot说） / "group"（群友互聊/对大家/自言自语）
+            action_plan: 发言权系统生成的结构化行为计划
 
         Returns:
             str: 生成的回复；如果 LLM 选择沉默或回复被过滤则返回 None
@@ -205,6 +207,7 @@ class ReplyGenerator:
             emotional_state,
             session_context,
             direction,
+            action_plan,
         )
 
         # 2. 调用 LLM
@@ -238,6 +241,13 @@ class ReplyGenerator:
         # 6. 应用说话风格
         reply = self.style_manager.apply_style(result)
 
+        # 行为计划的长度是最终约束，避免“短反应”被模型扩写成长回复。
+        if action_plan:
+            reply = self._limit_action_length(
+                reply,
+                int(action_plan.get("max_chars", 0) or 0),
+            )
+
         # 7. emoji 兜底：最多保留 1 个
         reply = limit_emoji(reply, max_emoji=1)
 
@@ -261,6 +271,7 @@ class ReplyGenerator:
         emotional_state: EmotionalState = None,
         session_context: Dict[str, Any] = None,
         direction: str = "to_bot",
+        action_plan: Dict[str, Any] = None,
     ) -> ChatRequest:
         """构建 LLM 请求"""
 
@@ -296,6 +307,9 @@ class ReplyGenerator:
         # 参与规则 - 根据消息指向决定「该不该插嘴」
         request.add_system(self._build_participation_guide(direction))
 
+        if action_plan:
+            request.add_system(self._build_action_guide(action_plan))
+
         # 添加说话风格指导
         style_guide = self.style_manager.get_style_guide()
         if style_guide:
@@ -323,6 +337,43 @@ class ReplyGenerator:
             request.add_user(f"{current_message}")
 
         return request
+
+    @staticmethod
+    def _build_action_guide(action_plan: Dict[str, Any]) -> str:
+        """把结构化行为计划翻译成简短、明确的生成约束。"""
+        action = action_plan.get("action", "reply")
+        tone = action_plan.get("tone", "自然口语")
+        max_chars = int(action_plan.get("max_chars", 30) or 30)
+        guides = {
+            "react": "只做一个很短的即时反应，不解释、不展开新话题",
+            "answer": "直接回答问题，先给结论，不复述提问",
+            "follow_up": "延续正在进行的对聊，不重新问候，不重复前文",
+            "reply": "像普通群友一样自然接一句，不接管整个话题",
+            "interrupt": "只有确实能补充重要信息时才插话，并立刻说重点",
+            "silent": "不要回复，只输出 <silent>",
+        }
+        behavior = guides.get(action, guides["reply"])
+        return (
+            f"本轮行为计划：{behavior}。语气：{tone}。"
+            f"最终回复不得超过{max_chars}个字符。"
+        )
+
+    @staticmethod
+    def _limit_action_length(text: str, max_chars: int) -> str:
+        """按行为计划限制长度，优先保留完整短句。"""
+        if not text or max_chars <= 0 or len(text) <= max_chars:
+            return text
+
+        sentences = re.split(r"(?<=[。！？!?~…])", text)
+        result = ""
+        for sentence in sentences:
+            if len(result) + len(sentence) > max_chars:
+                break
+            result += sentence
+
+        if result.strip():
+            return result.strip()
+        return text[:max_chars].rstrip("，,。.!！ ")
 
     def _build_participation_guide(self, direction: str) -> str:
         """构建参与规则：告诉 LLM 当前消息是谁对谁说的，以及它有没有权保持沉默"""

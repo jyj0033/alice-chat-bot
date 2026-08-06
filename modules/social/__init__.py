@@ -23,6 +23,12 @@ from .enhanced_decider import (
     SpeakingDecision,
     EnhancedSpeakingDecider,
 )
+from .conversation_floor import (
+    ActionType,
+    ActionPlan,
+    ConversationFloor,
+    ConversationFloorManager,
+)
 
 __all__ = [
     # awareness
@@ -42,4 +48,9 @@ __all__ = [
     # enhanced_decider
     "SpeakingDecision",
     "EnhancedSpeakingDecider",
+    # conversation_floor
+    "ActionType",
+    "ActionPlan",
+    "ConversationFloor",
+    "ConversationFloorManager",
 ]

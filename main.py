@@ -34,6 +34,7 @@ from modules.social.awareness import SocialAwarenessManager, SocialContext, Trig
 from modules.social.attention import AttentionManager, AttentionKeywordsDetector
 from modules.social.fatigue import FatigueManager
 from modules.social.enhanced_decider import EnhancedSpeakingDecider
+from modules.social.conversation_floor import ConversationFloorManager
 
 from modules.reply.generator import ReplyGenerator, ThinkingDelay, ResponseFilter
 
@@ -84,6 +85,7 @@ class GroupChatBot:
         self.attention_keywords_detector: Optional[AttentionKeywordsDetector] = None
         self.fatigue_manager: Optional[FatigueManager] = None
         self.speaking_decider: Optional[EnhancedSpeakingDecider] = None
+        self.conversation_floor_manager: Optional[ConversationFloorManager] = None
 
         # 回复生成
         self.reply_generator: Optional[ReplyGenerator] = None
@@ -291,6 +293,7 @@ class GroupChatBot:
         attention_config = self.config.get("attention", {})
         emotion_config = self.config.get("emotion", {})
         fatigue_config = self.config.get("fatigue", {})
+        floor_config = self.config.get("conversation_floor", {})
         typing_config = self.config.get("typing_style", {})
 
         bot_nickname = self.personality.name
@@ -340,6 +343,14 @@ class GroupChatBot:
             bot_nickname=bot_nickname,
             interested_topics=self.personality.interested_topics,
             bored_topics=self.personality.bored_topics
+        )
+
+        # 群聊发言权：判断谁在和谁说话、当前插嘴成本以及候选行为。
+        self.conversation_floor_manager = ConversationFloorManager(
+            active_window_seconds=floor_config.get("active_window_seconds", 45),
+            burst_window_seconds=floor_config.get("burst_window_seconds", 12),
+            burst_message_threshold=floor_config.get("burst_message_threshold", 4),
+            topic_shift_threshold=floor_config.get("topic_shift_threshold", 0.12),
         )
 
         # 发言决策器
@@ -530,6 +541,57 @@ class GroupChatBot:
         context.extra["is_private"] = is_private
         context = self.social_awareness.analyze(context)
 
+        # 发言权和行为计划。当前消息已在快速路径进入上下文，因此可直接分析消息拓扑。
+        window = self.context_manager.get_window(session_id)
+        recent_context_messages = window.get_recent(12)
+        action_plan = None
+        current_is_latest = bool(recent_context_messages) and (
+            (
+                bool(message.message_id)
+                and recent_context_messages[-1].message_id == message.message_id
+            )
+            or (
+                not message.message_id
+                and recent_context_messages[-1].sender_id == message.sender_id
+                and recent_context_messages[-1].content == message.content
+            )
+        )
+        if current_is_latest:
+            current_context_message = recent_context_messages[-1]
+            floor_has_name = any(
+                reason.startswith("昵称")
+                for reason in trigger_result.get("reasons", [])
+            )
+            directed_for_floor = (
+                is_private
+                or message.mentioned_me
+                or quoted_bot
+                or is_reply_to_bot
+                or continuing
+                or trigger_result.get("forced_trigger", False)
+                or context.is_emergency
+                or (floor_has_name and context.is_direct_question)
+            )
+            if directed_for_floor:
+                current_context_message.directed_to_bot = True
+            floor, action_plan = self.conversation_floor_manager.analyze(
+                current_context_message,
+                recent_context_messages,
+                bot_id=self_id,
+                is_private=is_private,
+                directed_to_bot=directed_for_floor,
+                continuing=continuing,
+                mentioned_others=message.mentioned_others,
+                topic_relevance=context.topic_relevance,
+                is_question=context.is_direct_question,
+            )
+            context.extra["floor"] = floor
+            context.extra["action_plan"] = action_plan
+            logger.info(
+                f"[发言权] 动作={action_plan.action.value}, "
+                f"插话成本={floor.interruption_cost:.2f}, 原因={action_plan.reason}"
+            )
+
         # 发言决策
         emotional_state = self.emotional_manager.get_state(session_id)
         should_speak, reason, probability = self.speaking_decider.should_speak(
@@ -566,6 +628,7 @@ class GroupChatBot:
             "probability": probability,
             "emotional_state": emotional_state,
             "context": context,
+            "action_plan": action_plan,
         }
 
     async def _compose_and_send(self, message: Message, decision: dict) -> None:
@@ -576,6 +639,7 @@ class GroupChatBot:
         probability = decision["probability"]
         emotional_state = decision["emotional_state"]
         context = decision["context"]
+        action_plan = decision.get("action_plan")
 
         try:
             # === 检索长期记忆 ===
@@ -585,8 +649,22 @@ class GroupChatBot:
             await self.thinking_delay.wait(
                 message_length=len(message.content),
                 topic_familiarity=context.topic_familiarity,
-                emotional_modifier=emotional_state.get_thinking_delay_multiplier()
+                emotional_modifier=(
+                    emotional_state.get_thinking_delay_multiplier()
+                    * (action_plan.wait_multiplier if action_plan else 1.0)
+                )
             )
+
+            # 思考期间群聊可能已经向前发展；非定向插话过期时直接放弃。
+            if action_plan:
+                cancel, cancel_reason = self.conversation_floor_manager.should_cancel(
+                    action_plan,
+                    self.context_manager.get_window(session_id).get_recent(30),
+                    bot_id=str(self.config.get("qq", {}).get("self_id", "")),
+                )
+                if cancel:
+                    logger.info(f"[发送复核] 放弃回复：{cancel_reason}")
+                    return
 
             # === 构建提示词（此刻的上下文 = 思考期间的最新消息，不会回旧话题） ===
             context_prompt = self.context_manager.build_context_prompt(
@@ -604,6 +682,7 @@ class GroupChatBot:
                     current_message=message.content,
                     emotional_state=emotional_state,
                     direction=direction,
+                    action_plan=action_plan.to_dict() if action_plan else None,
                 )
             except asyncio.CancelledError:
                 raise
@@ -619,6 +698,17 @@ class GroupChatBot:
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
                 return
+
+            # LLM 调用和模拟打字也会耗时，发送前再复核一次群聊局势。
+            if action_plan:
+                cancel, cancel_reason = self.conversation_floor_manager.should_cancel(
+                    action_plan,
+                    self.context_manager.get_window(session_id).get_recent(30),
+                    bot_id=str(self.config.get("qq", {}).get("self_id", "")),
+                )
+                if cancel:
+                    logger.info(f"[发送复核] 生成后放弃回复：{cancel_reason}")
+                    return
 
             # === 过滤回复 ===
             passed, result = self.response_filter.filter(reply)
@@ -638,18 +728,32 @@ class GroupChatBot:
             from modules.reply.generator import split_reply_into_messages
 
             segments = split_reply_into_messages(reply)
-            sent_any = False
+            sent_segments = []
             for i, seg in enumerate(segments):
+                if i > 0 and action_plan:
+                    cancel, cancel_reason = self.conversation_floor_manager.should_cancel(
+                        action_plan,
+                        self.context_manager.get_window(session_id).get_recent(30),
+                        bot_id=str(self.config.get("qq", {}).get("self_id", "")),
+                    )
+                    if cancel:
+                        logger.info(f"[分段复核] 停止剩余消息：{cancel_reason}")
+                        break
                 success = await self.qq_adapter.send_message(session_id, seg)
                 if success:
-                    sent_any = True
+                    sent_segments.append(seg)
                     logger.info(f"[回复段{i+1}/{len(segments)}] {self.personality.name}: {seg[:50]}")
                     # 段间延迟，模拟真人打字停顿
                     if i < len(segments) - 1:
                         await asyncio.sleep(random.uniform(0.6, 2.0))
+                else:
+                    # 保持分段顺序；前一段失败后继续发后一段会显得语义残缺。
+                    break
 
-            if sent_any:
-                logger.info(f"[回复] {self.personality.name}: {reply[:50]}...")
+            if sent_segments:
+                sent_reply = "".join(sent_segments)
+                all_segments_sent = len(sent_segments) == len(segments)
+                logger.info(f"[回复] {self.personality.name}: {sent_reply[:50]}...")
 
                 # Bot回复后状态更新（真实概率：高概率的@/回复不触发冷却，对话可延续）
                 self.speaking_decider.on_bot_reply(
@@ -664,7 +768,7 @@ class GroupChatBot:
                     session_id=session_id,
                     sender_id=self.config.get("qq", {}).get("self_id", ""),
                     sender_name=self.personality.name,
-                    content=reply,
+                    content=sent_reply,
                     is_bot=True,
                     message_id="",
                     reply_to_id=message.message_id,
@@ -672,7 +776,10 @@ class GroupChatBot:
                 )
 
                 # 疲劳收尾只在主回复成功后发送；成功后重置，避免连续多轮重复说“先走了”。
-                if self.fatigue_manager.should_close_conversation(session_id):
+                if (
+                    all_segments_sent
+                    and self.fatigue_manager.should_close_conversation(session_id)
+                ):
                     closing_msg = self.fatigue_manager.get_closing_message()
                     closing_sent = await self.qq_adapter.send_message(
                         session_id, closing_msg
@@ -704,13 +811,10 @@ class GroupChatBot:
                 self._reply_tasks.pop(session_id, None)
 
     def _is_reply_to_bot(self, message: Message) -> bool:
-        """检查消息是否针对Bot：引用Bot消息，或内容提到名字/昵称"""
+        """检查消息是否引用了 Bot；名字/昵称提及由触发检测器单独处理。"""
         if message.reply_to_qq:
             self_id = str(self.config.get("qq", {}).get("self_id", ""))
             if self_id and str(message.reply_to_qq) == self_id:
-                return True
-        for name in (self.personality.name, self.personality.nickname):
-            if name and name in message.content:
                 return True
         return False
 
@@ -1031,6 +1135,12 @@ class GroupChatBot:
                     "min": 0.5,
                     "max": 10.0
                 }
+            },
+            "conversation_floor": {
+                "active_window_seconds": 45,
+                "burst_window_seconds": 12,
+                "burst_message_threshold": 4,
+                "topic_shift_threshold": 0.12
             },
             "memory": {
                 "context_window_size": 50,
