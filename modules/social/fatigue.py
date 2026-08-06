@@ -112,11 +112,12 @@ class FatigueManager:
         state.last_activity_time = current_time
 
         if is_bot_message:
+            # 一轮按 bot 实际发出一次回复计算，而不是按群里所有人的消息计算。
+            state.conversation_rounds += 1
             state.consecutive_bot_replies += 1
             state.last_bot_speak_time = current_time
         else:
             state.consecutive_bot_replies = 0  # 别人说话则重置连续计数
-            state.conversation_rounds += 1
 
         # 更新疲劳等级
         self._update_fatigue_level(state)

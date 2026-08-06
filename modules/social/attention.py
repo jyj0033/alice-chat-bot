@@ -7,7 +7,6 @@ import time
 import math
 from dataclasses import dataclass, field
 from typing import Optional, Dict
-from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -89,14 +88,15 @@ class AttentionManager:
         self.spillover_min_trigger = spillover_min_trigger
 
         # 群组注意力状态
-        self._group_states: Dict[str, BotAttentionState] = defaultdict(
-            lambda: BotAttentionState(group_id="")
-        )
+        self._group_states: Dict[str, BotAttentionState] = {}
 
     def get_group_state(self, group_id: str) -> BotAttentionState:
         """获取群组注意力状态"""
         if group_id not in self._group_states:
-            self._group_states[group_id] = BotAttentionState(group_id=group_id)
+            self._group_states[group_id] = BotAttentionState(
+                group_id=group_id,
+                base_attention=self.initial_attention,
+            )
         return self._group_states[group_id]
 
     def get_user_attention(self, group_id: str, user_id: str) -> float:
@@ -104,7 +104,10 @@ class AttentionManager:
         state = self.get_group_state(group_id)
 
         if user_id not in state.user_attentions:
-            state.user_attentions[user_id] = UserAttention(user_id=user_id)
+            state.user_attentions[user_id] = UserAttention(
+                user_id=user_id,
+                attention=self.initial_attention,
+            )
 
         # 应用衰减
         self._apply_decay(state, user_id)
@@ -134,12 +137,12 @@ class AttentionManager:
         state.last_activity = current_time
         state.message_count += 1
 
-        # 清理过多追踪用户
-        self._cleanup_user_tracking(state)
-
         # 获取或创建用户注意力
         if user_id not in state.user_attentions:
-            state.user_attentions[user_id] = UserAttention(user_id=user_id)
+            state.user_attentions[user_id] = UserAttention(
+                user_id=user_id,
+                attention=self.initial_attention,
+            )
 
         user_attention = state.user_attentions[user_id]
 
@@ -157,6 +160,9 @@ class AttentionManager:
         # 触发溢出效果
         if self.enable_spillover and user_attention.attention > self.spillover_min_trigger:
             self._apply_spillover(state, user_id, user_attention.attention)
+
+        # 完成本条消息的更新后再淘汰低注意力用户。
+        self._cleanup_user_tracking(state)
 
     def on_bot_reply(self, group_id: str) -> None:
         """Bot回复后降低自己注意力"""

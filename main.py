@@ -409,6 +409,14 @@ class GroupChatBot:
 
         # === 1. 快速路径：状态更新 + 上下文记录（立即执行，bot 实时"看到"消息） ===
         is_reply_to_bot = self._is_reply_to_bot(message)
+        continuing = self._is_continuing_conversation(message)
+        # 私聊天然是对 bot 说；群聊则结合 @、引用/称呼和最近实际回复判断。
+        directed_to_bot = (
+            message.message_type == "private"
+            or message.mentioned_me
+            or is_reply_to_bot
+            or continuing
+        )
         try:
             # 疲劳/注意力更新
             self.speaking_decider.on_message(
@@ -417,15 +425,19 @@ class GroupChatBot:
                 user_id=message.sender_id,
                 mentioned_bot=message.mentioned_me,
                 is_reply_to_bot=is_reply_to_bot,
+                is_directed_to_bot=directed_to_bot,
             )
 
             # 情感更新（@ 提升参与度）
             emotional_trigger = "mentioned" if message.mentioned_me else "normal_message"
             self.emotional_manager.trigger_event(session_id, emotional_trigger)
-            # 情感关键词（夸奖/骂人）影响心情
-            emotion_desc = self.emotional_manager.detect_and_apply_keywords(session_id, message.content)
-            if emotion_desc:
-                logger.debug(f"[情绪] {emotion_desc}")
+            # 只有明确对 bot 说的话才按夸奖/冒犯归因，避免把群友互聊误认成针对自己。
+            if directed_to_bot:
+                emotion_desc = self.emotional_manager.detect_and_apply_keywords(
+                    session_id, message.content
+                )
+                if emotion_desc:
+                    logger.debug(f"[情绪] {emotion_desc}")
 
             # 消息入上下文（关键：立即记录，慢路径构建提示词时能看到这条）
             self.context_manager.add_message(
@@ -435,7 +447,9 @@ class GroupChatBot:
                 content=message.content,
                 is_bot=False,
                 message_id=message.message_id,
+                reply_to_id=message.reply_to_id,
                 reply_to_qq=message.reply_to_qq,
+                directed_to_bot=directed_to_bot,
             )
 
             # 长期记忆（内部已异步后台执行）
@@ -447,7 +461,7 @@ class GroupChatBot:
             logger.error(f"Fast path error: {e}", exc_info=True)
 
         # === 2. 发言决策（快，无 LLM 调用） ===
-        decision = self._decide_reply(message, is_reply_to_bot)
+        decision = self._decide_reply(message, is_reply_to_bot, continuing)
         if not decision:
             return
 
@@ -468,10 +482,16 @@ class GroupChatBot:
                 self._compose_and_send(message, decision)
             )
 
-    def _decide_reply(self, message: Message, is_reply_to_bot: bool) -> Optional[dict]:
+    def _decide_reply(
+        self,
+        message: Message,
+        is_reply_to_bot: bool,
+        continuing: bool = False,
+    ) -> Optional[dict]:
         """发言决策（同步、快速）：返回回复参数，不发言则返回 None"""
         session_id = message.session_id
         group_id = message.group_id or ""
+        is_private = message.message_type == "private"
         self_id = str(self.config.get("qq", {}).get("self_id", ""))
         quoted_bot = bool(message.reply_to_qq) and bool(self_id) and str(message.reply_to_qq) == self_id
 
@@ -481,10 +501,10 @@ class GroupChatBot:
             or (bool(message.reply_to_qq) and not quoted_bot)
         )
 
-        # 延续对话：bot 刚回复过该用户，TA 没@没引用就接着对 bot 说。
-        # 必须在 should_speak 之前判断——should_speak 内部会记录本条回复，会污染判断。
-        continuing = (
-            not talking_to_others
+        # 延续对话：bot 最近确实回复成功过该用户，TA 没@没引用就接着对 bot 说。
+        continuing = continuing or (
+            not is_private
+            and not talking_to_others
             and not message.mentioned_me
             and self.speaking_decider.is_conversation_with(session_id, message.sender_id)
         )
@@ -507,6 +527,7 @@ class GroupChatBot:
         # 触发检测 + 社交感知分析
         trigger_result = self.trigger_detector.detect(context)
         context.extra["trigger"] = trigger_result
+        context.extra["is_private"] = is_private
         context = self.social_awareness.analyze(context)
 
         # 发言决策
@@ -535,7 +556,7 @@ class GroupChatBot:
         has_question = any(r == "直接提问" for r in trigger_reasons)
         has_emergency = "紧急" in trigger_reasons
 
-        must_reply = message.mentioned_me or quoted_bot or forced or has_emergency
+        must_reply = is_private or message.mentioned_me or quoted_bot or forced or has_emergency
         is_addressed = must_reply or (has_name and has_question) or continuing
         direction = "to_bot" if is_addressed else "group"
         logger.debug(f"[指向] {direction} (触发: {trigger_reasons}, 延续对话={continuing})")
@@ -571,7 +592,8 @@ class GroupChatBot:
             context_prompt = self.context_manager.build_context_prompt(
                 session_id=session_id,
                 bot_name=self.personality.name,
-                persona_prompt=self.personality.build_persona_prompt(),
+                # 人格已经作为 system message 注入 ReplyGenerator，避免重复两遍。
+                persona_prompt="",
                 memories=memories
             )
 
@@ -630,7 +652,12 @@ class GroupChatBot:
                 logger.info(f"[回复] {self.personality.name}: {reply[:50]}...")
 
                 # Bot回复后状态更新（真实概率：高概率的@/回复不触发冷却，对话可延续）
-                self.speaking_decider.on_bot_reply(session_id, group_id, probability=probability)
+                self.speaking_decider.on_bot_reply(
+                    session_id,
+                    group_id,
+                    probability=probability,
+                    user_id=message.sender_id,
+                )
 
                 # 添加回复到上下文
                 self.context_manager.add_message(
@@ -640,18 +667,30 @@ class GroupChatBot:
                     content=reply,
                     is_bot=True,
                     message_id="",
+                    reply_to_id=message.message_id,
                     reply_to_qq=message.sender_id,  # bot 回复的是当前这条消息
                 )
+
+                # 疲劳收尾只在主回复成功后发送；成功后重置，避免连续多轮重复说“先走了”。
+                if self.fatigue_manager.should_close_conversation(session_id):
+                    closing_msg = self.fatigue_manager.get_closing_message()
+                    closing_sent = await self.qq_adapter.send_message(
+                        session_id, closing_msg
+                    )
+                    if closing_sent:
+                        self.context_manager.add_message(
+                            session_id=session_id,
+                            sender_id=self.config.get("qq", {}).get("self_id", ""),
+                            sender_name=self.personality.name,
+                            content=closing_msg,
+                            is_bot=True,
+                        )
+                        self.fatigue_manager.get_state(session_id).reset()
+                        logger.info(f"[疲劳] {closing_msg}")
             else:
                 logger.error("Failed to send reply")
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
-
-            # === 疲劳时可能结束对话 ===
-            if self.fatigue_manager.should_close_conversation(session_id):
-                closing_msg = self.fatigue_manager.get_closing_message()
-                await self.qq_adapter.send_message(session_id, closing_msg)
-                logger.info(f"[疲劳] {closing_msg}")
 
         except asyncio.CancelledError:
             # 被更新的"对我说"消息取代，静默退出
@@ -674,6 +713,29 @@ class GroupChatBot:
             if name and name in message.content:
                 return True
         return False
+
+    def _is_continuing_conversation(self, message: Message) -> bool:
+        """判断消息是否自然延续了 bot 与同一用户的最近一次真实对话。"""
+        if message.message_type == "private":
+            return True
+
+        self_id = str(self.config.get("qq", {}).get("self_id", ""))
+        quoted_bot = (
+            bool(message.reply_to_qq)
+            and bool(self_id)
+            and str(message.reply_to_qq) == self_id
+        )
+        talking_to_others = (
+            bool(message.mentioned_others)
+            or (bool(message.reply_to_qq) and not quoted_bot)
+        )
+        return (
+            not talking_to_others
+            and not message.mentioned_me
+            and self.speaking_decider.is_conversation_with(
+                message.session_id, message.sender_id
+            )
+        )
 
     # 个人信息关键词 - 出现时消息有较高记忆价值
     _PERSONAL_KEYWORDS = [

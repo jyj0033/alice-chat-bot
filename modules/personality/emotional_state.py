@@ -38,6 +38,12 @@ class EmotionalState:
     # 情感修饰
     mood_modifier: float = 1.0  # 心情修正因子
 
+    # 情绪围绕人格基线自然恢复，而不是随着运行时间永久掉到最低值。
+    decay_halflife: float = 600.0  # 秒
+    baseline_energy: float = 0.7
+    baseline_engagement: float = 0.5
+    emotion_intensity: float = 0.0
+
     _last_update: float = None
 
     def __post_init__(self):
@@ -52,7 +58,7 @@ class EmotionalState:
             intensity: 影响强度
         """
         current_time = time.time()
-        elapsed = (current_time - self._last_update) / 3600  # 转换为小时
+        elapsed = current_time - self._last_update
 
         # 情感衰减
         self._apply_decay(elapsed)
@@ -86,19 +92,36 @@ class EmotionalState:
 
         self._last_update = current_time
 
-    def _apply_decay(self, elapsed_hours: float) -> None:
-        """应用时间衰减"""
-        self.energy = max(0.1, self.energy - self.energy_decay * elapsed_hours)
-        self.engagement = max(0.1, self.engagement - self.engagement_decay * elapsed_hours)
+    def _apply_decay(self, elapsed_seconds: float) -> None:
+        """让精力、投入度和短期情绪按半衰期回归人格基线。"""
+        if elapsed_seconds <= 0 or self.decay_halflife <= 0:
+            return
+
+        factor = 0.5 ** (elapsed_seconds / self.decay_halflife)
+        self.energy = self.baseline_energy + (self.energy - self.baseline_energy) * factor
+        self.engagement = (
+            self.baseline_engagement
+            + (self.engagement - self.baseline_engagement) * factor
+        )
+        self.emotion_intensity *= factor
+        if self.emotion_intensity < 0.05:
+            self.current_emotion = Emotion.NEUTRAL
+            self.emotion_intensity = 0.0
 
     def _update_emotion(self, emotion: Emotion, delta: float) -> None:
         """更新情感"""
-        if delta > 0:
-            self.current_emotion = emotion
-        else:
-            # 消极变化时，只有当前情绪与目标情绪不同时才切换
-            if self.current_emotion == emotion:
-                self.current_emotion = Emotion.NEUTRAL
+        if emotion == Emotion.NEUTRAL:
+            self.current_emotion = Emotion.NEUTRAL
+            self.emotion_intensity = 0.0
+            return
+
+        # delta 的正负表示体验是提振还是消耗，不应决定能否进入该情绪。
+        self.current_emotion = emotion
+        self.emotion_intensity = min(
+            1.0,
+            max(self.emotion_intensity, 0.15, abs(delta) * 3),
+        )
+        self._boost(energy=delta * 0.25, engagement=delta)
 
     def _boost(self, energy: float = 0, engagement: float = 0) -> None:
         """提升情感值"""
@@ -161,16 +184,19 @@ class EmotionalState:
             "energy": self.energy,
             "engagement": self.engagement,
             "mood_modifier": self.mood_modifier,
+            "emotion_intensity": self.emotion_intensity,
+            "decay_halflife": self.decay_halflife,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "EmotionalState":
         """从字典加载"""
-        state = cls()
+        state = cls(decay_halflife=data.get("decay_halflife", 600.0))
         state.current_emotion = Emotion(data.get("emotion", "neutral"))
         state.energy = data.get("energy", 0.7)
         state.engagement = data.get("engagement", 0.5)
         state.mood_modifier = data.get("mood_modifier", 1.0)
+        state.emotion_intensity = data.get("emotion_intensity", 0.0)
         return state
 
 
@@ -184,15 +210,17 @@ class EmotionalManager:
         negative_keywords: list = None,
     ):
         self._states: dict[str, EmotionalState] = {}
-        self._default_state = EmotionalState()
         self.decay_halflife = decay_halflife
+        self._default_state = EmotionalState(decay_halflife=decay_halflife)
         self.positive_keywords = positive_keywords or []
         self.negative_keywords = negative_keywords or []
 
     def get_state(self, session_id: str) -> EmotionalState:
         """获取会话的情感状态"""
         if session_id not in self._states:
-            self._states[session_id] = EmotionalState()
+            self._states[session_id] = EmotionalState(
+                decay_halflife=self.decay_halflife
+            )
         return self._states[session_id]
 
     def update(self, session_id: str, trigger: str, intensity: float = 0.1) -> None:
@@ -245,17 +273,21 @@ class EmotionalManager:
             # 被夸奖/感谢 → 心情变好，精力投入提升
             state._boost(energy=0.05, engagement=0.08)
             state.current_emotion = Emotion.HAPPY
+            state.emotion_intensity = max(state.emotion_intensity, 0.35)
         else:
             # 被骂/负面 → 心情变差，兴趣下降
             state._boost(energy=-0.03, engagement=-0.05)
             state.current_emotion = Emotion.BORED
+            state.emotion_intensity = max(state.emotion_intensity, 0.4)
         state._update_mood_modifier()
         return desc
 
     def reset(self, session_id: str) -> None:
         """重置情感状态"""
         if session_id in self._states:
-            self._states[session_id] = EmotionalState()
+            self._states[session_id] = EmotionalState(
+                decay_halflife=self.decay_halflife
+            )
 
     def cleanup_inactive(self, active_sessions: set[str]) -> int:
         """清理不活跃的会话状态"""

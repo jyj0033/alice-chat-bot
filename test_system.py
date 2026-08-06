@@ -139,18 +139,19 @@ def test_fatigue():
         threshold_heavy=8,
     )
 
-    # 模拟多次对话
+    # 模拟同一会话中 bot 实际参与了 4 轮对话
     for i in range(4):
-        fatigue_manager.on_message(f"session_{i}", is_bot_message=False)
+        fatigue_manager.on_message("test_session", is_bot_message=False)
+        fatigue_manager.on_message("test_session", is_bot_message=True)
 
-    penalty = fatigue_manager.get_probability_penalty("session_3")
-    state = fatigue_manager.get_state("session_3")
+    penalty = fatigue_manager.get_probability_penalty("test_session")
+    state = fatigue_manager.get_state("test_session")
 
     print(f"✓ 疲劳系统正常工作")
     print(f"  - 对话轮次: {state.conversation_rounds}")
     print(f"  - 疲劳等级: {state.fatigue_level:.2f}")
     print(f"  - 概率惩罚: {penalty:.2f}")
-    print(f"  - 是否应该结束: {fatigue_manager.should_close_conversation('session_3')}")
+    print(f"  - 是否应该结束: {fatigue_manager.should_close_conversation('test_session')}")
 
     return True
 

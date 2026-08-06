@@ -128,12 +128,19 @@ class EnhancedSpeakingDecider:
                 modifiers={}
             )
 
+        # 私聊中的每条普通消息天然都是对 bot 说的，不走群聊随机插话概率。
+        if context.extra.get("is_private", False):
+            return SpeakingDecision(
+                should_speak=True,
+                probability=0.98,
+                reason="私聊消息",
+                modifiers={"private": True},
+            )
+
         # === 3. 强制触发检查 ===
         trigger_result = context.extra.get("trigger", {})
         if trigger_result.get("forced_trigger", False):
             reasons = trigger_result.get("reasons", ["强制触发"])
-            # 强制回复也要记录，才能让"同一人继续对话"拿到回复后加成
-            self._record_reply(session_id, context.sender_id)
             return SpeakingDecision(
                 should_speak=True,
                 probability=0.95,
@@ -148,7 +155,6 @@ class EnhancedSpeakingDecider:
         has_nickname = any(r.startswith("昵称") for r in reasons)
         has_question = "直接提问" in reasons
         if context.reply_to_me or (has_nickname and has_question):
-            self._record_reply(session_id, context.sender_id)
             return SpeakingDecision(
                 should_speak=True,
                 probability=0.9,
@@ -166,11 +172,7 @@ class EnhancedSpeakingDecider:
         # === 6. 决策 ===
         should_speak = random.random() < final_probability
 
-        # === 7. 记录状态更新 ===
-        if should_speak:
-            self._record_reply(session_id, context.sender_id)
-
-        # === 8. 生成原因 ===
+        # === 7. 生成原因 ===
         reason = self._explain_decision(context, probability, modifiers)
 
         return SpeakingDecision(
@@ -228,6 +230,18 @@ class EnhancedSpeakingDecider:
 
         # === E. 情感加成 ===
         modifiers["情绪"] = emotional_bonus
+
+        # === E.5 话题兴趣与群聊节奏 ===
+        # relevance 以 0.5 为中点：感兴趣的话题更愿意接话，厌烦话题更愿意潜水。
+        topic_bonus = (context.topic_relevance - 0.5) * 0.3
+        if abs(topic_bonus) > 1e-6:
+            modifiers["话题兴趣"] = topic_bonus
+
+        # 群越热闹越谨慎插嘴；冷清时只给很小的加成，避免为了暖场而刷屏。
+        if context.group_activity > 0.8:
+            modifiers["群聊节奏"] = -0.08
+        elif context.group_activity < 0.15:
+            modifiers["群聊节奏"] = 0.03
 
         # === F. 疲劳惩罚 ===
         fatigue_penalty = self.fatigue_manager.get_probability_penalty(session_id)
@@ -352,19 +366,30 @@ class EnhancedSpeakingDecider:
         group_id: str,
         user_id: str,
         mentioned_bot: bool = False,
-        is_reply_to_bot: bool = False
+        is_reply_to_bot: bool = False,
+        is_directed_to_bot: bool = True,
     ) -> None:
         """消息到达时的状态更新"""
-        # 更新疲劳
-        self.fatigue_manager.on_message(session_id, is_bot_message=False)
+        # 疲劳只跟踪 bot 实际参与的对话。无关群聊只影响注意力，不累计轮次。
+        if is_directed_to_bot:
+            self.fatigue_manager.on_message(session_id, is_bot_message=False)
 
         # 更新注意力
         self.attention_manager.on_message_received(
             group_id, user_id, mentioned_bot, is_reply_to_bot
         )
 
-    def on_bot_reply(self, session_id: str, group_id: str, probability: float = 0.0) -> None:
+    def on_bot_reply(
+        self,
+        session_id: str,
+        group_id: str,
+        probability: float = 0.0,
+        user_id: str = "",
+    ) -> None:
         """Bot回复后的状态更新"""
+        # 只有平台实际发送成功后，才把会话标记为已回复。
+        self._record_reply(session_id, user_id)
+
         # 更新疲劳
         self.fatigue_manager.on_message(session_id, is_bot_message=True)
 

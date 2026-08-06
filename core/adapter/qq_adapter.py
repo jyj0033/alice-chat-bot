@@ -43,6 +43,9 @@ class QQAdapter(PlatformAdapter):
 
         self.messages_sent = 0
         self.messages_received = 0
+        # 用最近消息 ID 补全 reply 段缺失的发送者信息，帮助判断谁在回复谁。
+        self._message_senders: dict[str, str] = {}
+        self._message_sender_cache_size = 2000
 
     async def connect(self) -> None:
         """启动 WebSocket 服务端接收 NapCat 连接"""
@@ -194,6 +197,9 @@ class QQAdapter(PlatformAdapter):
                     reply_to_qq = str(qq) if qq is not None else None
                     break
 
+        if reply_to_id and not reply_to_qq:
+            reply_to_qq = self._message_senders.get(str(reply_to_id))
+
         # 检查是否 @ 了 bot，并收集 @ 的其他 QQ 号（区分"对bot说"和"对别人说"）
         mentioned_me = False
         mentioned_others: list[str] = []
@@ -209,20 +215,26 @@ class QQAdapter(PlatformAdapter):
                 if isinstance(seg, dict) and seg.get("type") == "at":
                     mentioned_data = seg.get("data", {})
                     qq = mentioned_data.get("qq")
-                    if qq == self.self_id or qq == "all":
+                    if str(qq) == str(self.self_id):
                         mentioned_me = True
-                    elif qq is not None and str(qq) != str(self.self_id):
+                    elif qq is not None and str(qq) not in (str(self.self_id), "all"):
                         mentioned_others.append(str(qq))
 
         # 回复了 bot 的消息，等同于 @（也算"提到我"）
         if not mentioned_me and reply_to_qq and str(reply_to_qq) == str(self.self_id):
             mentioned_me = True
 
-        return Message(
+        sender = data.get("sender", {}) or {}
+        message = Message(
             message_id=str(data.get("message_id", "")),
             message_type=data.get("message_type", "private"),
             sender_id=str(data.get("user_id", "")),
-            sender_name=data.get("sender", {}).get("nickname", f"User_{data.get('user_id', '')}"),
+            # 群名片比 QQ 昵称更符合群友实际看到的称呼。
+            sender_name=(
+                sender.get("card")
+                or sender.get("nickname")
+                or f"User_{data.get('user_id', '')}"
+            ),
             group_id=str(data.get("group_id", "")) if data.get("message_type") == "group" else None,
             content=content,
             raw_content=raw_content if isinstance(raw_content, str) else str(raw_content),
@@ -232,19 +244,54 @@ class QQAdapter(PlatformAdapter):
             reply_to_qq=reply_to_qq,
         )
 
+        if message.message_id:
+            self._message_senders[message.message_id] = message.sender_id
+            while len(self._message_senders) > self._message_sender_cache_size:
+                self._message_senders.pop(next(iter(self._message_senders)))
+
+        return message
+
     def _extract_text(self, content) -> str:
-        """提取纯文本 - 支持数组和字符串格式"""
+        """提取可理解的消息语义；非文本段保留简短占位，避免图片变成空消息。"""
+        placeholders = {
+            "image": "[图片]",
+            "mface": "[表情包]",
+            "face": "[QQ表情]",
+            "record": "[语音]",
+            "video": "[视频]",
+            "file": "[文件]",
+            "share": "[分享]",
+            "json": "[卡片消息]",
+            "xml": "[卡片消息]",
+        }
+
         if isinstance(content, str):
-            # CQ码格式
-            return re.sub(r'\[CQ:[^\]]+\]', '', content).strip()
+            # CQ 字符串格式：@/reply 由结构化字段表达，其他常见消息段留下语义占位。
+            def replace_cq(match):
+                segment_type = match.group(1).lower()
+                if segment_type in ("at", "reply"):
+                    return ""
+                return placeholders.get(segment_type, "")
+
+            return re.sub(
+                r'\[CQ:([^,\]]+)(?:,[^\]]*)?\]',
+                replace_cq,
+                content,
+            ).strip()
         elif isinstance(content, list):
-            # 数组格式
             parts = []
             for seg in content:
                 if isinstance(seg, dict):
-                    text = seg.get("data", {}).get("text", "")
-                    if text:
-                        parts.append(text)
+                    segment_type = str(seg.get("type", "")).lower()
+                    data = seg.get("data", {}) or {}
+                    if segment_type == "text":
+                        text = data.get("text", "")
+                        if text:
+                            parts.append(text)
+                    elif segment_type not in ("at", "reply"):
+                        placeholder = placeholders.get(segment_type)
+                        if placeholder:
+                            parts.append(placeholder)
                 elif isinstance(seg, str):
                     parts.append(seg)
             return ''.join(parts).strip()

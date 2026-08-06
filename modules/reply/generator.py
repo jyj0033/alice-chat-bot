@@ -315,9 +315,9 @@ class ReplyGenerator:
         # 对话内容
         if context_prompt:
             request.add_user(
-                f"【对话历史】\n{context_prompt}\n\n"
-                f"【当前消息】{current_message}\n\n"
-                f"请以爱丽丝的身份回复。"
+                f"【截至现在的对话】\n{context_prompt}\n\n"
+                "请以你的人格身份判断并回应。对话中标注了哪些消息明确对你说；"
+                "如果触发你回复之后又出现了新消息，要结合最新进展，不要机械重复回答旧问题。"
             )
         else:
             request.add_user(f"{current_message}")
@@ -337,7 +337,7 @@ class ReplyGenerator:
             "你可以这样表现：\n"
             "1. 自然插一句——像朋友搭话那样简短接一句，语气自然，不要用「被点名」的口吻；\n"
             "2. 保持沉默——如果你觉得没话说、不该插嘴、或话题与你无关，"
-            "请只输出 <silent> 三个字符（必须是单独的，不能夹杂其他文字）。\n"
+            "请只输出 <silent> 这个标记（必须单独输出，不能夹杂其他文字）。\n"
             "大部分时候保持沉默很正常，但偶尔插一句更真实。"
         )
 

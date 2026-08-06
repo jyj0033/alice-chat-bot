@@ -57,8 +57,9 @@ class ContextMessage:
     timestamp: datetime = field(default_factory=datetime.now)
     is_bot: bool = False
     message_id: str = ""
-    reply_to: Optional[str] = None        # 被回复消息的 ID
+    reply_to_id: Optional[str] = None     # 被回复消息的 ID（平台原始字段）
     reply_to_qq: Optional[str] = None     # 被回复消息的发送者 QQ 号
+    directed_to_bot: bool = False         # 是否明确对 bot 说
 
     def to_dict(self) -> dict:
         return {
@@ -68,7 +69,9 @@ class ContextMessage:
             "timestamp": self.timestamp.isoformat(),
             "is_bot": self.is_bot,
             "message_id": self.message_id,
+            "reply_to_id": self.reply_to_id,
             "reply_to_qq": self.reply_to_qq,
+            "directed_to_bot": self.directed_to_bot,
         }
 
 
@@ -143,6 +146,14 @@ class ContextWindow:
             if msg.sender_id:
                 qq_to_name[msg.sender_id] = bot_name if msg.is_bot else msg.sender_name
 
+        # message_id → 发送者，用于 reply 段只有消息 ID、没有发送者 QQ 的情况。
+        message_id_to_name: dict[str, str] = {}
+        for msg in recent:
+            if msg.message_id:
+                message_id_to_name[str(msg.message_id)] = (
+                    bot_name if msg.is_bot else msg.sender_name
+                )
+
         for msg in recent:
             if not include_bot and msg.is_bot:
                 continue
@@ -154,20 +165,28 @@ class ContextWindow:
 
             # 标注回复指向：这条消息是"回复谁"的（A→B，或 →@bot）
             pointer = ""
-            if msg.reply_to_qq:
-                target = qq_to_name.get(msg.reply_to_qq)
+            if msg.reply_to_id or msg.reply_to_qq:
+                target = None
+                if msg.reply_to_id:
+                    target = message_id_to_name.get(str(msg.reply_to_id))
+                if not target and msg.reply_to_qq:
+                    target = qq_to_name.get(str(msg.reply_to_qq))
                 if target:
                     if target == speaker:
                         pointer = f"(回@{target}自己)"
                     else:
                         pointer = f"(回@{target})"
-                elif str(msg.reply_to_qq) in ("", "0"):
+                elif str(msg.reply_to_qq or "") in ("", "0"):
                     pointer = "(回复某条消息)"
                 else:
-                    pointer = f"(回@尾号{msg.reply_to_qq[-4:]})"
+                    pointer = f"(回@尾号{str(msg.reply_to_qq)[-4:]})"
+
+            direction = ""
+            if msg.directed_to_bot and not msg.is_bot:
+                direction = "(对你说)"
 
             time_str = format_message_time(msg.timestamp, now)
-            lines.append(f"[{time_str}] {speaker}{pointer}：{msg.content}")
+            lines.append(f"[{time_str}] {speaker}{pointer}{direction}：{msg.content}")
 
         return "\n".join(lines)
 
@@ -227,7 +246,9 @@ class ContextManager:
         content: str,
         is_bot: bool = False,
         message_id: str = "",
-        reply_to_qq: Optional[str] = None
+        reply_to_id: Optional[str] = None,
+        reply_to_qq: Optional[str] = None,
+        directed_to_bot: bool = False,
     ) -> None:
         """添加消息到上下文"""
         window = self.get_window(session_id)
@@ -237,7 +258,9 @@ class ContextManager:
             content=content,
             is_bot=is_bot,
             message_id=message_id,
+            reply_to_id=reply_to_id,
             reply_to_qq=reply_to_qq,
+            directed_to_bot=directed_to_bot,
         ))
 
     def build_context_prompt(
@@ -281,7 +304,8 @@ class ContextManager:
         if conversation:
             parts.append(
                 "[最近对话]（[时间]表示距现在多久，如\"昨天 20:15\"是昨晚的事；"
-                "标注\"回@某人\"表示这条消息是回复那个人的，不是对你说的话）\n" + conversation
+                "标注\"回@某人\"表示回复对象，标注\"对你说\"表示消息明确指向你）\n"
+                + conversation
             )
 
         return "\n\n".join(parts)
