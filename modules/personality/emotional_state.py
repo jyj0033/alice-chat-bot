@@ -234,6 +234,24 @@ class EmotionalManager:
 
         return 0.0, ""
 
+    def detect_and_apply_keywords(self, session_id: str, message: str) -> str:
+        """检测消息情绪关键词并应用到会话情感状态，返回描述（空串=无变化）"""
+        change, desc = self.detect_emotion_keywords(message)
+        if change == 0:
+            return ""
+
+        state = self.get_state(session_id)
+        if change > 0:
+            # 被夸奖/感谢 → 心情变好，精力投入提升
+            state._boost(energy=0.05, engagement=0.08)
+            state.current_emotion = Emotion.HAPPY
+        else:
+            # 被骂/负面 → 心情变差，兴趣下降
+            state._boost(energy=-0.03, engagement=-0.05)
+            state.current_emotion = Emotion.BORED
+        state._update_mood_modifier()
+        return desc
+
     def reset(self, session_id: str) -> None:
         """重置情感状态"""
         if session_id in self._states:

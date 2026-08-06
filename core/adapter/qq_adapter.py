@@ -194,17 +194,25 @@ class QQAdapter(PlatformAdapter):
                     reply_to_qq = str(qq) if qq is not None else None
                     break
 
-        # 检查是否 @ 了 bot
+        # 检查是否 @ 了 bot，并收集 @ 的其他 QQ 号（区分"对bot说"和"对别人说"）
         mentioned_me = False
+        mentioned_others: list[str] = []
         if isinstance(raw_content, str):
             mentioned_me = f"[CQ:at,qq={self.self_id}]" in raw_content
+            # 字符串格式也提取 @ 的其他人
+            for m in re.finditer(r'\[CQ:at,qq=([-\d]+)\]', raw_content):
+                qq = m.group(1)
+                if qq != self.self_id:
+                    mentioned_others.append(qq)
         elif isinstance(raw_content, list):
             for seg in raw_content:
                 if isinstance(seg, dict) and seg.get("type") == "at":
                     mentioned_data = seg.get("data", {})
-                    if mentioned_data.get("qq") == self.self_id or mentioned_data.get("qq") == "all":
+                    qq = mentioned_data.get("qq")
+                    if qq == self.self_id or qq == "all":
                         mentioned_me = True
-                        break
+                    elif qq is not None and str(qq) != str(self.self_id):
+                        mentioned_others.append(str(qq))
 
         # 回复了 bot 的消息，等同于 @（也算"提到我"）
         if not mentioned_me and reply_to_qq and str(reply_to_qq) == str(self.self_id):
@@ -219,6 +227,7 @@ class QQAdapter(PlatformAdapter):
             content=content,
             raw_content=raw_content if isinstance(raw_content, str) else str(raw_content),
             mentioned_me=mentioned_me,
+            mentioned_others=mentioned_others,
             reply_to_id=reply_to_id,
             reply_to_qq=reply_to_qq,
         )

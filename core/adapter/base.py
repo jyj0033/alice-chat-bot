@@ -3,7 +3,7 @@
 定义统一的接口规范
 """
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -18,6 +18,7 @@ class Message:
     content: str = ""
     raw_content: str = ""  # 原始消息内容
     mentioned_me: bool = False
+    mentioned_others: list[str] = field(default_factory=list)  # 本条消息 @ 的其他 QQ 号（不含 bot）
     reply_to_id: Optional[str] = None
     reply_to_qq: Optional[str] = None  # 被回复消息的发送者 QQ 号（OneBot reply 段扩展字段）
 

@@ -144,20 +144,14 @@ class SpeakingStyleManager:
         return text
 
     def _apply_fillers(self, text: str) -> str:
-        """添加语气词"""
+        """句首添加语气词（低频，且避免重复/破坏引号）"""
         if not self.style.filler_words or random.random() > 0.2:
             return text
 
-        # 在句首添加语气词
-        fillers = self.style.filler_words
-        filler = random.choice(fillers)
-
-        if text and text[0].isalpha():
-            return filler + text
-        elif text.startswith("「") or text.startswith("\""):
-            return filler + text[1] + filler + text[1:]
-
-        return text
+        filler = random.choice(self.style.filler_words)
+        if text.startswith(filler):
+            return text
+        return filler + text
 
     def _apply_punctuation(self, text: str) -> str:
         """处理标点符号"""

@@ -3,6 +3,7 @@
 集成注意力、情绪、疲劳等系统的综合发言决策
 """
 import logging
+import math
 import random
 import time
 from dataclasses import dataclass
@@ -106,8 +107,10 @@ class EnhancedSpeakingDecider:
         session_id = context.session_id
         modifiers = {}
 
-        # === 1. 检查冷却（@ 机器人时跳过）===
-        if self.fatigue_manager.is_in_cooldown(session_id) and not context.mentioned_me:
+        # === 1. 检查冷却（@ 或引用回复机器人时跳过）===
+        if self.fatigue_manager.is_in_cooldown(session_id) and not (
+            context.mentioned_me or context.reply_to_me
+        ):
             remaining = self.fatigue_manager.get_cooldown_remaining(session_id)
             return SpeakingDecision(
                 should_speak=False,
@@ -129,11 +132,28 @@ class EnhancedSpeakingDecider:
         trigger_result = context.extra.get("trigger", {})
         if trigger_result.get("forced_trigger", False):
             reasons = trigger_result.get("reasons", ["强制触发"])
+            # 强制回复也要记录，才能让"同一人继续对话"拿到回复后加成
+            self._record_reply(session_id, context.sender_id)
             return SpeakingDecision(
                 should_speak=True,
                 probability=0.95,
                 reason=" + ".join(reasons),
                 modifiers={"forced": True}
+            )
+
+        # === 3.5 明确对我说（引用bot / 名字+提问）→ 高概率必答 ===
+        # @ 已被上面的 forced_trigger（0.95）接管；这里覆盖"引用bot回复"和"叫名字提问"，
+        # 它们不像 @ 那么"刺耳"，但仍是明确对 bot 说的，应该答。
+        reasons = trigger_result.get("reasons", [])
+        has_nickname = any(r.startswith("昵称") for r in reasons)
+        has_question = "直接提问" in reasons
+        if context.reply_to_me or (has_nickname and has_question):
+            self._record_reply(session_id, context.sender_id)
+            return SpeakingDecision(
+                should_speak=True,
+                probability=0.9,
+                reason=" + ".join(reasons or ["对我说"]),
+                modifiers={"directed": True}
             )
 
         # === 4. 计算发言概率 ===
@@ -148,7 +168,7 @@ class EnhancedSpeakingDecider:
 
         # === 7. 记录状态更新 ===
         if should_speak:
-            self._record_reply(session_id)
+            self._record_reply(session_id, context.sender_id)
 
         # === 8. 生成原因 ===
         reason = self._explain_decision(context, probability, modifiers)
@@ -171,7 +191,16 @@ class EnhancedSpeakingDecider:
         base_prob = self.base_probability
 
         # === A. 回复后概率提升 ===
-        after_reply_bonus = self._get_after_reply_bonus(session_id)
+        # 仅当"消息明确对bot说"或"是同一个人在延续和bot的对话"时才给加成，
+        # 否则普通群友互聊也给 75% 加成会导致 bot 刷屏。
+        trigger = context.extra.get("trigger", {})
+        reasons = trigger.get("reasons", [])
+        is_directed = (
+            context.mentioned_me
+            or context.reply_to_me
+            or any(r.startswith(("昵称", "关键词", "被@", "被回复")) for r in reasons)
+        )
+        after_reply_bonus = self._get_after_reply_bonus(session_id, context.sender_id, is_directed)
         if after_reply_bonus > 0:
             modifiers["回复提升"] = after_reply_bonus
             base_prob = after_reply_bonus
@@ -218,30 +247,58 @@ class EnhancedSpeakingDecider:
             if isinstance(value, (int, float)):
                 total += value
 
-        # Sigmoid 归一化到 0-1
-        probability = 1 / (1 + 1e-10 + (total - 0.5) * 6)
+        # 标准 logistic 映射（单调递增：总修正越高，概率越高）
+        # total=0.05 → ~3%，total=0.5 → 50%，total=0.9 → ~96%
+        # 原公式 1/(1+(total-0.5)*6) 是错的：total>0.5 时概率反而骤降，且可为负
+        probability = 1 / (1 + math.exp(-(total - 0.5) * 8))
         probability = max(0.01, min(0.99, probability))
 
         return probability
 
-    def _get_after_reply_bonus(self, session_id: str) -> float:
-        """获取回复后概率提升"""
-        if session_id not in self._recent_replies:
+    def _get_after_reply_bonus(
+        self,
+        session_id: str,
+        sender_id: str = "",
+        is_directed: bool = False
+    ) -> float:
+        """获取回复后概率提升
+
+        仅当消息明确对bot说（@/回复/昵称/关键词）或来自"bot刚回复过的那位用户"
+        时生效，避免 bot 回复一次后对整个群的每条消息都高概率接话。
+        """
+        entry = self._recent_replies.get(session_id)
+        if not entry:
             return 0.0
 
-        last_reply = self._recent_replies[session_id]
-        elapsed = time.time() - last_reply
+        elapsed = time.time() - entry["time"]
+        if elapsed >= self.probability_duration:
+            return 0.0
 
-        if elapsed < self.probability_duration:
-            # 线性衰减
-            factor = 1 - (elapsed / self.probability_duration)
-            return self.after_reply_probability * factor
+        if not (is_directed or (sender_id and sender_id == entry.get("user_id", ""))):
+            return 0.0
 
-        return 0.0
+        # 线性衰减
+        factor = 1 - (elapsed / self.probability_duration)
+        return self.after_reply_probability * factor
 
-    def _record_reply(self, session_id: str) -> None:
-        """记录Bot回复"""
-        self._recent_replies[session_id] = time.time()
+    def _record_reply(self, session_id: str, user_id: str = "") -> None:
+        """记录Bot回复（含被回复的用户，用于区分"对bot说"还是普通群聊）"""
+        self._recent_replies[session_id] = {"time": time.time(), "user_id": user_id}
+
+    def is_conversation_with(self, session_id: str, sender_id: str) -> bool:
+        """判断是否在与该用户延续对话（bot 刚回复过 TA，且在窗口期内）
+
+        用于：同一人没 @、没引用 bot 就接着对 bot 说话时，
+        应视为"对我说"（真人对聊不需要每句都点名）。
+        """
+        if not sender_id:
+            return False
+        entry = self._recent_replies.get(session_id)
+        if not entry:
+            return False
+        if entry.get("user_id", "") != sender_id:
+            return False
+        return time.time() - entry["time"] < self.probability_duration
 
     def _is_command(self, message: str) -> bool:
         """检查是否命令"""
@@ -273,7 +330,13 @@ class EnhancedSpeakingDecider:
             reasons.append(attention_reason)
 
         # 回复后状态
-        if self._get_after_reply_bonus(context.session_id) > 0.3:
+        trigger_reasons = context.extra.get("trigger", {}).get("reasons", [])
+        is_directed = (
+            context.mentioned_me
+            or context.reply_to_me
+            or any(r.startswith(("昵称", "关键词", "被@", "被回复")) for r in trigger_reasons)
+        )
+        if self._get_after_reply_bonus(context.session_id, context.sender_id, is_directed) > 0.3:
             reasons.append("回复后窗口期")
 
         if not reasons:
@@ -300,7 +363,7 @@ class EnhancedSpeakingDecider:
             group_id, user_id, mentioned_bot, is_reply_to_bot
         )
 
-    def on_bot_reply(self, session_id: str, group_id: str) -> None:
+    def on_bot_reply(self, session_id: str, group_id: str, probability: float = 0.0) -> None:
         """Bot回复后的状态更新"""
         # 更新疲劳
         self.fatigue_manager.on_message(session_id, is_bot_message=True)
@@ -308,8 +371,9 @@ class EnhancedSpeakingDecider:
         # 更新注意力
         self.attention_manager.on_bot_reply(group_id)
 
-        # 启动冷却
-        probability = self.base_probability  # 使用基础概率估算
+        # 启动冷却：用本次真实发言概率。
+        # 被@/引用回复等强制触发时概率高(>=阈值)，不进入冷却，对话可自然延续；
+        # 只有低概率随机插话才冷却，避免连续刷屏。
         self.fatigue_manager.start_cooldown(session_id, probability)
 
     def cleanup(self) -> None:
@@ -319,8 +383,8 @@ class EnhancedSpeakingDecider:
         # 清理过期回复记录
         current_time = time.time()
         to_remove = [
-            sid for sid, last_time in self._recent_replies.items()
-            if current_time - last_time > self.probability_duration * 2
+            sid for sid, entry in self._recent_replies.items()
+            if current_time - entry["time"] > self.probability_duration * 2
         ]
         for sid in to_remove:
             del self._recent_replies[sid]

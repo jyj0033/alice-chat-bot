@@ -184,15 +184,23 @@ class MemoryStorage:
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
     def retrieve_session_recent(
-        self, session: str, limit: int = 5
+        self, session: str, limit: int = 5, memory_type: Optional[str] = None
     ) -> list[Memory]:
-        """获取某个会话最近的记忆（按重要性和时间排序）"""
-        cursor = self.conn.execute("""
-            SELECT * FROM memories
-            WHERE source_session = ?
-            ORDER BY importance DESC, created_at DESC
-            LIMIT ?
-        """, (session, limit))
+        """获取某个会话最近的记忆（可按类型过滤；指定类型时按时间倒序，未指定按重要性）"""
+        if memory_type:
+            cursor = self.conn.execute("""
+                SELECT * FROM memories
+                WHERE source_session = ? AND memory_type = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            """, (session, memory_type, limit))
+        else:
+            cursor = self.conn.execute("""
+                SELECT * FROM memories
+                WHERE source_session = ?
+                ORDER BY importance DESC, created_at DESC
+                LIMIT ?
+            """, (session, limit))
 
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
@@ -458,7 +466,7 @@ class MemoryStorage:
         """取候选记忆：会话内优先，不足补其他会话"""
         cursor = self.conn.execute("""
             SELECT * FROM memories
-            WHERE memory_type IN ('episodic', 'semantic')
+            WHERE memory_type IN ('episodic', 'semantic', 'session_summary')
             ORDER BY importance DESC, last_accessed DESC
             LIMIT ?
         """, (top_k,))
@@ -568,9 +576,11 @@ class AsyncMemoryStorage:
         """异步获取所有长期记忆"""
         return await asyncio.to_thread(self._storage.get_all, limit)
 
-    async def retrieve_session_recent(self, session: str, limit: int = 5) -> list[Memory]:
-        """异步获取某个会话最近的记忆"""
-        return await asyncio.to_thread(self._storage.retrieve_session_recent, session, limit)
+    async def retrieve_session_recent(
+        self, session: str, limit: int = 5, memory_type: Optional[str] = None
+    ) -> list[Memory]:
+        """异步获取某个会话最近的记忆（可按类型过滤）"""
+        return await asyncio.to_thread(self._storage.retrieve_session_recent, session, limit, memory_type)
 
     async def semantic_search(
         self,

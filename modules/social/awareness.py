@@ -49,9 +49,11 @@ class TriggerDetector:
     def __init__(
         self,
         bot_nickname: str = "",
+        nicknames: list[str] = None,
         trigger_keywords: list[str] = None
     ):
         self.bot_nickname = bot_nickname
+        self.nicknames = [n for n in (nicknames or []) if n]
         self.trigger_keywords = trigger_keywords or []
 
     def detect(self, context: SocialContext) -> dict:
@@ -82,13 +84,14 @@ class TriggerDetector:
         question_patterns = [
             r"[？?]$",  # 句尾问号
             r"是不是",
-            r"是不是",
             r"能不能",
             r"怎么",
             r"为什么",
-            r"能不能",
             r"你觉得",
             r"你说",
+            r"什么",  # 中文口语常省略问号："吃什么""干啥"等
+            r"啥",
+            r"哪[个儿]",
         ]
         for pattern in question_patterns:
             if re.search(pattern, context.message_content):
@@ -105,9 +108,15 @@ class TriggerDetector:
                 context.contains_keywords = True
                 break
 
-        # 5. 昵称检测
+        # 5. 昵称检测（主名 + 简称，如"爱丽丝"、"小爱"）
+        matched_names = []
         if self.bot_nickname and self.bot_nickname in context.message_content:
-            reasons.append(f"昵称「{self.bot_nickname}」")
+            matched_names.append(self.bot_nickname)
+        for nick in self.nicknames:
+            if nick and nick in context.message_content:
+                matched_names.append(nick)
+        if matched_names:
+            reasons.append(f"昵称「{matched_names[0]}」")
             priority += 0.3
 
         # 6. 紧急标记

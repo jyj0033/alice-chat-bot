@@ -49,6 +49,7 @@ def split_reply_into_messages(
 
     - 短回复（<= min_split_length）整条一条
     - 长回复按逗号/句号等断句标点拆分，每条语义尽量完整
+    - 括号/引号内部的标点不断句（真人不会在括号中间停顿）
     - 太短的碎片并入前一段，避免碎消息
     - 最多拆 max_segments 条，超出则从后往前合并
     """
@@ -59,8 +60,29 @@ def split_reply_into_messages(
     if len(reply) <= min_split_length:
         return [reply]
 
-    # 按断句标点切分（保留标点，中文英文都支持）
-    parts = re.split(r'(?<=[，。！？!?…~、；;])', reply)
+    # 括号/引号深度跟踪：深度>0 时的标点不当作断句点
+    OPEN_CHARS = set("（([{「『\"'")
+    CLOSE_CHARS = set("）)]}」』\"'")
+    depth = 0
+    boundaries = []  # 可断句的字符下标（含该标点）
+    for i, ch in enumerate(reply):
+        if ch in OPEN_CHARS:
+            depth += 1
+        elif ch in CLOSE_CHARS:
+            depth = max(0, depth - 1)
+        elif depth == 0 and ch in "，。！？!?…~、；;":
+            boundaries.append(i)
+
+    if not boundaries:
+        return [reply]
+
+    # 按下标切分（每个边界都包含结尾标点，语义完整）
+    parts = []
+    prev = 0
+    for b in boundaries:
+        parts.append(reply[prev:b + 1])
+        prev = b + 1
+    parts.append(reply[prev:])
     parts = [p.strip() for p in parts if p.strip()]
 
     # 太短的碎片（≤4字）并入前一段
@@ -345,12 +367,11 @@ class ReplyGenerator:
         elif state.engagement < 0.3:
             guides.append("你对这个话题兴趣一般，保持简短")
 
-        # 情绪影响
-        if hasattr(state, 'mood'):
-            if state.mood > 0.5:
-                guides.append("你心情不错，语气可以更轻松愉快")
-            elif state.mood < -0.5:
-                guides.append("你心情不太好，回避沉重话题")
+        # 情绪影响（mood_modifier >1 心情好，<1 心情差；EmotionalState 无 mood 字段）
+        if state.mood_modifier > 1.1:
+            guides.append("你心情不错，语气可以更轻松愉快")
+        elif state.mood_modifier < 0.85:
+            guides.append("你心情不太好，回避沉重话题")
 
         return "，".join(guides) if guides else ""
 

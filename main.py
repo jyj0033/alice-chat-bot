@@ -4,9 +4,11 @@
 """
 import asyncio
 import logging
+import random
 import signal
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -92,6 +94,12 @@ class GroupChatBot:
         self._running = False
         self._tasks: list[asyncio.Task] = []
         self._start_time: float = 0
+        # 每会话正在进行的回复生成任务（同一会话同时只生成一条回复）
+        self._reply_tasks: dict[str, asyncio.Task] = {}
+        # 群聊纪要（滚动总结）：每 N 条消息把新聊天压缩成一条长期记忆，隔天也不会忘
+        self._digest_config: dict = {}
+        self._last_digest_at: dict[str, float] = {}  # session -> 上次纪要覆盖到的消息时间戳
+        self._digest_tasks: dict[str, asyncio.Task] = {}  # 进行中的纪要任务
 
     async def initialize(self) -> None:
         """初始化 Bot"""
@@ -236,6 +244,17 @@ class GroupChatBot:
         # 衰减清理任务的上次执行时间（初始为"从未"）
         self._last_decay_run: float = 0.0
 
+        # 群聊纪要配置：把固定条数的群聊滚动总结成长期记忆
+        digest_cfg = memory_config.get("digest", {}) or {}
+        self._digest_config = {
+            "enabled": digest_cfg.get("enabled", True),
+            "interval_messages": digest_cfg.get("interval_messages", 20),
+            "min_messages": digest_cfg.get("min_messages", 10),
+            "max_tokens": digest_cfg.get("max_tokens", 200),
+        }
+        logger.info(f"✓ 群聊纪要: enabled={self._digest_config['enabled']}, "
+                    f"每{self._digest_config['interval_messages']}条消息总结一次")
+
     def _init_personality(self) -> None:
         """初始化人格系统"""
         speaking_config = self.config.get("speaking", {})
@@ -280,6 +299,7 @@ class GroupChatBot:
         # 触发检测器
         self.trigger_detector = TriggerDetector(
             bot_nickname=bot_nickname,
+            nicknames=[self.personality.nickname],
             trigger_keywords=trigger_keywords
         )
 
@@ -363,8 +383,14 @@ class GroupChatBot:
         )
 
     async def _handle_message(self, message: Message) -> None:
-        """处理接收到的消息"""
+        """处理接收到的消息
+
+        拆成两条路径，避免"思考期间看不到新消息"的失真：
+        - 快速路径（立即执行）：状态更新 + 消息写入上下文 + 发言决策，不阻塞接收循环
+        - 慢路径（后台任务）：思考延迟 + LLM 生成 + 发送，期间新消息仍会进入上下文
+        """
         logger.info(f"[{message.group_id or '私聊'}] {message.sender_name}: {message.content[:50]}...")
+        session_id = message.session_id
 
         # 创建事件
         event = Event(
@@ -378,34 +404,92 @@ class GroupChatBot:
             }
         )
 
-        # 发布事件
+        # 发布事件（入队即可，不等待处理）
         await self.event_bus.publish(event)
 
-        # 处理消息
-        await self._process_message(message)
+        # === 1. 快速路径：状态更新 + 上下文记录（立即执行，bot 实时"看到"消息） ===
+        is_reply_to_bot = self._is_reply_to_bot(message)
+        try:
+            # 疲劳/注意力更新
+            self.speaking_decider.on_message(
+                session_id=session_id,
+                group_id=message.group_id or "",
+                user_id=message.sender_id,
+                mentioned_bot=message.mentioned_me,
+                is_reply_to_bot=is_reply_to_bot,
+            )
 
-    async def _process_message(self, message: Message) -> None:
-        """处理消息主流程"""
+            # 情感更新（@ 提升参与度）
+            emotional_trigger = "mentioned" if message.mentioned_me else "normal_message"
+            self.emotional_manager.trigger_event(session_id, emotional_trigger)
+            # 情感关键词（夸奖/骂人）影响心情
+            emotion_desc = self.emotional_manager.detect_and_apply_keywords(session_id, message.content)
+            if emotion_desc:
+                logger.debug(f"[情绪] {emotion_desc}")
+
+            # 消息入上下文（关键：立即记录，慢路径构建提示词时能看到这条）
+            self.context_manager.add_message(
+                session_id=session_id,
+                sender_id=message.sender_id,
+                sender_name=message.sender_name,
+                content=message.content,
+                is_bot=False,
+                message_id=message.message_id,
+                reply_to_qq=message.reply_to_qq,
+            )
+
+            # 长期记忆（内部已异步后台执行）
+            self._store_long_term_memory(message, session_id)
+
+            # 群聊纪要：距上次总结的新消息达到固定条数 → 后台压缩成纪要存长期记忆
+            self._maybe_schedule_digest(session_id)
+        except Exception as e:
+            logger.error(f"Fast path error: {e}", exc_info=True)
+
+        # === 2. 发言决策（快，无 LLM 调用） ===
+        decision = self._decide_reply(message, is_reply_to_bot)
+        if not decision:
+            return
+
+        # === 3. 调度回复生成（后台任务，避免阻塞接收循环） ===
+        current = self._reply_tasks.get(session_id)
+        if current and not current.done():
+            if decision["direction"] == "to_bot":
+                # 正在生成时又来了更强的"对我说"信号 → 取消旧任务改回新消息
+                current.cancel()
+                self._reply_tasks[session_id] = asyncio.create_task(
+                    self._compose_and_send(message, decision)
+                )
+            else:
+                # 旧任务生成时会把新消息纳入上下文，无需另起一条回复
+                return
+        else:
+            self._reply_tasks[session_id] = asyncio.create_task(
+                self._compose_and_send(message, decision)
+            )
+
+    def _decide_reply(self, message: Message, is_reply_to_bot: bool) -> Optional[dict]:
+        """发言决策（同步、快速）：返回回复参数，不发言则返回 None"""
         session_id = message.session_id
         group_id = message.group_id or ""
+        self_id = str(self.config.get("qq", {}).get("self_id", ""))
+        quoted_bot = bool(message.reply_to_qq) and bool(self_id) and str(message.reply_to_qq) == self_id
 
-        # === 1. 状态更新 ===
-        is_reply_to_bot = self._is_reply_to_bot(message)
-        self.speaking_decider.on_message(
-            session_id=session_id,
-            group_id=group_id,
-            user_id=message.sender_id,
-            mentioned_bot=message.mentioned_me,
-            is_reply_to_bot=is_reply_to_bot,
+        # 引用/@了别人（非bot）→ 明显在跟别人说话，不当作对bot延续
+        talking_to_others = (
+            bool(message.mentioned_others)
+            or (bool(message.reply_to_qq) and not quoted_bot)
         )
 
-        # === 2. 更新情感状态 ===
-        emotional_trigger = "mentioned" if message.mentioned_me else "normal_message"
-        self.emotional_manager.trigger_event(session_id, emotional_trigger)
+        # 延续对话：bot 刚回复过该用户，TA 没@没引用就接着对 bot 说。
+        # 必须在 should_speak 之前判断——should_speak 内部会记录本条回复，会污染判断。
+        continuing = (
+            not talking_to_others
+            and not message.mentioned_me
+            and self.speaking_decider.is_conversation_with(session_id, message.sender_id)
+        )
 
-        emotional_state = self.emotional_manager.get_state(session_id)
-
-        # === 3. 构建社交上下文 ===
+        # 构建社交上下文
         context = SocialContext(
             message_content=message.content,
             sender_id=message.sender_id,
@@ -415,146 +499,181 @@ class GroupChatBot:
             mentioned_me=message.mentioned_me,
             reply_to_me=is_reply_to_bot,
         )
+        # 群活跃度（近10分钟消息量，真实反映冷热，避免恒为默认值）
+        context.group_activity = self.context_manager.get_window(session_id).get_activity_level(
+            window_minutes=10
+        )
 
-        # === 4. 社交感知分析 ===
+        # 触发检测 + 社交感知分析
         trigger_result = self.trigger_detector.detect(context)
         context.extra["trigger"] = trigger_result
         context = self.social_awareness.analyze(context)
 
-        # === 5. 添加消息到上下文 ===
-        self.context_manager.add_message(
-            session_id=session_id,
-            sender_id=message.sender_id,
-            sender_name=message.sender_name,
-            content=message.content,
-            is_bot=False,
-            message_id=message.message_id,
-            reply_to_qq=message.reply_to_qq,
-        )
-
-        # === 5.5 写入长期记忆（有记忆价值的消息） ===
-        await self._store_long_term_memory(message, session_id)
-
-        # === 6. 发言决策 ===
+        # 发言决策
+        emotional_state = self.emotional_manager.get_state(session_id)
         should_speak, reason, probability = self.speaking_decider.should_speak(
             context,
             emotional_bonus=emotional_state.get_speaking_bonus()
         )
-
         logger.info(f"[决策] 发言={should_speak}, 概率={probability:.2f}, 原因={reason}")
 
         if not should_speak:
-            return
+            # 被明确点名却保持沉默 → 降低对发话人的关注（真人也会忙/没看见）
+            if message.mentioned_me or is_reply_to_bot:
+                self.attention_manager.on_no_reply(group_id, message.sender_id)
+            return None
 
-        # === 6.5 判断消息指向（决定参与方式） ===
-        # 明确提到bot的信号：@、回复bot、提到昵称/触发词/紧急
-        # 只有这些才当"对我说"，否则归为群友互聊/对大家/自言自语，由LLM判断是否插嘴
-        trigger_reasons = context.extra.get("trigger", {}).get("reasons", [])
-        has_direct_signal = (
-            message.mentioned_me
-            or is_reply_to_bot
-            or any(r not in ("直接提问",) for r in trigger_reasons)
-        )
-        direction = "to_bot" if has_direct_signal else "group"
-        logger.debug(f"[指向] {direction} (触发: {trigger_reasons})")
+        # 判断消息指向：
+        # - 必须回：@、引用bot、强制触发、紧急
+        # - 视为对我说：必须回，或（提到名字/昵称 且 带提问）
+        # - 同一人延续对话：bot 刚回复过 TA，TA 没@没引用就接着对 bot 说 → 也算对我说
+        # - 其余（纯群聊/自言自语/只是顺口提到名字）→ group，由 LLM 决定插嘴还是潜水
+        trigger_reasons = trigger_result.get("reasons", [])
+        forced = trigger_result.get("forced_trigger", False)
 
-        # === 7. 构建上下文提示（含长期记忆检索） ===
-        memories = await self._retrieve_memories(message.content, session_id)
+        has_name = any(r.startswith("昵称") for r in trigger_reasons)
+        has_question = any(r == "直接提问" for r in trigger_reasons)
+        has_emergency = "紧急" in trigger_reasons
 
-        context_prompt = self.context_manager.build_context_prompt(
-            session_id=session_id,
-            bot_name=self.personality.name,
-            persona_prompt=self.personality.build_persona_prompt(),
-            memories=memories
-        )
+        must_reply = message.mentioned_me or quoted_bot or forced or has_emergency
+        is_addressed = must_reply or (has_name and has_question) or continuing
+        direction = "to_bot" if is_addressed else "group"
+        logger.debug(f"[指向] {direction} (触发: {trigger_reasons}, 延续对话={continuing})")
 
-        # === 8. 思考延迟 ===
-        await self.thinking_delay.wait(
-            message_length=len(message.content),
-            topic_familiarity=context.topic_familiarity,
-            emotional_modifier=emotional_state.get_thinking_delay_multiplier()
-        )
+        return {
+            "direction": direction,
+            "probability": probability,
+            "emotional_state": emotional_state,
+            "context": context,
+        }
 
-        # === 9. 生成回复（direction 控制是否可沉默） ===
+    async def _compose_and_send(self, message: Message, decision: dict) -> None:
+        """慢路径：思考延迟 → 用最新上下文生成回复 → 发送"""
+        session_id = message.session_id
+        group_id = message.group_id or ""
+        direction = decision["direction"]
+        probability = decision["probability"]
+        emotional_state = decision["emotional_state"]
+        context = decision["context"]
+
         try:
-            reply = await self.reply_generator.generate(
-                context_prompt=context_prompt,
-                current_message=message.content,
-                emotional_state=emotional_state,
-                direction=direction,
+            # === 检索长期记忆 ===
+            memories = await self._retrieve_memories(message.content, session_id)
+
+            # === 思考延迟（期间新消息会进入上下文，等对方把话说完） ===
+            await self.thinking_delay.wait(
+                message_length=len(message.content),
+                topic_familiarity=context.topic_familiarity,
+                emotional_modifier=emotional_state.get_thinking_delay_multiplier()
             )
-        except Exception as e:
-            logger.error(f"Error generating reply: {e}", exc_info=True)
-            return
 
-        # LLM 选择沉默（群友互聊/自言自语时的正常行为）
-        if reply is None:
-            logger.info(f"[沉默] direction={direction}，不参与该条消息")
-            return
-
-        # === 10. 过滤回复 ===
-        passed, result = self.response_filter.filter(reply)
-        if not passed:
-            logger.info(f"回复被过滤: {result}")
-            return
-        reply = result
-
-        # === 11. 应用错字生成 ===
-        typing_config = self.config.get("typing_style", {})
-        if typing_config.get("enable_typo_generator", True):
-            reply = self.typo_generator.apply_typo(reply)
-
-        # === 12. 发送回复（拆成多条，模拟真人分段发送） ===
-        import random
-        from modules.reply.generator import split_reply_into_messages
-
-        segments = split_reply_into_messages(reply)
-        sent_any = False
-        for i, seg in enumerate(segments):
-            success = await self.qq_adapter.send_message(session_id, seg)
-            if success:
-                sent_any = True
-                logger.info(f"[回复段{i+1}/{len(segments)}] {self.personality.name}: {seg[:50]}")
-                # 段间延迟，模拟真人打字停顿
-                if i < len(segments) - 1:
-                    await asyncio.sleep(random.uniform(0.6, 2.0))
-
-        if sent_any:
-            logger.info(f"[回复] {self.personality.name}: {reply[:50]}...")
-
-            # === 13. Bot回复后状态更新 ===
-            self.speaking_decider.on_bot_reply(session_id, group_id)
-
-            # === 14. 添加回复到上下文 ===
-            self.context_manager.add_message(
+            # === 构建提示词（此刻的上下文 = 思考期间的最新消息，不会回旧话题） ===
+            context_prompt = self.context_manager.build_context_prompt(
                 session_id=session_id,
-                sender_id=self.config.get("qq", {}).get("self_id", ""),
-                sender_name=self.personality.name,
-                content=reply,
-                is_bot=True,
-                message_id="",
-                reply_to_qq=message.sender_id,  # bot 回复的是当前这条消息
+                bot_name=self.personality.name,
+                persona_prompt=self.personality.build_persona_prompt(),
+                memories=memories
             )
-        else:
-            logger.error("Failed to send reply")
 
-        # === 15. 疲劳时可能结束对话 ===
-        if self.fatigue_manager.should_close_conversation(session_id):
-            closing_msg = self.fatigue_manager.get_closing_message()
-            await self.qq_adapter.send_message(session_id, closing_msg)
-            logger.info(f"[疲劳] {closing_msg}")
+            # === 生成回复（direction 控制是否可沉默） ===
+            try:
+                reply = await self.reply_generator.generate(
+                    context_prompt=context_prompt,
+                    current_message=message.content,
+                    emotional_state=emotional_state,
+                    direction=direction,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error generating reply: {e}", exc_info=True)
+                if direction == "to_bot":
+                    self.attention_manager.on_no_reply(group_id, message.sender_id)
+                return
+
+            # LLM 选择沉默（群友互聊/自言自语时的正常行为）
+            if reply is None:
+                logger.info(f"[沉默] direction={direction}，不参与该条消息")
+                if direction == "to_bot":
+                    self.attention_manager.on_no_reply(group_id, message.sender_id)
+                return
+
+            # === 过滤回复 ===
+            passed, result = self.response_filter.filter(reply)
+            if not passed:
+                logger.info(f"回复被过滤: {result}")
+                if direction == "to_bot":
+                    self.attention_manager.on_no_reply(group_id, message.sender_id)
+                return
+            reply = result
+
+            # === 应用错字生成 ===
+            typing_config = self.config.get("typing_style", {})
+            if typing_config.get("enable_typo_generator", True):
+                reply = self.typo_generator.apply_typo(reply)
+
+            # === 发送回复（拆成多条，模拟真人分段发送） ===
+            from modules.reply.generator import split_reply_into_messages
+
+            segments = split_reply_into_messages(reply)
+            sent_any = False
+            for i, seg in enumerate(segments):
+                success = await self.qq_adapter.send_message(session_id, seg)
+                if success:
+                    sent_any = True
+                    logger.info(f"[回复段{i+1}/{len(segments)}] {self.personality.name}: {seg[:50]}")
+                    # 段间延迟，模拟真人打字停顿
+                    if i < len(segments) - 1:
+                        await asyncio.sleep(random.uniform(0.6, 2.0))
+
+            if sent_any:
+                logger.info(f"[回复] {self.personality.name}: {reply[:50]}...")
+
+                # Bot回复后状态更新（真实概率：高概率的@/回复不触发冷却，对话可延续）
+                self.speaking_decider.on_bot_reply(session_id, group_id, probability=probability)
+
+                # 添加回复到上下文
+                self.context_manager.add_message(
+                    session_id=session_id,
+                    sender_id=self.config.get("qq", {}).get("self_id", ""),
+                    sender_name=self.personality.name,
+                    content=reply,
+                    is_bot=True,
+                    message_id="",
+                    reply_to_qq=message.sender_id,  # bot 回复的是当前这条消息
+                )
+            else:
+                logger.error("Failed to send reply")
+                if direction == "to_bot":
+                    self.attention_manager.on_no_reply(group_id, message.sender_id)
+
+            # === 疲劳时可能结束对话 ===
+            if self.fatigue_manager.should_close_conversation(session_id):
+                closing_msg = self.fatigue_manager.get_closing_message()
+                await self.qq_adapter.send_message(session_id, closing_msg)
+                logger.info(f"[疲劳] {closing_msg}")
+
+        except asyncio.CancelledError:
+            # 被更新的"对我说"消息取代，静默退出
+            logger.debug(f"Reply task cancelled: {session_id}")
+            raise
+        except Exception as e:
+            logger.error(f"Compose/send error: {e}", exc_info=True)
+        finally:
+            # 释放会话锁：只有自己仍是当前登记的任务才移除，避免误删被更新的任务
+            if self._reply_tasks.get(session_id) is asyncio.current_task():
+                self._reply_tasks.pop(session_id, None)
 
     def _is_reply_to_bot(self, message: Message) -> bool:
-        """检查是否回复了Bot：
-        1. 被回复消息的发送者是 bot 的 QQ 号（reply 段的 qq 字段）
-        2. 内容里提到 bot 昵称
-        """
+        """检查消息是否针对Bot：引用Bot消息，或内容提到名字/昵称"""
         if message.reply_to_qq:
             self_id = str(self.config.get("qq", {}).get("self_id", ""))
             if self_id and str(message.reply_to_qq) == self_id:
                 return True
-        bot_name = self.personality.name
-        return bot_name in message.content
+        for name in (self.personality.name, self.personality.nickname):
+            if name and name in message.content:
+                return True
+        return False
 
     # 个人信息关键词 - 出现时消息有较高记忆价值
     _PERSONAL_KEYWORDS = [
@@ -609,11 +728,86 @@ class GroupChatBot:
         # 不阻塞消息处理主流程
         asyncio.create_task(_save())
 
+    def _maybe_schedule_digest(self, session_id: str) -> None:
+        """检查是否该生成群聊纪要：距上次纪要的新消息达到固定条数就调度后台总结"""
+        if not self._digest_config.get("enabled", True):
+            return
+        if session_id in self._digest_tasks and not self._digest_tasks[session_id].done():
+            return  # 已有纪要任务在跑，等它结束后重新计数
+
+        since = self._last_digest_at.get(session_id, 0.0)
+        window = self.context_manager.get_window(session_id)
+        new_msgs = [m for m in window.messages if m.timestamp.timestamp() > since]
+        if len(new_msgs) < self._digest_config.get("interval_messages", 20):
+            return
+
+        self._digest_tasks[session_id] = asyncio.create_task(
+            self._generate_digest(session_id, new_msgs)
+        )
+
+    async def _generate_digest(self, session_id: str, messages: list) -> None:
+        """把一批群聊消息压缩成纪要，存入长期记忆（后台执行，不阻塞消息流）"""
+        try:
+            if len(messages) < self._digest_config.get("min_messages", 10):
+                return
+
+            # 组织消息文本（带时间和发送者，供 LLM 总结）
+            lines = []
+            for m in messages:
+                speaker = self.personality.name if m.is_bot else m.sender_name
+                t = m.timestamp.strftime("%H:%M")
+                lines.append(f"[{t}] {speaker}：{m.content[:80]}")
+            chat_text = "\n".join(lines)
+
+            provider = self.get_active_provider()
+            if not provider:
+                return
+
+            from modules.llm.base import ChatRequest
+            req = ChatRequest(
+                temperature=0.4,
+                max_tokens=self._digest_config.get("max_tokens", 200),
+                top_p=0.9,
+            )
+            req.add_system(
+                "你是群聊纪要助手。把下面的群聊记录总结成2-4句简短的纪要："
+                "①主要聊了什么话题；②谁提到的（用昵称）；③有没有值得记住的信息（约定、喜好、八卦）。"
+                "口语化、像群友转述，不要寒暄、不要列点、不要复述原话。"
+            )
+            req.add_user(f"【群聊记录】\n{chat_text}")
+
+            resp = await provider.chat(req)
+            summary = (resp.content or "").strip()
+            if not summary:
+                return
+
+            now = datetime.now()
+            memory = Memory(
+                content=f"【群聊纪要 {now.month}月{now.day}日 {now.strftime('%H:%M')}】{summary}",
+                memory_type="session_summary",
+                importance=0.75,
+                source_session=session_id,
+                tags=["纪要"],
+                metadata={"kind": "session_summary"},
+            )
+            await self.memory_storage.store(memory)
+            logger.info(f"[纪要] {session_id}: {summary[:60]}...")
+
+            # 纪要覆盖到的最后一条消息时间；之后新到的消息下次再总结
+            self._last_digest_at[session_id] = max(m.timestamp.timestamp() for m in messages)
+        except Exception as e:
+            logger.error(f"Digest generation failed: {e}", exc_info=True)
+        finally:
+            self._digest_tasks.pop(session_id, None)
+
     async def _retrieve_memories(self, query: str, session_id: str, limit: int = None) -> list:
         """检索相关长期记忆：
-        优先向量语义检索（TF-IDF + 余弦），失败或空时退回该会话最近记忆。
+        1. 该会话最近的群聊纪要（始终带上，bot 记得"最近群里聊过什么"，不会隔天失忆）
+        2. 向量语义检索（TF-IDF + 余弦），失败或空时退回该会话最近记忆
         """
         limit = limit or self.memory_search_top_k
+
+        memories: list = []
         try:
             memories = await self.memory_storage.semantic_search(
                 query=query,
@@ -622,17 +816,30 @@ class GroupChatBot:
                 half_life_days=self.memory_half_life_days,
                 similarity_weight=self.memory_similarity_weight,
             )
-            if memories:
-                return memories
         except Exception as e:
             logger.error(f"Semantic search failed: {e}")
 
-        # 兜底：该会话最近的高价值记忆
+        if not memories:
+            # 兜底：该会话最近的高价值记忆
+            try:
+                memories = await self.memory_storage.retrieve_session_recent(session_id, limit=limit)
+            except Exception as e:
+                logger.error(f"Failed to retrieve memories: {e}")
+                memories = []
+
+        # 最近纪要作为"近况"放最前，细节记忆在后（去重避免重复出现）
         try:
-            return await self.memory_storage.retrieve_session_recent(session_id, limit=limit)
+            digests = await self.memory_storage.retrieve_session_recent(
+                session_id, limit=2, memory_type="session_summary"
+            )
         except Exception as e:
-            logger.error(f"Failed to retrieve memories: {e}")
-            return []
+            logger.debug(f"Digest retrieval skipped: {e}")
+            digests = []
+        if digests:
+            digest_ids = {d.id for d in digests}
+            memories = digests + [m for m in memories if m.id not in digest_ids]
+
+        return memories
 
     async def run(self) -> None:
         """运行 Bot"""
