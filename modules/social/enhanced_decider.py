@@ -223,7 +223,16 @@ class EnhancedSpeakingDecider:
     ) -> float:
         """计算发言概率"""
         session_id = context.session_id
-        base_prob = self.base_probability
+        configured_group_probability = context.extra.get("group_base_probability")
+        try:
+            base_prob = (
+                float(configured_group_probability)
+                if configured_group_probability is not None
+                else self.base_probability
+            )
+        except (TypeError, ValueError):
+            base_prob = self.base_probability
+        base_prob = max(0.0, min(1.0, base_prob))
 
         # === A. 回复后概率提升 ===
         # 仅当"消息明确对bot说"或"是同一个人在延续和bot的对话"时才给加成，
@@ -255,9 +264,12 @@ class EnhancedSpeakingDecider:
             modifiers["注意力"] = (attention - 0.5) * 0.3
 
         # === D. 注意力关键词 ===
-        attention_change, attention_reason = self.attention_keywords_detector.detect_attention_keywords(
-            context.extra.get("outer_text", context.message_content), context.sender_id
-        )
+        if self.attention_manager.enabled:
+            attention_change, attention_reason = self.attention_keywords_detector.detect_attention_keywords(
+                context.extra.get("outer_text", context.message_content), context.sender_id
+            )
+        else:
+            attention_change, attention_reason = 0.0, ""
         if attention_change != 0:
             modifiers["关键词"] = attention_change
 
@@ -379,9 +391,11 @@ class EnhancedSpeakingDecider:
             reasons.extend(trigger.get("reasons", []))
 
         # 关键词
-        attention_reason = self.attention_keywords_detector.detect_attention_keywords(
-            context.extra.get("outer_text", context.message_content), context.sender_id
-        )[1]
+        attention_reason = ""
+        if self.attention_manager.enabled:
+            attention_reason = self.attention_keywords_detector.detect_attention_keywords(
+                context.extra.get("outer_text", context.message_content), context.sender_id
+            )[1]
         if attention_reason:
             reasons.append(attention_reason)
 

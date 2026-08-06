@@ -9,6 +9,7 @@ services:
       - ./logs:/app/logs
     ports:
       - "30080:30080"
+      - "3001:3001"
     environment:
       - PYTHONUNBUFFERED=1
     networks:

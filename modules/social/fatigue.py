@@ -42,6 +42,7 @@ class FatigueManager:
 
     def __init__(
         self,
+        enabled: bool = True,
         # 重置配置
         reset_threshold: float = 300,  # 5分钟无活动重置
         # 疲劳阈值
@@ -60,6 +61,7 @@ class FatigueManager:
         cooldown_trigger_threshold: float = 0.3,
         cooldown_attention_decrease: float = 0.2,
     ):
+        self.enabled = enabled
         self.reset_threshold = reset_threshold
 
         # 阈值
@@ -99,6 +101,8 @@ class FatigueManager:
             session_id: 会话ID
             is_bot_message: 是否是Bot自己的消息
         """
+        if not self.enabled:
+            return
         state = self.get_state(session_id)
         current_time = time.time()
 
@@ -142,6 +146,8 @@ class FatigueManager:
         Returns:
             float: 概率惩罚值（负数）
         """
+        if not self.enabled:
+            return 0.0
         state = self.get_state(session_id)
 
         if state.fatigue_level < 0.3:
@@ -162,6 +168,8 @@ class FatigueManager:
         Returns:
             bool: 是否应该结束
         """
+        if not self.enabled:
+            return False
         state = self.get_state(session_id)
 
         # 只有在高疲劳时才可能结束
@@ -190,7 +198,7 @@ class FatigueManager:
 
     def is_in_cooldown(self, session_id: str) -> bool:
         """检查是否在冷却中"""
-        if not self.cooldown_enabled:
+        if not self.enabled or not self.cooldown_enabled:
             return False
 
         if session_id not in self._cooldowns:
@@ -207,7 +215,7 @@ class FatigueManager:
             session_id: 会话ID
             probability: 当前发言概率
         """
-        if not self.cooldown_enabled:
+        if not self.enabled or not self.cooldown_enabled:
             return
 
         if probability >= self.cooldown_trigger_threshold:

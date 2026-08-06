@@ -176,6 +176,16 @@ class GroupChatBot:
         providers_config = self.config.get("providers", {})
         self.llm_providers = {}
 
+        # 兼容旧版 llm.api_key/model 扁平结构，统一视为 primary Provider。
+        legacy_keys = {"api_key", "base_url", "model", "provider_type"}
+        legacy_llm = (
+            isinstance(llm_config, dict)
+            and legacy_keys.intersection(llm_config)
+            and not any(isinstance(value, dict) for value in llm_config.values())
+        )
+        if legacy_llm:
+            llm_config = {"primary": llm_config}
+
         # 合并两个配置源，providers 优先级更高
         all_providers = {**llm_config, **providers_config}
 
@@ -186,6 +196,7 @@ class GroupChatBot:
                     provider = create_provider(
                         provider_config.get("provider_type", "openai"),
                         {
+                            "provider_type": provider_config.get("provider_type", "openai"),
                             "api_key": provider_config.get("api_key", ""),
                             "base_url": provider_config.get("base_url", "https://api.openai.com/v1"),
                             "model": provider_config.get("model", "gpt-4o"),
@@ -265,9 +276,12 @@ class GroupChatBot:
         # 情感管理器
         emotion_config = self.config.get("emotion", {})
         self.emotional_manager = EmotionalManager(
+            enabled=emotion_config.get("enabled", True),
             decay_halflife=emotion_config.get("decay_halflife", 600),
             positive_keywords=emotion_config.get("positive_keywords", []),
             negative_keywords=emotion_config.get("negative_keywords", []),
+            positive_boost=emotion_config.get("positive_boost", 0.1),
+            negative_decrease=emotion_config.get("negative_decrease", 0.15),
         )
 
         # 说话风格
@@ -296,6 +310,7 @@ class GroupChatBot:
         fatigue_config = self.config.get("fatigue", {})
         floor_config = self.config.get("conversation_floor", {})
         typing_config = self.config.get("typing_style", {})
+        cooldown_config = self.config.get("cooldown", {})
 
         bot_nickname = self.personality.name
         trigger_keywords = speaking_config.get("trigger_keywords", [])
@@ -309,6 +324,7 @@ class GroupChatBot:
 
         # 注意力管理器
         self.attention_manager = AttentionManager(
+            enabled=attention_config.get("enabled", True),
             initial_attention=attention_config.get("initial_attention", 0.5),
             decay_halflife=attention_config.get("attention_decay_halflife", 300),
             boost_step=attention_config.get("attention_boost_step", 0.4),
@@ -329,6 +345,7 @@ class GroupChatBot:
 
         # 疲劳管理器
         self.fatigue_manager = FatigueManager(
+            enabled=fatigue_config.get("enabled", True),
             reset_threshold=fatigue_config.get("reset_threshold", 300),
             threshold_light=fatigue_config.get("threshold_light", 3),
             threshold_medium=fatigue_config.get("threshold_medium", 5),
@@ -337,6 +354,10 @@ class GroupChatBot:
             decrease_medium=fatigue_config.get("decrease_medium", 0.2),
             decrease_heavy=fatigue_config.get("decrease_heavy", 0.35),
             closing_probability=fatigue_config.get("closing_probability", 0.3),
+            cooldown_enabled=cooldown_config.get("enabled", True),
+            cooldown_max_duration=cooldown_config.get("max_duration", 600),
+            cooldown_trigger_threshold=cooldown_config.get("trigger_threshold", 0.3),
+            cooldown_attention_decrease=cooldown_config.get("attention_decrease", 0.2),
         )
 
         # 社交感知管理器
@@ -408,6 +429,14 @@ class GroupChatBot:
         - 慢路径（后台任务）：思考延迟 + LLM 生成 + 发送，期间新消息仍会进入上下文
         """
         session_id = message.session_id
+        group_config = (
+            self.config.get("groups", {}).get(str(message.group_id), {})
+            if message.message_type == "group"
+            else {}
+        )
+        if message.message_type == "group" and group_config.get("enabled") is False:
+            logger.debug("群 %s 已在 Web 配置中停用", message.group_id)
+            return
 
         # 富媒体增强只依据最外层文字和结构化指向判断。转发/卡片内部即使含有
         # bot 昵称、@ 或问题，也不能把一条普通分享误判为“对 bot 说”。
@@ -505,7 +534,7 @@ class GroupChatBot:
         # 富媒体增强可能涉及 NapCat API 或安全网页预览。它在后台执行，决策仍走
         # 快速路径；真正生成回复前会等待本条消息的增强结果。
         enrichment_task = None
-        if message.segments:
+        if message.rich_type:
             enrichment_task = asyncio.create_task(
                 self._enrich_context_message(message, rich_directed)
             )
@@ -544,6 +573,7 @@ class GroupChatBot:
         """发言决策（同步、快速）：返回回复参数，不发言则返回 None"""
         session_id = message.session_id
         group_id = message.group_id or ""
+        group_config = self.config.get("groups", {}).get(str(group_id), {})
         is_private = message.message_type == "private"
         self_id = str(self.config.get("qq", {}).get("self_id", ""))
         quoted_bot = bool(message.reply_to_qq) and bool(self_id) and str(message.reply_to_qq) == self_id
@@ -587,6 +617,9 @@ class GroupChatBot:
         )
         context.extra["rich_message_only"] = message.rich_only
         context.extra["rich_type"] = message.rich_type
+        context.extra["group_base_probability"] = group_config.get(
+            "speaking_probability"
+        )
         # 话题兴趣可以参考安全渲染后的富媒体摘要，但强制触发结果已经在上面锁定。
         context.message_content = message.content
         context = self.social_awareness.analyze(context)
@@ -645,10 +678,16 @@ class GroupChatBot:
             )
 
         # 发言决策
-        emotional_state = self.emotional_manager.get_state(session_id)
+        emotional_state = (
+            self.emotional_manager.get_state(session_id)
+            if self.emotional_manager.enabled
+            else None
+        )
         should_speak, reason, probability = self.speaking_decider.should_speak(
             context,
-            emotional_bonus=emotional_state.get_speaking_bonus()
+            emotional_bonus=(
+                emotional_state.get_speaking_bonus() if emotional_state else 0.0
+            )
         )
         logger.info(f"[决策] 发言={should_speak}, 概率={probability:.2f}, 原因={reason}")
 
@@ -711,7 +750,7 @@ class GroupChatBot:
                 message_length=len(message.content),
                 topic_familiarity=context.topic_familiarity,
                 emotional_modifier=(
-                    emotional_state.get_thinking_delay_multiplier()
+                    (emotional_state.get_thinking_delay_multiplier() if emotional_state else 1.0)
                     * (action_plan.wait_multiplier if action_plan else 1.0)
                 )
             )
@@ -1196,6 +1235,8 @@ class GroupChatBot:
             "personality": {
                 "name": "爱丽丝",
                 "nickname": "小艾",
+                "age_range": "20-25",
+                "avatar_description": "",
                 "background": "一个活泼可爱、喜欢聊天的女孩，喜欢分享有趣的事情和倾听朋友的故事。",
                 "traits": {
                     "openness": 0.7,
@@ -1205,31 +1246,99 @@ class GroupChatBot:
                     "neuroticism": 0.3
                 },
                 "interested_topics": ["美食", "旅行", "音乐", "电影", "八卦", "日常闲聊"],
-                "bored_topics": ["广告推销", "政治敏感话题", "重复的无聊话题"]
+                "bored_topics": ["广告推销", "政治敏感话题", "重复的无聊话题"],
+                "humor_style": "dry",
+                "taboo_topics": [],
+                "catchphrases": [],
+                "emoji_set": ["😅", "🤔", "😂", "👍", "🙄"],
+                "speaking_style": {
+                    "common_words": [],
+                    "banned_words": [],
+                    "filler_words": ["呃", "嗯", "那个", "这个"],
+                    "max_reply_length": 60,
+                    "use_ellipsis": True,
+                    "use_emoji": True,
+                    "emoji_frequency": 0.2,
+                    "formality": 0.3,
+                    "enthusiasm": 0.6,
+                    "use_exclamation": True
+                }
             },
             "llm": {
-                "provider_type": "openai",
-                "api_key": "",
-                "base_url": "https://api.openai.com/v1",
-                "model": "gpt-4o",
-                "temperature": 0.8,
-                "max_tokens": 500,
-                "top_p": 0.9,
-                "timeout": 120
+                "primary": {
+                    "provider_type": "openai_compatible",
+                    "api_key": "",
+                    "base_url": "https://api.openai.com/v1",
+                    "model": "gpt-4o",
+                    "temperature": 0.8,
+                    "max_tokens": 500,
+                    "timeout": 120,
+                    "enabled": True
+                }
             },
             "qq": {
-                "ws_url": "ws://127.0.0.1:3001",
+                "ws_host": "0.0.0.0",
+                "ws_port": 3001,
                 "access_token": "",
                 "self_id": ""
             },
             "speaking": {
-                "base_probability": 0.4,
+                "base_probability": 0.02,
+                "after_reply_probability": 0.8,
+                "probability_duration": 120,
+                "command_prefixes": ["/", "!", "#"],
                 "trigger_keywords": ["爱丽丝", "小艾", "bot", "机器人"],
-                "thinking_delay": {
-                    "base": 2.0,
+            },
+            "thinking": {
+                "base_delay": 2.0,
+                "random_delay": {
                     "min": 0.5,
                     "max": 10.0
                 }
+            },
+            "typing_style": {
+                "enable_typo_generator": True,
+                "typo_error_rate": 0.04,
+                "min_chinese_chars": 3,
+                "min_message_length": 10,
+                "homophones": {}
+            },
+            "emotion": {
+                "enabled": True,
+                "decay_halflife": 600,
+                "positive_boost": 0.1,
+                "negative_decrease": 0.15,
+                "positive_keywords": [],
+                "negative_keywords": []
+            },
+            "attention": {
+                "enabled": True,
+                "initial_attention": 0.5,
+                "attention_decay_halflife": 300,
+                "attention_boost_step": 0.4,
+                "attention_decrease_step": 0.1,
+                "attention_decrease_threshold": 0.3,
+                "max_tracked_users": 10,
+                "enable_spillover": True,
+                "spillover_ratio": 0.35,
+                "spillover_decay_halflife": 90,
+                "attention_spillover_min_trigger": 0.4
+            },
+            "fatigue": {
+                "enabled": True,
+                "reset_threshold": 300,
+                "threshold_light": 3,
+                "threshold_medium": 5,
+                "threshold_heavy": 8,
+                "decrease_light": 0.1,
+                "decrease_medium": 0.2,
+                "decrease_heavy": 0.35,
+                "closing_probability": 0.3
+            },
+            "cooldown": {
+                "enabled": True,
+                "max_duration": 600,
+                "trigger_threshold": 0.3
             },
             "conversation_floor": {
                 "active_window_seconds": 45,
@@ -1264,7 +1373,16 @@ class GroupChatBot:
                 "context_window_size": 50,
                 "context_max_age_hours": 2.0,
                 "enable_long_term_memory": True,
-                "db_path": "data/memory.db"
+                "db_path": "data/memory.db",
+                "retrieval_top_k": 5,
+                "half_life_days": 30,
+                "similarity_weight": 0.85,
+                "digest": {
+                    "enabled": True,
+                    "interval_messages": 20,
+                    "min_messages": 10,
+                    "max_tokens": 200
+                }
             },
             "groups": {}
         }

@@ -10,6 +10,7 @@ from modules.reply.generator import ReplyGenerator
 from modules.social.attention import AttentionManager
 from modules.social.awareness import SocialContext
 from modules.social.enhanced_decider import EnhancedSpeakingDecider
+from modules.social.fatigue import FatigueManager
 
 
 class HumanizationLogicTests(unittest.TestCase):
@@ -112,6 +113,50 @@ class HumanizationLogicTests(unittest.TestCase):
 
         self.assertEqual(attention.get_group_state("g1").base_attention, 0.1)
         self.assertAlmostEqual(attention.get_user_attention("g1", "u1"), 0.1)
+
+    def test_web_enabled_switches_really_disable_social_state_systems(self):
+        attention = AttentionManager(enabled=False)
+        attention.on_message_received("g1", "u1", mentioned_bot=True)
+        self.assertEqual(attention.get_effective_attention("g1", "u1"), 0.5)
+        self.assertFalse(attention._group_states)
+
+        fatigue = FatigueManager(enabled=False)
+        fatigue.on_message("group_g1", is_bot_message=True)
+        self.assertEqual(fatigue.get_probability_penalty("group_g1"), 0.0)
+        self.assertFalse(fatigue.should_close_conversation("group_g1"))
+
+        emotion = EmotionalManager(
+            enabled=False,
+            positive_keywords=["谢谢"],
+            positive_boost=0.4,
+        )
+        self.assertEqual(emotion.detect_emotion_keywords("谢谢"), (0.0, ""))
+
+    def test_group_probability_override_is_used(self):
+        decider = EnhancedSpeakingDecider(base_probability=0.02)
+        default_context = SocialContext(
+            group_id="g1", session_id="group_g1", sender_id="u1"
+        )
+        override_context = SocialContext(
+            group_id="g2", session_id="group_g2", sender_id="u1"
+        )
+        default_context.extra["trigger"] = {}
+        override_context.extra["trigger"] = {}
+        override_context.extra["group_base_probability"] = 0.8
+
+        default_probability = decider._calculate_probability(
+            default_context, 0.0, {}
+        )
+        override_probability = decider._calculate_probability(
+            override_context, 0.0, {}
+        )
+        self.assertGreater(override_probability, default_probability)
+
+        override_context.extra["group_base_probability"] = "invalid"
+        invalid_probability = decider._calculate_probability(
+            override_context, 0.0, {}
+        )
+        self.assertAlmostEqual(invalid_probability, default_probability)
 
     def test_topic_interest_changes_participation_probability(self):
         decider = EnhancedSpeakingDecider()

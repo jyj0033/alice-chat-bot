@@ -62,6 +62,7 @@ class AttentionManager:
 
     def __init__(
         self,
+        enabled: bool = True,
         initial_attention: float = 0.5,
         decay_halflife: float = 300,  # 5分钟半衰期
         boost_step: float = 0.4,
@@ -74,6 +75,7 @@ class AttentionManager:
         spillover_halflife: float = 90,
         spillover_min_trigger: float = 0.4,
     ):
+        self.enabled = enabled
         self.initial_attention = initial_attention
         self.decay_halflife = decay_halflife
         self.boost_step = boost_step
@@ -130,6 +132,8 @@ class AttentionManager:
             mentioned_bot: 是否@了Bot
             is_reply_to_bot: 是否回复了Bot
         """
+        if not self.enabled:
+            return
         state = self.get_group_state(group_id)
         current_time = time.time()
 
@@ -166,6 +170,8 @@ class AttentionManager:
 
     def on_bot_reply(self, group_id: str) -> None:
         """Bot回复后降低自己注意力"""
+        if not self.enabled:
+            return
         state = self.get_group_state(group_id)
 
         # Bot回复后，所有用户注意力略微下降
@@ -174,6 +180,8 @@ class AttentionManager:
 
     def on_no_reply(self, group_id: str, user_id: str) -> None:
         """Bot未回复某用户消息"""
+        if not self.enabled:
+            return
         state = self.get_group_state(group_id)
 
         if user_id in state.user_attentions:
@@ -192,6 +200,8 @@ class AttentionManager:
             group_id: 群ID
             user_id: 用户ID（可选，不指定则返回Bot整体注意力）
         """
+        if not self.enabled:
+            return 0.5
         state = self.get_group_state(group_id)
         current_time = time.time()
 

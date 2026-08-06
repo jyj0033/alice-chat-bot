@@ -67,32 +67,53 @@ class RichMediaEnricher:
         self._preview_cache: OrderedDict[str, tuple[float, tuple[str, str]]] = OrderedDict()
         self._ocr_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._cache_size = max(16, int(config.get("cache_size", 256)))
+        self._stats = {
+            "messages_seen": 0,
+            "forward_expanded": 0,
+            "link_previewed": 0,
+            "image_ocr": 0,
+            "failures": 0,
+        }
 
     async def enrich(self, message: Message, *, directed: bool = False) -> Message:
         if not self.enabled or not message.segments:
             return message
 
+        self._stats["messages_seen"] += 1
         changed = False
         for segment in message.segments:
             try:
                 if segment.type == "forward" and self.forward_enabled and (
                     directed or self.forward_expand_undirected
                 ):
-                    changed = await self._expand_forward(segment) or changed
+                    enriched = await self._expand_forward(segment)
+                    if enriched:
+                        self._stats["forward_expanded"] += 1
+                    changed = enriched or changed
                 elif segment.type == "link" and self.links_enabled and (
                     directed or not self.links_directed_only
                 ):
-                    changed = await self._preview_link(segment) or changed
+                    enriched = await self._preview_link(segment)
+                    if enriched:
+                        self._stats["link_previewed"] += 1
+                    changed = enriched or changed
                 elif segment.type == "image" and directed and self.image_ocr_enabled:
-                    changed = await self._ocr_image(segment) or changed
+                    enriched = await self._ocr_image(segment)
+                    if enriched:
+                        self._stats["image_ocr"] += 1
+                    changed = enriched or changed
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._stats["failures"] += 1
                 logger.debug("Rich media enrichment skipped (%s): %s", segment.type, exc)
 
         if changed:
             refresh_message_content(message)
         return message
+
+    def statistics(self) -> dict[str, int | bool]:
+        return {"enabled": self.enabled, **self._stats}
 
     async def _expand_forward(self, segment: MessageSegment) -> bool:
         payload: Any = segment.data.get("content")
@@ -105,6 +126,7 @@ class RichMediaEnricher:
                     self.forward_timeout,
                 )
             except Exception as exc:
+                self._stats["failures"] += 1
                 logger.debug("get_forward_msg failed for %s: %s", forward_id, exc)
                 return False
 

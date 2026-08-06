@@ -208,12 +208,18 @@ class EmotionalManager:
         decay_halflife: float = 600,
         positive_keywords: list = None,
         negative_keywords: list = None,
+        enabled: bool = True,
+        positive_boost: float = 0.1,
+        negative_decrease: float = 0.15,
     ):
         self._states: dict[str, EmotionalState] = {}
+        self.enabled = enabled
         self.decay_halflife = decay_halflife
         self._default_state = EmotionalState(decay_halflife=decay_halflife)
         self.positive_keywords = positive_keywords or []
         self.negative_keywords = negative_keywords or []
+        self.positive_boost = max(0.0, float(positive_boost))
+        self.negative_decrease = max(0.0, float(negative_decrease))
 
     def get_state(self, session_id: str) -> EmotionalState:
         """获取会话的情感状态"""
@@ -225,6 +231,8 @@ class EmotionalManager:
 
     def update(self, session_id: str, trigger: str, intensity: float = 0.1) -> None:
         """更新情感"""
+        if not self.enabled:
+            return
         state = self.get_state(session_id)
         state.update(trigger, intensity)
 
@@ -250,15 +258,17 @@ class EmotionalManager:
         Returns:
             tuple[float, str]: (情绪变化, 描述)
         """
+        if not self.enabled:
+            return 0.0, ""
         message_lower = message.lower()
 
         for keyword in self.positive_keywords:
             if keyword.lower() in message_lower:
-                return 0.1, f"正面词「{keyword}」"
+                return self.positive_boost, f"正面词「{keyword}」"
 
         for keyword in self.negative_keywords:
             if keyword.lower() in message_lower:
-                return -0.15, f"负面词「{keyword}」"
+                return -self.negative_decrease, f"负面词「{keyword}」"
 
         return 0.0, ""
 
@@ -271,12 +281,12 @@ class EmotionalManager:
         state = self.get_state(session_id)
         if change > 0:
             # 被夸奖/感谢 → 心情变好，精力投入提升
-            state._boost(energy=0.05, engagement=0.08)
+            state._boost(energy=change * 0.5, engagement=change * 0.8)
             state.current_emotion = Emotion.HAPPY
             state.emotion_intensity = max(state.emotion_intensity, 0.35)
         else:
             # 被骂/负面 → 心情变差，兴趣下降
-            state._boost(energy=-0.03, engagement=-0.05)
+            state._boost(energy=change * 0.2, engagement=change / 3)
             state.current_emotion = Emotion.BORED
             state.emotion_intensity = max(state.emotion_intensity, 0.4)
         state._update_mood_modifier()

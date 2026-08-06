@@ -2,6 +2,7 @@
 爱丽丝 (Alice) - Web 管理面板
 """
 import logging
+from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
@@ -16,11 +17,31 @@ CONFIG_FILE = BASE_DIR / "config" / "config.yaml"
 
 app = FastAPI(title="爱丽丝 - Alice")
 bot_instance = None
+LOG_BUFFER = deque(maxlen=1000)
+
+
+class DashboardLogHandler(logging.Handler):
+    """保留最近日志，未配置文件日志时仍可在 Web 页面查看。"""
+
+    def emit(self, record):
+        try:
+            LOG_BUFFER.append(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+_dashboard_log_handler = DashboardLogHandler()
+_dashboard_log_handler.setFormatter(logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+))
+logging.getLogger().addHandler(_dashboard_log_handler)
 
 
 def set_bot(bot):
-    global bot_instance
+    global bot_instance, CONFIG_FILE
     bot_instance = bot
+    # 与 Bot 实际加载路径保持一致，兼容 `main.py -c custom.yaml`。
+    CONFIG_FILE = Path(bot.config_path)
 
 
 def load_config():
@@ -34,6 +55,32 @@ def save_config(cfg):
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+
+
+def deep_merge(base, changes):
+    """递归合并配置，页面只提交某个子面板时不丢失同级高级参数。"""
+    result = dict(base) if isinstance(base, dict) else {}
+    for key, value in (changes or {}).items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def normalize_llm_config(config):
+    """把旧版扁平 llm 配置映射为 Provider 结构。"""
+    raw = config.get('llm', {}) if isinstance(config, dict) else {}
+    if not isinstance(raw, dict):
+        return {}
+    legacy_keys = {'api_key', 'base_url', 'model', 'provider_type'}
+    if legacy_keys.intersection(raw) and not any(
+        isinstance(value, dict) for value in raw.values()
+    ):
+        normalized = {'primary': dict(raw)}
+        config['llm'] = normalized
+        return normalized
+    return raw
 
 
 HTML_CONTENT = open(BASE_DIR / "templates" / "dashboard.html", 'r', encoding='utf-8').read()
@@ -54,13 +101,16 @@ async def get_config():
         config = {}
     # 隐藏 API Keys
     if 'llm' in config:
-        for name, provider in config['llm'].items():
+        for name, provider in normalize_llm_config(config).items():
             if isinstance(provider, dict) and 'api_key' in provider:
                 provider['api_key'] = '********' if provider['api_key'] else ''
     if 'memory' in config and isinstance(config.get('memory'), dict):
         emb = config['memory'].get('embedding')
         if isinstance(emb, dict) and emb.get('api_key'):
             emb['api_key'] = '********'
+    if 'qq' in config and isinstance(config.get('qq'), dict):
+        if config['qq'].get('access_token'):
+            config['qq']['access_token'] = '********'
     return config
 
 
@@ -72,7 +122,8 @@ async def update_config(request: Request):
 
         # LLM 配置 - 支持多 provider
         if 'llm' in data:
-            llm = current.setdefault('llm', {})
+            llm = normalize_llm_config(current)
+            current['llm'] = llm
             for name, provider_data in data['llm'].items():
                 if isinstance(provider_data, dict):
                     provider = llm.setdefault(name, {})
@@ -85,13 +136,16 @@ async def update_config(request: Request):
         # QQ 配置
         if 'qq' in data:
             qq = current.setdefault('qq', {})
-            for key in ['ws_url', 'access_token', 'self_id']:
+            for key in ['ws_url', 'ws_host', 'ws_port', 'access_token', 'self_id']:
                 if key in data['qq']:
-                    qq[key] = data['qq'][key]
+                    value = data['qq'][key]
+                    if key == 'access_token' and str(value).startswith('*'):
+                        continue
+                    qq[key] = value
 
         # 发言设置
         if 'speaking' in data:
-            current['speaking'] = {**current.get('speaking', {}), **data['speaking']}
+            current['speaking'] = deep_merge(current.get('speaking', {}), data['speaking'])
 
         # 记忆设置
         if 'memory' in data:
@@ -103,7 +157,7 @@ async def update_config(request: Request):
                     old_emb = current_mem.get('embedding', {})
                     new_emb['api_key'] = old_emb.get('api_key', '')
                 data['memory']['embedding'] = new_emb
-            current['memory'] = {**current_mem, **data['memory']}
+            current['memory'] = deep_merge(current_mem, data['memory'])
 
         # Bot 基本信息
         if 'bot' in data:
@@ -111,7 +165,9 @@ async def update_config(request: Request):
 
         # 人格配置
         if 'personality' in data:
-            current['personality'] = {**current.get('personality', {}), **data['personality']}
+            current['personality'] = deep_merge(
+                current.get('personality', {}), data['personality']
+            )
 
         # 群组设置
         if 'groups' in data:
@@ -119,27 +175,37 @@ async def update_config(request: Request):
 
         # 情感系统设置
         if 'emotion' in data:
-            current['emotion'] = {**current.get('emotion', {}), **data['emotion']}
+            current['emotion'] = deep_merge(current.get('emotion', {}), data['emotion'])
 
         # 注意力系统设置
         if 'attention' in data:
-            current['attention'] = {**current.get('attention', {}), **data['attention']}
+            current['attention'] = deep_merge(current.get('attention', {}), data['attention'])
 
         # 疲劳系统设置
         if 'fatigue' in data:
-            current['fatigue'] = {**current.get('fatigue', {}), **data['fatigue']}
+            current['fatigue'] = deep_merge(current.get('fatigue', {}), data['fatigue'])
 
         # 冷却系统设置
         if 'cooldown' in data:
-            current['cooldown'] = {**current.get('cooldown', {}), **data['cooldown']}
+            current['cooldown'] = deep_merge(current.get('cooldown', {}), data['cooldown'])
 
         # 思考延迟设置
         if 'thinking' in data:
-            current['thinking'] = {**current.get('thinking', {}), **data['thinking']}
+            current['thinking'] = deep_merge(current.get('thinking', {}), data['thinking'])
 
         # 打字风格设置
         if 'typing_style' in data:
-            current['typing_style'] = {**current.get('typing_style', {}), **data['typing_style']}
+            current['typing_style'] = deep_merge(current.get('typing_style', {}), data['typing_style'])
+
+        if 'conversation_floor' in data:
+            current['conversation_floor'] = deep_merge(
+                current.get('conversation_floor', {}), data['conversation_floor']
+            )
+
+        if 'rich_media' in data:
+            current['rich_media'] = deep_merge(
+                current.get('rich_media', {}), data['rich_media']
+            )
 
         save_config(current)
         return {"success": True, "message": "配置已保存"}
@@ -151,6 +217,38 @@ async def update_config(request: Request):
 async def get_status():
     if not bot_instance:
         return {"status": "not_initialized", "running": False}
+    rich_media = {}
+    if bot_instance.qq_adapter:
+        enricher = getattr(bot_instance.qq_adapter, 'rich_media_enricher', None)
+        if enricher:
+            rich_media = enricher.statistics()
+    emotion = {
+        "energy": 0.7,
+        "engagement": 0.5,
+        "mood": 0.5,
+        "emotion": "neutral",
+    }
+    manager = getattr(bot_instance, 'emotional_manager', None)
+    states = getattr(manager, '_states', {}) if manager else {}
+    if states:
+        # 仪表盘展示最近活跃会话的状态，比固定默认值更能反映当前运行情况。
+        latest = max(states.values(), key=lambda state: state._last_update or 0)
+        mood_values = {
+            "happy": 0.8,
+            "excited": 0.9,
+            "calm": 0.6,
+            "neutral": 0.5,
+            "anxious": 0.35,
+            "bored": 0.25,
+            "tired": 0.2,
+        }
+        emotion = {
+            "energy": latest.energy,
+            "engagement": latest.engagement,
+            "mood": mood_values.get(latest.current_emotion.value, 0.5),
+            "emotion": latest.current_emotion.value,
+        }
+
     return {
         "status": "running" if bot_instance._running else "stopped",
         "running": bot_instance._running,
@@ -158,7 +256,14 @@ async def get_status():
             "connected": bot_instance.qq_adapter.is_connected if bot_instance.qq_adapter else False,
             "messages_sent": bot_instance.qq_adapter.messages_sent if bot_instance.qq_adapter else 0,
             "messages_received": bot_instance.qq_adapter.messages_received if bot_instance.qq_adapter else 0,
-        }
+        },
+        "runtime": {
+            "active_sessions": len(bot_instance.context_manager._windows) if bot_instance.context_manager else 0,
+            "pending_replies": len(bot_instance._reply_tasks),
+            "pending_api_calls": len(bot_instance.qq_adapter._pending_api) if bot_instance.qq_adapter else 0,
+        },
+        "rich_media": rich_media,
+        "emotion": emotion,
     }
 
 
@@ -169,6 +274,8 @@ async def get_personality():
         return {
             "name": "爱丽丝",
             "nickname": "小艾",
+            "age_range": "20-25",
+            "avatar_description": "",
             "background": "一个活泼可爱、喜欢聊天的女孩",
             "traits": {
                 "openness": 0.7,
@@ -179,17 +286,15 @@ async def get_personality():
             },
             "interested_topics": ["美食", "旅行", "音乐", "电影", "闲聊"],
             "bored_topics": ["广告", "政治"],
+            "humor_style": "dry",
+            "taboo_topics": [],
+            "catchphrases": [],
+            "emoji_set": ["😅", "🤔", "😂", "👍", "🙄"],
             "description": ""
         }
-    return {
-        "name": bot_instance.personality.name,
-        "nickname": bot_instance.personality.nickname,
-        "background": bot_instance.personality.background,
-        "traits": bot_instance.personality.traits,
-        "interested_topics": bot_instance.personality.interested_topics,
-        "bored_topics": bot_instance.personality.bored_topics,
-        "description": bot_instance.personality.description if hasattr(bot_instance.personality, 'description') else ""
-    }
+    personality = bot_instance.personality.to_dict()
+    personality["description"] = getattr(bot_instance.personality, 'description', '')
+    return personality
 
 
 @app.get("/api/sessions")
@@ -269,6 +374,10 @@ async def test_embedding(request: Request):
     try:
         data = await request.json()
         api_key = (data.get("api_key") or "").strip()
+        if api_key.startswith('*'):
+            api_key = str(
+                load_config().get("memory", {}).get("embedding", {}).get("api_key", "")
+            ).strip()
         if not api_key:
             return {"success": False, "error": "API Key 不能为空"}
         model = data.get("embed_model") or "Qwen/Qwen3-Embedding-8B"
@@ -276,8 +385,11 @@ async def test_embedding(request: Request):
         from modules.memory.embedding import EmbeddingRerankService
         svc = EmbeddingRerankService({
             "api_key": api_key,
+            "base_url": data.get("base_url") or "https://api.siliconflow.cn/v1",
             "embed_model": model,
             "rerank_model": data.get("rerank_model") or "Pro/BAAI/bge-reranker-v2-m3",
+            "input_type": data.get("input_type") or None,
+            "batch_size": data.get("batch_size") or 32,
         })
         try:
             vecs = await svc.embed(["测试连接"])
@@ -296,6 +408,8 @@ async def test_embedding(request: Request):
 async def get_emotion(session_id: str):
     if not bot_instance:
         return {"energy": 0.8, "engagement": 0.6, "mood": 0.5, "emotion": "平静"}
+    if not bot_instance.emotional_manager.enabled:
+        return {"energy": 0.7, "engagement": 0.5, "mood": 0.5, "emotion": "neutral"}
     return bot_instance.emotional_manager.get_state(session_id).to_dict()
 
 
@@ -304,7 +418,7 @@ async def get_providers():
     """获取所有 LLM providers"""
     config = load_config()
     providers = []
-    for name, provider in config.get('llm', {}).items():
+    for name, provider in normalize_llm_config(config).items():
         if isinstance(provider, dict):
             providers.append({
                 "name": name,
@@ -329,7 +443,8 @@ async def add_provider(request: Request):
             return {"success": False, "error": "Invalid provider name"}
 
         current = load_config()
-        llm = current.setdefault('llm', {})
+        llm = normalize_llm_config(current)
+        current['llm'] = llm
 
         if name in llm:
             return {"success": False, "error": f"Provider '{name}' already exists"}
@@ -357,7 +472,7 @@ async def delete_provider(name: str):
     """删除 LLM provider"""
     try:
         current = load_config()
-        llm = current.get('llm', {})
+        llm = normalize_llm_config(current)
 
         if name not in llm:
             return {"success": False, "error": f"Provider '{name}' not found"}
@@ -377,7 +492,7 @@ async def test_provider(name: str):
     try:
         current = load_config()
         # 先检查 llm.primary/llm.fallback，再检查 providers
-        provider_config = current.get('llm', {}).get(name)
+        provider_config = normalize_llm_config(current).get(name)
         if not provider_config:
             provider_config = current.get('providers', {}).get(name)
         if not provider_config:
@@ -422,7 +537,11 @@ async def test_generate(request: Request):
         reply = await bot_instance.reply_generator.generate(
             context_prompt="[测试模式]",
             current_message=message,
-            emotional_state=bot_instance.emotional_manager.get_state("test")
+            emotional_state=(
+                bot_instance.emotional_manager.get_state("test")
+                if bot_instance.emotional_manager.enabled
+                else None
+            )
         )
         return {"success": True, "reply": reply}
     except Exception as e:
@@ -431,11 +550,11 @@ async def test_generate(request: Request):
 
 @app.get("/api/logs")
 async def get_logs():
-    log_file = Path("/app/logs/bot.log")
-    if log_file.exists():
-        lines = log_file.read_text(encoding='utf-8').splitlines()[-200:]
-        return "\n".join(lines)
-    return "暂无日志"
+    for log_file in (BASE_DIR / "logs" / "bot.log", Path("/app/logs/bot.log")):
+        if log_file.exists():
+            lines = log_file.read_text(encoding='utf-8', errors='replace').splitlines()[-200:]
+            return "\n".join(lines)
+    return "\n".join(list(LOG_BUFFER)[-200:]) or "暂无日志"
 
 
 @app.post("/api/restart")
