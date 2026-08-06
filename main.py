@@ -98,6 +98,7 @@ class GroupChatBot:
         self._start_time: float = 0
         # 每会话正在进行的回复生成任务（同一会话同时只生成一条回复）
         self._reply_tasks: dict[str, asyncio.Task] = {}
+        self._rich_media_tasks: set[asyncio.Task] = set()
         # 群聊纪要（滚动总结）：每 N 条消息把新聊天压缩成一条长期记忆，隔天也不会忘
         self._digest_config: dict = {}
         self._last_digest_at: dict[str, float] = {}  # session -> 上次纪要覆盖到的消息时间戳
@@ -388,8 +389,14 @@ class GroupChatBot:
     def _init_qq_adapter(self) -> None:
         """初始化 QQ 适配器"""
         qq_config = self.config.get("qq", {})
+        adapter_config = {
+            **qq_config,
+            "rich_media": self.config.get(
+                "rich_media", qq_config.get("rich_media", {})
+            ),
+        }
         self.qq_adapter = QQAdapter(
-            config=qq_config,
+            config=adapter_config,
             on_message=self._handle_message
         )
 
@@ -400,8 +407,34 @@ class GroupChatBot:
         - 快速路径（立即执行）：状态更新 + 消息写入上下文 + 发言决策，不阻塞接收循环
         - 慢路径（后台任务）：思考延迟 + LLM 生成 + 发送，期间新消息仍会进入上下文
         """
-        logger.info(f"[{message.group_id or '私聊'}] {message.sender_name}: {message.content[:50]}...")
         session_id = message.session_id
+
+        # 富媒体增强只依据最外层文字和结构化指向判断。转发/卡片内部即使含有
+        # bot 昵称、@ 或问题，也不能把一条普通分享误判为“对 bot 说”。
+        is_reply_to_bot = self._is_reply_to_bot(message)
+        continuing = self._is_continuing_conversation(message)
+        rich_probe = SocialContext(
+            message_content=(
+                message.outer_text if message.segments else message.content
+            ),
+            mentioned_me=message.mentioned_me,
+            reply_to_me=is_reply_to_bot,
+        )
+        rich_trigger = self.trigger_detector.detect(rich_probe)
+        rich_reasons = rich_trigger.get("reasons", [])
+        rich_directed = (
+            message.message_type == "private"
+            or message.mentioned_me
+            or is_reply_to_bot
+            or continuing
+            or rich_trigger.get("forced_trigger", False)
+            or "紧急" in rich_reasons
+            or (
+                any(reason.startswith("昵称") for reason in rich_reasons)
+                and rich_probe.is_direct_question
+            )
+        )
+        logger.info(f"[{message.group_id or '私聊'}] {message.sender_name}: {message.content[:50]}...")
 
         # 创建事件
         event = Event(
@@ -419,8 +452,6 @@ class GroupChatBot:
         await self.event_bus.publish(event)
 
         # === 1. 快速路径：状态更新 + 上下文记录（立即执行，bot 实时"看到"消息） ===
-        is_reply_to_bot = self._is_reply_to_bot(message)
-        continuing = self._is_continuing_conversation(message)
         # 私聊天然是对 bot 说；群聊则结合 @、引用/称呼和最近实际回复判断。
         directed_to_bot = (
             message.message_type == "private"
@@ -471,10 +502,21 @@ class GroupChatBot:
         except Exception as e:
             logger.error(f"Fast path error: {e}", exc_info=True)
 
+        # 富媒体增强可能涉及 NapCat API 或安全网页预览。它在后台执行，决策仍走
+        # 快速路径；真正生成回复前会等待本条消息的增强结果。
+        enrichment_task = None
+        if message.segments:
+            enrichment_task = asyncio.create_task(
+                self._enrich_context_message(message, rich_directed)
+            )
+            self._rich_media_tasks.add(enrichment_task)
+            enrichment_task.add_done_callback(self._rich_media_tasks.discard)
+
         # === 2. 发言决策（快，无 LLM 调用） ===
         decision = self._decide_reply(message, is_reply_to_bot, continuing)
         if not decision:
             return
+        decision["enrichment_task"] = enrichment_task
 
         # === 3. 调度回复生成（后台任务，避免阻塞接收循环） ===
         current = self._reply_tasks.get(session_id)
@@ -522,7 +564,8 @@ class GroupChatBot:
 
         # 构建社交上下文
         context = SocialContext(
-            message_content=message.content,
+            # 触发检测只能看最外层文字，不能被转发记录/卡片标题中的昵称或问题影响。
+            message_content=(message.outer_text if message.segments else message.content),
             sender_id=message.sender_id,
             sender_name=message.sender_name,
             group_id=group_id,
@@ -539,6 +582,13 @@ class GroupChatBot:
         trigger_result = self.trigger_detector.detect(context)
         context.extra["trigger"] = trigger_result
         context.extra["is_private"] = is_private
+        context.extra["outer_text"] = (
+            message.outer_text if message.segments else message.content
+        )
+        context.extra["rich_message_only"] = message.rich_only
+        context.extra["rich_type"] = message.rich_type
+        # 话题兴趣可以参考安全渲染后的富媒体摘要，但强制触发结果已经在上面锁定。
+        context.message_content = message.content
         context = self.social_awareness.analyze(context)
 
         # 发言权和行为计划。当前消息已在快速路径进入上下文，因此可直接分析消息拓扑。
@@ -584,6 +634,8 @@ class GroupChatBot:
                 mentioned_others=message.mentioned_others,
                 topic_relevance=context.topic_relevance,
                 is_question=context.is_direct_question,
+                rich_message_only=message.rich_only,
+                rich_type=message.rich_type,
             )
             context.extra["floor"] = floor
             context.extra["action_plan"] = action_plan
@@ -642,6 +694,15 @@ class GroupChatBot:
         action_plan = decision.get("action_plan")
 
         try:
+            enrichment_task = decision.get("enrichment_task")
+            if enrichment_task:
+                try:
+                    await enrichment_task
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("富媒体增强失败，使用占位符继续：%s", exc)
+
             # === 检索长期记忆 ===
             memories = await self._retrieve_memories(message.content, session_id)
 
@@ -810,6 +871,22 @@ class GroupChatBot:
             if self._reply_tasks.get(session_id) is asyncio.current_task():
                 self._reply_tasks.pop(session_id, None)
 
+    async def _enrich_context_message(
+        self,
+        message: Message,
+        directed: bool,
+    ) -> None:
+        """后台增强富媒体，并原位更新已经进入滑动窗口的那条消息。"""
+        original_content = message.content
+        await self.qq_adapter.enrich_message(message, directed=directed)
+        if message.content != original_content:
+            self.context_manager.update_message_content(
+                message.session_id,
+                message.message_id,
+                message.content,
+            )
+            logger.debug("[富媒体] %s", message.content[:120])
+
     def _is_reply_to_bot(self, message: Message) -> bool:
         """检查消息是否引用了 Bot；名字/昵称提及由触发检测器单独处理。"""
         if message.reply_to_qq:
@@ -857,7 +934,13 @@ class GroupChatBot:
         - 含个人信息关键词（我叫/我喜欢/我的生日…）→ +0.3
         - 超过阈值 0.5 才值得长期记住
         """
-        content = message.content.strip()
+        # 卡片/转发是外部引用材料，不把其内容误记成发送者自己的事实。
+        # 如果外层另有文字，只记外层文字和附件类型。
+        if message.rich_only:
+            return
+        content = (message.outer_text or message.content).strip()
+        if message.rich_type:
+            content = f"{content} [{message.rich_type}]".strip()
         if not content or len(content) < 4:
             return
 
@@ -1071,6 +1154,18 @@ class GroupChatBot:
         # 取消所有任务
         for task in self._tasks:
             task.cancel()
+        background_tasks = (
+            list(self._reply_tasks.values())
+            + list(self._rich_media_tasks)
+            + list(self._digest_tasks.values())
+        )
+        for task in background_tasks:
+            task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        self._reply_tasks.clear()
+        self._rich_media_tasks.clear()
+        self._digest_tasks.clear()
 
         # 停止事件总线
         if self.event_bus:
@@ -1141,6 +1236,29 @@ class GroupChatBot:
                 "burst_window_seconds": 12,
                 "burst_message_threshold": 4,
                 "topic_shift_threshold": 0.12
+            },
+            "rich_media": {
+                "enabled": True,
+                "forward": {
+                    "enabled": True,
+                    "expand_when_undirected": True,
+                    "max_nodes": 12,
+                    "max_chars": 600,
+                    "timeout": 5.0
+                },
+                "links": {
+                    "enabled": True,
+                    "directed_only": True,
+                    "timeout": 3.0,
+                    "max_bytes": 262144,
+                    "max_redirects": 3,
+                    "cache_ttl": 1800
+                },
+                "image": {
+                    "ocr_enabled": False,
+                    "ocr_action": "ocr_image",
+                    "ocr_timeout": 5.0
+                }
             },
             "memory": {
                 "context_window_size": 50,

@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .rich_content import MessageSegment
+
 
 @dataclass
 class Message:
@@ -21,6 +23,10 @@ class Message:
     mentioned_others: list[str] = field(default_factory=list)  # 本条消息 @ 的其他 QQ 号（不含 bot）
     reply_to_id: Optional[str] = None
     reply_to_qq: Optional[str] = None  # 被回复消息的发送者 QQ 号（OneBot reply 段扩展字段）
+    segments: list[MessageSegment] = field(default_factory=list)
+    outer_text: str = ""  # 仅发送者最外层输入，用于触发检测，排除转发/卡片内容
+    rich_only: bool = False
+    rich_type: str = ""
 
     @property
     def session_id(self) -> str:

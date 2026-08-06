@@ -3,14 +3,22 @@ QQ 适配器 - 使用 NapCat/OneBot v11 协议
 作为 WebSocket 服务端接收 NapCat 的连接
 """
 import asyncio
+import contextlib
 import json
 import logging
-import re
 import uuid
 import websockets
 from typing import Callable, Awaitable, Optional, Set
 
 from .base import PlatformAdapter, Message
+from .rich_content import (
+    is_rich_only,
+    parse_message_segments,
+    primary_rich_type,
+    render_outer_text,
+    render_segments,
+)
+from .rich_media import RichMediaEnricher
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +45,8 @@ class QQAdapter(PlatformAdapter):
         self._running = False
         self._connected = False
         self._clients: Set[websockets.WebSocketServerProtocol] = set()
+        self._pending_api: dict[str, asyncio.Future] = {}
+        self._message_tasks: set[asyncio.Task] = set()
 
         # 消息 ID 计数器
         self._message_id = 0
@@ -46,6 +56,10 @@ class QQAdapter(PlatformAdapter):
         # 用最近消息 ID 补全 reply 段缺失的发送者信息，帮助判断谁在回复谁。
         self._message_senders: dict[str, str] = {}
         self._message_sender_cache_size = 2000
+        self.rich_media_enricher = RichMediaEnricher(
+            config.get("rich_media", {}) or {},
+            self.call_api,
+        )
 
     async def connect(self) -> None:
         """启动 WebSocket 服务端接收 NapCat 连接"""
@@ -94,10 +108,12 @@ class QQAdapter(PlatformAdapter):
             data = json.loads(raw_message)
             post_type = data.get("post_type", "")
             action = data.get("action", "")
-            status = data.get("status", "")
+            echo = data.get("echo")
 
-            # API 响应 - 忽略
-            if status:
+            # API 响应：唤醒发起 call_api 的协程。消息回调在独立任务中运行，
+            # 接收循环可继续处理 echo，避免 get_forward_msg 等调用死锁。
+            if echo is not None and ("status" in data or "retcode" in data):
+                self._resolve_api_response(str(echo), data)
                 return
 
             # API 调用
@@ -111,8 +127,9 @@ class QQAdapter(PlatformAdapter):
                 message_type = data.get("message_type", "private")
                 message = self._parse_message(data)
                 logger.info(f"[{'群聊' if message_type == 'group' else '私聊'}] {message.sender_name}: {message.content[:50]}...")
-                if self.on_message_callback:
-                    await self.on_message_callback(message)
+                task = asyncio.create_task(self._dispatch_message(message))
+                self._message_tasks.add(task)
+                task.add_done_callback(self._message_tasks.discard)
 
             # 元事件
             elif post_type == "meta_event":
@@ -124,6 +141,56 @@ class QQAdapter(PlatformAdapter):
 
         except Exception as e:
             logger.error(f"Error handling message: {e}")
+
+    async def _dispatch_message(self, message: Message) -> None:
+        """独立处理消息，让接收循环能继续接收 API 回执和后续群消息。"""
+        try:
+            if self.on_message_callback:
+                await self.on_message_callback(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Message callback failed: %s", exc, exc_info=True)
+
+    def _resolve_api_response(self, echo: str, response: dict) -> None:
+        future = self._pending_api.get(echo)
+        if not future or future.done():
+            return
+        status = str(response.get("status", "ok")).lower()
+        retcode = int(response.get("retcode", 0) or 0)
+        if status in ("ok", "async") and retcode == 0:
+            future.set_result(response.get("data"))
+        else:
+            message = response.get("message") or response.get("wording") or "NapCat API 调用失败"
+            future.set_exception(RuntimeError(f"{message} (retcode={retcode})"))
+
+    async def call_api(
+        self,
+        action: str,
+        params: dict,
+        timeout: float | None = 10.0,
+    ):
+        """向 NapCat 调用 API 并等待匹配 echo 的响应。"""
+        if not self._clients:
+            raise ConnectionError("No NapCat connected")
+        echo = f"alice-{uuid.uuid4().hex}"
+        future = asyncio.get_running_loop().create_future()
+        self._pending_api[echo] = future
+        try:
+            await self._broadcast(json.dumps({
+                "action": action,
+                "params": params,
+                "echo": echo,
+            }, ensure_ascii=False))
+            if timeout is None:
+                return await future
+            return await asyncio.wait_for(future, timeout=max(0.1, float(timeout)))
+        finally:
+            self._pending_api.pop(echo, None)
+
+    async def enrich_message(self, message: Message, *, directed: bool = False) -> Message:
+        """按配置展开转发、链接标题和图片 OCR。"""
+        return await self.rich_media_enricher.enrich(message, directed=directed)
 
     async def _handle_api_call(self, action: str, params: dict, echo: str = None) -> None:
         """处理 API 调用"""
@@ -178,24 +245,25 @@ class QQAdapter(PlatformAdapter):
     def _parse_message(self, data: dict) -> Message:
         """解析消息"""
         raw_content = data.get("message", "")
-        # 消息可能是数组格式或字符串格式
-        content = self._extract_text(raw_content)
+        segments = parse_message_segments(raw_content)
+        outer_message_id = str(data.get("message_id", "") or "")
+        for segment in segments:
+            if segment.type == "forward" and not (
+                segment.data.get("id") or segment.file_id
+            ):
+                # 部分 NapCat 版本只给外层消息 ID，也可用于 get_forward_msg。
+                segment.file_id = outer_message_id
+        content = render_segments(segments) or "[无法识别的消息]"
+        outer_text = render_outer_text(segments)
 
         # 解析被回复的对象（[CQ:reply] 消息段），两种格式都支持
         reply_to_id, reply_to_qq = None, None
-        if isinstance(raw_content, str):
-            m = re.search(r'\[CQ:reply,id=(\d+)(?:,qq=([-\d]+))?\]', raw_content)
-            if m:
-                reply_to_id = m.group(1)
-                reply_to_qq = m.group(2)
-        elif isinstance(raw_content, list):
-            for seg in raw_content:
-                if isinstance(seg, dict) and seg.get("type") == "reply":
-                    rdata = seg.get("data", {}) or {}
-                    reply_to_id = str(rdata.get("id", "")) or None
-                    qq = rdata.get("qq")
-                    reply_to_qq = str(qq) if qq is not None else None
-                    break
+        for segment in segments:
+            if segment.type == "reply":
+                reply_to_id = str(segment.data.get("id", "")) or None
+                qq = segment.data.get("qq")
+                reply_to_qq = str(qq) if qq is not None else None
+                break
 
         if reply_to_id and not reply_to_qq:
             reply_to_qq = self._message_senders.get(str(reply_to_id))
@@ -203,22 +271,14 @@ class QQAdapter(PlatformAdapter):
         # 检查是否 @ 了 bot，并收集 @ 的其他 QQ 号（区分"对bot说"和"对别人说"）
         mentioned_me = False
         mentioned_others: list[str] = []
-        if isinstance(raw_content, str):
-            mentioned_me = f"[CQ:at,qq={self.self_id}]" in raw_content
-            # 字符串格式也提取 @ 的其他人
-            for m in re.finditer(r'\[CQ:at,qq=([-\d]+)\]', raw_content):
-                qq = m.group(1)
-                if qq != self.self_id:
-                    mentioned_others.append(qq)
-        elif isinstance(raw_content, list):
-            for seg in raw_content:
-                if isinstance(seg, dict) and seg.get("type") == "at":
-                    mentioned_data = seg.get("data", {})
-                    qq = mentioned_data.get("qq")
-                    if str(qq) == str(self.self_id):
-                        mentioned_me = True
-                    elif qq is not None and str(qq) not in (str(self.self_id), "all"):
-                        mentioned_others.append(str(qq))
+        for segment in segments:
+            if segment.type != "at":
+                continue
+            qq = segment.data.get("qq")
+            if str(qq) == str(self.self_id):
+                mentioned_me = True
+            elif qq is not None and str(qq) not in (str(self.self_id), "all"):
+                mentioned_others.append(str(qq))
 
         # 回复了 bot 的消息，等同于 @（也算"提到我"）
         if not mentioned_me and reply_to_qq and str(reply_to_qq) == str(self.self_id):
@@ -237,11 +297,19 @@ class QQAdapter(PlatformAdapter):
             ),
             group_id=str(data.get("group_id", "")) if data.get("message_type") == "group" else None,
             content=content,
-            raw_content=raw_content if isinstance(raw_content, str) else str(raw_content),
+            raw_content=(
+                raw_content
+                if isinstance(raw_content, str)
+                else json.dumps(raw_content, ensure_ascii=False, separators=(",", ":"))
+            ),
             mentioned_me=mentioned_me,
             mentioned_others=mentioned_others,
             reply_to_id=reply_to_id,
             reply_to_qq=reply_to_qq,
+            segments=segments,
+            outer_text=outer_text,
+            rich_only=is_rich_only(segments),
+            rich_type=primary_rich_type(segments),
         )
 
         if message.message_id:
@@ -252,50 +320,8 @@ class QQAdapter(PlatformAdapter):
         return message
 
     def _extract_text(self, content) -> str:
-        """提取可理解的消息语义；非文本段保留简短占位，避免图片变成空消息。"""
-        placeholders = {
-            "image": "[图片]",
-            "mface": "[表情包]",
-            "face": "[QQ表情]",
-            "record": "[语音]",
-            "video": "[视频]",
-            "file": "[文件]",
-            "share": "[分享]",
-            "json": "[卡片消息]",
-            "xml": "[卡片消息]",
-        }
-
-        if isinstance(content, str):
-            # CQ 字符串格式：@/reply 由结构化字段表达，其他常见消息段留下语义占位。
-            def replace_cq(match):
-                segment_type = match.group(1).lower()
-                if segment_type in ("at", "reply"):
-                    return ""
-                return placeholders.get(segment_type, "")
-
-            return re.sub(
-                r'\[CQ:([^,\]]+)(?:,[^\]]*)?\]',
-                replace_cq,
-                content,
-            ).strip()
-        elif isinstance(content, list):
-            parts = []
-            for seg in content:
-                if isinstance(seg, dict):
-                    segment_type = str(seg.get("type", "")).lower()
-                    data = seg.get("data", {}) or {}
-                    if segment_type == "text":
-                        text = data.get("text", "")
-                        if text:
-                            parts.append(text)
-                    elif segment_type not in ("at", "reply"):
-                        placeholder = placeholders.get(segment_type)
-                        if placeholder:
-                            parts.append(placeholder)
-                elif isinstance(seg, str):
-                    parts.append(seg)
-            return ''.join(parts).strip()
-        return str(content)
+        """兼容旧调用：富媒体现在统一走结构化解析器。"""
+        return render_segments(parse_message_segments(content))
 
     async def send_message(self, session_id: str, content: str) -> bool:
         """发送消息"""
@@ -336,6 +362,17 @@ class QQAdapter(PlatformAdapter):
     async def disconnect(self) -> None:
         self._running = False
         self._connected = False
+        if self._message_tasks:
+            tasks = list(self._message_tasks)
+            for task in tasks:
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(*tasks)
+            self._message_tasks.clear()
+        for future in self._pending_api.values():
+            if not future.done():
+                future.set_exception(ConnectionError("NapCat disconnected"))
+        self._pending_api.clear()
         if self._server:
             self._server.close()
             await self._server.wait_closed()

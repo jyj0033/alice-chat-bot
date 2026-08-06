@@ -269,7 +269,13 @@ class SocialAwarenessManager:
         # 这里只做氛围和话题分析
 
         # 氛围分析
+        semantic_content = context.message_content
+        # 氛围只依据发送者外层发言；转发内容中的争吵不代表当前群正在争吵。
+        outer_text = context.extra.get("outer_text")
+        if outer_text is not None:
+            context.message_content = outer_text
         ambience = self.ambience_analyzer.analyze(context)
+        context.message_content = semantic_content
         context.extra["ambience"] = ambience
 
         # 话题分析

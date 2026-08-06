@@ -263,6 +263,22 @@ class ContextManager:
             directed_to_bot=directed_to_bot,
         ))
 
+    def update_message_content(
+        self,
+        session_id: str,
+        message_id: str,
+        content: str,
+    ) -> bool:
+        """富媒体异步解析完成后原位更新上下文，不改变消息先后顺序。"""
+        if not message_id or not content:
+            return False
+        window = self.get_window(session_id)
+        for message in reversed(window.messages):
+            if str(message.message_id) == str(message_id):
+                message.content = content
+                return True
+        return False
+
     def build_context_prompt(
         self,
         session_id: str,

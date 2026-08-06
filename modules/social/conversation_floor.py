@@ -110,6 +110,8 @@ class ConversationFloorManager:
         mentioned_others: list[str] | None = None,
         topic_relevance: float = 0.5,
         is_question: bool = False,
+        rich_message_only: bool = False,
+        rich_type: str = "",
     ) -> tuple[ConversationFloor, ActionPlan]:
         """分析当前消息，并返回发言权快照与动作计划。"""
         now = current_message.timestamp
@@ -202,6 +204,8 @@ class ConversationFloorManager:
             topic_relevance=topic_relevance,
             is_question=is_question,
             topic_tokens=current_tokens,
+            rich_message_only=rich_message_only,
+            rich_type=rich_type,
         )
         return floor, plan
 
@@ -259,6 +263,8 @@ class ConversationFloorManager:
         topic_relevance: float,
         is_question: bool,
         topic_tokens: set[str],
+        rich_message_only: bool,
+        rich_type: str,
     ) -> ActionPlan:
         expressive = self._is_expressive(current_message.content)
 
@@ -286,6 +292,18 @@ class ConversationFloorManager:
             tone, max_chars = "保持旁观", 0
             confidence = 0.88
             reason = "两位群友正在连续对聊"
+            wait_multiplier = 1.0
+        elif rich_message_only and rich_type in ("image", "mface", "face", "video"):
+            action = ActionType.REACT
+            tone, max_chars = "只在确实有自然反应时回几个字；不知道内容就沉默", 8
+            confidence = 0.38
+            reason = "纯媒体消息只适合偶尔短反应"
+            wait_multiplier = 0.8
+        elif rich_message_only:
+            action = ActionType.SILENT
+            tone, max_chars = "像普通群友一样略过无人提问的分享", 0
+            confidence = 0.9
+            reason = "无人提问的链接、卡片或转发不主动点评"
             wait_multiplier = 1.0
         elif expressive and len(current_message.content.strip()) <= 14:
             action = ActionType.REACT

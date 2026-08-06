@@ -99,6 +99,44 @@ qq:
   self_id: "123456789"  # Bot QQ 号
 ```
 
+### 富媒体消息
+
+图片、视频、小程序、网页链接和合并转发会先转换为安全的短语义，再进入群聊上下文：
+
+- 图片/视频的临时 URL 不会写进提示词或长期记忆；
+- 小程序和 JSON 卡片只提取标题、来源等白名单字段；
+- 合并转发通过 `get_forward_msg` 展开，默认最多保留 12 个节点；
+- 转发、卡片和网页中的昵称、`@`、问题不会触发机器人；
+- 无人提问的链接、卡片和转发默认不插话，纯图片/视频只可能偶尔短反应；
+- 明确对机器人发送网页链接时才抓取标题，且会拒绝内网地址和非标准端口。
+
+可选配置：
+
+```yaml
+rich_media:
+  enabled: true
+  forward:
+    enabled: true
+    expand_when_undirected: true
+    max_nodes: 12
+    max_chars: 600
+    timeout: 5.0
+  links:
+    enabled: true
+    directed_only: true
+    timeout: 3.0
+    max_bytes: 262144
+    max_redirects: 3
+    cache_ttl: 1800
+  image:
+    # NapCat OCR 只识别图片文字，不等同于视觉理解；默认关闭。
+    ocr_enabled: false
+    ocr_action: "ocr_image"
+    ocr_timeout: 5.0
+```
+
+当前没有配置视觉模型时，普通图片和视频会诚实保留为 `[图片]`、`[视频]`，机器人不会猜测画面。视频不会自动下载或抽帧，避免在群聊中产生高延迟和大流量。
+
 ## 管理面板
 
 - 状态监控

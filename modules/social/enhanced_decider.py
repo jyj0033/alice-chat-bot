@@ -121,7 +121,8 @@ class EnhancedSpeakingDecider:
             )
 
         # === 2. 检查命令 ===
-        if self._is_command(context.message_content):
+        decision_text = context.extra.get("outer_text", context.message_content)
+        if self._is_command(decision_text):
             return SpeakingDecision(
                 should_speak=False,
                 probability=0.0,
@@ -139,6 +140,19 @@ class EnhancedSpeakingDecider:
             )
 
         action_plan = context.extra.get("action_plan")
+        if (
+            context.extra.get("rich_message_only", False)
+            and context.extra.get("rich_type") not in ("image", "mface", "face", "video")
+            and not context.mentioned_me
+            and not context.reply_to_me
+            and not context.is_emergency
+        ):
+            return SpeakingDecision(
+                should_speak=False,
+                probability=0.0,
+                reason="无人提问的链接、卡片或转发不主动点评",
+                modifiers={"rich_message_only": True},
+            )
         if (
             action_plan
             and action_plan.action == ActionType.SILENT
@@ -242,7 +256,7 @@ class EnhancedSpeakingDecider:
 
         # === D. 注意力关键词 ===
         attention_change, attention_reason = self.attention_keywords_detector.detect_attention_keywords(
-            context.message_content, context.sender_id
+            context.extra.get("outer_text", context.message_content), context.sender_id
         )
         if attention_change != 0:
             modifiers["关键词"] = attention_change
@@ -366,7 +380,7 @@ class EnhancedSpeakingDecider:
 
         # 关键词
         attention_reason = self.attention_keywords_detector.detect_attention_keywords(
-            context.message_content, context.sender_id
+            context.extra.get("outer_text", context.message_content), context.sender_id
         )[1]
         if attention_reason:
             reasons.append(attention_reason)
