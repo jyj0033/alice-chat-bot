@@ -173,14 +173,18 @@ class MemoryStorage:
 
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
-    def get_all(self, limit: int = 1000) -> list[Memory]:
-        """获取所有长期记忆（情景+语义），按重要性排序"""
-        cursor = self.conn.execute("""
+    def get_all(self, limit: int = 1000, memory_type: Optional[str] = None) -> list[Memory]:
+        """获取长期记忆（默认情景+语义；指定类型时只返回该类型），按重要性排序"""
+        if memory_type:
+            where, params = "memory_type = ?", (memory_type,)
+        else:
+            where, params = "memory_type IN ('episodic', 'semantic')", ()
+        cursor = self.conn.execute(f"""
             SELECT * FROM memories
-            WHERE memory_type IN ('episodic', 'semantic')
+            WHERE {where}
             ORDER BY importance DESC, created_at DESC
             LIMIT ?
-        """, (limit,))
+        """, (*params, limit))
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
     def retrieve_session_recent(
@@ -572,9 +576,9 @@ class AsyncMemoryStorage:
         """异步获取最近记忆"""
         return await asyncio.to_thread(self._storage.get_recent, memory_type, limit)
 
-    async def get_all(self, limit: int = 1000) -> list[Memory]:
-        """异步获取所有长期记忆"""
-        return await asyncio.to_thread(self._storage.get_all, limit)
+    async def get_all(self, limit: int = 1000, memory_type: Optional[str] = None) -> list[Memory]:
+        """异步获取长期记忆（默认情景+语义；指定类型时只返回该类型）"""
+        return await asyncio.to_thread(self._storage.get_all, limit, memory_type)
 
     async def retrieve_session_recent(
         self, session: str, limit: int = 5, memory_type: Optional[str] = None

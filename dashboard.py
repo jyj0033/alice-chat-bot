@@ -6,7 +6,7 @@ from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 import uvicorn
 import yaml
 
@@ -111,6 +111,10 @@ async def get_config():
     if 'qq' in config and isinstance(config.get('qq'), dict):
         if config['qq'].get('access_token'):
             config['qq']['access_token'] = '********'
+    if 'image' in config and isinstance(config.get('image'), dict):
+        vision = config['image'].get('vision')
+        if isinstance(vision, dict) and vision.get('api_key'):
+            vision['api_key'] = '********'
     return config
 
 
@@ -206,6 +210,16 @@ async def update_config(request: Request):
             current['rich_media'] = deep_merge(
                 current.get('rich_media', {}), data['rich_media']
             )
+
+        # 图片/视觉模型配置
+        if 'image' in data:
+            current_image = current.get('image', {})
+            if isinstance(data['image'].get('vision'), dict):
+                new_vision = data['image']['vision'].copy()
+                if str(new_vision.get('api_key', '')).startswith('*'):
+                    new_vision['api_key'] = (current_image.get('vision') or {}).get('api_key', '')
+                data['image']['vision'] = new_vision
+            current['image'] = deep_merge(current_image, data['image'])
 
         save_config(current)
         return {"success": True, "message": "配置已保存"}
@@ -314,15 +328,27 @@ async def get_context(session_id: str):
 
 
 @app.get("/api/memories")
-async def get_memories(session: str = "", q: str = "", limit: int = 100):
-    """获取长期记忆列表（支持按会话/关键词过滤，含时间衰减后的有效重要性）"""
+async def get_memories(session: str = "", q: str = "", type: str = "all", limit: int = 100):
+    """获取长期记忆列表（支持按会话/关键词/类型过滤，含时间衰减后的有效重要性）
+    type: all=长期记忆+群聊纪要, memory=仅长期记忆, digest=仅群聊纪要
+    """
     if not bot_instance or not bot_instance.memory_storage:
         return {"memories": [], "total": 0}
 
     from datetime import datetime
 
     try:
-        all_mem = await bot_instance.memory_storage.get_all(limit=1000)
+        if type == "digest":
+            all_mem = await bot_instance.memory_storage.get_all(limit=1000, memory_type="session_summary")
+            allowed_types = {"session_summary"}
+        elif type == "memory":
+            all_mem = await bot_instance.memory_storage.get_all(limit=1000)
+            allowed_types = {"episodic", "semantic"}
+        else:
+            regular = await bot_instance.memory_storage.get_all(limit=1000)
+            digests = await bot_instance.memory_storage.get_all(limit=1000, memory_type="session_summary")
+            all_mem = list(regular) + list(digests)
+            allowed_types = {"episodic", "semantic", "session_summary"}
     except Exception as e:
         logger.error(f"Failed to load memories: {e}")
         return {"memories": [], "total": 0}
@@ -331,7 +357,7 @@ async def get_memories(session: str = "", q: str = "", limit: int = 100):
     result = []
     q_lower = (q or "").strip().lower()
     for m in all_mem:
-        if m.memory_type not in ("episodic", "semantic"):
+        if m.memory_type not in allowed_types:
             continue
         if session and m.source_session != session:
             continue
@@ -344,6 +370,7 @@ async def get_memories(session: str = "", q: str = "", limit: int = 100):
             "importance": round(m.importance, 3),
             "effective_importance": round(eff, 3),
             "memory_type": m.memory_type,
+            "tags": list(m.tags or []),
             "created_at": m.created_at.isoformat(),
             "last_accessed": m.last_accessed.isoformat(),
             "source_session": m.source_session,
@@ -525,6 +552,49 @@ async def test_provider(name: str):
         return {"success": False, "error": error_msg}
 
 
+@app.post("/api/vision/test")
+async def test_vision(request: Request):
+    """测试视觉模型连接（与 LLM 相同创建方式，但用 image.vision 独立配置）"""
+    try:
+        data = await request.json()
+        api_key = (data.get("api_key") or "").strip()
+        if api_key.startswith('*'):
+            api_key = str(
+                load_config().get("image", {}).get("vision", {}).get("api_key", "")
+            ).strip()
+        if not api_key:
+            return {"success": False, "error": "API Key 不能为空"}
+        provider_type = data.get("provider_type") or "anthropic"
+        base_url = (data.get("base_url") or "").strip()
+        model = (data.get("model") or "").strip()
+        if not base_url or not model:
+            return {"success": False, "error": "Base URL 和模型不能为空"}
+
+        from modules.llm.openai_provider import create_provider
+        from modules.llm.base import ChatRequest, ChatMessage
+        test_provider = create_provider(
+            provider_type,
+            {
+                'api_key': api_key,
+                'base_url': base_url,
+                'model': model,
+                'timeout': 30,
+                'provider_type': provider_type,
+            },
+        )
+        resp = await test_provider.chat(ChatRequest(
+            messages=[ChatMessage(role="user", content="Hi, respond with OK")],
+            temperature=0.1,
+            max_tokens=10,
+        ))
+        return {"success": True, "response": resp.content[:100]}
+    except Exception as e:
+        import traceback
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        logger.error(f"Vision test failed: {error_msg}\n{traceback.format_exc()}")
+        return {"success": False, "error": error_msg}
+
+
 @app.post("/api/test/generate")
 async def test_generate(request: Request):
     if not bot_instance:
@@ -550,11 +620,13 @@ async def test_generate(request: Request):
 
 @app.get("/api/logs")
 async def get_logs():
+    # 必须返回 text/plain 而非裸 str，否则 FastAPI 会按 JSON 转义把换行变成字面 \n。
     for log_file in (BASE_DIR / "logs" / "bot.log", Path("/app/logs/bot.log")):
         if log_file.exists():
             lines = log_file.read_text(encoding='utf-8', errors='replace').splitlines()[-200:]
-            return "\n".join(lines)
-    return "\n".join(list(LOG_BUFFER)[-200:]) or "暂无日志"
+            return Response(content="\n".join(lines), media_type="text/plain; charset=utf-8")
+    text = "\n".join(list(LOG_BUFFER)[-200:]) or "暂无日志"
+    return Response(content=text, media_type="text/plain; charset=utf-8")
 
 
 @app.post("/api/restart")

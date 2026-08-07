@@ -38,7 +38,14 @@ class DashboardSurfaceTests(unittest.TestCase):
             "rich-enabled",
             "rich-forward-enabled",
             "rich-links-enabled",
-            "rich-ocr-enabled",
+            # 图片识别（视觉模型）控件，OCR 已由视觉模型取代
+            "image-to-text-scope",
+            "image-to-text-context",
+            "image-group-enabled",
+            # 视觉模型独立配置（LLM 页）
+            "vision-enabled",
+            # 群聊纪要查询/管理（记忆页）
+            "memory-type-filter",
             "digest-enabled",
             "attention-spillover-enabled",
             "cooldown-enabled",
@@ -54,6 +61,8 @@ class DashboardSurfaceTests(unittest.TestCase):
         }
         self.assertTrue(required_ids.issubset(set(self.parser.ids)))
         self.assertNotIn("qq-ws-url", self.parser.ids)
+        # OCR 已被视觉模型取代，不应再暴露单独配置
+        self.assertNotIn("rich-ocr-enabled", self.parser.ids)
 
     def test_session_messages_are_html_escaped(self):
         self.assertIn("escapeHtml(m.sender)", self.html)
