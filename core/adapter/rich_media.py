@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from datetime import datetime
 from html.parser import HTMLParser
 import ipaddress
 import logging
@@ -101,6 +102,8 @@ class RichMediaEnricher:
         self._ocr_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._image_desc_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._cache_size = max(16, int(config.get("cache_size", 256)))
+        # 最近图片识别结果（供 Web 面板复核识别是否正确），最旧自动丢弃
+        self._recognition_log: deque[dict] = deque(maxlen=60)
         self._stats = {
             "messages_seen": 0,
             "forward_expanded": 0,
@@ -148,6 +151,7 @@ class RichMediaEnricher:
                         )
                         if enriched:
                             self._stats["image_to_text"] += 1
+                            self._record_recognition(message, segment)
                         changed = enriched or changed
                     elif self.image_ocr_enabled and directed:
                         enriched = await self._ocr_image(segment)
@@ -166,6 +170,23 @@ class RichMediaEnricher:
 
     def statistics(self) -> dict[str, int | bool]:
         return {"enabled": self.enabled, **self._stats}
+
+    def recognition_history(self, limit: int = 20) -> list[dict]:
+        """最近图片识别记录（新→旧），供 Web 面板复核识别结果。"""
+        return list(self._recognition_log)[-limit:][::-1]
+
+    def _record_recognition(self, message: Message, segment: MessageSegment) -> None:
+        """记录一次成功的图片识别结果。"""
+        try:
+            self._recognition_log.append({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "session_id": message.session_id,
+                "sender": message.sender_name,
+                "rich_type": segment.type,
+                "description": (segment.summary or "").strip(),
+            })
+        except Exception as exc:
+            logger.debug("Recognition record failed: %s", exc)
 
     def _image_describe_applicable(self, directed: bool) -> bool:
         """判断当前图片是否需要走视觉描述。scope=all 时所有图片都识别。"""

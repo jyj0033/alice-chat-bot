@@ -449,6 +449,31 @@
         .memory-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; gap: 8px; flex-wrap: wrap; }
         .memory-foot .hint { margin: 0; }
 
+        /* ========== 图片识别记录 ========== */
+        .recognition-list { display: flex; flex-direction: column; max-height: 420px; overflow-y: auto; }
+        .recognition-item {
+            display: flex; gap: 12px; align-items: flex-start;
+            padding: 12px 6px; border-bottom: 1px solid var(--border);
+        }
+        .recognition-item:last-child { border-bottom: none; }
+        .recognition-item:hover { background: #fafbff; }
+        .recognition-badge {
+            flex-shrink: 0; margin-top: 2px;
+            font-size: 11px; font-weight: 700;
+            padding: 2px 9px; border-radius: 999px;
+        }
+        .recognition-badge.image { background: var(--info-light); color: #0369a1; }
+        .recognition-badge.mface { background: var(--warning-light); color: #b45309; }
+        .recognition-body { flex: 1; min-width: 0; }
+        .recognition-meta {
+            display: flex; align-items: center; gap: 8px;
+            font-size: 12px; color: var(--text-secondary); margin-bottom: 3px;
+            flex-wrap: wrap;
+        }
+        .recognition-meta .r-sender { font-weight: 700; color: var(--text); }
+        .recognition-meta .r-time { font-family: monospace; }
+        .recognition-desc { font-size: 13px; line-height: 1.6; color: var(--text); word-break: break-all; }
+
         /* ========== Provider 卡片 ========== */
         .providers-list { display: flex; flex-direction: column; gap: 14px; }
         .provider-card {
@@ -915,6 +940,20 @@
                             <div class="gauge-label">情绪</div>
                             <div class="gauge-tag">当前心情状态</div>
                         </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <span class="card-ico"><svg class="icon-sm"><use href="#i-eye"/></svg></span>
+                            图片识别记录
+                            <span class="hint" id="recognition-count" style="margin-left:6px"></span>
+                        </div>
+                        <span class="badge gray">最近 20 条</span>
+                    </div>
+                    <div id="recognition-list" class="recognition-list">
+                        <div class="hint" style="padding: 14px;">暂无识别记录，群里出现图片后会自动展示</div>
                     </div>
                 </div>
             </div>
@@ -1903,12 +1942,44 @@
                 updateGauge('energy', emotion.energy);
                 updateGauge('engagement', emotion.engagement);
                 updateGauge('mood', emotion.mood);
+
+                // 图片识别记录
+                renderRecognition(status.recognition_history || []);
             } catch (e) {
                 document.getElementById('status-text').textContent = '连接失败';
                 document.getElementById('status-pill').className = 'status-pill offline';
                 document.getElementById('status-dot').className = 'status-dot offline';
                 console.error(e);
             }
+        }
+
+        function renderRecognition(records) {
+            const list = document.getElementById('recognition-list');
+            const count = document.getElementById('recognition-count');
+            count.textContent = `共 ${records.length} 条`;
+            if (!records.length) {
+                list.innerHTML = '<div class="hint" style="padding: 14px;">暂无识别记录，群里出现图片后会自动展示</div>';
+                return;
+            }
+            list.innerHTML = records.map(r => {
+                const isMface = r.rich_type === 'mface';
+                const badge = isMface
+                    ? '<span class="recognition-badge mface">表情包</span>'
+                    : '<span class="recognition-badge image">图片</span>';
+                const time = r.ts ? new Date(r.ts).toLocaleString('zh-CN', {hour12:false}) : '';
+                return `
+                    <div class="recognition-item">
+                        ${badge}
+                        <div class="recognition-body">
+                            <div class="recognition-meta">
+                                <span class="r-sender">${escapeHtml(r.sender || '未知')}</span>
+                                <span class="r-time">${escapeHtml(time)}</span>
+                                <span class="hint" style="font-family:monospace;font-size:11px;">${escapeHtml(r.session_id || '')}</span>
+                            </div>
+                            <div class="recognition-desc">${escapeHtml(r.description || '')}</div>
+                        </div>
+                    </div>`;
+            }).join('');
         }
 
         function updateGauge(type, value) {

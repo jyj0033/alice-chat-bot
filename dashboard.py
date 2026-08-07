@@ -232,10 +232,15 @@ async def get_status():
     if not bot_instance:
         return {"status": "not_initialized", "running": False}
     rich_media = {}
+    recognition_history = []
     if bot_instance.qq_adapter:
         enricher = getattr(bot_instance.qq_adapter, 'rich_media_enricher', None)
         if enricher:
             rich_media = enricher.statistics()
+            try:
+                recognition_history = enricher.recognition_history(20)
+            except Exception as e:
+                logger.warning("recognition_history failed: %s", e)
     emotion = {
         "energy": 0.7,
         "engagement": 0.5,
@@ -277,6 +282,7 @@ async def get_status():
             "pending_api_calls": len(bot_instance.qq_adapter._pending_api) if bot_instance.qq_adapter else 0,
         },
         "rich_media": rich_media,
+        "recognition_history": recognition_history,
         "emotion": emotion,
     }
 

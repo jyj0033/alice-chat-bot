@@ -286,11 +286,32 @@ class EnhancedSpeakingDecider:
         if abs(topic_bonus) > 1e-6:
             modifiers["话题兴趣"] = topic_bonus
 
-        # 群越热闹越谨慎插嘴；冷清时只给很小的加成，避免为了暖场而刷屏。
-        if context.group_activity > 0.8:
-            modifiers["群聊节奏"] = -0.08
-        elif context.group_activity < 0.15:
-            modifiers["群聊节奏"] = 0.03
+        # 群聊节奏：多人高强度聊天时压低插话频率，有人单独发消息时更愿意接话。
+        # 优先用发言权拓扑（active_speakers/fast_burst），比 group_activity 的
+        # 10 分钟均值更能反映"此刻"的冷热：3+ 人同时在场或消息爆发都算热聊，
+        # 只有当前发话人（45 秒窗口内）则视为"单独发消息"。
+        floor = context.extra.get("floor")
+        group_activity = context.group_activity
+        if floor is not None:
+            n_speakers = len(floor.active_speakers)
+            multi_hot = (
+                (n_speakers >= 3 and group_activity > 0.5)
+                or (floor.fast_burst and n_speakers >= 2)
+            )
+            solo = n_speakers <= 1 and not floor.two_person_thread
+            if multi_hot:
+                modifiers["多人热聊谨慎"] = -0.2
+            elif solo:
+                modifiers["独聊更积极"] = 0.15
+            elif group_activity > 0.8:
+                modifiers["群聊节奏"] = -0.12
+            elif group_activity < 0.2:
+                modifiers["群聊节奏"] = 0.06
+        else:
+            if group_activity > 0.8:
+                modifiers["群聊节奏"] = -0.12
+            elif group_activity < 0.15:
+                modifiers["群聊节奏"] = 0.06
 
         # === E.6 发言权成本 ===
         action_plan = context.extra.get("action_plan")
