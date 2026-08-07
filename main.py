@@ -8,9 +8,10 @@ import random
 import signal
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
 
@@ -103,6 +104,14 @@ class GroupChatBot:
         self._digest_config: dict = {}
         self._last_digest_at: dict[str, float] = {}  # session -> 上次纪要覆盖到的消息时间戳
         self._digest_tasks: dict[str, asyncio.Task] = {}  # 进行中的纪要任务
+
+        # 媒体轨迹：记录最近消息(时间/sender/是否纯图片/图片url)，用于判断"连图"。
+        self._media_trail: dict[str, deque] = {}
+        self._media_trail_limit = 30
+
+    @property
+    def _image_group_config(self) -> dict:
+        return self.config.get("image", {}) or {} if self.config else {}
 
     async def initialize(self) -> None:
         """初始化 Bot"""
@@ -355,7 +364,7 @@ class GroupChatBot:
             decrease_heavy=fatigue_config.get("decrease_heavy", 0.35),
             closing_probability=fatigue_config.get("closing_probability", 0.3),
             cooldown_enabled=cooldown_config.get("enabled", True),
-            cooldown_max_duration=cooldown_config.get("max_duration", 600),
+            cooldown_max_duration=cooldown_config.get("max_duration", 60),
             cooldown_trigger_threshold=cooldown_config.get("trigger_threshold", 0.3),
             cooldown_attention_decrease=cooldown_config.get("attention_decrease", 0.2),
         )
@@ -407,18 +416,52 @@ class GroupChatBot:
             speaking_style_manager=self.speaking_style_manager
         )
 
+    def _init_vision_provider(self) -> Optional[Any]:
+        """初始化视觉模型 Provider（图片→文字描述）。未启用/失败返回 None，不阻断启动。"""
+        image_config = self.config.get("image", {}) or {}
+        vision_config = image_config.get("vision", {}) or {}
+        if not vision_config.get("enabled", False):
+            return None
+        try:
+            provider = create_provider(
+                vision_config.get("provider_type", "openai"),
+                {
+                    "provider_type": vision_config.get("provider_type", "openai"),
+                    "api_key": vision_config.get("api_key", ""),
+                    "base_url": vision_config.get(
+                        "base_url", "https://api.openai.com/v1"
+                    ),
+                    "model": vision_config.get("model", "gpt-4o-mini"),
+                    "timeout": vision_config.get("timeout", 60),
+                    "temperature": vision_config.get("temperature", 0.4),
+                    "max_tokens": 300,
+                },
+            )
+            logger.info(
+                f"✓ Vision provider: {vision_config.get('base_url')}, model: {vision_config.get('model')}"
+            )
+            return provider
+        except Exception as e:
+            logger.error(f"✗ Failed to init vision provider: {e}")
+            return None
+
     def _init_qq_adapter(self) -> None:
         """初始化 QQ 适配器"""
         qq_config = self.config.get("qq", {})
+        # 顶层 image 段（to_text_scope/prompt/vision 等）合并进 rich_media 配置。
+        rich_media_config = dict(self.config.get("rich_media", qq_config.get("rich_media", {})))
+        image_config = self.config.get("image", {}) or {}
+        if image_config:
+            merged_image = {**rich_media_config.get("image", {}), **image_config}
+            rich_media_config["image"] = merged_image
         adapter_config = {
             **qq_config,
-            "rich_media": self.config.get(
-                "rich_media", qq_config.get("rich_media", {})
-            ),
+            "rich_media": rich_media_config,
         }
         self.qq_adapter = QQAdapter(
             config=adapter_config,
-            on_message=self._handle_message
+            on_message=self._handle_message,
+            vision_provider=self._init_vision_provider(),
         )
 
     async def _handle_message(self, message: Message) -> None:
@@ -528,6 +571,9 @@ class GroupChatBot:
 
             # 群聊纪要：距上次总结的新消息达到固定条数 → 后台压缩成纪要存长期记忆
             self._maybe_schedule_digest(session_id)
+
+            # 记录媒体轨迹，供"连图整体识别"判断连续纯图片
+            self._record_media_trail(message)
         except Exception as e:
             logger.error(f"Fast path error: {e}", exc_info=True)
 
@@ -917,7 +963,14 @@ class GroupChatBot:
     ) -> None:
         """后台增强富媒体，并原位更新已经进入滑动窗口的那条消息。"""
         original_content = message.content
-        await self.qq_adapter.enrich_message(message, directed=directed)
+        conversation_context = self._build_image_conversation_context(message)
+        group_image_urls = self._collect_group_image_urls(message)
+        await self.qq_adapter.enrich_message(
+            message,
+            directed=directed,
+            conversation_context=conversation_context,
+            group_image_urls=group_image_urls,
+        )
         if message.content != original_content:
             self.context_manager.update_message_content(
                 message.session_id,
@@ -925,6 +978,87 @@ class GroupChatBot:
                 message.content,
             )
             logger.debug("[富媒体] %s", message.content[:120])
+
+    def _record_media_trail(self, message: Message) -> None:
+        """记录消息轨迹（时间/sender/是否纯图片/图片url），用于判断连续连图。"""
+        try:
+            sid = message.session_id
+            is_pure_image = message.rich_only and message.rich_type in ("image", "mface")
+            url = ""
+            if is_pure_image:
+                for seg in message.segments:
+                    if seg.type in ("image", "mface") and seg.url:
+                        url = seg.url
+                        break
+            trail = self._media_trail.setdefault(sid, deque(maxlen=self._media_trail_limit))
+            trail.append({
+                "ts": time.time(),
+                "sender_id": message.sender_id,
+                "is_image": is_pure_image,
+                "url": url,
+                "message_id": message.message_id,
+            })
+        except Exception as e:
+            logger.debug("Record media trail failed: %s", e)
+
+    def _collect_group_image_urls(self, message: Message) -> list[str]:
+        """取当前图片消息之前、同一人连续发的纯图片 URL（相邻间隔≤60s）。
+
+        从轨迹中往回扫：同 sender 的纯图片且与前一条间隔在窗口内 → 收进组；
+        遇到不同 sender / 非图片 / 超窗 → 停止（严格连续）。返回时间正序。
+        """
+        if not (self.config.get("image", {}).get("group_enabled", True)):
+            return []
+        trail = self._media_trail.get(message.session_id)
+        if not trail:
+            return []
+        interval = float(self.config.get("image", {}).get("group_interval_seconds", 60))
+        cap = int(self.config.get("image", {}).get("group_max_images", 4)) - 1  # 除当前图
+        now = time.time()
+        sender = message.sender_id
+        current_msg_id = getattr(message, "message_id", "") or ""
+        collected: list[str] = []
+        for entry in reversed(list(trail)):
+            # 跳过当前这条消息本身（快路径已把它写入轨迹末尾）
+            if entry.get("message_id") and current_msg_id and entry["message_id"] == current_msg_id:
+                continue
+            if entry["sender_id"] != sender:
+                break
+            if not entry["is_image"] or not entry["url"]:
+                break
+            # 相邻间隔：该条目与其后一条（或当前消息）的时间差超过窗口则视为断组
+            if now - entry["ts"] > interval:
+                break
+            collected.append(entry["url"])
+            if len(collected) >= cap:
+                break
+            now = entry["ts"]  # 向前推移，判断下一条与前一条的间隔
+        collected.reverse()  # 时间正序
+        if collected:
+            logger.debug("[连图] 当前图前收集 %d 张组图: %s", len(collected), collected)
+        return collected
+
+    def _build_image_conversation_context(self, message: Message) -> str:
+        """取当前图片消息之前的若干条对话，供视觉模型判断图片/表情包的意图。"""
+        try:
+            window = self.context_manager.get_window(message.session_id)
+            recent = window.get_recent(8)
+            lines = []
+            current_id = getattr(message, "message_id", "") or ""
+            for m in reversed(recent):
+                # 排除当前这条（后台增强时它已在窗口内）
+                if current_id and m.message_id and m.message_id == current_id:
+                    continue
+                if not current_id and m.sender_id == message.sender_id and m.content == message.content:
+                    continue
+                speaker = "爱丽丝" if m.is_bot else (m.sender_name or m.sender_id)
+                lines.append(f"[{m.timestamp.strftime('%H:%M')}] {speaker}：{m.content[:80]}")
+                if len(lines) >= 6:
+                    break
+            return "\n".join(reversed(lines))
+        except Exception as e:
+            logger.debug("Build image conversation context failed: %s", e)
+            return ""
 
     def _is_reply_to_bot(self, message: Message) -> bool:
         """检查消息是否引用了 Bot；名字/昵称提及由触发检测器单独处理。"""
@@ -1337,7 +1471,7 @@ class GroupChatBot:
             },
             "cooldown": {
                 "enabled": True,
-                "max_duration": 600,
+                "max_duration": 60,
                 "trigger_threshold": 0.3
             },
             "conversation_floor": {
@@ -1366,7 +1500,25 @@ class GroupChatBot:
                 "image": {
                     "ocr_enabled": False,
                     "ocr_action": "ocr_image",
-                    "ocr_timeout": 5.0
+                    "ocr_timeout": 5.0,
+                    "to_text_scope": "all",
+                    "to_text_prompt": "用一两句话（50字以内）描述图片内容，如果是表情包/梗图，重点说明它想表达的情绪和意图（如调侃、无语、赞同、嘲讽、自嘲），并结合前文对话判断含义。",
+                    "to_text_context": True,
+                    "context_window": 6,
+                    "to_text_timeout": 60,
+                    "max_download_bytes": 5242880,
+                    "cache_ttl": 600,
+                    "group_enabled": True,
+                    "group_interval_seconds": 60,
+                    "group_max_images": 4,
+                    "vision": {
+                        "enabled": False,
+                        "provider_type": "openai",
+                        "api_key": "",
+                        "base_url": "https://api.openai.com/v1",
+                        "model": "gpt-4o-mini",
+                        "timeout": 60
+                    }
                 }
             },
             "memory": {

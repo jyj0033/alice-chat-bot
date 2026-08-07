@@ -108,9 +108,13 @@ class EnhancedSpeakingDecider:
         session_id = context.session_id
         modifiers = {}
 
-        # === 1. 检查冷却（@ 或引用回复机器人时跳过）===
+        # === 1. 检查冷却（@ / 引用 / 当前正延续对话时跳过）===
+        # 冷却用于限制“低概率随机插话”刷屏；明确对我说或 bot 刚回复过对方、
+        # 对方正自然延续对话时，不应被冷却挡住，否则会错过真人之间 30-60s 的接话。
         if self.fatigue_manager.is_in_cooldown(session_id) and not (
-            context.mentioned_me or context.reply_to_me
+            context.mentioned_me
+            or context.reply_to_me
+            or self.is_conversation_with(session_id, context.sender_id)
         ):
             remaining = self.fatigue_manager.get_cooldown_remaining(session_id)
             return SpeakingDecision(

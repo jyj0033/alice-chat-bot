@@ -39,10 +39,17 @@ ApiCaller = Callable[[str, dict[str, Any], float | None], Awaitable[Any]]
 class RichMediaEnricher:
     """在协议解析之后补全安全、简短的语义信息。"""
 
-    def __init__(self, config: dict[str, Any] | None, api_call: ApiCaller):
+    def __init__(
+        self,
+        config: dict[str, Any] | None,
+        api_call: ApiCaller,
+        vision_provider: Any | None = None,
+    ):
         config = config or {}
         self.enabled = bool(config.get("enabled", True))
         self.api_call = api_call
+        # 视觉模型 Provider（可选）。启用后图片走 LLM 描述，OCR 只作无 vision 时的兜底。
+        self.vision_provider = vision_provider
 
         forward = config.get("forward", {}) or {}
         self.forward_enabled = bool(forward.get("enabled", True))
@@ -64,23 +71,59 @@ class RichMediaEnricher:
         self.image_ocr_action = str(image.get("ocr_action", "ocr_image") or "ocr_image")
         self.image_ocr_timeout = max(0.5, float(image.get("ocr_timeout", 5.0)))
 
+        # 图片→文字（视觉模型描述画面）
+        self.image_to_text_enabled = bool(
+            image.get("to_text_enabled", bool(self.vision_provider))
+        )
+        self.image_to_text_scope = str(image.get("to_text_scope", "mention_only")).lower()
+        self.image_to_text_prompt = str(
+            image.get(
+                "to_text_prompt",
+                "用一两句话（50字以内）描述图片内容，如果是表情包/梗图，重点说明它想表达的"
+                "情绪和意图（如调侃、无语、赞同、嘲讽、自嘲），并结合前文对话判断含义。",
+            )
+        )
+        self.image_to_text_timeout = max(1.0, float(image.get("to_text_timeout", 60)))
+        self.image_to_text_context = bool(image.get("to_text_context", True))
+        self.image_context_window = max(1, int(image.get("context_window", 6)))
+        self.image_max_download_bytes = max(
+            64 * 1024, int(image.get("max_download_bytes", 5 * 1024 * 1024))
+        )
+        self.image_cache_ttl = max(60.0, float(image.get("cache_ttl", 600)))
+        self.image_max_images = max(1, int(image.get("max_images", 10)))
+
+        # 连图整体识别：同一人短时间连发的纯图片，递增多图一起喂给视觉模型
+        self.image_group_enabled = bool(image.get("group_enabled", True))
+        self.image_group_interval_seconds = max(1, float(image.get("group_interval_seconds", 60)))
+        self.image_group_max_images = max(2, int(image.get("group_max_images", 4)))
+
         self._preview_cache: OrderedDict[str, tuple[float, tuple[str, str]]] = OrderedDict()
         self._ocr_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self._image_desc_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._cache_size = max(16, int(config.get("cache_size", 256)))
         self._stats = {
             "messages_seen": 0,
             "forward_expanded": 0,
             "link_previewed": 0,
             "image_ocr": 0,
+            "image_to_text": 0,
             "failures": 0,
         }
 
-    async def enrich(self, message: Message, *, directed: bool = False) -> Message:
+    async def enrich(
+        self,
+        message: Message,
+        *,
+        directed: bool = False,
+        conversation_context: str = "",
+        group_image_urls: list[str] | None = None,
+    ) -> Message:
         if not self.enabled or not message.segments:
             return message
 
         self._stats["messages_seen"] += 1
         changed = False
+        image_processed = 0
         for segment in message.segments:
             try:
                 if segment.type == "forward" and self.forward_enabled and (
@@ -97,11 +140,20 @@ class RichMediaEnricher:
                     if enriched:
                         self._stats["link_previewed"] += 1
                     changed = enriched or changed
-                elif segment.type == "image" and directed and self.image_ocr_enabled:
-                    enriched = await self._ocr_image(segment)
-                    if enriched:
-                        self._stats["image_ocr"] += 1
-                    changed = enriched or changed
+                elif segment.type in ("image", "mface"):
+                    if self._image_describe_applicable(directed) and image_processed < self.image_max_images:
+                        image_processed += 1
+                        enriched = await self._describe_image(
+                            segment, conversation_context, group_image_urls
+                        )
+                        if enriched:
+                            self._stats["image_to_text"] += 1
+                        changed = enriched or changed
+                    elif self.image_ocr_enabled and directed:
+                        enriched = await self._ocr_image(segment)
+                        if enriched:
+                            self._stats["image_ocr"] += 1
+                        changed = enriched or changed
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -114,6 +166,14 @@ class RichMediaEnricher:
 
     def statistics(self) -> dict[str, int | bool]:
         return {"enabled": self.enabled, **self._stats}
+
+    def _image_describe_applicable(self, directed: bool) -> bool:
+        """判断当前图片是否需要走视觉描述。scope=all 时所有图片都识别。"""
+        if not self.image_to_text_enabled or self.vision_provider is None:
+            return False
+        if self.image_to_text_scope == "all":
+            return True
+        return directed
 
     async def _expand_forward(self, segment: MessageSegment) -> bool:
         payload: Any = segment.data.get("content")
@@ -292,6 +352,185 @@ class RichMediaEnricher:
 
         walk(payload)
         return " ".join(dict.fromkeys(texts))[:300]
+
+    async def _describe_image(
+        self,
+        segment: MessageSegment,
+        conversation_context: str = "",
+        group_image_urls: list[str] | None = None,
+    ) -> bool:
+        """用视觉模型把图片转成文字描述（含意图解读），写入 segment.summary。
+
+        group_image_urls：同一人此前连续发的图片 URL。非空时把整组一起喂给
+        视觉模型判断整体含义，此时不读/不写缓存（组含义随上下文变化）。
+        """
+        image_ref = segment.unique_id or segment.url
+        if not image_ref:
+            return False
+
+        is_group = bool(group_image_urls and self.image_group_enabled)
+        if is_group:
+            # 组识别结果依赖整组上下文，不能复用单图缓存，避免"旧含义"污染
+            desc = await self._call_vision(segment, conversation_context, group_image_urls)
+        else:
+            cached = self._cache_get(self._image_desc_cache, image_ref, self.image_cache_ttl)
+            if cached is None:
+                cached = await self._call_vision(segment, conversation_context)
+                if cached:
+                    self._cache_put(self._image_desc_cache, image_ref, cached)
+            desc = cached
+
+        if not desc:
+            return False
+        prefix = "[表情包，内容：" if segment.type == "mface" else "[图片，内容："
+        segment.summary = f"{prefix}{desc[:100]}]"
+        return True
+
+    async def _call_vision(
+        self,
+        segment: MessageSegment,
+        conversation_context: str = "",
+        group_image_urls: list[str] | None = None,
+    ) -> str:
+        """先直接传图床 URL；失败则下载→base64→data URL 重试一次。
+
+        prompt 由「意图导向基础提示 + 消息类型提示 + 前文对话」组成，
+        让视觉模型判断图/表情包在对话中想表达什么，而不只是描述画面。
+        带 group_image_urls 时把整组图一起喂，判断组整体含义。
+        """
+        if self.vision_provider is None:
+            return ""
+
+        prompt = self._build_image_prompt(segment, conversation_context, group_image_urls)
+
+        # 组内前图也走直传；若当前图 URL 直传失败，整体降级为「仅当前图」。
+        group_urls = []
+        if group_image_urls and self.image_group_enabled:
+            cap = self.image_group_max_images - 1  # 除当前图外最多带几张
+            group_urls = [u for u in group_image_urls[:cap] if u]
+
+        # 1. 直传图床 URL（当前图 + 前图）
+        url = segment.url
+        if url:
+            try:
+                text = await self._vision_chat(prompt, [url, *group_urls])
+                if text:
+                    return text
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "Vision via URL failed (%s, %d group imgs), trying fallback: %s",
+                    url, len(group_urls), exc,
+                )
+
+        # 2. 回退：下载当前图→base64→data URL（限大小，仅内存驻留，用完即弃）
+        data_url = await self._download_image_data_url(segment)
+        if not data_url:
+            return ""
+        try:
+            # 多图调用失败时降级为仅当前图，避免前图 URL 拖垮整张识别
+            if group_urls:
+                try:
+                    text = await self._vision_chat(prompt, [data_url, *group_urls])
+                    if text:
+                        return text
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("Vision via group base64 failed, degrade to single: %s", exc)
+            text = await self._vision_chat(prompt, [data_url])
+            if text:
+                return text
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._stats["failures"] += 1
+            logger.debug("Vision via base64 failed: %s", exc)
+        return ""
+
+    def _build_image_prompt(
+        self,
+        segment: MessageSegment,
+        conversation_context: str,
+        group_image_urls: list[str] | None = None,
+    ) -> str:
+        """构造意图导向的视觉 prompt。"""
+        parts = [self.image_to_text_prompt]
+        if segment.type == "mface":
+            parts.append("这是群友发的表情包/梗图，重点分析它想表达的情绪和意图。")
+        if group_image_urls and self.image_group_enabled:
+            parts.append(
+                f"这些图是同一人连续发的（共{len(group_image_urls) + 1}张），"
+                "请判断这组图合起来想表达什么、在回应什么，以及当前这张在组里的作用。"
+            )
+        if conversation_context and self.image_to_text_context:
+            parts.append(f"前文对话：\n{conversation_context}\n结合前文判断这张图在说什么、在回应谁。")
+        return "\n".join(parts)
+
+    async def _vision_chat(self, prompt: str, image_urls: list[str]) -> str:
+        from modules.llm.base import ChatMessage, ChatRequest
+
+        # 必须显式指定视觉模型：ChatRequest.model 默认 "gpt-4o"，会覆盖 provider 配置的模型。
+        # 用 getattr 防御：provider 若未暴露 model 属性，留空走 provider 自身默认。
+        content: list[dict] = [{"type": "text", "text": prompt}]
+        for image_url in image_urls:
+            if image_url:
+                content.append({"type": "image_url", "image_url": {"url": image_url}})
+
+        request = ChatRequest(
+            model=getattr(self.vision_provider, "model", "") or "",
+            messages=[ChatMessage(role="user", content=content)],
+            max_tokens=300,
+            temperature=0.4,
+        )
+        response = await asyncio.wait_for(
+            self.vision_provider.chat(request),
+            timeout=self.image_to_text_timeout,
+        )
+        text = (response.content or "").strip()
+        return text[:300]
+
+    async def _download_image_data_url(self, segment: MessageSegment) -> str:
+        """下载图片转 base64 data URL。仅内存驻留，返回后即可释放；超限返回空串。"""
+        if aiohttp is None:
+            return ""
+        url = segment.url
+        if not url:
+            return ""
+        _validate_http_url(url)
+        resolver = _SafeResolver()
+        connector = aiohttp.TCPConnector(resolver=resolver, ttl_dns_cache=0)
+        timeout = aiohttp.ClientTimeout(total=max(10.0, self.image_to_text_timeout * 0.5))
+        try:
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.get(url, allow_redirects=True) as response:
+                    if response.status < 200 or response.status >= 300:
+                        return ""
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    body = bytearray()
+                    async for chunk in response.content.iter_chunked(65536):
+                        body.extend(chunk)
+                        if len(body) > self.image_max_download_bytes:
+                            logger.debug("Image download exceeds %d bytes, skipped", self.image_max_download_bytes)
+                            return ""
+            media_type = "image/jpeg"
+            if "image/png" in content_type:
+                media_type = "image/png"
+            elif "image/gif" in content_type:
+                media_type = "image/gif"
+            elif "image/webp" in content_type:
+                media_type = "image/webp"
+            import base64
+            encoded = base64.b64encode(bytes(body)).decode("ascii")
+            return f"data:{media_type};base64,{encoded}"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Image download failed: %s", exc)
+            return ""
+        finally:
+            await connector.close()
 
     def _cache_get(self, cache: OrderedDict, key: str, ttl: float):
         entry = cache.get(key)

@@ -12,9 +12,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ChatMessage:
-    """聊天消息"""
+    """聊天消息
+
+    content 支持两种形式：
+    - ``str``：纯文本（现有行为不变）
+    - ``list``：OpenAI 多模态格式，如
+      ``[{"type": "text", "text": "..."},
+        {"type": "image_url", "image_url": {"url": "..."}}]``
+      Claude 兼容 Provider 会把 ``image_url`` 转换为 Anthropic image source。
+    """
     role: str  # system / user / assistant
-    content: str
+    content: str | list
     name: Optional[str] = None
 
 
@@ -84,7 +92,7 @@ class LLMProvider(ABC):
         """格式化消息列表"""
         result = []
         for msg in messages:
-            item = {"role": msg.role, "content": msg.content}
+            item: dict[str, Any] = {"role": msg.role, "content": msg.content}
             if msg.name:
                 item["name"] = msg.name
             result.append(item)

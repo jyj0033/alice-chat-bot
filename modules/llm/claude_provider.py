@@ -101,23 +101,65 @@ class ClaudeProvider(LLMProvider):
         """将消息转换为 Claude 格式"""
         result = []
         for msg in messages:
+            content = msg.content
+            if isinstance(content, list):
+                # OpenAI 多模态格式 → Anthropic 格式：
+                #   {"type": "image_url", "image_url": {"url": ...}} → image source
+                #   {"type": "text", "text": ...} → 原样
+                # 已是 Anthropic image source 的片段原样保留（不丢弃）
+                claude_content = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = part.get("type")
+                    if part_type == "image_url":
+                        url = (part.get("image_url") or {}).get("url", "")
+                        if url:
+                            claude_content.append(self._image_url_to_source(url))
+                    elif part_type == "text":
+                        claude_content.append({"type": "text", "text": part.get("text", "")})
+                    elif part_type == "image":
+                        # 已是 Anthropic image source，直接保留
+                        claude_content.append(part)
+                if not claude_content:
+                    claude_content = msg.content if isinstance(msg.content, str) else ""
+            else:
+                claude_content = content
+
             if msg.role == "system":
                 # Claude 不支持 system 消息，转换为 user 消息
                 result.append({
                     "role": "user",
-                    "content": msg.content
+                    "content": claude_content
                 })
             elif msg.role == "user":
                 result.append({
                     "role": "user",
-                    "content": msg.content
+                    "content": claude_content
                 })
             elif msg.role == "assistant":
                 result.append({
                     "role": "assistant",
-                    "content": msg.content
+                    "content": claude_content
                 })
         return result
+
+    @staticmethod
+    def _image_url_to_source(url: str) -> dict:
+        """把图片 URL 转成 Anthropic image source。
+
+        data URL（下载回退路径）→ base64 source；普通 http(s) URL → url source
+        （MiniMax 等兼容端点支持直传 URL）。
+        """
+        if url.startswith("data:"):
+            # data:image/png;base64,xxxx
+            head, _, b64 = url.partition(",")
+            media_type = head[5:].split(";")[0] or "image/jpeg"
+            return {
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": b64},
+            }
+        return {"type": "image", "source": {"type": "url", "url": url}}
 
     async def stream_chat(self, request: ChatRequest) -> AsyncIterator[str]:
         """流式聊天请求"""

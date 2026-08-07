@@ -8,7 +8,7 @@ import json
 import logging
 import uuid
 import websockets
-from typing import Callable, Awaitable, Optional, Set
+from typing import Any, Callable, Awaitable, Optional, Set
 
 from .base import PlatformAdapter, Message
 from .rich_content import (
@@ -29,7 +29,8 @@ class QQAdapter(PlatformAdapter):
     def __init__(
         self,
         config: dict,
-        on_message: Optional[Callable[[Message], Awaitable[None]]] = None
+        on_message: Optional[Callable[[Message], Awaitable[None]]] = None,
+        vision_provider: Any | None = None,
     ):
         super().__init__(config)
         self.config = config
@@ -59,6 +60,7 @@ class QQAdapter(PlatformAdapter):
         self.rich_media_enricher = RichMediaEnricher(
             config.get("rich_media", {}) or {},
             self.call_api,
+            vision_provider=vision_provider,
         )
 
     async def connect(self) -> None:
@@ -188,9 +190,21 @@ class QQAdapter(PlatformAdapter):
         finally:
             self._pending_api.pop(echo, None)
 
-    async def enrich_message(self, message: Message, *, directed: bool = False) -> Message:
-        """按配置展开转发、链接标题和图片 OCR。"""
-        return await self.rich_media_enricher.enrich(message, directed=directed)
+    async def enrich_message(
+        self,
+        message: Message,
+        *,
+        directed: bool = False,
+        conversation_context: str = "",
+        group_image_urls: list[str] | None = None,
+    ) -> Message:
+        """按配置展开转发、链接标题和图片识别/意图解读。"""
+        return await self.rich_media_enricher.enrich(
+            message,
+            directed=directed,
+            conversation_context=conversation_context,
+            group_image_urls=group_image_urls,
+        )
 
     async def _handle_api_call(self, action: str, params: dict, echo: str = None) -> None:
         """处理 API 调用"""
