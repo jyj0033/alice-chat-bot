@@ -1601,7 +1601,7 @@ class GroupChatBot:
             },
             "search": {
                 "enabled": False,
-                "primary": "bocha",
+                "primary": "doubao",
                 "min_interval_seconds": 60,
                 "result_limit": 5,
                 "trigger_keywords": [
@@ -1611,6 +1611,7 @@ class GroupChatBot:
                     "结果", "发布", "官宣", "宣布", "百科", "是什么", "为什么",
                     # 游戏类时效性意图（游戏名无法枚举，用通用意图词覆盖）
                     "卡池", "抽卡", "UP", "复刻", "兑换码", "礼包码",
+                    "角色", "是谁", "谁up",
                     "前瞻", "爆料", "开服", "公测", "内测", "强度",
                     "评测", "节奏榜", "T0", "版本", "赛程", "赛事", "联动", "攻略", "阵容",
                 ],

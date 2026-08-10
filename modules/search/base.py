@@ -14,15 +14,19 @@ class SearchResult:
     content: str = ""    # 完整正文（可能为空）
 
     def to_context(self, index: int) -> str:
-        """格式化成给 LLM 看的一条文本。"""
-        parts = [f"{index}. {self.title}"]
-        if self.url:
-            parts.append(f"来源：{self.url}")
+        """格式化成给 LLM 看的一条文本。时间放最前，避免被摘要淹没。"""
+        parts = []
+        if self.date:
+            parts.append(f"{index}. [{self.date[:10]}] {self.title}")
+        else:
+            parts.append(f"{index}. {self.title}")
+        if self.site:
+            parts.append(f"来源：{self.site}")
         body = self.summary or self.snippet or self.content
         if body:
-            parts.append(body[:800])
-        if self.date:
-            parts.append(f"时间：{self.date[:10]}")
+            parts.append(body[:600])
+        if self.url:
+            parts.append(self.url[:100])
         return "\n".join(parts)
 
 

@@ -30,7 +30,7 @@ class DoubaoSearch(BaseSearchBackend):
         self.timeout = max(5.0, float(config.get("timeout", 15)))
         self.need_content = bool(config.get("need_content", False))
 
-    async def search(self, query: str) -> list[SearchResult]:
+    async def search(self, query: str, time_range: str | None = None) -> list[SearchResult]:
         if aiohttp is None:
             logger.warning("aiohttp 未安装，搜索不可用")
             return []
@@ -51,8 +51,9 @@ class DoubaoSearch(BaseSearchBackend):
                 "NeedUrl": True,
             },
         }
-        if self.time_range:
-            body["TimeRange"] = self.time_range
+        # 时效性问题临时覆盖时间范围（由 SearchClient 传入）；否则用配置值
+        if time_range or self.time_range:
+            body["TimeRange"] = time_range or self.time_range
 
         try:
             async with aiohttp.ClientSession() as session:

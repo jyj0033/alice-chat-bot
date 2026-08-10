@@ -94,18 +94,13 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(gen._search_enabled("今天有什么新闻"))
         self.assertFalse(gen._search_enabled("晚饭吃什么"))
 
-    async def test_tool_loop_calls_search_and_returns_final_reply(self):
+    async def test_search_injects_results_into_clean_context_call(self):
         tool_llm = MagicMock()
-        # 第一轮：请求 web_search；第二轮：直接回答
-        tool_llm.chat = AsyncMock(side_effect=[
-            ChatResponse(content="", model="test", tool_calls=[{
-                "id": "call_1", "name": "web_search",
-                "arguments": {"query": "最新新闻"},
-            }]),
-            ChatResponse(content="今天的新闻是xxx", model="test"),
-        ])
+        tool_llm.chat = AsyncMock(return_value=ChatResponse(content="今天的新闻是xxx", model="test"))
         search_client = MagicMock()
         search_client.available = True
+        search_client.is_time_sensitive = lambda q: True
+        search_client.all_future = lambda r: False
         search_client.search = AsyncMock(return_value=[
             SearchResult(title="某新闻", url="https://n.com", snippet="snippet"),
         ])
@@ -120,11 +115,36 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("xxx", reply)
         search_client.search.assert_awaited_once()
-        # 第二轮请求应包含 tool 回放与 tool 结果消息
-        self.assertEqual(tool_llm.chat.call_count, 2)
-        roles = [m.role for m in tool_llm.chat.await_args.args[0].messages]
-        self.assertIn("assistant", roles)
-        self.assertIn("tool", roles)
+        # 一次干净的 LLM 调用（不用工具循环），资料已注入上下文
+        self.assertEqual(tool_llm.chat.call_count, 1)
+        last_content = tool_llm.chat.await_args.args[0].messages[-1].content
+        self.assertIn("搜索到的资料", last_content)
+
+    async def test_no_results_falls_back_to_main_llm(self):
+        tool_llm = MagicMock()
+        tool_llm.chat = AsyncMock(return_value=ChatResponse(content="不该被调用", model="test"))
+        main_llm = MagicMock()
+        main_llm.chat = AsyncMock(return_value=ChatResponse(content="没搜到，正常回答", model="test"))
+        search_client = MagicMock()
+        search_client.available = True
+        search_client.is_time_sensitive = lambda q: True
+        search_client.all_future = lambda r: False
+        search_client.search = AsyncMock(return_value=[])
+
+        gen = ReplyGenerator(
+            llm_provider=main_llm,
+            tool_llm_provider=tool_llm,
+            search_client=search_client,
+            search_trigger_keywords=["新闻", "天气"],
+        )
+        reply = await gen.generate(
+            context_prompt="[刚刚] 小明：今天有什么新闻？",
+            current_message="今天有什么新闻",
+            direction="group",
+        )
+        self.assertIn("没搜到", reply)
+        tool_llm.chat.assert_not_awaited()
+        main_llm.chat.assert_awaited_once()
 
     async def test_no_search_when_keyword_misses(self):
         tool_llm = MagicMock()

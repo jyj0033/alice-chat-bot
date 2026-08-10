@@ -1231,10 +1231,10 @@
                         <div class="form-group">
                             <label>主搜索后端</label>
                             <select id="search-primary">
-                                <option value="bocha">博查 Bocha</option>
                                 <option value="doubao">豆包 / 火山引擎</option>
+                                <option value="bocha">博查 Bocha</option>
                             </select>
-                            <div class="hint">主后端失败时自动回退到另一个</div>
+                            <div class="hint">豆包对时效性/游戏卡池更准，博查擅长通用搜索；主后端失败自动回退</div>
                         </div>
                         <div class="form-group">
                             <label>搜索最小间隔（秒）</label>
@@ -2130,7 +2130,7 @@
         function loadSearchConfig(config) {
             const s = config.search || {};
             document.getElementById('search-enabled').checked = s.enabled === true;
-            document.getElementById('search-primary').value = s.primary || 'bocha';
+            document.getElementById('search-primary').value = s.primary || 'doubao';
             document.getElementById('search-interval').value = s.min_interval_seconds ?? 60;
             document.getElementById('search-result-limit').value = s.result_limit ?? 5;
             document.getElementById('search-trigger-keywords').value = (s.trigger_keywords || []).join(',');

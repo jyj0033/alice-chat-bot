@@ -29,7 +29,7 @@ class BochaSearch(BaseSearchBackend):
         self.count = max(1, min(10, int(config.get("count", 5))))
         self.timeout = max(5.0, float(config.get("timeout", 15)))
 
-    async def search(self, query: str) -> list[SearchResult]:
+    async def search(self, query: str, freshness: str | None = None) -> list[SearchResult]:
         if aiohttp is None:
             logger.warning("aiohttp 未安装，搜索不可用")
             return []
@@ -43,7 +43,9 @@ class BochaSearch(BaseSearchBackend):
         }
         body = {
             "query": query,
-            "freshness": self.freshness,
+            # 时效性问题（现在/今天/最新等）由 SearchClient 临时覆盖为 oneMonth；
+            # 未覆盖时用配置值（默认 noLimit 保留历史版本查询能力）。
+            "freshness": freshness or self.freshness,
             "summary": True,  # 让结果带正文相关摘要，更适合 LLM
             "count": self.count,
         }

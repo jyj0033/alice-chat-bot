@@ -3,6 +3,7 @@
 调用 LLM 生成回复，并应用说话风格
 """
 import asyncio
+import copy
 import json
 import logging
 import random
@@ -225,26 +226,19 @@ class ReplyGenerator:
             action_plan,
         )
 
-        # 2. 联网搜索：命中触发词且可用时，走支持 function calling 的 LLM，
-        #    LLM 自行决定是否调用 web_search 工具。
+        # 2. 联网搜索：命中触发词且可用时，先确定性搜索，再把资料注入上下文
+        #    用一次干净的 LLM 调用生成回复。
+        #    （不用 function calling 工具循环：MiniMax 工具协议不稳定——
+        #    内容泄漏、空回复、原生 <invoke> 标记——预搜索+注入更可靠。）
         if self._search_enabled(current_message):
             try:
-                response = await self._generate_with_search(request, session_id)
+                response = await self._generate_with_search(
+                    request, session_id, current_message
+                )
             except Exception as e:
                 logger.error(f"Search generation failed, fallback to normal: {e}", exc_info=True)
                 response = None
-            if response is not None:
-                reply = response.content
-            else:
-                # 搜索路径异常 → 走常规 LLM 兜底
-                try:
-                    resp = await self.llm.chat(request)
-                    reply = resp.content.strip()
-                except Exception as e:
-                    logger.error(f"LLM error: {e}", exc_info=True)
-                    if direction == "group":
-                        return None
-                    reply = self._get_fallback_reply()
+            reply = response.content if (response is not None) else ""
         else:
             # 3. 常规调用 LLM
             try:
@@ -259,6 +253,23 @@ class ReplyGenerator:
 
         # 4. 清理思考过程
         reply = self._clean_thinking_process(reply)
+
+        # 4.5 搜索路径没产出可用回复（空/残留工具标记）→ 用主 LLM 干净重答一轮，
+        #     保证 to_bot 一定有回应，group 则按 LLM 是否愿意参与决定。
+        if self._has_tool_markup(reply) or not reply:
+            logger.warning("搜索回复不可用(%s)，回退主 LLM 重答", (reply or "")[:40])
+            try:
+                resp2 = await self.llm.chat(request)
+                reply2 = self._clean_thinking_process(resp2.content.strip())
+            except Exception as e:
+                logger.error(f"LLM fallback error: {e}", exc_info=True)
+                reply2 = ""
+            if self._has_tool_markup(reply2) or not reply2:
+                if direction == "group":
+                    return None
+                reply = self._get_fallback_reply()
+            else:
+                reply = reply2
 
         # 5. 参与决策：LLM 有权选择沉默（群友互聊/自言自语时）
         if self._is_silent(reply):
@@ -310,98 +321,117 @@ class ReplyGenerator:
         """
         if not self.tool_llm or not self.search_client or not self.search_client.available:
             return False
-        text = (current_message or "").strip()
-        return any(kw and kw in text for kw in self.search_trigger_keywords)
+        text = (current_message or "").strip().lower()
+        # 大小写不敏感匹配（群友常发小写 "up" 而配置是 "UP"）
+        return any(kw and kw.lower() in text for kw in self.search_trigger_keywords)
 
-    async def _generate_with_search(self, request: ChatRequest, session_id: str = "") -> Optional[ChatResponse]:
-        """工具循环：LLM 请求搜索 → 执行 → 回填结果 → 再生成（最多 2 轮）。"""
-        request.add_tool(
-            name="web_search",
-            description=(
-                "搜索最新网络信息（新闻、热点、百科、天气、价格、比分等）。"
-                "当你需要回答时效性、事实性或你不确定的问题时使用；"
-                "搜索结果能帮助给出准确答案。"
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "搜索关键词，简明准确"},
-                },
-                "required": ["query"],
-            },
-        )
+    async def _generate_with_search(
+        self,
+        request: ChatRequest,
+        session_id: str = "",
+        current_message: str = "",
+    ) -> Optional[ChatResponse]:
+        """确定性搜索 + 资料注入上下文，一次干净 LLM 调用生成回复。
 
-        max_rounds = 3
-        response: Optional[ChatResponse] = None
+        不用 function calling 工具循环：MiniMax 工具协议不稳定（内容泄漏、
+        空回复、原生 <invoke> 标记、轮数超限后还要重建请求），
+        预搜索 + 把资料当作普通上下文注入更可靠。关键词已把关，
+        LLM 看到资料后自主决定怎么用。
+        """
+        # 1. 搜索词 = 当前消息（去掉对话前缀，取最后一行实质内容）
+        query = (current_message or "").strip()
+        if not query:
+            for m in reversed(request.messages):
+                if m.role == "user" and isinstance(m.content, str):
+                    query = m.content.strip()
+                    break
 
-        # 搜索场景额外指引：工具是可选的，只有真需要实时/未知信息才搜。
-        request.messages.insert(0, ChatMessage(
-            role="system",
+        results = await self.search_client.search(query, session_id=session_id)
+        self.search_calls += 1
+
+        # 2. 用户问"现在/当前"，但搜到的全是下版本前瞻（如鸣潮全是3.6预告）：
+        #    自动推断当前版本号，补搜「游戏名+当前版本+卡池」拿正在进行的卡池。
+        if (
+            results
+            and self.search_client.is_time_sensitive(query)
+            and self.search_client.all_future(results)
+        ):
+            cur_ver = self.search_client.infer_current_version(results)
+            game = self.search_client.extract_game_name(query)
+            if cur_ver and game:
+                # 强制豆包+近期时间窗：实测豆包 oneMonth 能命中
+                # 「当前版本在售卡池」的文章（如"鸣潮3.5首期唤取开启"），
+                # 博查对这类查询返回的多是旧版本攻略。
+                followup = await self.search_client.search(
+                    f"{game}{cur_ver}卡池",
+                    session_id=session_id,
+                    force_backend="doubao",
+                    prefer_recent=True,
+                )
+                self.search_calls += 1
+                if followup:
+                    results = followup
+
+        if not results:
+            return None  # 没搜到 → 上层回退主 LLM 正常回答
+
+        # 3. 干净请求：在原始请求副本上追加资料（无任何工具），一次生成。
+        clean = copy.deepcopy(request)
+        import datetime as _dt
+        _today = _dt.datetime.now().strftime("%Y年%m月%d日")
+        clean.messages.append(ChatMessage(
+            role="user",
             content=(
-                "web_search 工具是可选的，不要为了用而用。\n"
-                "只有当你确实需要【最新/实时/时效性】信息，或用户问的事实性内容超出你的知识时，"
-                "才调用它。\n"
-                "普通闲聊、你已知道答案、无需实时信息的问题，直接回答，绝不调用搜索工具。\n"
-                "若调用了搜索，把搜索结果用你自己的话自然说出来即可，不要提「据xxx」「搜索显示」"
-                "这类话，也不要贴链接，就像平时聊天一样。\n"
-                "如果搜索没有结果：也不要承认自己查过或说「没查到」，像正常人一样自然地带过去"
-                "（比如「不太清楚」「这个真不知道，等我去看下」或者顺着话题聊别的），绝不要编造事实。"
+                f"今天是{_today}。以下是爱丽丝查到的资料（每条标注了日期）：\n\n"
+                + self.search_client.format_results(results)
+                + "\n\n请基于这些资料回答。要求：\n"
+                "1. 用户问「现在/当前」时，只回答【正在进行】的内容；"
+                "标了【前瞻预告】或日期在未来的是还没发生的事，要明确说「X号才开/下个版本才上」，"
+                "不能当成现在。\n"
+                "2. 把资料当作你自己本来就知道的事，用平时跟群友聊天的语气自然说出来；"
+                "不要提「据xxx」「搜索显示」「仅供参考」，不要贴链接。\n"
+                "3. 资料过时或和现在对不上、没有直接答案时，像记不清一样自然带过"
+                "（比如「这我哪记得」「好久没关注了」），绝不要编造版本号或角色名。\n"
+                "4. 直接给出最终回复，不要输出思考过程或英文草稿。"
             ),
         ))
+        clean.max_tokens = max(clean.max_tokens, 300)
+        return await self.tool_llm.chat(clean)
 
-        for round_no in range(max_rounds):
-            response = await self.tool_llm.chat(request)
-            if not response.tool_calls:
-                return response
+    @staticmethod
+    def _has_tool_markup(content: str) -> bool:
+        """判断文本里是否残留工具调用标记（MiniMax 泄漏的兜底信号）。"""
+        return any(tag in content for tag in ("<tool_call>", "<invoke", "<]minimax", "<parameter"))
 
-            # 执行工具调用
-            tool_texts = []
-            for tc in response.tool_calls:
-                if tc.get("name") != "web_search":
-                    tool_texts.append(f"未知工具：{tc.get('name')}，请直接用已有知识回答。")
-                    continue
-                query = str((tc.get("arguments") or {}).get("query", "") or "").strip()
-                if not query:
-                    tool_texts.append("搜索关键词为空，请直接用已有知识回答。")
-                    continue
-                results = await self.search_client.search(query, session_id=session_id)
-                self.search_calls += 1
-                if results:
-                    tool_texts.append(self.search_client.format_results(results))
-                else:
-                    tool_texts.append("没有搜索到相关内容，请如实说明并基于已有知识回答。")
+    @staticmethod
+    def _extract_native_tool_calls(content: str) -> list[dict]:
+        """解析 MiniMax 原生工具调用泄漏在文本里的格式。
 
-            # 回放 assistant 的工具调用 + 填充 tool 结果（OpenAI 格式）
-            request.messages.append(ChatMessage(
-                role="assistant",
-                content="",
-                tool_calls=[
-                    {
-                        "id": tc.get("id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": tc.get("name", ""),
-                            "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False),
-                        },
-                    }
-                    for tc in response.tool_calls
-                ],
-            ))
-            for i, tc in enumerate(response.tool_calls):
-                request.messages.append(ChatMessage(
-                    role="tool",
-                    content=tool_texts[i] if i < len(tool_texts) else "无结果",
-                    tool_call_id=tc.get("id", ""),
-                ))
-
-        # 达到轮数上限仍想再搜：撤掉工具，逼模型用已拿到的事实作答，避免空转。
-        if response and response.tool_calls:
-            request.tools = []
-            try:
-                response = await self.tool_llm.chat(request)
-            except Exception as exc:
-                logger.error(f"工具循环最终回答失败: {exc}", exc_info=True)
-        return response
+        兼容两种参数写法：
+          <invoke name="web_search"><parameter name="query">xxx</parameter></invoke>
+          <invoke name="web_search"><query>xxx</query></invoke>
+        返回与结构化 tool_calls 相同结构的列表；解析不到返回空列表。
+        """
+        if not content:
+            return []
+        calls = []
+        # 兼容 `<invoke name=` 与 `<invokename=`（MiniMax 泄漏时偶无空格）
+        for m in re.finditer(r"<invoke\s*name=[\"']([^\"']+)[\"']>([\s\S]*?)</invoke>", content):
+            name = m.group(1).strip()
+            args_text = m.group(2)
+            query = ""
+            # 形式一：<parameter name="query">...</parameter>
+            qm = re.search(r"<parameter\s+name=[\"']query[\"']>([\s\S]*?)</parameter>", args_text)
+            # 形式二：<query>...</query>
+            if not qm:
+                qm = re.search(r"<query>([\s\S]*?)</query>", args_text)
+            if qm:
+                query = qm.group(1).strip()
+            if not query:
+                query = re.sub(r"<[^>]+>", "", args_text).strip()
+            if name and query:
+                calls.append({"id": "", "name": name, "arguments": {"query": query}})
+        return calls
 
     def _build_request(
         self,
