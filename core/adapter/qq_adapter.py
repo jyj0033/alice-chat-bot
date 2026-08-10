@@ -337,15 +337,18 @@ class QQAdapter(PlatformAdapter):
         """兼容旧调用：富媒体现在统一走结构化解析器。"""
         return render_segments(parse_message_segments(content))
 
-    async def send_message(self, session_id: str, content: str) -> bool:
-        """发送消息"""
+    async def send_message(self, session_id: str, content: str, reply_to_id: str | None = None) -> bool:
+        """发送消息（可选引用一条消息，供插话时指明回应对象）"""
         if not self._clients:
             logger.error("No NapCat connected")
             return False
 
         try:
-            # OneBot v11 需要消息数组格式
-            message_array = [{"type": "text", "data": {"text": content}}]
+            # OneBot v11 需要消息数组格式；带引用时在首段前加 reply 段。
+            message_array = []
+            if reply_to_id:
+                message_array.append({"type": "reply", "data": {"id": reply_to_id}})
+            message_array.append({"type": "text", "data": {"text": content}})
 
             if session_id.startswith("group_"):
                 group_id = int(session_id.replace("group_", ""))
@@ -367,8 +370,8 @@ class QQAdapter(PlatformAdapter):
             logger.error(f"Failed to send: {e}")
             return False
 
-    async def send_group_message(self, group_id: str, content: str) -> bool:
-        return await self.send_message(f"group_{group_id}", content)
+    async def send_group_message(self, group_id: str, content: str, reply_to_id: str | None = None) -> bool:
+        return await self.send_message(f"group_{group_id}", content, reply_to_id=reply_to_id)
 
     async def send_private_message(self, user_id: str, content: str) -> bool:
         return await self.send_message(f"private_{user_id}", content)

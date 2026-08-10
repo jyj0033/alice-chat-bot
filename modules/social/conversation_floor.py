@@ -228,7 +228,15 @@ class ConversationFloorManager:
             return False, "没有更新的群消息"
 
         if plan.action == ActionType.REACT:
-            return True, "简短反应已错过时机"
+            # 简短反应：只有后续聊天仍密集（短窗口内多条新消息）才算错过时机；
+            # 如果只是零星新消息，真人也会补一句，不必放弃。
+            recent_active = [
+                m for m in newer
+                if (datetime.now() - m.timestamp).total_seconds() <= self.burst_window_seconds
+            ]
+            if len(recent_active) >= 2:
+                return True, "简短反应已错过时机"
+            return False, "后续聊天不密集，仍可补一句"
 
         if plan.target_message_id and any(
             str(m.reply_to_id or "") == str(plan.target_message_id)
@@ -288,11 +296,20 @@ class ConversationFloorManager:
             reason = "插话会打断正在进行的交流"
             wait_multiplier = 1.0
         elif floor.two_person_thread and floor.interruption_cost >= 0.65:
-            action = ActionType.SILENT
-            tone, max_chars = "保持旁观", 0
-            confidence = 0.88
-            reason = "两位群友正在连续对聊"
-            wait_multiplier = 1.0
+            if topic_relevance >= 0.7 and not floor.fast_burst:
+                # 两人连续对聊但话题与人格高度相关且非消息爆发：允许偶尔自然
+                # 加入讨论，不硬性沉默。真正开不开口由决策概率 + 发送复核把关。
+                action = ActionType.REPLY
+                tone, max_chars = "像加入讨论一样自然地接一句，不抢主导权", 24
+                confidence = 0.45
+                reason = "两人连续对聊，话题相关可自然融入"
+                wait_multiplier = 1.2
+            else:
+                action = ActionType.SILENT
+                tone, max_chars = "保持旁观", 0
+                confidence = 0.88
+                reason = "两位群友正在连续对聊"
+                wait_multiplier = 1.0
         elif rich_message_only and rich_type in ("image", "mface", "face", "video"):
             action = ActionType.REACT
             tone, max_chars = "只在确实有自然反应时回几个字；不知道内容就沉默", 8

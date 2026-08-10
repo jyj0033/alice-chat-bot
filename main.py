@@ -532,10 +532,11 @@ class GroupChatBot:
             or continuing
         )
         try:
-            # 疲劳/注意力更新
+            # 疲劳/注意力更新。注意：注意力按 group_id 键控，私聊没有群号，
+            # 用 session_id（private_xxx）作键，避免所有私聊共用同一个注意力桶。
             self.speaking_decider.on_message(
                 session_id=session_id,
-                group_id=message.group_id or "",
+                group_id=message.group_id or message.session_id,
                 user_id=message.sender_id,
                 mentioned_bot=message.mentioned_me,
                 is_reply_to_bot=is_reply_to_bot,
@@ -740,7 +741,10 @@ class GroupChatBot:
         if not should_speak:
             # 被明确点名却保持沉默 → 降低对发话人的关注（真人也会忙/没看见）
             if message.mentioned_me or is_reply_to_bot:
-                self.attention_manager.on_no_reply(group_id, message.sender_id)
+                # 私聊没有群号，用 session_id（private_xxx）作注意力键，避免所有私聊共用一个桶
+                self.attention_manager.on_no_reply(
+                    message.group_id or session_id, message.sender_id
+                )
             return None
 
         # 判断消息指向：
@@ -771,7 +775,8 @@ class GroupChatBot:
     async def _compose_and_send(self, message: Message, decision: dict) -> None:
         """慢路径：思考延迟 → 用最新上下文生成回复 → 发送"""
         session_id = message.session_id
-        group_id = message.group_id or ""
+        # 私聊没有群号，用 session_id（private_xxx）作注意力键，与 _handle_message 一致。
+        group_id = message.group_id or session_id
         direction = decision["direction"]
         probability = decision["probability"]
         emotional_state = decision["emotional_state"]
@@ -874,6 +879,13 @@ class GroupChatBot:
             from modules.reply.generator import split_reply_into_messages
 
             segments = split_reply_into_messages(reply)
+            # 插话进入群聊讨论时，引用触发消息，让群友明确知道在回应哪一条；
+            # 明确对我说（directed）的消息本来就指向清楚，不用再引用。
+            quote_id = (
+                action_plan.target_message_id
+                if action_plan and not action_plan.directed and action_plan.target_message_id
+                else ""
+            )
             sent_segments = []
             for i, seg in enumerate(segments):
                 if i > 0 and action_plan:
@@ -885,7 +897,9 @@ class GroupChatBot:
                     if cancel:
                         logger.info(f"[分段复核] 停止剩余消息：{cancel_reason}")
                         break
-                success = await self.qq_adapter.send_message(session_id, seg)
+                success = await self.qq_adapter.send_message(
+                    session_id, seg, reply_to_id=(quote_id if i == 0 else "")
+                )
                 if success:
                     sent_segments.append(seg)
                     logger.info(f"[回复段{i+1}/{len(segments)}] {self.personality.name}: {seg[:50]}")

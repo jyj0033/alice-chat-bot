@@ -298,11 +298,20 @@ class EnhancedSpeakingDecider:
                 (n_speakers >= 3 and group_activity > 0.5)
                 or (floor.fast_burst and n_speakers >= 2)
             )
-            solo = n_speakers <= 1 and not floor.two_person_thread
+            # 单独/少数人发消息：更愿意接话。放宽到 ≤2 人，避免两人来回聊时
+            # 也被当成"热聊"而错过自然的接话机会。
+            solo = n_speakers <= 2 and not floor.two_person_thread
             if multi_hot:
                 modifiers["多人热聊谨慎"] = -0.2
             elif solo:
-                modifiers["独聊更积极"] = 0.15
+                modifiers["独聊更积极"] = 0.18 if n_speakers <= 1 else 0.10
+            elif floor.two_person_thread:
+                # 两人连续对聊：不盲目插话。话题与人格高度相关且非消息爆发时，
+                # 允许偶尔自然融入讨论；否则旁观。低概率由插话成本惩罚保证。
+                if context.topic_relevance >= 0.7 and not floor.fast_burst:
+                    modifiers["自然融入对聊"] = 0.12
+                else:
+                    modifiers["两人对聊旁观"] = -0.18
             elif group_activity > 0.8:
                 modifiers["群聊节奏"] = -0.12
             elif group_activity < 0.2:
@@ -321,6 +330,24 @@ class EnhancedSpeakingDecider:
                 modifiers["群问题可回答"] = 0.08
             elif action_plan.action == ActionType.REACT:
                 modifiers["仅适合短反应"] = -0.02
+            elif action_plan.action == ActionType.REPLY:
+                # 普通群聊接话是 bot 最主要的参与方式，给一点底子，
+                # 避免随机接话概率常年被压到 0 档（发言率偏低的根因之一）。
+                modifiers["可自然接话"] = 0.1
+
+        # === E.6.5 图片分享更愿意评论 ===
+        # 视觉模型已把画面内容写进上下文，bot 可以像真人一样偶尔点评分享的
+        # 图片/表情包；是否真开口仍交给 LLM（结合画面描述判断），这里只把
+        # 概率抬到"偶尔会评"的档位。
+        rich_only = context.extra.get("rich_message_only", False)
+        rich_type = context.extra.get("rich_type", "")
+        if (
+            rich_only
+            and rich_type in ("image", "mface", "face", "video")
+            and not context.mentioned_me
+            and not context.reply_to_me
+        ):
+            modifiers["图片可评论"] = 0.12
 
         # === F. 疲劳惩罚 ===
         fatigue_penalty = self.fatigue_manager.get_probability_penalty(session_id)
@@ -341,9 +368,9 @@ class EnhancedSpeakingDecider:
                 total += value
 
         # 标准 logistic 映射（单调递增：总修正越高，概率越高）
-        # total=0.05 → ~3%，total=0.5 → 50%，total=0.9 → ~96%
-        # 原公式 1/(1+(total-0.5)*6) 是错的：total>0.5 时概率反而骤降，且可为负
-        probability = 1 / (1 + math.exp(-(total - 0.5) * 8))
+        # 中点取 0.45（略低于默认的 0.5）：把低档次的"自然接话"概率整体抬一点，
+        # 缓解发言率长期偏低的保守倾向。total=0.1→~6%，0.45→50%，0.9→~97%。
+        probability = 1 / (1 + math.exp(-(total - 0.45) * 8))
         probability = max(0.01, min(0.99, probability))
 
         return probability

@@ -467,7 +467,11 @@ class MemoryStorage:
         return result
 
     def _get_candidates(self, session: str = "", top_k: int = 200) -> list[Memory]:
-        """取候选记忆：会话内优先，不足补其他会话"""
+        """取候选记忆：会话内优先，不足补其他会话。
+
+        会话隔离：群会话不检索私聊来源的记忆（私事不外泄）；私聊会话仍可检索
+        群聊记忆（更贴心）；跨群记忆共享保持不变（爱丽丝是统一人格）。
+        """
         cursor = self.conn.execute("""
             SELECT * FROM memories
             WHERE memory_type IN ('episodic', 'semantic', 'session_summary')
@@ -479,6 +483,14 @@ class MemoryStorage:
 
         if not session:
             return memories
+
+        # 群会话：过滤掉私聊来源记忆，避免把私聊内容带进群聊上下文。
+        if session.startswith("group_"):
+            memories = [
+                m for m in memories
+                if not (m.source_session or "").startswith("private_")
+            ]
+
         session_mem = [m for m in memories if m.source_session == session]
         others = [m for m in memories if m.source_session != session]
         # 会话内优先，剩余名额补齐

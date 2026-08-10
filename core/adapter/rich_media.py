@@ -34,6 +34,10 @@ from .rich_content import (
 
 logger = logging.getLogger(__name__)
 
+# 视觉模型判定图片敏感/违规被拒时的占位描述：不暴露原图，只说明爱丽丝不想看。
+# 作为摘要写入上下文后，LLM 会明白 bot 不愿讨论该内容，而不是当成"没有描述"。
+SENSITIVE_IMAGE_NOTE = "爱丽丝不喜欢看这个内容"
+
 ApiCaller = Callable[[str, dict[str, Any], float | None], Awaitable[Any]]
 
 
@@ -404,6 +408,10 @@ class RichMediaEnricher:
         if not desc:
             return False
         prefix = "[表情包，内容：" if segment.type == "mface" else "[图片，内容："
+        if desc == SENSITIVE_IMAGE_NOTE:
+            # 敏感图：直接落占位文案，让 LLM 知道"爱丽丝看了不想看"，而不是空占位。
+            segment.summary = f"{prefix}{SENSITIVE_IMAGE_NOTE}]"
+            return True
         segment.summary = f"{prefix}{desc[:100]}]"
         return True
 
@@ -440,6 +448,8 @@ class RichMediaEnricher:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if _is_sensitive_rejection(exc):
+                    return SENSITIVE_IMAGE_NOTE
                 logger.debug(
                     "Vision via URL failed (%s, %d group imgs), trying fallback: %s",
                     url, len(group_urls), exc,
@@ -459,6 +469,8 @@ class RichMediaEnricher:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    if _is_sensitive_rejection(exc):
+                        return SENSITIVE_IMAGE_NOTE
                     logger.debug("Vision via group base64 failed, degrade to single: %s", exc)
             text = await self._vision_chat(prompt, [data_url])
             if text:
@@ -466,6 +478,8 @@ class RichMediaEnricher:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if _is_sensitive_rejection(exc):
+                return SENSITIVE_IMAGE_NOTE
             self._stats["failures"] += 1
             logger.debug("Vision via base64 failed: %s", exc)
         return ""
@@ -640,6 +654,12 @@ def _validate_ip(address: str) -> None:
     ip = ipaddress.ip_address(address)
     if not ip.is_global:
         raise ValueError("不允许访问非公网地址")
+
+
+def _is_sensitive_rejection(exc: Exception) -> bool:
+    """判断视觉模型报错是否为「图片内容敏感/违规」被拒（MiniMax 等端点返回）。"""
+    text = str(exc or "").lower()
+    return any(token in text for token in ("sensitive", "inappropriate", "敏感", "违规"))
 
 
 class _PreviewHTMLParser(HTMLParser):
