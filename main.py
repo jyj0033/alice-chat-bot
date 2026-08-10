@@ -410,7 +410,7 @@ class GroupChatBot:
 
         self.response_filter = ResponseFilter()
 
-        # 联网搜索（function calling）。普通闲聊仍走主 LLM，零回归。
+        # 联网搜索（LLM 判断是否需要搜索）。普通闲聊仍走主 LLM，零回归。
         search_client, tool_llm = self._init_search()
 
         self.reply_generator = ReplyGenerator(
@@ -419,9 +419,6 @@ class GroupChatBot:
             speaking_style_manager=self.speaking_style_manager,
             tool_llm_provider=tool_llm,
             search_client=search_client,
-            search_trigger_keywords=(self.config.get("search", {}) or {}).get(
-                "trigger_keywords", []
-            ),
         )
 
     def _init_search(self):

@@ -159,7 +159,6 @@ class ReplyGenerator:
         thinking_delay: float = 2.0,
         tool_llm_provider=None,
         search_client=None,
-        search_trigger_keywords: list[str] | None = None,
     ):
         """
         初始化
@@ -169,9 +168,8 @@ class ReplyGenerator:
             personality_prompt: 人格提示词
             speaking_style_manager: 说话风格管理器
             thinking_delay: 基础思考延迟（秒）
-            tool_llm_provider: 支持 function calling 的 LLM 提供者（联网搜索时用）
+            tool_llm_provider: 支持联网搜索判断/带资料生成的 LLM 提供者
             search_client: 搜索客户端（模块 search.SearchClient）
-            search_trigger_keywords: 命中即开放搜索工具的关键词
         """
         self.llm = llm_provider
         self.personality_prompt = personality_prompt
@@ -182,12 +180,17 @@ class ReplyGenerator:
         # 联网搜索
         self.tool_llm = tool_llm_provider
         self.search_client = search_client
-        self.search_trigger_keywords = search_trigger_keywords or []
 
         # 统计
         self.replies_generated = 0
         self.replies_filtered = 0
         self.search_calls = 0
+
+    # 富媒体识别描述（图片/表情包等）不能当搜索词：描述里常含"角色""是什么"等
+    # 触发词，会把整段图片描述拿去搜，既无意义又浪费限频额度。
+    MEDIA_DESCRIPTION_PREFIXES = (
+        "[图片", "[表情包", "[表情，", "[动画表情", "[语音", "[视频",
+    )
 
     async def generate(
         self,
@@ -226,11 +229,13 @@ class ReplyGenerator:
             action_plan,
         )
 
-        # 2. 联网搜索：命中触发词且可用时，先确定性搜索，再把资料注入上下文
-        #    用一次干净的 LLM 调用生成回复。
+        # 2. 联网搜索：先让 LLM 判断这条回复是否需要联网（关键词太局限且易误判，
+        #    富媒体描述、玩梗、闲聊都会被误触发），判断需要才确定性预搜索，
+        #    再把资料注入上下文用一次干净调用生成回复。
         #    （不用 function calling 工具循环：MiniMax 工具协议不稳定——
-        #    内容泄漏、空回复、原生 <invoke> 标记——预搜索+注入更可靠。）
-        if self._search_enabled(current_message):
+        #    内容泄漏、空回复、原生 <invoke> 标记——LLM 判断 + 预搜索 + 注入更可靠。）
+        need_search = await self._judge_need_search(current_message, context_prompt)
+        if need_search:
             try:
                 response = await self._generate_with_search(
                     request, session_id, current_message
@@ -311,19 +316,71 @@ class ReplyGenerator:
         silent_markers = {"<silent>", "silent", "沉默", "不参与", "不说话"}
         return r in silent_markers or not r
 
-    # === 联网搜索（function calling） ===
+    # === 联网搜索（LLM 判断是否需要搜索） ===
 
-    def _search_enabled(self, current_message: str) -> bool:
-        """判断当前消息是否需要开放搜索工具。
+    async def _judge_need_search(self, current_message: str, context_prompt: str = "") -> bool:
+        """让 LLM 判断这条回复是否需要联网搜索（替代关键词匹配）。
 
-        命中触发词（新闻/最新/天气/价格等时效性或事实性问题）且搜索可用时，
-        才走支持 function calling 的 LLM；普通闲聊保持原有路径，零回归。
+        只有 bot 决策层已经决定要回复的消息才会走到 generate()，所以每次
+        回复多一次轻量判断调用（max_tokens≈8，极简 prompt，约 1s）可接受，
+        换来的是关键词机制没有的上下文理解——「绝区零现在开的谁的池子」能命中，
+        而「猜猜多少钱」这类玩梗、表情包描述不会被误触发。
+
+        返回 False 的情况：媒体描述、判断调用失败/无响应（保守不搜索）、
+        搜索后端不可用、LLM 判定不需要。
         """
         if not self.tool_llm or not self.search_client or not self.search_client.available:
             return False
-        text = (current_message or "").strip().lower()
-        # 大小写不敏感匹配（群友常发小写 "up" 而配置是 "UP"）
-        return any(kw and kw.lower() in text for kw in self.search_trigger_keywords)
+        text = (current_message or "").strip()
+        # 富媒体识别描述不判断也不搜索（描述里常带"角色""是什么"等字眼，实为图片内容）
+        if text.startswith(self.MEDIA_DESCRIPTION_PREFIXES):
+            return False
+        try:
+            # 上下文取最近几行即可（context_prompt 每行是一条历史消息）
+            context_tail = (context_prompt or "")[-600:]
+            judge_prompt = (
+                "你是爱丽丝的联网搜索判断器。爱丽丝是普通大学生，群聊里说话随意、选择性参与。\n"
+                f"群聊最近对话（节选）：\n{context_tail or '（无）'}\n\n"
+                f"爱丽丝正要回复这条消息：{text}\n\n"
+                "判断：要自然地回复这条消息，是否需要联网搜索实时/精确信息？\n"
+                "需要联网：问现在/今天/最新/天气/温度/价格/比分/新闻/热搜/汇率；"
+                "游戏当前卡池、当前版本、开服/公测时间、兑换码/礼包码、赛事赛程；"
+                "未来的具体日程（某游戏明天开服吗、XX号上线吗、发售时间）；"
+                "需要精确事实（人物/作品/名词百科）。\n"
+                "不需要联网：闲聊、玩笑、玩梗、表情包、日常吐槽、问爱丽丝个人看法或喜好、"
+                "情绪回应、续接话题、问不需要外部信息的常识。\n"
+                "最后一行严格输出 <verdict>YES</verdict> 或 <verdict>NO</verdict>，不要输出其他内容。"
+            )
+            resp = await self.tool_llm.chat(ChatRequest(
+                messages=[ChatMessage(role="user", content=judge_prompt)],
+                model=getattr(self.tool_llm, "model", None) or "gpt-4o",
+                temperature=0.0,
+                max_tokens=512,
+            ))
+            verdict = self._parse_search_verdict(resp.content if resp else "")
+            logger.info(f"[搜索判断] 「{text[:40]}」 → {'需要搜索' if verdict else '不搜索'}")
+            return verdict
+        except Exception as e:
+            logger.error(f"搜索判断失败，按不需搜索处理: {e}", exc_info=True)
+            return False
+
+    @staticmethod
+    def _parse_search_verdict(content: str) -> bool:
+        """解析判断器输出。
+
+        MiniMax 会先输出 <think> 思考块再给结论，所以不能只取开头几个字；
+        max_tokens 足够时输出形如「<verdict>YES</verdict>」。优先解析标签，
+        找不到再回退关键词信号（明确否定优先，防「不需要」误判成要搜）。
+        """
+        if not content:
+            return False
+        m = re.search(r"<verdict>\s*(YES|NO)\s*</verdict>", content, re.IGNORECASE)
+        if m:
+            return m.group(1).upper() == "YES"
+        c = re.sub(r"<think>.*?</think>", "", content or "", flags=re.DOTALL).strip().lower()
+        if re.search(r"^no\b|不需要|不用搜索|不用搜|不用联网|不用查|无需|不必", c):
+            return False
+        return bool(re.search(r"\byes\b|^是|^对|需要搜索|需要联网|需要查|应该搜|搜索一下|联网查", c))
 
     async def _generate_with_search(
         self,
@@ -345,6 +402,9 @@ class ReplyGenerator:
                 if m.role == "user" and isinstance(m.content, str):
                     query = m.content.strip()
                     break
+        # 富媒体识别描述不搜索（见 _search_enabled 的注释），兜底防绕过。
+        if query.startswith(self.MEDIA_DESCRIPTION_PREFIXES):
+            return None
 
         results = await self.search_client.search(query, session_id=session_id)
         self.search_calls += 1
@@ -396,7 +456,31 @@ class ReplyGenerator:
             ),
         ))
         clean.max_tokens = max(clean.max_tokens, 300)
-        return await self.tool_llm.chat(clean)
+
+        resp = await self.tool_llm.chat(clean)
+        # 工具 LLM（OpenAI 兼容端点）偶发：空回复 / 只输出 <think> 思考块 /
+        # 残留工具标记。一律清理思考后再判定是否可用——若可用内容为空，
+        # 改用主 LLM 对同一份资料重答，不浪费已经搜到的结果
+        # （回退无资料的主 LLM 只能凭记忆，搜索等于白做）。
+        reply = self._clean_thinking_process(str(resp.content or "")) if resp else ""
+        if not reply or self._has_tool_markup(reply):
+            reason = f"finish={getattr(resp, 'finish_reason', '?')!r}" if resp else "无响应"
+            logger.warning(
+                "搜索工具 LLM 回复不可用(%r，%s)，改用主 LLM 带资料重答",
+                reply[:40],
+                reason,
+            )
+            try:
+                resp = await self.llm.chat(clean)
+                reply = self._clean_thinking_process(str(resp.content or "")) if resp else ""
+            except Exception as exc:
+                logger.error(f"主 LLM 带资料重答失败: {exc}", exc_info=True)
+                resp = None
+                reply = ""
+            if not reply or self._has_tool_markup(reply):
+                logger.warning("主 LLM 带资料重答仍不可用，丢弃搜索结果")
+                resp = None
+        return resp
 
     @staticmethod
     def _has_tool_markup(content: str) -> bool:

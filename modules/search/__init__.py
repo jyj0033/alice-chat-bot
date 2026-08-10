@@ -124,7 +124,13 @@ class SearchClient:
         if time_sensitive:
             query = self._ensure_current_month(query)
 
-        order = [force_backend] if force_backend in self._backends else []
+        # primary 优先，force_backend 最高优先，其余按注册顺序兜底。
+        # （之前只用 dict 插入顺序，导致 primary 配置从未生效，永远 bocha 优先）
+        order = []
+        if force_backend in self._backends:
+            order.append(force_backend)
+        if self.primary in self._backends and self.primary not in order:
+            order.append(self.primary)
         order += [name for name in self._backends if name not in order]
         for name in order:
             backend = self._backends[name]
