@@ -20,10 +20,16 @@ class ChatMessage:
       ``[{"type": "text", "text": "..."},
         {"type": "image_url", "image_url": {"url": "..."}}]``
       Claude 兼容 Provider 会把 ``image_url`` 转换为 Anthropic image source。
+
+    function calling 字段：
+    - ``tool_calls``：assistant 消息回放模型发起的工具调用（OpenAI 格式）
+    - ``tool_call_id``：tool 消息标识它回应的那次调用
     """
-    role: str  # system / user / assistant
+    role: str  # system / user / assistant / tool
     content: str | list
     name: Optional[str] = None
+    tool_calls: list[dict] = field(default_factory=list)
+    tool_call_id: Optional[str] = None
 
 
 @dataclass
@@ -36,6 +42,7 @@ class ChatRequest:
     top_p: float = 0.9
     stream: bool = False
     stop: Optional[list[str]] = None
+    tools: list[dict] = field(default_factory=list)  # function calling 工具定义（OpenAI 格式）
 
     def add_message(self, role: str, content: str, name: Optional[str] = None) -> "ChatRequest":
         """添加消息"""
@@ -54,6 +61,14 @@ class ChatRequest:
         """添加助手消息"""
         return self.add_message("assistant", content)
 
+    def add_tool(self, name: str, description: str, parameters: dict) -> "ChatRequest":
+        """添加一个 function tool（OpenAI 格式）"""
+        self.tools.append({
+            "type": "function",
+            "function": {"name": name, "description": description, "parameters": parameters},
+        })
+        return self
+
 
 @dataclass
 class ChatResponse:
@@ -63,6 +78,9 @@ class ChatResponse:
     usage: dict = field(default_factory=dict)
     finish_reason: str = "stop"
     raw_response: Optional[Any] = None
+    # function calling：模型请求调用的工具列表
+    # [{"id": str, "name": str, "arguments": dict}, ...]
+    tool_calls: list[dict] = field(default_factory=list)
 
 
 class LLMProvider(ABC):
@@ -89,11 +107,15 @@ class LLMProvider(ABC):
         raise NotImplementedError
 
     def format_messages(self, messages: list[ChatMessage]) -> list[dict]:
-        """格式化消息列表"""
+        """格式化消息列表（OpenAI 格式，含 function calling 支持）"""
         result = []
         for msg in messages:
             item: dict[str, Any] = {"role": msg.role, "content": msg.content}
             if msg.name:
                 item["name"] = msg.name
+            if msg.tool_calls:
+                item["tool_calls"] = msg.tool_calls
+            if msg.tool_call_id:
+                item["tool_call_id"] = msg.tool_call_id
             result.append(item)
         return result

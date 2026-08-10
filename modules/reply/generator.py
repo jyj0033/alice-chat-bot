@@ -3,12 +3,13 @@
 调用 LLM 生成回复，并应用说话风格
 """
 import asyncio
+import json
 import logging
 import random
 import re
 from typing import Optional, Dict, Any
 
-from modules.llm.base import ChatRequest, ChatResponse
+from modules.llm.base import ChatMessage, ChatRequest, ChatResponse
 from modules.personality.speaking_style import SpeakingStyleManager, create_default_style
 from modules.personality.emotional_state import EmotionalState
 
@@ -154,16 +155,22 @@ class ReplyGenerator:
         llm_provider,
         personality_prompt: str = "",
         speaking_style_manager: SpeakingStyleManager = None,
-        thinking_delay: float = 2.0
+        thinking_delay: float = 2.0,
+        tool_llm_provider=None,
+        search_client=None,
+        search_trigger_keywords: list[str] | None = None,
     ):
         """
         初始化
 
         Args:
-            llm_provider: LLM 提供者
+            llm_provider: LLM 提供者（日常回复）
             personality_prompt: 人格提示词
             speaking_style_manager: 说话风格管理器
             thinking_delay: 基础思考延迟（秒）
+            tool_llm_provider: 支持 function calling 的 LLM 提供者（联网搜索时用）
+            search_client: 搜索客户端（模块 search.SearchClient）
+            search_trigger_keywords: 命中即开放搜索工具的关键词
         """
         self.llm = llm_provider
         self.personality_prompt = personality_prompt
@@ -171,9 +178,15 @@ class ReplyGenerator:
         self.base_thinking_delay = thinking_delay
         self.response_filter = ResponseFilter()
 
+        # 联网搜索
+        self.tool_llm = tool_llm_provider
+        self.search_client = search_client
+        self.search_trigger_keywords = search_trigger_keywords or []
+
         # 统计
         self.replies_generated = 0
         self.replies_filtered = 0
+        self.search_calls = 0
 
     async def generate(
         self,
@@ -184,6 +197,7 @@ class ReplyGenerator:
         session_context: Dict[str, Any] = None,
         direction: str = "to_bot",
         action_plan: Dict[str, Any] = None,
+        session_id: str = "",
     ) -> Optional[str]:
         """
         生成回复
@@ -196,6 +210,7 @@ class ReplyGenerator:
             session_context: 会话上下文（群ID、用户ID等）
             direction: 消息指向 "to_bot"（明确对bot说） / "group"（群友互聊/对大家/自言自语）
             action_plan: 发言权系统生成的结构化行为计划
+            session_id: 会话ID（用于联网搜索限频）
 
         Returns:
             str: 生成的回复；如果 LLM 选择沉默或回复被过滤则返回 None
@@ -210,26 +225,47 @@ class ReplyGenerator:
             action_plan,
         )
 
-        # 2. 调用 LLM
-        try:
-            response = await self.llm.chat(request)
-            reply = response.content.strip()
-        except Exception as e:
-            logger.error(f"LLM error: {e}", exc_info=True)
-            if direction == "group":
-                # 群友互聊场景 LLM 挂了 → 安静潜水，比说错话好
-                return None
-            reply = self._get_fallback_reply()
+        # 2. 联网搜索：命中触发词且可用时，走支持 function calling 的 LLM，
+        #    LLM 自行决定是否调用 web_search 工具。
+        if self._search_enabled(current_message):
+            try:
+                response = await self._generate_with_search(request, session_id)
+            except Exception as e:
+                logger.error(f"Search generation failed, fallback to normal: {e}", exc_info=True)
+                response = None
+            if response is not None:
+                reply = response.content
+            else:
+                # 搜索路径异常 → 走常规 LLM 兜底
+                try:
+                    resp = await self.llm.chat(request)
+                    reply = resp.content.strip()
+                except Exception as e:
+                    logger.error(f"LLM error: {e}", exc_info=True)
+                    if direction == "group":
+                        return None
+                    reply = self._get_fallback_reply()
+        else:
+            # 3. 常规调用 LLM
+            try:
+                response = await self.llm.chat(request)
+                reply = response.content.strip()
+            except Exception as e:
+                logger.error(f"LLM error: {e}", exc_info=True)
+                if direction == "group":
+                    # 群友互聊场景 LLM 挂了 → 安静潜水，比说错话好
+                    return None
+                reply = self._get_fallback_reply()
 
-        # 3. 清理思考过程
+        # 4. 清理思考过程
         reply = self._clean_thinking_process(reply)
 
-        # 4. 参与决策：LLM 有权选择沉默（群友互聊/自言自语时）
+        # 5. 参与决策：LLM 有权选择沉默（群友互聊/自言自语时）
         if self._is_silent(reply):
             logger.debug(f"LLM 选择沉默（direction={direction}）")
             return None
 
-        # 5. 过滤回复
+        # 6. 过滤回复
         passed, result = self.response_filter.filter(reply)
         if not passed:
             logger.info(f"Reply filtered: {result}")
@@ -238,7 +274,7 @@ class ReplyGenerator:
 
         self.replies_generated += 1
 
-        # 6. 应用说话风格
+        # 7. 应用说话风格
         reply = self.style_manager.apply_style(result)
 
         # 行为计划的长度是最终约束，避免“短反应”被模型扩写成长回复。
@@ -248,10 +284,10 @@ class ReplyGenerator:
                 int(action_plan.get("max_chars", 0) or 0),
             )
 
-        # 7. emoji 兜底：最多保留 1 个
+        # 8. emoji 兜底：最多保留 1 个
         reply = limit_emoji(reply, max_emoji=1)
 
-        # 8. 添加随机延迟（模拟打字）
+        # 9. 添加随机延迟（模拟打字）
         delay = self._calculate_delay(emotional_state)
         await asyncio.sleep(delay)
 
@@ -263,6 +299,109 @@ class ReplyGenerator:
         r = (reply or "").strip().lower().strip("[]()（）")
         silent_markers = {"<silent>", "silent", "沉默", "不参与", "不说话"}
         return r in silent_markers or not r
+
+    # === 联网搜索（function calling） ===
+
+    def _search_enabled(self, current_message: str) -> bool:
+        """判断当前消息是否需要开放搜索工具。
+
+        命中触发词（新闻/最新/天气/价格等时效性或事实性问题）且搜索可用时，
+        才走支持 function calling 的 LLM；普通闲聊保持原有路径，零回归。
+        """
+        if not self.tool_llm or not self.search_client or not self.search_client.available:
+            return False
+        text = (current_message or "").strip()
+        return any(kw and kw in text for kw in self.search_trigger_keywords)
+
+    async def _generate_with_search(self, request: ChatRequest, session_id: str = "") -> Optional[ChatResponse]:
+        """工具循环：LLM 请求搜索 → 执行 → 回填结果 → 再生成（最多 2 轮）。"""
+        request.add_tool(
+            name="web_search",
+            description=(
+                "搜索最新网络信息（新闻、热点、百科、天气、价格、比分等）。"
+                "当你需要回答时效性、事实性或你不确定的问题时使用；"
+                "搜索结果能帮助给出准确答案。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词，简明准确"},
+                },
+                "required": ["query"],
+            },
+        )
+
+        max_rounds = 3
+        response: Optional[ChatResponse] = None
+
+        # 搜索场景额外指引：工具是可选的，只有真需要实时/未知信息才搜。
+        request.messages.insert(0, ChatMessage(
+            role="system",
+            content=(
+                "web_search 工具是可选的，不要为了用而用。\n"
+                "只有当你确实需要【最新/实时/时效性】信息，或用户问的事实性内容超出你的知识时，"
+                "才调用它。\n"
+                "普通闲聊、你已知道答案、无需实时信息的问题，直接回答，绝不调用搜索工具。\n"
+                "若调用了搜索，把搜索结果用你自己的话自然说出来即可，不要提「据xxx」「搜索显示」"
+                "这类话，也不要贴链接，就像平时聊天一样。\n"
+                "如果搜索没有结果：也不要承认自己查过或说「没查到」，像正常人一样自然地带过去"
+                "（比如「不太清楚」「这个真不知道，等我去看下」或者顺着话题聊别的），绝不要编造事实。"
+            ),
+        ))
+
+        for round_no in range(max_rounds):
+            response = await self.tool_llm.chat(request)
+            if not response.tool_calls:
+                return response
+
+            # 执行工具调用
+            tool_texts = []
+            for tc in response.tool_calls:
+                if tc.get("name") != "web_search":
+                    tool_texts.append(f"未知工具：{tc.get('name')}，请直接用已有知识回答。")
+                    continue
+                query = str((tc.get("arguments") or {}).get("query", "") or "").strip()
+                if not query:
+                    tool_texts.append("搜索关键词为空，请直接用已有知识回答。")
+                    continue
+                results = await self.search_client.search(query, session_id=session_id)
+                self.search_calls += 1
+                if results:
+                    tool_texts.append(self.search_client.format_results(results))
+                else:
+                    tool_texts.append("没有搜索到相关内容，请如实说明并基于已有知识回答。")
+
+            # 回放 assistant 的工具调用 + 填充 tool 结果（OpenAI 格式）
+            request.messages.append(ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": tc.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("name", ""),
+                            "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False),
+                        },
+                    }
+                    for tc in response.tool_calls
+                ],
+            ))
+            for i, tc in enumerate(response.tool_calls):
+                request.messages.append(ChatMessage(
+                    role="tool",
+                    content=tool_texts[i] if i < len(tool_texts) else "无结果",
+                    tool_call_id=tc.get("id", ""),
+                ))
+
+        # 达到轮数上限仍想再搜：撤掉工具，逼模型用已拿到的事实作答，避免空转。
+        if response and response.tool_calls:
+            request.tools = []
+            try:
+                response = await self.tool_llm.chat(request)
+            except Exception as exc:
+                logger.error(f"工具循环最终回答失败: {exc}", exc_info=True)
+        return response
 
     def _build_request(
         self,
@@ -290,6 +429,10 @@ class ReplyGenerator:
             max_tokens=200,
             top_p=0.9,
         )
+        # 显式带上 provider 的模型：ChatRequest 默认 "gpt-4o" 会对部分严格端点
+        # （如 MiniMax OpenAI 兼容端点）报 unknown model，不能让默认值覆盖真实配置。
+        if getattr(self.llm, "model", None):
+            request.model = self.llm.model
 
         # 系统提示 - 人格设定
         if self.personality_prompt:

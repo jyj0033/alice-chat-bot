@@ -115,6 +115,14 @@ async def get_config():
         vision = config['image'].get('vision')
         if isinstance(vision, dict) and vision.get('api_key'):
             vision['api_key'] = '********'
+    if 'search' in config and isinstance(config.get('search'), dict):
+        search = config['search']
+        if isinstance(search.get('llm'), dict) and search['llm'].get('api_key'):
+            search['llm']['api_key'] = '********'
+        for name in ('bocha', 'doubao'):
+            backend = (search.get('backends') or {}).get(name)
+            if isinstance(backend, dict) and backend.get('api_key'):
+                backend['api_key'] = '********'
     return config
 
 
@@ -220,6 +228,23 @@ async def update_config(request: Request):
                     new_vision['api_key'] = (current_image.get('vision') or {}).get('api_key', '')
                 data['image']['vision'] = new_vision
             current['image'] = deep_merge(current_image, data['image'])
+
+        # 联网搜索配置
+        if 'search' in data:
+            current_search = current.get('search', {})
+            new_search = data['search']
+            # 回填掩码过的 api_key
+            if isinstance(new_search.get('llm'), dict):
+                if str(new_search['llm'].get('api_key', '')).startswith('*'):
+                    new_search['llm']['api_key'] = (current_search.get('llm') or {}).get('api_key', '')
+            backends = new_search.get('backends') or {}
+            for name in ('bocha', 'doubao'):
+                if isinstance(backends.get(name), dict):
+                    if str(backends[name].get('api_key', '')).startswith('*'):
+                        backends[name]['api_key'] = (
+                            (current_search.get('backends') or {}).get(name, {}) or {}
+                        ).get('api_key', '')
+            current['search'] = deep_merge(current_search, new_search)
 
         save_config(current)
         return {"success": True, "message": "配置已保存"}

@@ -59,6 +59,17 @@ class ClaudeProvider(LLMProvider):
             if request.stop:
                 body["stop_sequences"] = [request.stop] if isinstance(request.stop, str) else request.stop
 
+            if request.tools:
+                # OpenAI function 格式 → Anthropic tools 格式
+                body["tools"] = [
+                    {
+                        "name": tool["function"]["name"],
+                        "description": tool["function"].get("description", ""),
+                        "input_schema": tool["function"].get("parameters", {"type": "object", "properties": {}}),
+                    }
+                    for tool in request.tools
+                ]
+
             # 发送请求
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -75,7 +86,17 @@ class ClaudeProvider(LLMProvider):
                     result = await response.json()
 
             # 解析响应
-            content = result.get("content", [{}])[0].get("text", "") if result.get("content") else ""
+            content = ""
+            tool_calls = []
+            for block in result.get("content", []) or []:
+                if block.get("type") == "text":
+                    content += block.get("text", "")
+                elif block.get("type") == "tool_use":
+                    tool_calls.append({
+                        "id": block.get("id", ""),
+                        "name": block.get("name", ""),
+                        "arguments": block.get("input", {}) or {},
+                    })
 
             usage = result.get("usage", {})
             return ChatResponse(
@@ -88,6 +109,7 @@ class ClaudeProvider(LLMProvider):
                 },
                 finish_reason=result.get("stop_reason", "stop"),
                 raw_response=result,
+                tool_calls=tool_calls,
             )
 
         except aiohttp.ClientError as e:

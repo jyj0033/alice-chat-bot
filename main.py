@@ -410,11 +410,59 @@ class GroupChatBot:
 
         self.response_filter = ResponseFilter()
 
+        # 联网搜索（function calling）。普通闲聊仍走主 LLM，零回归。
+        search_client, tool_llm = self._init_search()
+
         self.reply_generator = ReplyGenerator(
             llm_provider=self.get_active_provider(),
             personality_prompt=self.personality.build_persona_prompt(),
-            speaking_style_manager=self.speaking_style_manager
+            speaking_style_manager=self.speaking_style_manager,
+            tool_llm_provider=tool_llm,
+            search_client=search_client,
+            search_trigger_keywords=(self.config.get("search", {}) or {}).get(
+                "trigger_keywords", []
+            ),
         )
+
+    def _init_search(self):
+        """初始化联网搜索：SearchClient + 支持 function calling 的 LLM。
+
+        工具 LLM 默认复用主 LLM 的密钥/模型，但走 OpenAI 兼容端点
+        （MiniMax 的 function calling 在 OpenAI 端点上可用，Anthropic 端点上不支持）。
+        """
+        from modules.llm.openai_provider import OpenAIProvider
+        from modules.search import SearchClient
+
+        search_config = self.config.get("search", {}) or {}
+        search_client = SearchClient(search_config)
+
+        tool_llm = None
+        if search_client.available and search_config.get("enabled", False):
+            llm_cfg = search_config.get("llm", {}) or {}
+            primary = self.get_active_provider()
+            api_key = llm_cfg.get("api_key") or getattr(primary, "api_key", "")
+            model = llm_cfg.get("model") or getattr(primary, "model", "")
+            try:
+                tool_llm = OpenAIProvider({
+                    "provider_type": "openai_compatible",
+                    "api_key": api_key,
+                    "base_url": llm_cfg.get(
+                        "base_url", "https://api.minimaxi.com/v1"
+                    ),
+                    "model": model or "MiniMax-M3",
+                    "timeout": float(llm_cfg.get("timeout", 60)),
+                })
+                logger.info(f"✓ 联网搜索 LLM: {tool_llm.model}")
+            except Exception as e:
+                logger.error(f"✗ 联网搜索 LLM 初始化失败: {e}")
+                tool_llm = None
+
+        if search_client.available:
+            logger.info(
+                f"✓ 联网搜索已启用: primary={search_client.primary}, "
+                f"后端={list(search_client._backends.keys())}"
+            )
+        return search_client, tool_llm
 
     def _init_vision_provider(self) -> Optional[Any]:
         """初始化视觉模型 Provider（图片→文字描述）。未启用/失败返回 None，不阻断启动。"""
@@ -834,6 +882,7 @@ class GroupChatBot:
                     emotional_state=emotional_state,
                     direction=direction,
                     action_plan=action_plan.to_dict() if action_plan else None,
+                    session_id=session_id,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1548,6 +1597,40 @@ class GroupChatBot:
                     "interval_messages": 20,
                     "min_messages": 10,
                     "max_tokens": 200
+                }
+            },
+            "search": {
+                "enabled": False,
+                "primary": "bocha",
+                "min_interval_seconds": 60,
+                "result_limit": 5,
+                "trigger_keywords": [
+                    "新闻", "热搜", "最新", "今天", "现在", "天气", "温度",
+                    "价格", "多少钱", "比分", "谁赢了", "汇率", "油价",
+                    "涨幅", "跌了", "涨停", "什么情况", "怎么回事", "发生了",
+                    "结果", "发布", "官宣", "宣布", "百科", "是什么", "为什么",
+                    # 游戏类时效性意图（游戏名无法枚举，用通用意图词覆盖）
+                    "卡池", "抽卡", "UP", "复刻", "兑换码", "礼包码",
+                    "前瞻", "爆料", "开服", "公测", "内测", "强度",
+                    "评测", "节奏榜", "T0", "版本", "赛程", "赛事", "联动", "攻略", "阵容",
+                ],
+                "llm": {
+                    "api_key": "",
+                    "base_url": "https://api.minimaxi.com/v1",
+                    "model": "",
+                    "timeout": 60
+                },
+                "backends": {
+                    "bocha": {
+                        "api_key": "",
+                        "freshness": "noLimit",
+                        "count": 5
+                    },
+                    "doubao": {
+                        "api_key": "",
+                        "time_range": "",
+                        "count": 5
+                    }
                 }
             },
             "groups": {}

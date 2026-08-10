@@ -82,15 +82,37 @@ class OpenAIProvider(LLMProvider):
             if request.stop:
                 kwargs["stop"] = request.stop
 
+            if request.tools:
+                kwargs["tools"] = request.tools
+
             # 发送请求
             response = await self.client.chat.completions.create(**kwargs)
 
+            message = response.choices[0].message
             # Claude 兼容格式响应解析
             if self.provider_type in ("anthropic", "claude", "minimax"):
                 # Claude 返回的是 Anthropic 格式，需要转换
-                content = response.choices[0].message.content if hasattr(response.choices[0].message, 'content') else str(response.choices[0].message)
+                content = message.content if hasattr(message, 'content') else str(message)
             else:
-                content = response.choices[0].message.content or ""
+                content = message.content or ""
+
+            # function calling：解析模型请求的工具调用（OpenAI 格式）
+            tool_calls = []
+            for tc in (getattr(message, "tool_calls", None) or []):
+                fn = getattr(tc, "function", None)
+                if not fn:
+                    continue
+                arguments = {}
+                try:
+                    import json
+                    arguments = json.loads(fn.arguments or "{}")
+                except (TypeError, ValueError):
+                    arguments = {"raw": fn.arguments}
+                tool_calls.append({
+                    "id": getattr(tc, "id", ""),
+                    "name": getattr(fn, "name", ""),
+                    "arguments": arguments,
+                })
 
             return ChatResponse(
                 content=content,
@@ -102,6 +124,7 @@ class OpenAIProvider(LLMProvider):
                 },
                 finish_reason=response.choices[0].finish_reason,
                 raw_response=response,
+                tool_calls=tool_calls,
             )
 
         except openai.RateLimitError as e:

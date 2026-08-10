@@ -1207,6 +1207,111 @@
                     </div>
                     <div id="vision-test-result" style="margin-top: 14px; padding: 12px 14px; border-radius: 10px; display: none; font-size: 13.5px;"></div>
                 </div>
+
+                <div class="card" id="search-config-card">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <span class="card-ico"><svg class="icon-sm"><use href="#i-search"/></svg></span>
+                            联网搜索（Web Search）
+                            <span class="hint" id="search-status"></span>
+                        </div>
+                        <span class="badge gray">function calling</span>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>启用联网搜索</label>
+                            <div class="toggle-row" style="padding-top: 6px; max-width: 120px;">
+                                <label class="toggle">
+                                    <input type="checkbox" id="search-enabled">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="hint">LLM 判断需要实时信息时自动联网搜索</div>
+                        </div>
+                        <div class="form-group">
+                            <label>主搜索后端</label>
+                            <select id="search-primary">
+                                <option value="bocha">博查 Bocha</option>
+                                <option value="doubao">豆包 / 火山引擎</option>
+                            </select>
+                            <div class="hint">主后端失败时自动回退到另一个</div>
+                        </div>
+                        <div class="form-group">
+                            <label>搜索最小间隔（秒）</label>
+                            <input type="number" id="search-interval" value="60" min="10" max="3600">
+                            <div class="hint">同一会话两次搜索的最小间隔，防止刷屏</div>
+                        </div>
+                        <div class="form-group">
+                            <label>结果条数</label>
+                            <input type="number" id="search-result-limit" value="5" min="1" max="8">
+                            <div class="hint">每次喂给 LLM 的搜索结果条数</div>
+                        </div>
+                        <div class="form-group" style="grid-column: 1 / -1;">
+                            <label>触发关键词（逗号分隔）</label>
+                            <input type="text" id="search-trigger-keywords" placeholder="新闻,最新,天气,价格,...">
+                            <div class="hint">消息命中这些词才开放搜索工具（LLM 再决定是否真的搜）</div>
+                        </div>
+                        <div class="form-group" style="grid-column: 1 / -1;">
+                            <div class="card-divider" style="margin-bottom: 12px;"></div>
+                            <label>搜索判定 LLM（复用主模型密钥，一般无需改）</label>
+                        </div>
+                        <div class="form-group">
+                            <label>API Key</label>
+                            <input type="password" id="search-llm-api-key" placeholder="留空自动用主模型">
+                        </div>
+                        <div class="form-group">
+                            <label>Base URL</label>
+                            <input type="text" id="search-llm-base-url" placeholder="https://api.minimaxi.com/v1">
+                        </div>
+                        <div class="form-group">
+                            <label>模型</label>
+                            <input type="text" id="search-llm-model" placeholder="留空自动用主模型">
+                        </div>
+                        <div class="form-group">
+                            <label>超时（秒）</label>
+                            <input type="number" id="search-llm-timeout" value="60" min="10" max="300">
+                        </div>
+                        <div class="form-group" style="grid-column: 1 / -1;">
+                            <div class="card-divider" style="margin-bottom: 12px;"></div>
+                            <label>博查 Bocha 后端</label>
+                        </div>
+                        <div class="form-group">
+                            <label>博查 API Key</label>
+                            <input type="password" id="search-bocha-api-key" placeholder="open.bocha.cn 获取">
+                        </div>
+                        <div class="form-group">
+                            <label>时效范围</label>
+                            <select id="search-bocha-freshness">
+                                <option value="noLimit">不限</option>
+                                <option value="oneDay">一天内</option>
+                                <option value="oneWeek">一周内</option>
+                                <option value="oneMonth">一月内</option>
+                                <option value="oneYear">一年内</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="grid-column: 1 / -1;">
+                            <div class="card-divider" style="margin-bottom: 12px;"></div>
+                            <label>豆包 / 火山引擎 后端</label>
+                        </div>
+                        <div class="form-group">
+                            <label>豆包 API Key</label>
+                            <input type="password" id="search-doubao-api-key" placeholder="火山引擎 WebSearch key">
+                        </div>
+                        <div class="form-group">
+                            <label>时间范围</label>
+                            <select id="search-doubao-time-range">
+                                <option value="">不限</option>
+                                <option value="OneDay">一天内</option>
+                                <option value="OneWeek">一周内</option>
+                                <option value="OneMonth">一月内</option>
+                                <option value="OneYear">一年内</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="btn-group" style="margin-top: 16px;">
+                        <button class="btn btn-primary" onclick="saveSearchConfig()"><svg class="icon-sm"><use href="#i-save"/></svg>保存搜索配置</button>
+                    </div>
+                </div>
             </div>
 
             <!-- 模拟系统设置 -->
@@ -2019,6 +2124,77 @@
             const config = await configRes.json();
             renderProviders(providers.providers || []);
             loadVisionConfig(config);
+            loadSearchConfig(config);
+        }
+
+        function loadSearchConfig(config) {
+            const s = config.search || {};
+            document.getElementById('search-enabled').checked = s.enabled === true;
+            document.getElementById('search-primary').value = s.primary || 'bocha';
+            document.getElementById('search-interval').value = s.min_interval_seconds ?? 60;
+            document.getElementById('search-result-limit').value = s.result_limit ?? 5;
+            document.getElementById('search-trigger-keywords').value = (s.trigger_keywords || []).join(',');
+            const llm = s.llm || {};
+            document.getElementById('search-llm-api-key').value = llm.api_key || '';
+            document.getElementById('search-llm-base-url').value = llm.base_url || 'https://api.minimaxi.com/v1';
+            document.getElementById('search-llm-model').value = llm.model || '';
+            document.getElementById('search-llm-timeout').value = llm.timeout ?? 60;
+            const bocha = (s.backends || {}).bocha || {};
+            document.getElementById('search-bocha-api-key').value = bocha.api_key || '';
+            document.getElementById('search-bocha-freshness').value = bocha.freshness || 'noLimit';
+            const doubao = (s.backends || {}).doubao || {};
+            document.getElementById('search-doubao-api-key').value = doubao.api_key || '';
+            document.getElementById('search-doubao-time-range').value = doubao.time_range || '';
+            const st = document.getElementById('search-status');
+            const hasBocha = bocha.api_key || false;
+            const hasDoubao = doubao.api_key || false;
+            if (!s.enabled) {
+                st.innerHTML = '<span class="badge gray">已停用</span>';
+            } else if (hasBocha || hasDoubao) {
+                st.innerHTML = '<span class="badge green"><svg class="icon-xs"><use href="#i-check"/></svg>已配置</span>';
+            } else {
+                st.innerHTML = '<span class="badge amber">缺 API Key</span>';
+            }
+        }
+
+        async function saveSearchConfig() {
+            const keywords = document.getElementById('search-trigger-keywords').value
+                .split(/[,，]/).map(s => s.trim()).filter(Boolean);
+            const config = {
+                search: {
+                    enabled: document.getElementById('search-enabled').checked,
+                    primary: document.getElementById('search-primary').value,
+                    min_interval_seconds: parseInt(document.getElementById('search-interval').value) || 60,
+                    result_limit: parseInt(document.getElementById('search-result-limit').value) || 5,
+                    trigger_keywords: keywords,
+                    llm: {
+                        api_key: document.getElementById('search-llm-api-key').value.trim(),
+                        base_url: document.getElementById('search-llm-base-url').value.trim(),
+                        model: document.getElementById('search-llm-model').value.trim(),
+                        timeout: parseInt(document.getElementById('search-llm-timeout').value) || 60,
+                    },
+                    backends: {
+                        bocha: {
+                            api_key: document.getElementById('search-bocha-api-key').value.trim(),
+                            freshness: document.getElementById('search-bocha-freshness').value,
+                            count: parseInt(document.getElementById('search-result-limit').value) || 5,
+                        },
+                        doubao: {
+                            api_key: document.getElementById('search-doubao-api-key').value.trim(),
+                            time_range: document.getElementById('search-doubao-time-range').value,
+                            count: parseInt(document.getElementById('search-result-limit').value) || 5,
+                        },
+                    },
+                }
+            };
+            const res = await fetch(API + '/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(config)
+            });
+            const data = await res.json();
+            showToast(data.success ? '搜索配置已保存（重启后生效）' : '保存失败: ' + (data.error || ''), data.success ? 'success' : 'error');
+            if (data.success) loadLLMConfig();
         }
 
         function loadVisionConfig(config) {

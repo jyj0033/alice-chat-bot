@@ -58,6 +58,11 @@ class DashboardSurfaceTests(unittest.TestCase):
             "style-common-words",
             "style-max-reply",
             "typing-min-length",
+            # 联网搜索（LLM 页）
+            "search-enabled",
+            "search-primary",
+            "search-bocha-api-key",
+            "search-doubao-api-key",
         }
         self.assertTrue(required_ids.issubset(set(self.parser.ids)))
         self.assertNotIn("qq-ws-url", self.parser.ids)
