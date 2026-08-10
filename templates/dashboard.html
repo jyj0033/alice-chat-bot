@@ -2918,9 +2918,13 @@
             const select = document.getElementById('session-select');
             select.innerHTML = '<option value="">选择会话...</option>';
             for (const s of data.sessions || []) {
+                // 兼容旧格式(字符串)与新格式({session, active, message_count})
+                const id = typeof s === 'string' ? s : (s.session || '');
+                if (!id) continue;
                 const option = document.createElement('option');
-                option.value = s;
-                option.textContent = s;
+                option.value = id;
+                const cnt = (typeof s === 'object' && s.message_count) ? ` (${s.message_count}条)` : '';
+                option.textContent = id + cnt;
                 select.appendChild(option);
             }
         }

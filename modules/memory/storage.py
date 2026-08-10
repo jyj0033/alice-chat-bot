@@ -187,6 +187,23 @@ class MemoryStorage:
         """, (*params, limit))
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
+    def list_sessions(self, limit: int = 50) -> list[dict]:
+        """列出所有出现过消息的会话（含私聊），按最近活跃排序。
+
+        重启后内存上下文窗口为空，Web 会话管理靠这里恢复历史会话。
+        """
+        cursor = self.conn.execute("""
+            SELECT source_session AS session,
+                   COUNT(*) AS message_count,
+                   MAX(created_at) AS last_active
+            FROM memories
+            WHERE source_session != ''
+            GROUP BY source_session
+            ORDER BY last_active DESC
+            LIMIT ?
+        """, (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
     def retrieve_session_recent(
         self, session: str, limit: int = 5, memory_type: Optional[str] = None
     ) -> list[Memory]:
@@ -591,6 +608,10 @@ class AsyncMemoryStorage:
     async def get_all(self, limit: int = 1000, memory_type: Optional[str] = None) -> list[Memory]:
         """异步获取长期记忆（默认情景+语义；指定类型时只返回该类型）"""
         return await asyncio.to_thread(self._storage.get_all, limit, memory_type)
+
+    async def list_sessions(self, limit: int = 50) -> list[dict]:
+        """异步列出所有出现过消息的会话，按最近活跃排序（Web 会话管理用）"""
+        return await asyncio.to_thread(self._storage.list_sessions, limit)
 
     async def retrieve_session_recent(
         self, session: str, limit: int = 5, memory_type: Optional[str] = None

@@ -319,9 +319,40 @@ async def get_personality():
 
 @app.get("/api/sessions")
 async def get_sessions():
+    """会话列表 = 当前活跃(内存窗口) + 历史会话(SQLite记忆)。
+
+    重启后内存窗口为空，靠历史记忆恢复会话管理，避免"什么都看不到"。
+    """
     if not bot_instance:
         return {"sessions": []}
-    return {"sessions": list(bot_instance.context_manager._windows.keys())}
+
+    seen = set()
+    sessions = []
+
+    # 1. 当前活跃窗口（内存），优先展示
+    if bot_instance.context_manager:
+        for sid in bot_instance.context_manager._windows.keys():
+            seen.add(sid)
+            sessions.append({"session": sid, "active": True})
+
+    # 2. 历史会话（SQLite 记忆），重启后仍可恢复
+    try:
+        if bot_instance.memory_storage:
+            for row in await bot_instance.memory_storage.list_sessions(limit=50):
+                sid = row.get("session") or ""
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                sessions.append({
+                    "session": sid,
+                    "active": False,
+                    "message_count": row.get("message_count", 0),
+                    "last_active": (row.get("last_active") or ""),
+                })
+    except Exception as e:
+        logger.error(f"Failed to list sessions: {e}")
+
+    return {"sessions": sessions}
 
 
 @app.get("/api/context/{session_id}")
