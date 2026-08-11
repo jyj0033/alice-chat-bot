@@ -3377,12 +3377,14 @@
                     const hBefore = container.scrollHeight;
                     const scrollTop = container.scrollTop;
                     const oldBtn = document.getElementById('chat-more-btn');
-                    // 更早的消息插到「加载更早」按钮之后（即更靠上），保持原有消息顺序
+                    // 更早的消息插到「加载更早」按钮之前（即更靠上），保持数组顺序（旧在上、新在下）
                     const temp = document.createElement('div');
                     temp.innerHTML = older;
                     const children = Array.from(temp.children);
-                    if (oldBtn) for (const el of children) oldBtn.after(el);
-                    else container.prepend(...children);
+                    const frag = document.createDocumentFragment();
+                    for (const el of children) frag.appendChild(el);
+                    if (oldBtn) oldBtn.before(frag);
+                    else container.prepend(frag);
                     if (!chatState.hasMore && oldBtn) oldBtn.remove();
                     // 新增内容撑高了容器，回滚差值以保持可视位置稳定
                     container.scrollTop = scrollTop + (container.scrollHeight - hBefore);

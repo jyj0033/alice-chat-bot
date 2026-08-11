@@ -432,6 +432,7 @@ async def get_context(session_id: str, page: int = 1, page_size: int = 30):
 
         offset = (page - 2) * page_size  # page2 起从历史第一页开始
         rows = await history_page(offset, page_size, before=oldest_ts)
+        rows = rows[::-1]  # 库内为倒序（新→旧），翻转为升序，前端前置后严格「旧在上、新在下」
         msgs = [_memory_to_msg_dict(m) for m in rows]
         return {
             "messages": msgs,
@@ -445,6 +446,7 @@ async def get_context(session_id: str, page: int = 1, page_size: int = 30):
     db_total = await history_count()
     offset = (page - 1) * page_size
     rows = await history_page(offset, page_size)
+    rows = rows[::-1]  # 同上：库内倒序翻转为升序，前端按时间正序展示
     msgs = [_memory_to_msg_dict(m) for m in rows]
     return {
         "messages": msgs,
