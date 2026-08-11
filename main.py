@@ -838,8 +838,8 @@ class GroupChatBot:
                 except Exception as exc:
                     logger.debug("富媒体增强失败，使用占位符继续：%s", exc)
 
-            # === 检索长期记忆 ===
-            memories = await self._retrieve_memories(message.content, session_id)
+            # === 检索长期记忆（排除当前消息，防止刚写入库的这条被自己召回） ===
+            memories = await self._retrieve_memories(message.content, session_id, exclude_id=message.message_id)
 
             # === 思考延迟（期间新消息会进入上下文，等对方把话说完） ===
             await self.thinking_delay.wait(
@@ -1287,11 +1287,24 @@ class GroupChatBot:
                 "sender_id": message.sender_id,
                 "sender_name": message.sender_name,
                 "mentioned_me": message.mentioned_me,
+                "message_id": message.message_id,  # 检索时排除当前消息自召回
             },
         )
 
         async def _save():
             try:
+                # 写入去重：同会话同发送者已有近似内容 → 强化旧记忆，不新增重复条目
+                dup = await self.memory_storage.find_similar(
+                    session_id, message.sender_id, content
+                )
+                if dup is not None:
+                    boost = max(0.05, memory.importance - dup.importance)
+                    await self.memory_storage.bump_memories([dup.id], importance_boost=boost)
+                    logger.debug(
+                        "记忆去重: 更新已有 #%d (imp %.2f→+%.2f) 而非新增",
+                        dup.id, dup.importance, boost,
+                    )
+                    return
                 await self.memory_storage.store(memory)
                 logger.debug(f"Saved long-term memory: importance={memory.importance:.2f}")
             except Exception as e:
@@ -1404,10 +1417,15 @@ class GroupChatBot:
         finally:
             self._digest_tasks.pop(session_id, None)
 
-    async def _retrieve_memories(self, query: str, session_id: str, limit: int = None) -> list:
+    async def _retrieve_memories(self, query: str, session_id: str, limit: int = None,
+                                 exclude_id: str = "") -> list:
         """检索相关长期记忆：
         1. 该会话最近的群聊纪要（始终带上，bot 记得"最近群里聊过什么"，不会隔天失忆）
         2. 向量语义检索（TF-IDF + 余弦），失败或空时退回该会话最近记忆
+
+        exclude_id：当前消息的 message_id。快路径会先异步把当前消息写入 episodic，
+        检索发生在写入之后，若不排除，刚发的这条会把自己的内容召回——等于让 bot
+        复述自己刚说的话。这里通过 memory_id 映射排除。
         """
         limit = limit or self.memory_search_top_k
 
@@ -1431,6 +1449,15 @@ class GroupChatBot:
                 logger.error(f"Failed to retrieve memories: {e}")
                 memories = []
 
+        # 排除当前消息自己（若已落库且被召回）：通过 metadata.message_id 匹配
+        if exclude_id:
+            excluded = {m.id for m in memories
+                        if str((m.metadata or {}).get("message_id") or "") == str(exclude_id)}
+            if excluded:
+                memories = [m for m in memories if m.id not in excluded]
+
+        # 最近纪要作为"近况"放最前，细节记忆在后（去重避免重复出现）
+
         # 最近纪要作为"近况"放最前，细节记忆在后（去重避免重复出现）
         try:
             digests = await self.memory_storage.retrieve_session_recent(
@@ -1442,6 +1469,17 @@ class GroupChatBot:
         if digests:
             digest_ids = {d.id for d in digests}
             memories = digests + [m for m in memories if m.id not in digest_ids]
+
+        # 检索反馈强化：被召回的每一条记忆刷新 last_accessed + 轻微提升 importance。
+        # 时间衰减只看 last_accessed —— 不刷新的话，常用记忆会随写入时间一起老化，
+        # bot 会"忘记"明明刚用过的信息。刷新后常用记忆保持新鲜，冷门记忆自然淡出。
+        # 这是记忆系统的「回忆 → 强化」闭环。
+        try:
+            memory_ids = [m.id for m in memories if m.id]
+            if memory_ids:
+                await self.memory_storage.bump_memories(memory_ids)
+        except Exception as e:
+            logger.debug(f"Memory access bump skipped: {e}")
 
         return memories
 
@@ -1491,10 +1529,17 @@ class GroupChatBot:
             return
         try:
             self._last_decay_run = now
+            # 分级衰减：个人事实(semantic)活得最久、纪要(session_summary)次之、
+            # 消息流水(episodic)最短——"该记住的"不随闲聊一起老去。
             result = await self.memory_storage.apply_time_decay(
                 half_life_days=self.memory_half_life_days,
                 min_importance=0.1,
                 max_age_days=180,
+                presets={
+                    "semantic": {"half_life_days": 90, "max_age_days": 365},
+                    "session_summary": {"half_life_days": 45, "max_age_days": 180},
+                    "episodic": {"half_life_days": 14, "max_age_days": 90},
+                },
             )
             if result["decayed"] or result["deleted"]:
                 logger.info(f"[记忆衰减] {result}")

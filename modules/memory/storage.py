@@ -8,12 +8,38 @@ import logging
 import math
 import re
 import sqlite3
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_speaker(content: str) -> str:
+    """去掉记忆内容开头的「昵称：」前缀（昵称可能随改群名片变化，比较内容即可）。"""
+    if "：" in content:
+        head, rest = content.split("：", 1)
+        # 只有短前缀（像昵称）才剥离；消息正文本身含冒号时保留完整正文
+        if len(head) <= 40 and not head.startswith(("http", "[", "【")):
+            return rest.strip()
+    return content.strip()
+
+
+def _content_similarity(a: str, b: str) -> float:
+    """基于字符 bigram 的相似度（0~1），比 difflib 对短句更稳。"""
+    a, b = _strip_speaker(a), _strip_speaker(b)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    grams_a = {a[i:i + 2] for i in range(len(a) - 1)}
+    grams_b = {b[i:i + 2] for i in range(len(b) - 1)}
+    if not grams_a or not grams_b:
+        return 1.0 if a == b else 0.0
+    inter = len(grams_a & grams_b)
+    return (2.0 * inter) / (len(grams_a) + len(grams_b))
 
 
 @dataclass
@@ -63,9 +89,24 @@ class MemoryStorage:
         self._init_tables()
         # 嵌入服务（可选，未配置时语义检索回退 TF-IDF）
         self._embedding_service = None
-        # 内存向量缓存：memory_id -> list[float]
-        self._embed_cache: dict[int, list] = {}
+        # 内存向量缓存：memory_id -> list[float]（LRU，有上限，防长期运行内存膨胀）
+        self._embed_cache: OrderedDict[int, list] = OrderedDict()
+        self._embed_cache_max = 2048
         logger.info(f"Memory storage initialized at {db_path}")
+
+    def _cache_embed(self, memory_id: int, vector: list) -> None:
+        """写向量缓存（LRU 淘汰最旧，避免无限增长）"""
+        self._embed_cache[memory_id] = vector
+        self._embed_cache.move_to_end(memory_id)
+        while len(self._embed_cache) > self._embed_cache_max:
+            self._embed_cache.popitem(last=False)
+
+    def _get_embed(self, memory_id: int) -> Optional[list]:
+        """读向量缓存（命中即刷新为最近使用）"""
+        v = self._embed_cache.get(memory_id)
+        if v is not None:
+            self._embed_cache.move_to_end(memory_id)
+        return v
 
     def set_embedding_service(self, service) -> None:
         """注入嵌入+重排服务"""
@@ -102,6 +143,11 @@ class MemoryStorage:
         """)
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_source_session ON memories(source_session)
+        """)
+        # 会话历史分页/按会话查类型的常见查询：会话+类型组合索引
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_type
+            ON memories(source_session, memory_type, created_at DESC)
         """)
 
         self.conn.commit()
@@ -272,12 +318,66 @@ class MemoryStorage:
 
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
+    def find_similar(self, session: str, sender_id: str, content: str,
+                     memory_type: str = "episodic", lookback: int = 300) -> Optional[Memory]:
+        """写入去重：在同会话同发送者的已有记忆中找与 content 高度近似的一条。
+
+        - 记忆 content 形如「昵称：内容」，昵称可能因改群名片而变化，
+          所以只比较"内容"部分，且发送者按稳定的 sender_id 匹配。
+        - 相似度 ≥ 0.85 视为重复，返回该记忆；否则返回 None。
+        - 只扫最近 lookback 条（新消息大概率与近期内容重复，远了没意义）。
+        """
+        content = (content or "").strip()
+        if not content or not sender_id:
+            return None
+        cursor = self.conn.execute("""
+            SELECT * FROM memories
+            WHERE source_session = ? AND memory_type = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (session, memory_type, lookback))
+        best: Optional[Memory] = None
+        best_ratio = 0.0
+        for row in cursor.fetchall():
+            mem = self._row_to_memory(row)
+            meta = mem.metadata or {}
+            if str(meta.get("sender_id") or "") != str(sender_id):
+                continue
+            ratio = _content_similarity(mem.content, content)
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best = mem
+            if best_ratio >= 1.0:
+                break
+        return best if best_ratio >= 0.85 else None
+
     def update_access(self, memory_id: int) -> None:
         """更新访问时间"""
         self.conn.execute("""
             UPDATE memories SET last_accessed = CURRENT_TIMESTAMP WHERE id = ?
         """, (memory_id,))
         self.conn.commit()
+
+    def bump_memories(self, memory_ids: list[int], importance_boost: float = 0.01) -> int:
+        """检索反馈强化：批量刷新被召回记忆的 last_accessed 并轻微提升 importance。
+
+        - 时间衰减只看 last_accessed：刷新后常用记忆保持新鲜，冷门记忆自然淡出。
+        - importance 封顶 0.95，避免长期强化导致记忆永不衰减。
+        - 单条 UPDATE，命中数通常 ≤10，代价可忽略。
+        """
+        if not memory_ids:
+            return 0
+        ids = [i for i in memory_ids if i]
+        if not ids:
+            return 0
+        now = datetime.now().isoformat(sep=' ')
+        for mid in ids:
+            self.conn.execute(
+                "UPDATE memories SET last_accessed = ?, importance = MIN(0.95, importance + ?) WHERE id = ?",
+                (now, importance_boost, mid),
+            )
+        self.conn.commit()
+        return len(ids)
 
     def update_importance(self, memory_id: int, importance: float) -> None:
         """更新重要性"""
@@ -415,7 +515,7 @@ class MemoryStorage:
                 (json.dumps(vector), memory_id),
             )
             self.conn.commit()
-            self._embed_cache[memory_id] = vector
+            self._cache_embed(memory_id, vector)
         except Exception as e:
             logger.error(f"Failed to save embedding for memory {memory_id}: {e}")
 
@@ -565,20 +665,30 @@ class MemoryStorage:
         half_life_days: float = 30.0,
         min_importance: float = 0.1,
         max_age_days: float = 180.0,
+        presets: Optional[dict] = None,
     ) -> dict:
         """批量应用时间衰减：
         - 每条记忆 importance 按 last_accessed 半衰期衰减
         - 衰减后 importance < min_importance 且超过 max_age_days 的删除
         - 返回 {'decayed': n, 'deleted': n}
+
+        支持按 memory_type 分级（presets），让不同性质的记忆寿命不同：
+          presets = {type: {"half_life_days": .., "max_age_days": ..}}
+        未在 presets 里的类型使用默认参数。
         """
         now = datetime.now()
         rows = self.conn.execute(
-            "SELECT id, importance, last_accessed FROM memories"
+            "SELECT id, memory_type, importance, last_accessed FROM memories"
         ).fetchall()
 
         decayed = 0
         deleted = 0
+        updates: list[tuple] = []
+        deletes: list[int] = []
         for row in rows:
+            preset = (presets or {}).get(row["memory_type"], {})
+            hl = float(preset.get("half_life_days", half_life_days))
+            ma = float(preset.get("max_age_days", max_age_days))
             mid = row["id"]
             importance = row["importance"]
             last_acc = None
@@ -590,18 +700,25 @@ class MemoryStorage:
             last_acc = last_acc or now
 
             age_days = max(0.0, (now - last_acc).total_seconds()) / 86400.0
-            new_importance = importance * (0.5 ** (age_days / half_life_days))
+            new_importance = importance * (0.5 ** (age_days / hl))
 
-            if new_importance < min_importance and age_days > max_age_days:
-                self.conn.execute("DELETE FROM memories WHERE id = ?", (mid,))
+            if new_importance < min_importance and age_days > ma:
+                deletes.append(mid)
                 deleted += 1
                 self._embed_cache.pop(mid, None)
             elif abs(new_importance - importance) > 1e-6:
-                self.conn.execute(
-                    "UPDATE memories SET importance = ? WHERE id = ?",
-                    (round(new_importance, 4), mid),
-                )
+                updates.append((round(new_importance, 4), mid))
                 decayed += 1
+
+        # 批量执行，避免逐条 UPDATE 的开销
+        if updates:
+            self.conn.executemany(
+                "UPDATE memories SET importance = ? WHERE id = ?", updates
+            )
+        if deletes:
+            self.conn.executemany(
+                "DELETE FROM memories WHERE id = ?", [(mid,) for mid in deletes]
+            )
 
         self.conn.commit()
         if decayed or deleted:
@@ -679,6 +796,13 @@ class AsyncMemoryStorage:
         """异步分页获取会话的历史消息（episodic 记忆）"""
         return await asyncio.to_thread(
             self._storage.get_session_messages, session, limit, offset, before
+        )
+
+    async def find_similar(self, session: str, sender_id: str, content: str,
+                           memory_type: str = "episodic", lookback: int = 300) -> Optional[Memory]:
+        """异步写入去重：返回同会话同发送者的近重复记忆，无则 None"""
+        return await asyncio.to_thread(
+            self._storage.find_similar, session, sender_id, content, memory_type, lookback
         )
 
     async def semantic_search(
@@ -787,11 +911,11 @@ class AsyncMemoryStorage:
         missing = []
         missing_idx = []
         for i, m in enumerate(memories):
-            v = storage._embed_cache.get(m.id)
+            v = storage._get_embed(m.id)
             if v is None:
                 v = await asyncio.to_thread(storage.get_embedding, m.id)
                 if v is not None:
-                    storage._embed_cache[m.id] = v
+                    storage._cache_embed(m.id, v)
             if v is not None:
                 vecs.append(v)
             else:
@@ -808,11 +932,10 @@ class AsyncMemoryStorage:
                     return None
                 for m, v in zip(missing, new_vecs):
                     if v:
-                        storage.update_embedding(m.id, v)
-                        storage._embed_cache[m.id] = v
+                        storage.update_embedding(m.id, v)  # 内部走 _cache_embed
             # 填回
             for k, i in enumerate(missing_idx):
-                v = storage._embed_cache.get(missing[k].id)
+                v = storage._get_embed(missing[k].id)
                 vecs[i] = v
 
         if any(v is None for v in vecs):
@@ -820,16 +943,23 @@ class AsyncMemoryStorage:
         return vecs
 
     async def apply_time_decay(
-        self, half_life_days: float = 30.0, min_importance: float = 0.1, max_age_days: float = 180.0
+        self, half_life_days: float = 30.0, min_importance: float = 0.1, max_age_days: float = 180.0,
+        presets: Optional[dict] = None,
     ) -> dict:
-        """异步时间衰减"""
+        """异步时间衰减（支持按类型分级）"""
         return await asyncio.to_thread(
-            self._storage.apply_time_decay, half_life_days, min_importance, max_age_days
+            self._storage.apply_time_decay, half_life_days, min_importance, max_age_days, presets
         )
 
     async def update_access(self, memory_id: int) -> None:
         """异步更新访问"""
         await asyncio.to_thread(self._storage.update_access, memory_id)
+
+    async def bump_memories(self, memory_ids: list[int], importance_boost: float = 0.01) -> int:
+        """异步检索反馈强化"""
+        if not memory_ids:
+            return 0
+        return await asyncio.to_thread(self._storage.bump_memories, memory_ids, importance_boost)
 
     async def delete(self, memory_id: int) -> bool:
         """异步删除（同时清理向量缓存）"""
