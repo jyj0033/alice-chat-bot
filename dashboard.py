@@ -545,6 +545,45 @@ async def get_memories(session: str = "", q: str = "", type: str = "all", limit:
     return {"memories": result, "total": len(result)}
 
 
+@app.get("/api/profiles")
+async def get_profiles():
+    """所有用户画像（semantic 记忆，按最近更新排序）"""
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"profiles": [], "total": 0}
+    try:
+        profiles = await bot_instance.memory_storage.get_profiles()
+        result = []
+        for p in profiles:
+            meta = p.metadata or {}
+            result.append({
+                "id": p.id,
+                "sender_id": meta.get("sender_id", ""),
+                "sender_name": meta.get("sender_name", "") or "未知用户",
+                "content": p.content,
+                "fact_count": meta.get("fact_count", 0),
+                "created_at": p.created_at.isoformat(),
+                "last_accessed": p.last_accessed.isoformat(),
+                "source_session": p.source_session,
+            })
+        return {"profiles": result, "total": len(result)}
+    except Exception as e:
+        logger.error(f"Failed to load profiles: {e}")
+        return {"profiles": [], "total": 0}
+
+
+@app.post("/api/profiles/distill")
+async def distill_profiles():
+    """手动触发一次用户画像提炼（force=True）"""
+    if not bot_instance:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        result = await bot_instance._distill_user_profiles(force=True)
+        return {"success": True, **result}
+    except Exception as e:
+        logger.error(f"Manual profile distill failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
 @app.delete("/api/memories/{memory_id}")
 async def delete_memory(memory_id: int):
     """删除一条长期记忆"""

@@ -671,6 +671,41 @@
         .memory-content { margin-top: 10px; font-size: 13.5px; color: var(--text-secondary); line-height: 1.7; }
         .memory-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
 
+        /* ============ 用户画像 ============ */
+        .profiles-grid {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 16px; margin-top: 6px;
+        }
+        .profile-card {
+            padding: 20px 22px; border-radius: 15px;
+            background: #fff; border: 1px solid var(--border);
+            box-shadow: var(--shadow-sm);
+            transition: border-color .3s, transform .3s;
+            display: flex; flex-direction: column; gap: 12px;
+        }
+        .profile-card:hover { border-color: rgba(124,108,255,.28); transform: translateY(-2px); }
+        .profile-top { display: flex; align-items: center; gap: 12px; }
+        .profile-avatar {
+            width: 42px; height: 42px; border-radius: 12px; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 17px; font-weight: 800; color: #fff;
+            background: linear-gradient(135deg, #7c6cff, #a78bfa);
+        }
+        .profile-name { font-size: 15px; font-weight: 700; color: var(--text-primary); }
+        .profile-id { font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+        .profile-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+        .profile-content {
+            font-size: 13.5px; color: var(--text-secondary); line-height: 1.7;
+            padding: 12px 14px; border-radius: 10px;
+            background: linear-gradient(180deg, #f8f7ff, #f3f1ff);
+            border: 1px solid #ece9ff;
+        }
+        .profile-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+        .badge-facts {
+            padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 700;
+            background: #ede9fe; color: #6d28d9;
+        }
+
         /* ============ 会话聊天 ============ */
         .chat-container {
             max-height: 560px; overflow-y: auto;
@@ -1004,6 +1039,7 @@
                 <div class="nav-item" data-page="qq"><svg class="icon"><use href="#i-plug"/></svg> QQ 连接</div>
                 <div class="nav-item" data-page="speaking"><svg class="icon"><use href="#i-mic"/></svg> 发言设置</div>
                 <div class="nav-item" data-page="memory"><svg class="icon"><use href="#i-layers"/></svg> 记忆设置</div>
+                <div class="nav-item" data-page="profiles"><svg class="icon"><use href="#i-users"/></svg> 用户画像</div>
                 <div class="nav-item" data-page="behavior"><svg class="icon"><use href="#i-puzzle"/></svg> 高级行为</div>
                 <div class="nav-title">工具</div>
                 <div class="nav-item" data-page="test"><svg class="icon"><use href="#i-flask"/></svg> 测试对话</div>
@@ -1923,6 +1959,32 @@
                 </div>
             </div>
 
+            <!-- 用户画像 -->
+            <div id="page-profiles" class="page">
+                <div class="header">
+                    <div class="header-text">
+                        <h2>用户画像</h2>
+                        <div class="subtitle">从群聊中提炼每个群友的稳定个人特征，Bot 提问时能"想起"对方是什么样的人</div>
+                    </div>
+                    <div class="header-status" style="display: flex; align-items: center; gap: 8px;">
+                        <span class="hint" id="profiles-meta"></span>
+                        <button class="btn btn-primary" onclick="distillProfiles()"><svg class="icon-sm"><use href="#i-zap"/></svg>立即提炼</button>
+                        <button class="btn btn-secondary" onclick="loadProfiles()"><svg class="icon-sm"><use href="#i-refresh"/></svg>刷新</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="card-ico"><svg class="icon-sm"><use href="#i-users"/></svg></span>群友画像
+                            <span class="hint" id="profiles-count" style="margin-left:6px"></span>
+                        </div>
+                    </div>
+                    <div id="profiles-grid" class="profiles-grid">
+                        <div class="hint" style="padding: 14px;">加载中...</div>
+                    </div>
+                </div>
+            </div>
+
             <!-- 高级行为 -->
             <div id="page-behavior" class="page">
                 <div class="header">
@@ -2191,6 +2253,7 @@
                 if (item.dataset.page === 'personality') loadPersonality();
                 if (item.dataset.page === 'simulation') loadAdvancedConfig();
                 if (item.dataset.page === 'chat') loadSessions();
+                if (item.dataset.page === 'profiles') loadProfiles();
                 if (item.dataset.page === 'logs') loadLogs();
             });
         });
@@ -2854,6 +2917,61 @@
             const data = await res.json();
             showToast(data.message || (data.success ? '已删除' : '删除失败'), data.success ? 'success' : 'error');
             loadMemories();
+        }
+
+        async function loadProfiles() {
+            const data = await fetch(API + '/profiles').then(r => r.json());
+            const grid = document.getElementById('profiles-grid');
+            const profiles = data.profiles || [];
+            document.getElementById('profiles-count').textContent = `共 ${profiles.length} 个群友`;
+            document.getElementById('profiles-meta').textContent = '自动提炼：每30分钟检查一次新个人事实';
+            if (!profiles.length) {
+                grid.innerHTML = `<div class="empty"><div class="empty-ico"><svg class="icon-lg"><use href="#i-users"/></svg></div>暂无用户画像。<br>群友在群里聊到自己（我叫/我喜欢/我的工作…）后，Bot 会自动提炼；也可以点右上角「立即提炼」手动生成</div>`;
+                return;
+            }
+            grid.innerHTML = profiles.map(p => {
+                const name = escapeHtml(p.sender_name) || '未知用户';
+                const initial = (p.sender_name || '?').trim().charAt(0);
+                const created = new Date(p.created_at).toLocaleString('zh-CN', {hour12:false});
+                const updated = new Date(p.last_accessed).toLocaleString('zh-CN', {hour12:false});
+                const factCount = p.fact_count ? `<span class="badge-facts">基于 ${p.fact_count} 条自我描述</span>` : '';
+                // 内容去掉「【用户画像 名字】」前缀，只显示提炼结果
+                let body = p.content || '';
+                body = body.replace(/^【用户画像[^】]*】/, '');
+                return `
+                    <div class="profile-card">
+                        <div class="profile-top">
+                            <div class="profile-avatar">${escapeHtml(initial)}</div>
+                            <div>
+                                <div class="profile-name">${name}</div>
+                                <div class="profile-id">QQ ${escapeHtml(p.sender_id)}</div>
+                            </div>
+                        </div>
+                        <div class="profile-content">${escapeHtml(body)}</div>
+                        <div class="profile-meta">${factCount}<span>· 提炼于 ${created}</span><span style="margin-left:auto">更新 ${updated}</span></div>
+                    </div>`;
+            }).join('');
+        }
+
+        async function distillProfiles() {
+            const btn = document.querySelector('#page-profiles .btn-primary');
+            const old = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<svg class="icon-sm"><use href="#i-zap"/></svg>提炼中...';
+            try {
+                const res = await fetch(API + '/profiles/distill', { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    showToast(`提炼完成：新增 ${data.distilled || 0} 个，跳过 ${data.skipped || 0} 个`, 'success');
+                    loadProfiles();
+                } else {
+                    showToast('提炼失败：' + (data.error || '未知错误'), 'error');
+                }
+            } catch (e) {
+                showToast('提炼失败：' + e, 'error');
+            }
+            btn.disabled = false;
+            btn.innerHTML = old;
         }
 
         function impColor(p) {

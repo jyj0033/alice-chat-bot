@@ -278,6 +278,17 @@ class GroupChatBot:
         logger.info(f"✓ 群聊纪要: enabled={self._digest_config['enabled']}, "
                     f"每{self._digest_config['interval_messages']}条消息总结一次")
 
+        # 用户画像配置：从情景记忆提炼每个群友的稳定个人特征（semantic 记忆）
+        profile_cfg = memory_config.get("profile", {}) or {}
+        self._profile_config = {
+            "enabled": profile_cfg.get("enabled", True),
+            "interval_minutes": int(profile_cfg.get("interval_minutes", 30)),
+            "min_facts": max(1, int(profile_cfg.get("min_facts", 2))),
+        }
+        self._last_profile_distill: float = 0.0
+        logger.info(f"✓ 用户画像: enabled={self._profile_config['enabled']}, "
+                    f"每{self._profile_config['interval_minutes']}分钟提炼一次")
+
     def _init_personality(self) -> None:
         """初始化人格系统"""
         speaking_config = self.config.get("speaking", {})
@@ -1417,6 +1428,142 @@ class GroupChatBot:
         finally:
             self._digest_tasks.pop(session_id, None)
 
+    def _is_personal_fact(self, memory) -> bool:
+        """判断一条 episodic 记忆是否包含"关于发送者自己的事实"。
+
+        - 命中个人信息关键词（我叫/我喜欢/我的工作…）
+        - 或高重要性且含第一人称"我"（倾向于是自我描述）
+        """
+        content = memory.content or ""
+        if any(kw in content for kw in self._PERSONAL_KEYWORDS):
+            return True
+        if memory.importance >= 0.7 and "我" in content:
+            return True
+        return False
+
+    async def _distill_user_profiles(self, force: bool = False) -> dict:
+        """从情景记忆提炼用户画像（semantic 记忆，后台执行）。
+
+        对每个有足够个人事实的发送者，用 LLM 把TA近期的自我描述浓缩成
+        一句稳定画像。已有画像且没有新事实时跳过；force=True 强制重炼。
+        画像存为 semantic 记忆，语义检索时可被召回（问"阿狗是什么样的人"能答上）。
+        """
+        result = {"distilled": 0, "skipped": 0, "error": ""}
+        if not self._profile_config.get("enabled", True):
+            return result
+        min_facts = self._profile_config.get("min_facts", 3)
+        try:
+            episodes = await self.memory_storage.get_all(limit=2000, memory_type="episodic")
+            profiles = await self.memory_storage.get_profiles()
+            profile_by_sender = {
+                p.metadata.get("sender_id"): p
+                for p in profiles if p.metadata.get("sender_id")
+            }
+
+            # 按发送者分组个人相关消息（排除 bot 自己的回复）
+            by_sender: dict[str, list] = {}
+            for m in episodes:
+                meta = m.metadata or {}
+                sid = meta.get("sender_id")
+                if not sid or meta.get("is_bot"):
+                    continue
+                if not self._is_personal_fact(m):
+                    continue
+                by_sender.setdefault(sid, []).append(m)
+
+            provider = self.get_active_provider()
+            if not provider:
+                result["error"] = "no active provider"
+                return result
+
+            from modules.llm.base import ChatRequest
+
+            for sid, msgs in by_sender.items():
+                existing = profile_by_sender.get(sid)
+                newest = max(m.created_at for m in msgs)
+                # 已有画像且没有比它更新的个人事实 → 跳过
+                if (not force and existing and existing.created_at
+                        and newest <= existing.created_at):
+                    result["skipped"] += 1
+                    continue
+                if len(msgs) < min_facts:
+                    continue
+
+                # 取最近最多 12 条、去重近似内容
+                facts = sorted(msgs, key=lambda m: m.created_at, reverse=True)[:12]
+                unique_facts: list = []
+                seen: set = set()
+                for f in facts:
+                    key = (f.content or "")[:30]
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    unique_facts.append(f)
+
+                # 当前昵称（取最新一条），剥掉「昵称：」前缀后给 LLM
+                latest_name = unique_facts[0].metadata.get("sender_name") or "该用户"
+                lines = []
+                for f in reversed(unique_facts):
+                    body = f.content or ""
+                    n = (f.metadata or {}).get("sender_name")
+                    if n and body.startswith(n + "："):
+                        body = body[len(n) + 1:]
+                    lines.append(body[:120])
+                text = "\n".join(lines)
+
+                req = ChatRequest(temperature=0.3, max_tokens=150, top_p=0.9)
+                req.add_system(
+                    "你是用户画像提炼助手。根据群友说过的关于自己的话，提炼这个人的"
+                    "稳定个人特征（职业、喜好、习惯、家庭、性格、生活状态等），输出1-2句话。"
+                    "只写稳定事实，不要推测、不要复述原话、不要寒暄。用第三人称。"
+                )
+                req.add_user(f"群友「{latest_name}」说过的关于自己的话：\n{text}")
+                resp = await provider.chat(req)
+                summary = (resp.content or "").strip().strip('"\'“”')
+                if not summary:
+                    result["skipped"] += 1
+                    continue
+
+                now = datetime.now()
+                new_profile = Memory(
+                    content=f"【用户画像 {latest_name}】{summary}",
+                    memory_type="semantic",
+                    importance=0.8,
+                    source_session=unique_facts[0].source_session,
+                    tags=["用户画像"],
+                    created_at=now,
+                    last_accessed=now,
+                    metadata={
+                        "profile": True,
+                        "sender_id": sid,
+                        "sender_name": latest_name,
+                        "fact_count": len(unique_facts),
+                    },
+                )
+                if existing and existing.id:
+                    new_profile.id = existing.id
+                    await self.memory_storage.update_memory(new_profile)
+                else:
+                    await self.memory_storage.store(new_profile)
+                result["distilled"] += 1
+                logger.info(f"[画像] {latest_name}: {summary[:50]}...")
+        except Exception as e:
+            logger.error(f"User profile distillation failed: {e}", exc_info=True)
+            result["error"] = str(e)
+        return result
+
+    async def _maybe_distill_profiles(self) -> None:
+        """定时触发画像提炼（按 interval_minutes 节流，避免频繁调用 LLM）"""
+        if not self._profile_config.get("enabled", True):
+            return
+        import time
+        interval = max(5, self._profile_config.get("interval_minutes", 30))
+        now = time.time()
+        if self._last_profile_distill and (now - self._last_profile_distill) < interval * 60:
+            return
+        self._last_profile_distill = now
+        await self._distill_user_profiles(force=False)
+
     async def _retrieve_memories(self, query: str, session_id: str, limit: int = None,
                                  exclude_id: str = "") -> list:
         """检索相关长期记忆：
@@ -1518,6 +1665,7 @@ class GroupChatBot:
             self.fatigue_manager.cleanup()
             self.context_manager.cleanup_inactive(max_inactive_minutes=60)
             await self._maybe_decay_memories()
+            await self._maybe_distill_profiles()
             logger.debug("Cleaned up expired states")
 
     async def _maybe_decay_memories(self) -> None:
@@ -1761,6 +1909,11 @@ class GroupChatBot:
                     "interval_messages": 20,
                     "min_messages": 10,
                     "max_tokens": 200
+                },
+                "profile": {
+                    "enabled": True,
+                    "interval_minutes": 30,
+                    "min_facts": 2
                 }
             },
             "search": {

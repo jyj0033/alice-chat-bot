@@ -219,6 +219,43 @@ class MemoryStorage:
 
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
+    def get_profiles(self) -> list[Memory]:
+        """所有用户画像（semantic 记忆且 metadata.profile=True），按最近更新排序。
+
+        用 Python 过滤（semantic 数量少），避免依赖 json_extract 的兼容性。
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM memories WHERE memory_type = 'semantic'"
+        ).fetchall()
+        profiles = [
+            m for m in (self._row_to_memory(r) for r in rows)
+            if (m.metadata or {}).get("profile")
+        ]
+        profiles.sort(key=lambda m: m.last_accessed, reverse=True)
+        return profiles
+
+    def update_memory(self, memory: Memory) -> bool:
+        """整条更新已有记忆的字段（用户画像重新提炼时复用原 id，不产生孤儿记录）。"""
+        if not memory.id:
+            return False
+        self.conn.execute("""
+            UPDATE memories
+            SET content = ?, importance = ?, tags = ?, source_session = ?,
+                metadata = ?, created_at = ?, last_accessed = ?
+            WHERE id = ?
+        """, (
+            memory.content,
+            memory.importance,
+            json.dumps(memory.tags),
+            memory.source_session,
+            json.dumps(memory.metadata),
+            memory.created_at.isoformat(sep=' '),
+            memory.last_accessed.isoformat(sep=' '),
+            memory.id,
+        ))
+        self.conn.commit()
+        return True
+
     def get_all(self, limit: int = 1000, memory_type: Optional[str] = None) -> list[Memory]:
         """获取长期记忆（默认情景+语义；指定类型时只返回该类型），按重要性排序"""
         if memory_type:
@@ -768,6 +805,14 @@ class AsyncMemoryStorage:
     async def get_recent(self, memory_type: str, limit: int = 50) -> list[Memory]:
         """异步获取最近记忆"""
         return await asyncio.to_thread(self._storage.get_recent, memory_type, limit)
+
+    async def get_profiles(self) -> list[Memory]:
+        """异步获取所有用户画像（semantic 记忆）"""
+        return await asyncio.to_thread(self._storage.get_profiles)
+
+    async def update_memory(self, memory: Memory) -> bool:
+        """异步整条更新已有记忆（用户画像复用原 id）"""
+        return await asyncio.to_thread(self._storage.update_memory, memory)
 
     async def get_all(self, limit: int = 1000, memory_type: Optional[str] = None) -> list[Memory]:
         """异步获取长期记忆（默认情景+语义；指定类型时只返回该类型）"""
