@@ -381,12 +381,105 @@ async def get_sessions():
 
 
 @app.get("/api/context/{session_id}")
-async def get_context(session_id: str):
-    if not bot_instance:
-        return {"messages": []}
-    window = bot_instance.context_manager.get_window(session_id)
-    messages = window.get_recent(100)
-    return {"messages": [{"sender": m.sender_name, "content": m.content, "is_bot": m.is_bot, "timestamp": m.timestamp.isoformat()} for m in messages]}
+async def get_context(session_id: str, page: int = 1, page_size: int = 30):
+    """会话消息（分页）。
+
+    - page=1 且内存窗口有消息：返回窗口内的最近聊天记录；
+      更早的历史由「加载更早」分页拉取（SQLite episodic，即消息）。
+    - 重启后窗口为空：直接分页返回 SQLite 历史，避免什么都看不到。
+    - 绝不一次把全部消息载入前端。
+    """
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    empty = {"messages": [], "total": 0, "page": page, "page_size": page_size, "has_more": False}
+    if not bot_instance or not bot_instance.memory_storage:
+        return empty
+
+    window_msgs = []
+    if bot_instance.context_manager:
+        window = bot_instance.context_manager.get_window(session_id)
+        window_msgs = list(window.messages)  # 时间正序（旧→新）
+
+    storage = bot_instance.memory_storage
+
+    async def history_count(before=None):
+        try:
+            return await storage.count_session_messages(session_id, before=before)
+        except Exception:
+            return 0
+
+    async def history_page(offset, limit, before=None):
+        try:
+            return await storage.get_session_messages(session_id, limit=limit, offset=offset, before=before)
+        except Exception:
+            return []
+
+    # 内存窗口非空：窗口日志在前，历史记忆在后（以最早窗口消息时间为界，天然不重叠）
+    if window_msgs:
+        oldest_ts = window_msgs[0].timestamp
+        db_total = await history_count(before=oldest_ts)
+        total = len(window_msgs) + db_total
+
+        if page == 1:
+            msgs = [_window_msg_to_dict(m) for m in window_msgs]
+            return {
+                "messages": msgs,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "has_more": db_total > 0,
+            }
+
+        offset = (page - 2) * page_size  # page2 起从历史第一页开始
+        rows = await history_page(offset, page_size, before=oldest_ts)
+        msgs = [_memory_to_msg_dict(m) for m in rows]
+        return {
+            "messages": msgs,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "has_more": (page - 1) * page_size < db_total,
+        }
+
+    # 窗口为空（如重启后）：直接读历史
+    db_total = await history_count()
+    offset = (page - 1) * page_size
+    rows = await history_page(offset, page_size)
+    msgs = [_memory_to_msg_dict(m) for m in rows]
+    return {
+        "messages": msgs,
+        "total": db_total,
+        "page": page,
+        "page_size": page_size,
+        "has_more": page * page_size < db_total,
+    }
+
+
+def _window_msg_to_dict(m) -> dict:
+    return {
+        "sender": m.sender_name,
+        "content": m.content,
+        "is_bot": m.is_bot,
+        "timestamp": m.timestamp.isoformat(),
+        "from_history": False,
+    }
+
+
+def _memory_to_msg_dict(mem) -> dict:
+    """episodic 记忆即一条消息：content 形如「昵称：内容」，metadata 保留发送者信息。"""
+    content = mem.content or ""
+    meta = mem.metadata or {}
+    sender = meta.get("sender_name") or ""
+    body = content
+    if sender and content.startswith(sender + "："):
+        body = content[len(sender) + 1:]
+    return {
+        "sender": sender or "历史记录",
+        "content": body or content,
+        "is_bot": False,
+        "timestamp": mem.created_at.isoformat(),
+        "from_history": True,
+    }
 
 
 @app.get("/api/memories")

@@ -676,11 +676,26 @@
             max-height: 560px; overflow-y: auto;
             display: flex; flex-direction: column; gap: 14px; padding: 6px 2px;
         }
+        .chat-meta {
+            font-size: 11.5px; color: var(--muted); margin: -8px 2px 12px;
+            font-family: var(--font-mono); letter-spacing: .02em;
+        }
+        .chat-more {
+            align-self: center; cursor: pointer; user-select: none;
+            padding: 7px 18px; border-radius: 999px;
+            font-size: 12px; font-weight: 600; color: var(--primary-deep);
+            background: var(--grad-soft); border: 1px solid rgba(124,108,255,.22);
+            transition: transform .2s ease, box-shadow .2s ease;
+        }
+        .chat-more:hover { transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+        .chat-more.disabled { opacity: .55; pointer-events: none; }
         .chat-msg { max-width: 78%; padding: 12px 16px; border-radius: 16px; font-size: 13.5px; line-height: 1.65; color: var(--text); }
         .chat-msg .meta { display: flex; align-items: center; gap: 8px; font-size: 11.5px; margin-bottom: 6px; }
         .chat-msg .name { font-weight: 700; }
         .chat-msg .time { color: var(--muted); font-family: var(--font-mono); font-size: 10.5px; }
         .chat-msg .content { word-break: break-word; }
+        .chat-msg.hist { opacity: .82; }
+        .chat-msg.hist .time::after { content: ' · 历史'; color: var(--primary); font-weight: 600; }
         .chat-msg.user { align-self: flex-start; background: #fff; border: 1px solid var(--border); box-shadow: var(--shadow-sm); }
         .chat-msg.bot {
             align-self: flex-end;
@@ -1256,6 +1271,7 @@
                             <option value="">选择会话...</option>
                         </select>
                     </div>
+                    <div class="chat-meta" id="chat-meta">选择会话后展示聊天记录，历史消息分页加载</div>
                     <div class="chat-container" id="chat-container">
                         <div class="empty">
                             <div class="empty-ico"><svg class="icon-lg"><use href="#i-chat"/></svg></div>
@@ -3272,6 +3288,10 @@
         }
 
         // 会话
+        // ============ 会话管理（分页） ============
+        const CHAT_PAGE_SIZE = 30;
+        let chatState = { id: '', page: 1, hasMore: false, total: 0, loading: false };
+
         async function loadSessions() {
             const data = await fetch(API + '/sessions').then(r => r.json());
             const select = document.getElementById('session-select');
@@ -3288,23 +3308,90 @@
             }
         }
 
+        function renderMsg(m) {
+            const cls = m.is_bot ? 'bot' : 'user';
+            const hist = m.from_history ? ' hist' : '';
+            const icon = m.is_bot
+                ? '<span class="name" style="display:inline-flex;align-items:center;gap:5px;color:var(--primary)"><svg class="icon-xs"><use href="#i-bot"/></svg>' + escapeHtml(m.sender) + '</span>'
+                : '<span class="name">' + escapeHtml(m.sender) + '</span>';
+            return '<div class="chat-msg ' + cls + hist + '"><div class="meta">' + icon + '<span class="time">' + new Date(m.timestamp).toLocaleString() + '</span></div><div class="content">' + escapeHtml(m.content) + '</div></div>';
+        }
+
+        async function fetchContext(id, page) {
+            const res = await fetch(API + '/context/' + encodeURIComponent(id) + '?page=' + page + '&page_size=' + CHAT_PAGE_SIZE);
+            return res.json();
+        }
+
+        function setChatMeta(text) {
+            const el = document.getElementById('chat-meta');
+            if (el) el.textContent = text;
+        }
+
         async function loadSession() {
             const id = document.getElementById('session-select').value;
-            if (!id) return;
-            const data = await fetch(API + '/context/' + encodeURIComponent(id)).then(r => r.json());
             const container = document.getElementById('chat-container');
-            if (!data.messages?.length) {
-                container.innerHTML = '<div class="empty"><div class="empty-ico"><svg class="icon-lg"><use href="#i-chat"/></svg></div>暂无消息</div>';
+            if (!id) {
+                container.innerHTML = '<div class="empty"><div class="empty-ico"><svg class="icon-lg"><use href="#i-chat"/></svg></div>选择一个会话查看聊天记录</div>';
+                chatState = { id: '', page: 1, hasMore: false, total: 0, loading: false };
+                setChatMeta('选择会话后展示聊天记录，历史消息分页加载');
                 return;
             }
-            container.innerHTML = data.messages.map(m => {
-                const cls = m.is_bot ? 'bot' : 'user';
-                const icon = m.is_bot
-                    ? '<span class="name" style="display:inline-flex;align-items:center;gap:5px;color:var(--primary)"><svg class="icon-xs"><use href="#i-bot"/></svg>' + escapeHtml(m.sender) + '</span>'
-                    : '<span class="name">' + escapeHtml(m.sender) + '</span>';
-                return '<div class="chat-msg ' + cls + '"><div class="meta">' + icon + '<span class="time">' + new Date(m.timestamp).toLocaleString() + '</span></div><div class="content">' + escapeHtml(m.content) + '</div></div>';
-            }).join('');
-            container.scrollTop = container.scrollHeight;
+            chatState = { id, page: 1, hasMore: false, total: 0, loading: false };
+            try {
+                const data = await fetchContext(id, 1);
+                chatState.total = data.total || 0;
+                chatState.hasMore = !!data.has_more;
+                const msgs = data.messages || [];
+                if (!msgs.length) {
+                    container.innerHTML = '<div class="empty"><div class="empty-ico"><svg class="icon-lg"><use href="#i-chat"/></svg></div>暂无消息记录</div>';
+                } else {
+                    const moreHtml = chatState.hasMore ? '<div class="chat-more" id="chat-more-btn">↑ 加载更早消息</div>' : '';
+                    container.innerHTML = moreHtml + msgs.map(renderMsg).join('');
+                    const moreBtn = document.getElementById('chat-more-btn');
+                    if (moreBtn) moreBtn.onclick = loadOlder;
+                }
+                setChatMeta('共 ' + chatState.total + ' 条 · 显示最新 ' + msgs.length + ' 条' + (chatState.hasMore ? '，可加载更早' : ''));
+                container.scrollTop = container.scrollHeight;
+            } catch (e) {
+                container.innerHTML = '<div class="empty"><div class="empty-ico"><svg class="icon-lg"><use href="#i-alert"/></svg></div>加载失败：' + escapeHtml(e) + '</div>';
+            }
+        }
+
+        async function loadOlder() {
+            if (!chatState.id || !chatState.hasMore || chatState.loading) return;
+            chatState.loading = true;
+            const btn = document.getElementById('chat-more-btn');
+            if (btn) { btn.classList.add('disabled'); btn.textContent = '加载中...'; }
+            try {
+                const nextPage = chatState.page + 1;
+                const data = await fetchContext(chatState.id, nextPage);
+                const older = (data.messages || []).map(renderMsg).join('');
+                if (!older) {
+                    chatState.hasMore = false;
+                    if (btn) btn.remove();
+                } else {
+                    chatState.page = nextPage;
+                    chatState.hasMore = !!data.has_more;
+                    chatState.total = data.total || chatState.total;
+                    const container = document.getElementById('chat-container');
+                    const hBefore = container.scrollHeight;
+                    const scrollTop = container.scrollTop;
+                    const oldBtn = document.getElementById('chat-more-btn');
+                    // 更早的消息插到「加载更早」按钮之后（即更靠上），保持原有消息顺序
+                    const temp = document.createElement('div');
+                    temp.innerHTML = older;
+                    const children = Array.from(temp.children);
+                    if (oldBtn) for (const el of children) oldBtn.after(el);
+                    else container.prepend(...children);
+                    if (!chatState.hasMore && oldBtn) oldBtn.remove();
+                    // 新增内容撑高了容器，回滚差值以保持可视位置稳定
+                    container.scrollTop = scrollTop + (container.scrollHeight - hBefore);
+                    setChatMeta('共 ' + chatState.total + ' 条 · 已显示至第 ' + chatState.page + ' 页' + (chatState.hasMore ? '，可继续加载' : '，已到最早'));
+                }
+            } catch (e) {
+                if (btn) { btn.textContent = '↑ 加载更早消息'; btn.classList.remove('disabled'); }
+            }
+            chatState.loading = false;
         }
 
         // 测试

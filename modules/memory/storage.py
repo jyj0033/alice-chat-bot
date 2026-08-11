@@ -225,6 +225,53 @@ class MemoryStorage:
 
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
+    def count_session_messages(
+        self, session: str, before: Optional[datetime] = None
+    ) -> int:
+        """统计某个会话的 episodic 消息数（可选：仅统计早于某个时间点的历史）。"""
+        if before is not None:
+            cursor = self.conn.execute("""
+                SELECT COUNT(*) FROM memories
+                WHERE source_session = ? AND memory_type = 'episodic'
+                  AND created_at < ?
+            """, (session, before.isoformat(sep=' ')))
+        else:
+            cursor = self.conn.execute("""
+                SELECT COUNT(*) FROM memories
+                WHERE source_session = ? AND memory_type = 'episodic'
+            """, (session,))
+        return cursor.fetchone()[0]
+
+    def get_session_messages(
+        self,
+        session: str,
+        limit: int = 30,
+        offset: int = 0,
+        before: Optional[datetime] = None,
+    ) -> list[Memory]:
+        """分页获取某个会话的历史消息记录（episodic 即一条消息）。
+
+        与内存窗口以"最早一条窗口消息时间"为界拼接：窗口消息是最新日志，
+        before 之后的历史是更早的旧消息，二者不重叠。
+        """
+        if before is not None:
+            cursor = self.conn.execute("""
+                SELECT * FROM memories
+                WHERE source_session = ? AND memory_type = 'episodic'
+                  AND created_at < ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+            """, (session, before.isoformat(sep=' '), limit, offset))
+        else:
+            cursor = self.conn.execute("""
+                SELECT * FROM memories
+                WHERE source_session = ? AND memory_type = 'episodic'
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+            """, (session, limit, offset))
+
+        return [self._row_to_memory(row) for row in cursor.fetchall()]
+
     def update_access(self, memory_id: int) -> None:
         """更新访问时间"""
         self.conn.execute("""
@@ -618,6 +665,21 @@ class AsyncMemoryStorage:
     ) -> list[Memory]:
         """异步获取某个会话最近的记忆（可按类型过滤）"""
         return await asyncio.to_thread(self._storage.retrieve_session_recent, session, limit, memory_type)
+
+    async def count_session_messages(
+        self, session: str, before: Optional[datetime] = None
+    ) -> int:
+        """异步统计会话的 episodic 消息数（Web 会话管理分页用）"""
+        return await asyncio.to_thread(self._storage.count_session_messages, session, before)
+
+    async def get_session_messages(
+        self, session: str, limit: int = 30, offset: int = 0,
+        before: Optional[datetime] = None,
+    ) -> list[Memory]:
+        """异步分页获取会话的历史消息（episodic 记忆）"""
+        return await asyncio.to_thread(
+            self._storage.get_session_messages, session, limit, offset, before
+        )
 
     async def semantic_search(
         self,
