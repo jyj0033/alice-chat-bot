@@ -220,7 +220,8 @@ class HumanizationLogicTests(unittest.TestCase):
         text = manager.get_window("group_g1").build_conversation_text("爱丽丝")
 
         self.assertIn("小明(对你说)：爱丽丝在吗", text)
-        self.assertIn("小红(回@小明)：他刚才还在", text)
+        # 引用对象在窗口内时，顺带给出其内容，让 LLM 明白"回@谁"具体引用了什么
+        self.assertIn("小红(回@小明：爱丽丝在吗)：他刚才还在", text)
 
     def test_qq_parser_keeps_non_text_meaning_and_does_not_treat_at_all_as_me(self):
         adapter = self._qq_adapter_class()({"self_id": "42"})

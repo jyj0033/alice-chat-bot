@@ -1104,23 +1104,108 @@ class GroupChatBot:
         return collected
 
     def _build_image_conversation_context(self, message: Message) -> str:
-        """取当前图片消息之前的若干条对话，供视觉模型判断图片/表情包的意图。"""
+        """取当前图片消息相关的前后对话，供视觉模型判断图片/表情包的意图。
+
+        引用关系是关键：群友引用一张图说"这是好事啊"，视觉模型若不知道
+        "谁发的图、谁引用了图说了什么"，会把图的意图错安到引用者头上
+        （把引用者的话当成图的内容）。因此这里额外提供：
+        1. 发图人（当前图片是谁、什么时候发的；若它引用了别的消息一并说明）；
+        2. 窗口里引用/回复了这张图的消息：`X 引用了这张图，说：...`；
+        3. 最近对话带引用标记，帮助模型分清每条话是谁说的。
+        """
         try:
             window = self.context_manager.get_window(message.session_id)
-            recent = window.get_recent(8)
-            lines = []
+            recent = window.get_recent(12)
             current_id = getattr(message, "message_id", "") or ""
-            for m in reversed(recent):
-                # 排除当前这条（后台增强时它已在窗口内）
-                if current_id and m.message_id and m.message_id == current_id:
-                    continue
-                if not current_id and m.sender_id == message.sender_id and m.content == message.content:
-                    continue
-                speaker = "爱丽丝" if m.is_bot else (m.sender_name or m.sender_id)
-                lines.append(f"[{m.timestamp.strftime('%H:%M')}] {speaker}：{m.content[:80]}")
-                if len(lines) >= 6:
+            self_id = str(self.config.get("qq", {}).get("self_id", ""))
+
+            # 当前图片在窗口里对应消息的时间（Message 本身不带 timestamp）
+            now = datetime.now()
+            for m in recent:
+                if current_id and str(m.message_id or "") == str(current_id):
+                    now = m.timestamp
                     break
-            return "\n".join(reversed(lines))
+
+            # 改名归一：同一 QQ 号在窗口内改群名片时，统一到最近一次昵称，并附尾号绑定身份
+            id_to_names: dict[str, set] = {}
+            latest_name: dict[str, str] = {}
+            for m in recent:
+                if not m.sender_id or m.is_bot:
+                    continue
+                id_to_names.setdefault(m.sender_id, set()).add(m.sender_name)
+                latest_name[m.sender_id] = m.sender_name  # recent 时间正序，覆盖后为最新
+            renamed_ids = {i for i, ns in id_to_names.items() if len(ns) > 1}
+
+            def display(m) -> str:
+                if m.is_bot:
+                    return "爱丽丝"
+                sid = m.sender_id
+                name = latest_name.get(sid, m.sender_name) or sid
+                if sid and sid in renamed_ids:
+                    return f"{name}({sid[-4:]})"
+                return name
+
+            def display_by_id(sid: str) -> str:
+                if sid and self_id and str(sid) == self_id:
+                    return self.personality.name
+                name = latest_name.get(str(sid), "")
+                if sid and sid in renamed_ids:
+                    return f"{name}({sid[-4:]})"
+                return name or str(sid)
+
+            def quoted_target(m) -> str:
+                """返回某条消息引用的对象描述：窗口内能找到内容就给内容，否则给昵称。"""
+                qid = getattr(m, "reply_to_id", None)
+                qqq = getattr(m, "reply_to_qq", None)
+                if qid:
+                    for other in recent:
+                        if other is not m and str(other.message_id or "") == str(qid):
+                            return f"{display(other)}：{other.content[:40]}"
+                if qqq:
+                    name = display_by_id(str(qqq))
+                    if name:
+                        return name
+                return ""
+
+            lines: list[str] = []
+            # 1. 最近对话（当前图片之前，时间正序，最多6条），带引用标记
+            recent_list = list(recent)
+            cur_index = None
+            for i, m in enumerate(recent_list):
+                if current_id and m.message_id and str(m.message_id) == str(current_id):
+                    cur_index = i
+                    break
+                if not current_id and m.sender_id == message.sender_id and m.content == message.content:
+                    cur_index = i
+                    break
+            if cur_index is None:
+                cur_index = len(recent_list)  # 找不到当前图时退化为取全部
+            for m in recent_list[max(0, cur_index - 6):cur_index]:
+                seg = m.content[:80]
+                tgt = quoted_target(m)
+                if tgt:
+                    seg = f"{seg}（回复：{tgt}）"
+                lines.append(f"[{m.timestamp.strftime('%H:%M')}] {display(m)}：{seg}")
+
+            # 2. 当前图片：发图人 + 时间；若它引用了别的消息，一并说明
+            sender_name = (message.sender_name or message.sender_id or "未知用户")
+            header = f"[{now.strftime('%H:%M')}] {sender_name} 发来这张图"
+            tgt = quoted_target(message)
+            if tgt:
+                header += f"，回复的是：{tgt}"
+            lines.append(header)
+
+            # 3. 谁引用了这张图（窗口内 reply_to_id == 当前图 id），时间正序
+            for m in recent:
+                if not current_id or str(m.reply_to_id or "") != str(current_id):
+                    continue
+                if str(m.message_id or "") == current_id:
+                    continue
+                lines.append(
+                    f"[{m.timestamp.strftime('%H:%M')}] {display(m)} 引用了这张图，说：{m.content[:60]}"
+                )
+
+            return "\n".join(lines)
         except Exception as e:
             logger.debug("Build image conversation context failed: %s", e)
             return ""

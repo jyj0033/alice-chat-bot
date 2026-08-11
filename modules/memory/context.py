@@ -178,9 +178,13 @@ class ContextWindow:
 
         # message_id → 发送者，用于 reply 段只有消息 ID、没有发送者 QQ 的情况。
         message_id_to_name: dict[str, str] = {}
+        # message_id → 内容（引用的消息若是图片/表情包，能看到它的识别摘要）
+        message_id_to_content: dict[str, str] = {}
         for msg in recent:
             if msg.message_id:
                 message_id_to_name[str(msg.message_id)] = display_name(msg)
+                if msg.content and not msg.is_bot:
+                    message_id_to_content[str(msg.message_id)] = msg.content
 
         for msg in recent:
             if not include_bot and msg.is_bot:
@@ -200,7 +204,15 @@ class ContextWindow:
                     if target == speaker:
                         pointer = f"(回@{target}自己)"
                     else:
-                        pointer = f"(回@{target})"
+                        # 引用对象在窗口内时顺带给出其内容（图片则为识别摘要），
+                        # 让 LLM 明白"回@谁"具体引用了什么，避免把引用的话当成别人的发言。
+                        snippet = ""
+                        if msg.reply_to_id:
+                            snippet = (message_id_to_content.get(str(msg.reply_to_id), "") or "").strip()
+                        if snippet:
+                            pointer = f"(回@{target}：{snippet[:24]})"
+                        else:
+                            pointer = f"(回@{target})"
                 elif str(msg.reply_to_qq or "") in ("", "0"):
                     pointer = "(回复某条消息)"
                 else:
