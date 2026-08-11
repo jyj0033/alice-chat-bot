@@ -91,7 +91,7 @@
         }
         .aurora .blob {
             position: absolute; border-radius: 50%;
-            filter: blur(110px); opacity: .55; will-change: transform;
+            opacity: .55; will-change: transform; transform: translateZ(0);
         }
         .aurora .b1 {
             width: 52vw; height: 52vw; left: -14vw; top: -18vw;
@@ -267,7 +267,7 @@
             display: inline-flex; align-items: center; gap: 8px;
             padding: 9px 18px; border-radius: 999px;
             font-size: 12.5px; font-weight: 600;
-            background: rgba(255,255,255,.8); border: 1px solid var(--border); backdrop-filter: blur(12px);
+            background: rgba(255,255,255,.92); border: 1px solid var(--border);
             color: var(--text-secondary); position: relative; z-index: 1;
             box-shadow: var(--shadow-sm);
         }
@@ -289,9 +289,8 @@
             background:
                 radial-gradient(720px 340px at 82% -20%, rgba(240,107,165,.13), transparent 60%),
                 radial-gradient(620px 320px at -8% 110%, rgba(124,108,255,.13), transparent 60%),
-                linear-gradient(180deg, rgba(255,255,255,.85), rgba(248,247,253,.85));
+                linear-gradient(180deg, rgba(255,255,255,.92), rgba(248,247,253,.92));
             border: 1px solid var(--border);
-            backdrop-filter: blur(18px);
             box-shadow: var(--shadow);
             overflow: hidden;
         }
@@ -313,9 +312,7 @@
             background: linear-gradient(112deg, #2a2350 8%, #7c6cff 34%, #e0508f 60%, #f5a34b 88%);
             -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
             background-size: 200% 100%;
-            animation: grad-shift 8s ease-in-out infinite;
         }
-        @keyframes grad-shift { 0%,100% { background-position: 0% 0; } 50% { background-position: 100% 0; } }
         .hero .hero-sub { margin-top: 12px; color: var(--text-secondary); font-size: 14px; max-width: 520px; line-height: 1.7; }
         .hero-side { display: flex; flex-direction: column; align-items: flex-end; gap: 14px; }
         .orb {
@@ -343,7 +340,7 @@
             display: grid; grid-template-columns: repeat(4, 1fr);
             margin-top: 34px; position: relative; z-index: 1;
             border: 1px solid var(--border); border-radius: var(--radius);
-            background: rgba(255,255,255,.7); backdrop-filter: blur(10px);
+            background: rgba(255,255,255,.92);
             box-shadow: var(--shadow-sm);
             overflow: hidden;
         }
@@ -374,7 +371,7 @@
             display: flex; align-items: center; gap: 22px;
             padding: 26px 30px; margin-bottom: 22px;
             background: var(--glass); border: 1px solid var(--border); border-radius: var(--radius);
-            backdrop-filter: blur(16px); box-shadow: var(--shadow-sm);
+            box-shadow: var(--shadow-sm);
             transition: border-color .3s ease, transform .3s ease;
         }
         .persona-card:hover { border-color: rgba(124,108,255,.3); transform: translateY(-2px); }
@@ -391,8 +388,7 @@
 
         /* ============ 通用面板（卡片） ============ */
         .card {
-            background: linear-gradient(180deg, rgba(255,255,255,.88), rgba(255,255,255,.8));
-            backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+            background: linear-gradient(180deg, rgba(255,255,255,.94), rgba(255,255,255,.9));
             border: 1px solid var(--border); border-radius: var(--radius);
             padding: 26px 28px; margin-bottom: 22px;
             box-shadow: var(--shadow);
@@ -580,7 +576,7 @@
             display: flex; align-items: center; gap: 18px;
             padding: 20px 24px; border-radius: var(--radius);
             background: var(--glass); border: 1px solid var(--border);
-            backdrop-filter: blur(14px); box-shadow: var(--shadow-sm);
+            box-shadow: var(--shadow-sm);
             transition: border-color .3s, transform .3s, box-shadow .3s;
         }
         .provider-card:hover { border-color: rgba(124,108,255,.3); transform: translateX(4px); box-shadow: var(--shadow); }
@@ -753,7 +749,7 @@
             position: fixed; top: 26px; left: 50%; transform: translate(-50%, -24px);
             z-index: 200; display: flex; align-items: center; gap: 10px;
             padding: 13px 20px; border-radius: 15px;
-            background: rgba(255,255,255,.95); backdrop-filter: blur(20px);
+            background: rgba(255,255,255,.98);
             border: 1px solid var(--border); box-shadow: var(--shadow-lg);
             opacity: 0; pointer-events: none;
             transition: opacity .3s ease, transform .3s cubic-bezier(.22,1,.36,1);
@@ -785,7 +781,7 @@
         .modal-overlay {
             position: fixed; inset: 0; z-index: 300;
             display: flex; align-items: center; justify-content: center; padding: 24px;
-            background: rgba(28,25,49,.4); backdrop-filter: blur(8px);
+            background: rgba(28,25,49,.45);
             opacity: 0; pointer-events: none; transition: opacity .3s ease;
         }
         .modal-overlay.open { opacity: 1; pointer-events: auto; }
@@ -830,6 +826,13 @@
         .hero-dot { -webkit-text-fill-color: #e0508f; filter: drop-shadow(0 0 12px rgba(224,80,143,.55)); animation: dot-pulse 3s ease-in-out infinite; }
         @keyframes dot-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
         .hero-title { position: relative; }
+
+        /* 系统偏好：减弱动效 */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+            .cursor-ring { display: none; }
+            .aurora .blob { animation: none; }
+        }
     </style>
 </head>
 <body>
@@ -3367,15 +3370,20 @@
                 var ring = document.querySelector('.cursor-ring');
                 if (dot && ring) {
                     var mx = innerWidth / 2, my = innerHeight / 2, rx = mx, ry = my;
-                    window.addEventListener('mousemove', function (e) {
-                        mx = e.clientX; my = e.clientY;
-                        dot.style.left = mx + 'px'; dot.style.top = my + 'px';
-                    });
-                    (function loop() {
+                    var rafId = null, lastMove = 0;
+                    // 光环跟随：仅鼠标移动期间跑 lerp，静止 150ms 后自动停帧
+                    function ringLoop() {
                         rx += (mx - rx) * .16; ry += (my - ry) * .16;
                         ring.style.left = rx + 'px'; ring.style.top = ry + 'px';
-                        requestAnimationFrame(loop);
-                    })();
+                        if (performance.now() - lastMove > 150) { rafId = null; return; }
+                        rafId = requestAnimationFrame(ringLoop);
+                    }
+                    function startRingLoop() { if (rafId === null) rafId = requestAnimationFrame(ringLoop); }
+                    window.addEventListener('mousemove', function (e) {
+                        mx = e.clientX; my = e.clientY; lastMove = performance.now();
+                        dot.style.left = mx + 'px'; dot.style.top = my + 'px';
+                        startRingLoop();
+                    });
                     document.querySelectorAll('a, .btn, .nav-item, input, select, textarea, .stat-cell, .trait-card, .memory-item, .recognition-item').forEach(function (el) {
                         el.addEventListener('mouseenter', function () { ring.classList.add('is-active'); });
                         el.addEventListener('mouseleave', function () { ring.classList.remove('is-active'); });
