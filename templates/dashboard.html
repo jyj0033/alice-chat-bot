@@ -85,37 +85,26 @@
         ::-webkit-scrollbar-thumb { background: rgba(28,25,49,.18); border-radius: 8px; border: 2px solid var(--bg-0); }
         ::-webkit-scrollbar-thumb:hover { background: rgba(28,25,49,.3); }
 
-        /* ============ 背景层：柔和极光 + 噪点 ============ */
+        /* ============ 背景层：柔和极光（静态，零动画开销） ============ */
         .aurora {
             position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;
         }
         .aurora .blob {
             position: absolute; border-radius: 50%;
-            opacity: .55; will-change: transform; transform: translateZ(0);
+            opacity: .55;
         }
         .aurora .b1 {
             width: 52vw; height: 52vw; left: -14vw; top: -18vw;
             background: radial-gradient(circle, rgba(124,108,255,.22), transparent 68%);
-            animation: drift-a 26s ease-in-out infinite alternate;
         }
         .aurora .b2 {
             width: 46vw; height: 46vw; right: -12vw; top: 8vh;
             background: radial-gradient(circle, rgba(236,72,153,.16), transparent 66%);
-            animation: drift-b 32s ease-in-out infinite alternate;
         }
         .aurora .b3 {
             width: 40vw; height: 40vw; left: 28vw; bottom: -20vw;
             background: radial-gradient(circle, rgba(245,158,11,.15), transparent 62%);
-            opacity: .45; animation: drift-c 38s ease-in-out infinite alternate;
-        }
-        @keyframes drift-a { to { transform: translate(9vw, 7vh) scale(1.15); } }
-        @keyframes drift-b { to { transform: translate(-8vw, -6vh) scale(1.1); } }
-        @keyframes drift-c { to { transform: translate(-6vw, -9vh) scale(1.2); } }
-
-        .grain {
-            position: fixed; inset: 0; z-index: 2; pointer-events: none; opacity: .03;
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-            mix-blend-mode: multiply;
+            opacity: .45;
         }
 
         /* 自定义光标（桌面端） */
@@ -134,11 +123,10 @@
         /* ============ 布局 ============ */
         .layout { display: flex; min-height: 100vh; position: relative; z-index: 1; }
 
-        /* ---- 侧边栏：悬浮玻璃导轨 ---- */
+        /* ---- 侧边栏：悬浮导轨（近不透明，免 backdrop 重算） ---- */
         .sidebar {
             width: 250px; margin: 16px 0 16px 16px;
-            background: linear-gradient(180deg, rgba(255,255,255,.86), rgba(244,242,252,.86));
-            backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
+            background: linear-gradient(180deg, rgba(255,255,255,.97), rgba(246,244,253,.97));
             border: 1px solid var(--border); border-radius: var(--radius-lg);
             color: var(--text); position: fixed; top: 0; bottom: 0; left: 0; z-index: 60;
             display: flex; flex-direction: column;
@@ -209,7 +197,7 @@
         .mobile-topbar {
             display: none; align-items: center; gap: 12px;
             padding: 14px 18px; position: sticky; top: 0; z-index: 70;
-            background: rgba(255,255,255,.85); backdrop-filter: blur(16px); border-bottom: 1px solid var(--border);
+            background: rgba(255,255,255,.97); border-bottom: 1px solid var(--border);
         }
         .hamburger {
             background: var(--glass-2); border: 1px solid var(--border); color: var(--text);
@@ -217,7 +205,7 @@
         }
         .m-title { font-size: 15px; font-weight: 700; background: linear-gradient(120deg,#1c1931,#5b4bff); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
         .sidebar-backdrop {
-            display: none; position: fixed; inset: 0; z-index: 55; background: rgba(28,25,49,.35); backdrop-filter: blur(4px);
+            display: none; position: fixed; inset: 0; z-index: 55; background: rgba(28,25,49,.4);
         }
         .sidebar-backdrop.show { display: block; }
         @media (max-width: 900px) {
@@ -837,7 +825,6 @@
 </head>
 <body>
     <div class="aurora" aria-hidden="true"><div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div></div>
-    <div class="grain" aria-hidden="true"></div>
     <div class="cursor-dot"></div><div class="cursor-ring"></div>
 
     <!-- ========== SVG 图标库 ========== -->
