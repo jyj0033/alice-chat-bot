@@ -205,7 +205,7 @@ class RichMessageFloorTests(unittest.TestCase):
     def test_pure_media_only_allows_short_reaction(self):
         plan = self._analyze("image")
         self.assertEqual(plan.action, ActionType.REACT)
-        self.assertLessEqual(plan.max_chars, 8)
+        self.assertLessEqual(plan.max_chars, 14)
 
     def test_pure_link_and_forward_default_to_silent(self):
         self.assertEqual(self._analyze("link").action, ActionType.SILENT)

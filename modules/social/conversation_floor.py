@@ -228,8 +228,14 @@ class ConversationFloorManager:
             return False, "没有更新的群消息"
 
         if plan.action == ActionType.REACT:
-            # 简短反应：只有后续聊天仍密集（短窗口内多条新消息）才算错过时机；
-            # 如果只是零星新消息，真人也会补一句，不必放弃。
+            # 简短反应：目标发送者自己已经续了话（如发图后又补一句文字），
+            # 反应就过时了——再回图只会接错话茬。其他群友零星聊天则仍可补一句。
+            if any(
+                not m.is_bot
+                and str(m.sender_id) == str(plan.target_user_id or "")
+                for m in newer
+            ):
+                return True, "目标发送者已续话，简短反应过期"
             recent_active = [
                 m for m in newer
                 if (datetime.now() - m.timestamp).total_seconds() <= self.burst_window_seconds
@@ -312,7 +318,7 @@ class ConversationFloorManager:
                 wait_multiplier = 1.0
         elif rich_message_only and rich_type in ("image", "mface", "face", "video"):
             action = ActionType.REACT
-            tone, max_chars = "只在确实有自然反应时回几个字；不知道内容就沉默", 8
+            tone, max_chars = "只在确实有自然反应时回一句很短的；不知道内容就沉默", 14
             confidence = 0.38
             reason = "纯媒体消息只适合偶尔短反应"
             wait_multiplier = 0.8

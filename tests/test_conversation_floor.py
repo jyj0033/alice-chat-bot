@@ -164,6 +164,44 @@ class ConversationFloorTests(unittest.TestCase):
 
         self.assertFalse(cancel)
 
+    def test_react_cancels_when_same_sender_continues_after_image(self):
+        """发图的人自己又续了句话（如"换这个"），对图的简短反应已过期。"""
+        target = self.message("u1", "[图片]", 0, message_id="m1")
+        _, plan = self.manager.analyze(
+            target,
+            [target],
+            bot_id="bot",
+            rich_message_only=True,
+            rich_type="image",
+        )
+        self.assertEqual(plan.action, ActionType.REACT)
+        follow_up = self.message("u1", "换这个", 2, message_id="m2")
+
+        cancel, reason = self.manager.should_cancel(
+            plan, [target, follow_up], bot_id="bot"
+        )
+
+        self.assertTrue(cancel)
+        self.assertIn("续话", reason)
+
+    def test_react_kept_when_other_user_chimes_in(self):
+        """图主没续话，只是其他群友零星说话，简短反应仍可补一句。"""
+        target = self.message("u1", "[图片]", 0, message_id="m1")
+        _, plan = self.manager.analyze(
+            target,
+            [target],
+            bot_id="bot",
+            rich_message_only=True,
+            rich_type="image",
+        )
+        newer = self.message("u2", "路过", 2, message_id="m2")
+
+        cancel, _ = self.manager.should_cancel(
+            plan, [target, newer], bot_id="bot"
+        )
+
+        self.assertFalse(cancel)
+
     def test_decider_respects_silent_action_plan(self):
         plan = ActionPlan(
             action=ActionType.SILENT,
@@ -215,7 +253,10 @@ class ConversationFloorTests(unittest.TestCase):
         self.assertTrue(
             any("很短的即时反应" in message.content for message in request.messages)
         )
-        self.assertEqual(generator._limit_action_length("确实有点太离谱了", 6), "确实有点太离")
+        # 按词边界截断：不切进词中间（"确实有点太离谱了"→"确实有点太"）
+        cut = generator._limit_action_length("确实有点太离谱了", 6)
+        self.assertLessEqual(len(cut), 6)
+        self.assertEqual(cut, "确实有点太")
 
 
 if __name__ == "__main__":

@@ -558,7 +558,10 @@ class ReplyGenerator:
             "能用一句话说清就别用两句；不要分点、不要加解释、不要复述对方的话；"
             "偶尔超短也行（几个字），但绝不能长篇大论。\n"
             "回复中不要使用emoji表情符号，绝大多数消息应该是纯文字；"
-            "除非气氛真的很到位，否则不要加表情。"
+            "除非气氛真的很到位，否则不要加表情。\n"
+            "发送能力限制：你只能发送纯文字消息，不能发送图片、表情包、语音、视频或文件；"
+            "所以不要说「我发个表情包」「发张图给你」「传个文件」这类自己做不到的话，"
+            "想回应图片/表情包就用文字描述感受。"
         )
 
         # 参与规则 - 根据消息指向决定「该不该插嘴」
@@ -633,7 +636,7 @@ class ReplyGenerator:
 
     @staticmethod
     def _limit_action_length(text: str, max_chars: int) -> str:
-        """按行为计划限制长度，优先保留完整短句。"""
+        """按行为计划限制长度，优先保留完整短句；单句超长时按词边界截断。"""
         if not text or max_chars <= 0 or len(text) <= max_chars:
             return text
 
@@ -644,6 +647,21 @@ class ReplyGenerator:
                 break
             result += sentence
 
+        if result.strip():
+            return result.strip()
+
+        # 单句超长：按词边界截断（jieba），避免从词中间切断造成不知所云
+        # （如把「这个哈哈648一单走起」切出「这个哈哈648一」）。
+        try:
+            import jieba
+            words = [w for w in jieba.cut(text) if w.strip()]
+        except Exception:
+            words = []
+        result = ""
+        for w in words:
+            if len(result) + len(w) > max_chars:
+                break
+            result += w
         if result.strip():
             return result.strip()
         return text[:max_chars].rstrip("，,。.!！ ")
