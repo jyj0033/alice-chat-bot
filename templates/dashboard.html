@@ -2934,7 +2934,10 @@
                 const initial = (p.sender_name || '?').trim().charAt(0);
                 const created = new Date(p.created_at).toLocaleString('zh-CN', {hour12:false});
                 const updated = new Date(p.last_accessed).toLocaleString('zh-CN', {hour12:false});
-                const factCount = p.fact_count ? `<span class="badge-facts">基于 ${p.fact_count} 条自我描述</span>` : '';
+                let src = '';
+                if (p.fact_count) src += `基于 ${p.fact_count} 条自述`;
+                if (p.daily_count) src += (src ? ' + ' : '基于 ') + `${p.daily_count} 条日常发言`;
+                const factCount = src ? `<span class="badge-facts">${src}</span>` : '';
                 // 内容去掉「【用户画像 名字】」前缀，只显示提炼结果
                 let body = p.content || '';
                 body = body.replace(/^【用户画像[^】]*】/, '');

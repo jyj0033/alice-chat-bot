@@ -284,10 +284,15 @@ class GroupChatBot:
             "enabled": profile_cfg.get("enabled", True),
             "interval_minutes": int(profile_cfg.get("interval_minutes", 30)),
             "min_facts": max(1, int(profile_cfg.get("min_facts", 2))),
+            # 日常发言也参与提炼：有足够多的日常发言时，即使自述少也能画像
+            "daily_min_messages": max(3, int(profile_cfg.get("daily_min_messages", 8))),
+            "daily_window_days": max(3, int(profile_cfg.get("daily_window_days", 15))),
+            # 已有画像后，日常新增消息达到该数量才重炼（避免每次发言都刷）
+            "refresh_daily_count": max(1, int(profile_cfg.get("refresh_daily_count", 5))),
         }
         self._last_profile_distill: float = 0.0
         logger.info(f"✓ 用户画像: enabled={self._profile_config['enabled']}, "
-                    f"每{self._profile_config['interval_minutes']}分钟提炼一次")
+                    f"每{self._profile_config['interval_minutes']}分钟提炼一次（自述+日常发言）")
 
     def _init_personality(self) -> None:
         """初始化人格系统"""
@@ -1441,17 +1446,61 @@ class GroupChatBot:
             return True
         return False
 
+    def _is_meaningful_chat(self, memory) -> bool:
+        """判断一条记忆是否是有信息量的日常发言（可参与画像推断）。
+
+        - 太短 / 纯富媒体占位（图片、表情包、转发、链接摘要）没有稳定信号
+        - 只留正常聊天内容，供画像从"常聊话题 / 说话风格 / 行为习惯"中推断
+        """
+        content = (memory.content or "").strip()
+        if (memory.metadata or {}).get("is_bot"):
+            return False
+        if len(content) < 8:
+            return False
+        if content.startswith("[") and content.endswith("]"):
+            return False
+        return True
+
+    @staticmethod
+    def _strip_speaker(content: str) -> str:
+        """剥掉记忆内容开头的「昵称：」前缀（昵称可能随改群名片变化）。"""
+        if "：" in content:
+            head, rest = content.split("：", 1)
+            if len(head) <= 40 and not head.startswith(("http", "[", "【")):
+                return rest.strip()
+        return content.strip()
+
+    @staticmethod
+    def _dedupe_messages(msgs: list, cap: int) -> list:
+        """按内容去重（近似），保留时间较新的，最多 cap 条。"""
+        out: list = []
+        seen: set = set()
+        for m in msgs:  # 调用方已按时间倒序
+            key = (m.content or "")[:30]
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(m)
+            if len(out) >= cap:
+                break
+        return out
+
     async def _distill_user_profiles(self, force: bool = False) -> dict:
         """从情景记忆提炼用户画像（semantic 记忆，后台执行）。
 
-        对每个有足够个人事实的发送者，用 LLM 把TA近期的自我描述浓缩成
-        一句稳定画像。已有画像且没有新事实时跳过；force=True 强制重炼。
-        画像存为 semantic 记忆，语义检索时可被召回（问"阿狗是什么样的人"能答上）。
+        每个发送者的画像由两部分信号合成：
+        - 【自我描述】TA直接说过的关于自己的话（较可信）
+        - 【日常发言】TA的日常聊天，从中推断兴趣/性格/习惯等稳定倾向
+        已有画像且没有"新自述 + 足够新日常发言"时跳过；force=True 强制重炼。
+        画像存为 semantic 记忆，语义检索时可被召回。
         """
         result = {"distilled": 0, "skipped": 0, "error": ""}
         if not self._profile_config.get("enabled", True):
             return result
-        min_facts = self._profile_config.get("min_facts", 3)
+        min_facts = self._profile_config.get("min_facts", 2)
+        daily_min = self._profile_config.get("daily_min_messages", 8)
+        window_days = self._profile_config.get("daily_window_days", 15)
+        refresh_daily = self._profile_config.get("refresh_daily_count", 5)
         try:
             episodes = await self.memory_storage.get_all(limit=2000, memory_type="episodic")
             profiles = await self.memory_storage.get_profiles()
@@ -1460,16 +1509,20 @@ class GroupChatBot:
                 for p in profiles if p.metadata.get("sender_id")
             }
 
-            # 按发送者分组个人相关消息（排除 bot 自己的回复）
-            by_sender: dict[str, list] = {}
+            # 按发送者分组：自述 + 有信息量的日常发言
+            by_sender: dict[str, dict] = {}
             for m in episodes:
                 meta = m.metadata or {}
                 sid = meta.get("sender_id")
                 if not sid or meta.get("is_bot"):
                     continue
-                if not self._is_personal_fact(m):
-                    continue
-                by_sender.setdefault(sid, []).append(m)
+                entry = by_sender.setdefault(sid, {"self": [], "daily": [], "latest_name": ""})
+                if meta.get("sender_name"):
+                    entry["latest_name"] = meta["sender_name"]
+                if self._is_personal_fact(m):
+                    entry["self"].append(m)
+                elif self._is_meaningful_chat(m):
+                    entry["daily"].append(m)
 
             provider = self.get_active_provider()
             if not provider:
@@ -1477,59 +1530,73 @@ class GroupChatBot:
                 return result
 
             from modules.llm.base import ChatRequest
+            from datetime import timedelta
 
-            for sid, msgs in by_sender.items():
+            now = datetime.now()
+            cutoff = now - timedelta(days=window_days)
+
+            for sid, entry in by_sender.items():
+                self_facts = sorted(entry["self"], key=lambda m: m.created_at, reverse=True)
+                daily = sorted(entry["daily"], key=lambda m: m.created_at, reverse=True)
                 existing = profile_by_sender.get(sid)
-                newest = max(m.created_at for m in msgs)
-                # 已有画像且没有比它更新的个人事实 → 跳过
-                if (not force and existing and existing.created_at
-                        and newest <= existing.created_at):
+                latest_name = entry["latest_name"] or "该用户"
+
+                # 素材不足：自述少且日常发言也少 → 无可提炼
+                if len(self_facts) < min_facts and len(daily) < daily_min:
                     result["skipped"] += 1
                     continue
-                if len(msgs) < min_facts:
-                    continue
 
-                # 取最近最多 12 条、去重近似内容
-                facts = sorted(msgs, key=lambda m: m.created_at, reverse=True)[:12]
-                unique_facts: list = []
-                seen: set = set()
-                for f in facts:
-                    key = (f.content or "")[:30]
-                    if key in seen:
+                # 已有画像且没有足够新素材 → 跳过（避免每次发言都刷）
+                if not force and existing and existing.created_at:
+                    newest_self = self_facts[0].created_at if self_facts else None
+                    has_new_self = newest_self is not None and newest_self > existing.created_at
+                    new_daily = [m for m in daily if m.created_at > existing.created_at]
+                    if not has_new_self and len(new_daily) < refresh_daily:
+                        result["skipped"] += 1
                         continue
-                    seen.add(key)
-                    unique_facts.append(f)
 
-                # 当前昵称（取最新一条），剥掉「昵称：」前缀后给 LLM
-                latest_name = unique_facts[0].metadata.get("sender_name") or "该用户"
-                lines = []
-                for f in reversed(unique_facts):
-                    body = f.content or ""
-                    n = (f.metadata or {}).get("sender_name")
-                    if n and body.startswith(n + "："):
-                        body = body[len(n) + 1:]
-                    lines.append(body[:120])
-                text = "\n".join(lines)
+                # 构建样本：自述最多 12 条，日常发言限最近窗口内最多 20 条
+                unique_facts = self._dedupe_messages(self_facts, 12)
+                daily_window = [m for m in daily if m.created_at > cutoff]
+                unique_daily = self._dedupe_messages(daily_window, 20)
+
+                def render_section(msgs: list, cap_len: int = 120) -> str:
+                    return "\n".join(
+                        self._strip_speaker(m.content or "")[:cap_len] for m in reversed(msgs)
+                    )
+
+                self_text = render_section(unique_facts)
+                daily_text = render_section(unique_daily)
 
                 req = ChatRequest(temperature=0.3, max_tokens=150, top_p=0.9)
                 req.add_system(
-                    "你是用户画像提炼助手。根据群友说过的关于自己的话，提炼这个人的"
-                    "稳定个人特征（职业、喜好、习惯、家庭、性格、生活状态等），输出1-2句话。"
-                    "只写稳定事实，不要推测、不要复述原话、不要寒暄。用第三人称。"
+                    "你是用户画像提炼助手。根据群友的【自我描述】和【日常发言】，提炼这个人的"
+                    "稳定个人特征（职业、喜好、习惯、家庭、性格、生活状态、常聊话题等），输出1-2句话。\n"
+                    "- 【自我描述】是TA直接说过的关于自己的话，较可信，直接采用\n"
+                    "- 【日常发言】是TA在群里的日常聊天，从中推断兴趣、性格、习惯等长期倾向，"
+                    "不要被单条玩笑或偶然话题带偏\n"
+                    "只写稳定事实或长期倾向，不要推测、不要复述原话、不要寒暄。用第三人称。"
                 )
-                req.add_user(f"群友「{latest_name}」说过的关于自己的话：\n{text}")
+                parts = [f"群友「{latest_name}」的资料："]
+                if self_text:
+                    parts.append(f"【自我描述】\n{self_text}")
+                if daily_text:
+                    parts.append(f"【日常发言】\n{daily_text}")
+                req.add_user("\n".join(parts))
                 resp = await provider.chat(req)
                 summary = (resp.content or "").strip().strip('"\'“”')
                 if not summary:
                     result["skipped"] += 1
                     continue
 
-                now = datetime.now()
+                # 样本里最新一条的来源会话作为画像归属会话
+                sample = unique_facts + unique_daily
+                src_session = sample[0].source_session if sample else ""
                 new_profile = Memory(
                     content=f"【用户画像 {latest_name}】{summary}",
                     memory_type="semantic",
                     importance=0.8,
-                    source_session=unique_facts[0].source_session,
+                    source_session=src_session,
                     tags=["用户画像"],
                     created_at=now,
                     last_accessed=now,
@@ -1538,6 +1605,7 @@ class GroupChatBot:
                         "sender_id": sid,
                         "sender_name": latest_name,
                         "fact_count": len(unique_facts),
+                        "daily_count": len(unique_daily),
                     },
                 )
                 if existing and existing.id:
@@ -1913,7 +1981,10 @@ class GroupChatBot:
                 "profile": {
                     "enabled": True,
                     "interval_minutes": 30,
-                    "min_facts": 2
+                    "min_facts": 2,
+                    "daily_min_messages": 8,
+                    "daily_window_days": 15,
+                    "refresh_daily_count": 5
                 }
             },
             "search": {

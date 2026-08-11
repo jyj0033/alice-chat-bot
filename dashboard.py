@@ -561,6 +561,7 @@ async def get_profiles():
                 "sender_name": meta.get("sender_name", "") or "未知用户",
                 "content": p.content,
                 "fact_count": meta.get("fact_count", 0),
+                "daily_count": meta.get("daily_count", 0),
                 "created_at": p.created_at.isoformat(),
                 "last_accessed": p.last_accessed.isoformat(),
                 "source_session": p.source_session,
