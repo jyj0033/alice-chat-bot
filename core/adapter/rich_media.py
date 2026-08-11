@@ -89,6 +89,8 @@ class RichMediaEnricher:
             )
         )
         self.image_to_text_timeout = max(1.0, float(image.get("to_text_timeout", 60)))
+        # get_image 是本地文件查找，NapCat 响应很快；单独设短超时避免失败路径拖垮识别
+        self._get_image_timeout = min(10.0, max(2.0, self.image_to_text_timeout * 0.3))
         self.image_to_text_context = bool(image.get("to_text_context", True))
         self.image_context_window = max(1, int(image.get("context_window", 6)))
         self.image_max_download_bytes = max(
@@ -123,7 +125,7 @@ class RichMediaEnricher:
         *,
         directed: bool = False,
         conversation_context: str = "",
-        group_image_urls: list[str] | None = None,
+        group_image_urls: list[dict] | None = None,
     ) -> Message:
         if not self.enabled or not message.segments:
             return message
@@ -166,7 +168,10 @@ class RichMediaEnricher:
                 raise
             except Exception as exc:
                 self._stats["failures"] += 1
-                logger.debug("Rich media enrichment skipped (%s): %s", segment.type, exc)
+                if segment.type in ("image", "mface"):
+                    logger.warning("图片富媒体增强失败 (%s): %s", segment.type, exc)
+                else:
+                    logger.debug("Rich media enrichment skipped (%s): %s", segment.type, exc)
 
         if changed:
             refresh_message_content(message)
@@ -382,12 +387,12 @@ class RichMediaEnricher:
         self,
         segment: MessageSegment,
         conversation_context: str = "",
-        group_image_urls: list[str] | None = None,
+        group_image_urls: list[dict] | None = None,
     ) -> bool:
         """用视觉模型把图片转成文字描述（含意图解读），写入 segment.summary。
 
-        group_image_urls：同一人此前连续发的图片 URL。非空时把整组一起喂给
-        视觉模型判断整体含义，此时不读/不写缓存（组含义随上下文变化）。
+        group_image_urls：同一人此前连续发的图片（[{url, file}, ...]）。非空时把
+        整组一起喂给视觉模型判断整体含义，此时不读/不写缓存（组含义随上下文变化）。
         """
         image_ref = segment.unique_id or segment.url
         if not image_ref:
@@ -419,30 +424,34 @@ class RichMediaEnricher:
         self,
         segment: MessageSegment,
         conversation_context: str = "",
-        group_image_urls: list[str] | None = None,
+        group_image_urls: list[dict] | None = None,
     ) -> str:
-        """先直接传图床 URL；失败则下载→base64→data URL 重试一次。
+        """三级回退识别图片：
 
-        prompt 由「意图导向基础提示 + 消息类型提示 + 前文对话」组成，
-        让视觉模型判断图/表情包在对话中想表达什么，而不只是描述画面。
-        带 group_image_urls 时把整组图一起喂，判断组整体含义。
+        1. 直传图床 URL（当前图 + 组图）。MiniMax 等兼容端点抓取多张远程 URL 时，
+           任意一张抓不到整组就被拒（503/400），所以这只是快路径。
+        2. 全部转 base64 再传：逐张尽力下载（当前图失败走 NapCat get_image 兜底），
+           抓不到的组图直接丢弃，绝不让一张坏 URL 拖垮整组。
+        3. 组图识别失败 → 降级为仅当前图单图 base64。
+
+        prompt 由「意图导向基础提示 + 消息类型提示 + 前文对话」组成。
         """
         if self.vision_provider is None:
             return ""
 
         prompt = self._build_image_prompt(segment, conversation_context, group_image_urls)
 
-        # 组内前图也走直传；若当前图 URL 直传失败，整体降级为「仅当前图」。
-        group_urls = []
+        # 组内前图（list[dict]：{url, file}），cap 限制一次最多带几张（含当前图）
+        group_items: list[dict] = []
         if group_image_urls and self.image_group_enabled:
             cap = self.image_group_max_images - 1  # 除当前图外最多带几张
-            group_urls = [u for u in group_image_urls[:cap] if u]
+            group_items = [g for g in group_image_urls[:cap] if g.get("url")]
 
         # 1. 直传图床 URL（当前图 + 前图）
         url = segment.url
         if url:
             try:
-                text = await self._vision_chat(prompt, [url, *group_urls])
+                text = await self._vision_chat(prompt, [url, *(g["url"] for g in group_items)])
                 if text:
                     return text
             except asyncio.CancelledError:
@@ -451,19 +460,28 @@ class RichMediaEnricher:
                 if _is_sensitive_rejection(exc):
                     return SENSITIVE_IMAGE_NOTE
                 logger.debug(
-                    "Vision via URL failed (%s, %d group imgs), trying fallback: %s",
-                    url, len(group_urls), exc,
+                    "Vision via URL failed (%s, %d group imgs), trying base64: %s",
+                    url, len(group_items), exc,
                 )
 
-        # 2. 回退：下载当前图→base64→data URL（限大小，仅内存驻留，用完即弃）
-        data_url = await self._download_image_data_url(segment)
-        if not data_url:
+        # 2. 回退：全部转 base64（当前图优先 get_image 兜底，组图尽力而为，失败丢弃）
+        current_b64 = await self._download_image_data_url(segment)
+        if not current_b64:
+            logger.warning(
+                "图片下载失败，无法识别: url=%s file=%s", url, segment.file or segment.file_id
+            )
             return ""
+        group_b64s: list[str] = []
+        if group_items:
+            raw = await asyncio.gather(
+                *(self._download_group_image_base64(g) for g in group_items),
+                return_exceptions=True,
+            )
+            group_b64s = [b for b in raw if isinstance(b, str) and b]
         try:
-            # 多图调用失败时降级为仅当前图，避免前图 URL 拖垮整张识别
-            if group_urls:
+            if group_b64s:
                 try:
-                    text = await self._vision_chat(prompt, [data_url, *group_urls])
+                    text = await self._vision_chat(prompt, [current_b64, *group_b64s])
                     if text:
                         return text
                 except asyncio.CancelledError:
@@ -471,8 +489,8 @@ class RichMediaEnricher:
                 except Exception as exc:
                     if _is_sensitive_rejection(exc):
                         return SENSITIVE_IMAGE_NOTE
-                    logger.debug("Vision via group base64 failed, degrade to single: %s", exc)
-            text = await self._vision_chat(prompt, [data_url])
+                    logger.warning("组图 base64 识别失败，降级单图: %s", exc)
+            text = await self._vision_chat(prompt, [current_b64])
             if text:
                 return text
         except asyncio.CancelledError:
@@ -481,14 +499,39 @@ class RichMediaEnricher:
             if _is_sensitive_rejection(exc):
                 return SENSITIVE_IMAGE_NOTE
             self._stats["failures"] += 1
-            logger.debug("Vision via base64 failed: %s", exc)
+            logger.warning("视觉识别失败: %s", exc)
+        return ""
+
+    async def _download_group_image_base64(self, item: dict) -> str:
+        """尽力把一张组图转成 base64 data URL；失败返回空串（由调用方丢弃）。
+
+        先直连 URL；失败且有 file 时走 NapCat get_image 本地文件兜底。
+        """
+        url = str(item.get("url") or "")
+        if not url:
+            return ""
+        data = await self._http_get_bytes(url)
+        if data:
+            return _bytes_to_data_url(data, _guess_media_type(url, ""))
+        file_ref = str(item.get("file") or "")
+        if file_ref:
+            try:
+                result = await self.api_call("get_image", {"file": file_ref}, self._get_image_timeout)
+                path = result.get("path") if isinstance(result, dict) else ""
+                if path:
+                    with open(path, "rb") as f:
+                        return _bytes_to_data_url(f.read(), _guess_media_type(path, ""))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Group get_image fallback failed (%s): %s", file_ref[:40], exc)
         return ""
 
     def _build_image_prompt(
         self,
         segment: MessageSegment,
         conversation_context: str,
-        group_image_urls: list[str] | None = None,
+        group_image_urls: list[dict] | None = None,
     ) -> str:
         """构造意图导向的视觉 prompt。"""
         parts = [self.image_to_text_prompt]
@@ -527,13 +570,55 @@ class RichMediaEnricher:
         return text[:300]
 
     async def _download_image_data_url(self, segment: MessageSegment) -> str:
-        """下载图片转 base64 data URL。仅内存驻留，返回后即可释放；超限返回空串。"""
-        if aiohttp is None:
-            return ""
+        """下载当前图片转 base64 data URL。
+
+        先直连图床 URL；失败/超限时走 NapCat get_image 取本地文件兜底
+        （QQ 图床 URL 常带时效与防盗链，服务器直连失败的可靠替代）。
+        仅内存驻留，返回后即可释放；失败返回空串。
+        """
         url = segment.url
-        if not url:
+        if url and aiohttp is not None:
+            data = await self._http_get_bytes(url)
+            if data:
+                return _bytes_to_data_url(data, _sniff_media_type(data, _guess_media_type(url, "")))
+            logger.debug("Image URL download failed (%s), trying get_image", url[:80])
+        # get_image 兜底：NapCat 已把图片下载到本地，取路径读文件
+        return await self._download_image_data_url_via_get_image(segment)
+
+    async def _download_image_data_url_via_get_image(self, segment: MessageSegment) -> str:
+        """调用 NapCat get_image 取本地文件路径，读文件转 base64 data URL。"""
+        file_ref = segment.file or segment.file_id or segment.unique_id
+        if not file_ref:
             return ""
-        _validate_http_url(url)
+        try:
+            result = await self.api_call("get_image", {"file": file_ref}, self._get_image_timeout)
+            if not isinstance(result, dict):
+                return ""
+            path = result.get("path") or ""
+            if path:
+                with open(path, "rb") as f:
+                    data = f.read()
+                return _bytes_to_data_url(data, _sniff_media_type(data, _guess_media_type(path, "")))
+            # 部分实现不返回本地路径，只给 url；再用直连试一次
+            alt_url = result.get("url") or ""
+            if alt_url and aiohttp is not None:
+                data = await self._http_get_bytes(alt_url)
+                if data:
+                    return _bytes_to_data_url(data, _guess_media_type(alt_url, ""))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("get_image fallback failed (%s): %s", file_ref[:40], exc)
+        return ""
+
+    async def _http_get_bytes(self, url: str) -> bytes | None:
+        """尽力下载 URL 内容（SSRF 安全解析），超限/失败返回 None。"""
+        if aiohttp is None:
+            return None
+        try:
+            _validate_http_url(url)
+        except ValueError:
+            return None
         resolver = _SafeResolver()
         connector = aiohttp.TCPConnector(resolver=resolver, ttl_dns_cache=0)
         timeout = aiohttp.ClientTimeout(total=max(10.0, self.image_to_text_timeout * 0.5))
@@ -541,29 +626,19 @@ class RichMediaEnricher:
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 async with session.get(url, allow_redirects=True) as response:
                     if response.status < 200 or response.status >= 300:
-                        return ""
-                    content_type = response.headers.get("Content-Type", "").lower()
+                        return None
                     body = bytearray()
                     async for chunk in response.content.iter_chunked(65536):
                         body.extend(chunk)
                         if len(body) > self.image_max_download_bytes:
                             logger.debug("Image download exceeds %d bytes, skipped", self.image_max_download_bytes)
-                            return ""
-            media_type = "image/jpeg"
-            if "image/png" in content_type:
-                media_type = "image/png"
-            elif "image/gif" in content_type:
-                media_type = "image/gif"
-            elif "image/webp" in content_type:
-                media_type = "image/webp"
-            import base64
-            encoded = base64.b64encode(bytes(body)).decode("ascii")
-            return f"data:{media_type};base64,{encoded}"
+                            return None
+            return bytes(body)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.debug("Image download failed: %s", exc)
-            return ""
+            logger.debug("HTTP download failed (%s): %s", url[:80], exc)
+            return None
         finally:
             await connector.close()
 
@@ -660,6 +735,40 @@ def _is_sensitive_rejection(exc: Exception) -> bool:
     """判断视觉模型报错是否为「图片内容敏感/违规」被拒（MiniMax 等端点返回）。"""
     text = str(exc or "").lower()
     return any(token in text for token in ("sensitive", "inappropriate", "敏感", "违规"))
+
+
+def _guess_media_type(name: str, default: str = "image/jpeg") -> str:
+    """按文件名/URL 后缀猜图片 MIME 类型。"""
+    n = (name or "").lower()
+    if ".png" in n:
+        return "image/png"
+    if ".gif" in n:
+        return "image/gif"
+    if ".webp" in n:
+        return "image/webp"
+    if ".bmp" in n:
+        return "image/bmp"
+    return default or "image/jpeg"
+
+
+def _sniff_media_type(data: bytes, fallback: str = "image/jpeg") -> str:
+    """按文件魔数判断真实图片类型，防止后缀/URL 不可靠。"""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] in (b"GIF8"):
+        return "image/gif"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    return fallback or "image/jpeg"
+
+
+def _bytes_to_data_url(data: bytes, media_type: str) -> str:
+    import base64
+    return f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 class _PreviewHTMLParser(HTMLParser):

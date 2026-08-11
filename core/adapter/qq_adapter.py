@@ -196,7 +196,7 @@ class QQAdapter(PlatformAdapter):
         *,
         directed: bool = False,
         conversation_context: str = "",
-        group_image_urls: list[str] | None = None,
+        group_image_urls: list[dict] | None = None,
     ) -> Message:
         """按配置展开转发、链接标题和图片识别/意图解读。"""
         return await self.rich_media_enricher.enrich(

@@ -1061,15 +1061,20 @@ class GroupChatBot:
             logger.debug("[富媒体] %s", message.content[:120])
 
     def _record_media_trail(self, message: Message) -> None:
-        """记录消息轨迹（时间/sender/是否纯图片/图片url），用于判断连续连图。"""
+        """记录消息轨迹（时间/sender/是否纯图片/图片url+file），用于判断连续连图。
+
+        file 用于图片 URL 直连失败时走 NapCat get_image 取本地文件兜底。
+        """
         try:
             sid = message.session_id
             is_pure_image = message.rich_only and message.rich_type in ("image", "mface")
             url = ""
+            file = ""
             if is_pure_image:
                 for seg in message.segments:
-                    if seg.type in ("image", "mface") and seg.url:
-                        url = seg.url
+                    if seg.type in ("image", "mface"):
+                        url = seg.url or url
+                        file = seg.file or seg.file_id or file
                         break
             trail = self._media_trail.setdefault(sid, deque(maxlen=self._media_trail_limit))
             trail.append({
@@ -1077,13 +1082,14 @@ class GroupChatBot:
                 "sender_id": message.sender_id,
                 "is_image": is_pure_image,
                 "url": url,
+                "file": file,
                 "message_id": message.message_id,
             })
         except Exception as e:
             logger.debug("Record media trail failed: %s", e)
 
-    def _collect_group_image_urls(self, message: Message) -> list[str]:
-        """取当前图片消息之前、同一人连续发的纯图片 URL（相邻间隔≤60s）。
+    def _collect_group_image_urls(self, message: Message) -> list[dict]:
+        """取当前图片消息之前、同一人连续发的纯图片（URL+file，相邻间隔≤60s）。
 
         从轨迹中往回扫：同 sender 的纯图片且与前一条间隔在窗口内 → 收进组；
         遇到不同 sender / 非图片 / 超窗 → 停止（严格连续）。返回时间正序。
@@ -1098,7 +1104,7 @@ class GroupChatBot:
         now = time.time()
         sender = message.sender_id
         current_msg_id = getattr(message, "message_id", "") or ""
-        collected: list[str] = []
+        collected: list[dict] = []
         for entry in reversed(list(trail)):
             # 跳过当前这条消息本身（快路径已把它写入轨迹末尾）
             if entry.get("message_id") and current_msg_id and entry["message_id"] == current_msg_id:
@@ -1110,13 +1116,13 @@ class GroupChatBot:
             # 相邻间隔：该条目与其后一条（或当前消息）的时间差超过窗口则视为断组
             if now - entry["ts"] > interval:
                 break
-            collected.append(entry["url"])
+            collected.append({"url": entry["url"], "file": entry.get("file", "")})
             if len(collected) >= cap:
                 break
             now = entry["ts"]  # 向前推移，判断下一条与前一条的间隔
         collected.reverse()  # 时间正序
         if collected:
-            logger.debug("[连图] 当前图前收集 %d 张组图: %s", len(collected), collected)
+            logger.debug("[连图] 当前图前收集 %d 张组图: %s", len(collected), [c["url"] for c in collected])
         return collected
 
     def _build_image_conversation_context(self, message: Message) -> str:

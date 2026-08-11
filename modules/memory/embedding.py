@@ -6,6 +6,7 @@
 
 设计：未配置 api_key 或调用失败时返回 None，调用方自动回退到 TF-IDF。
 """
+import asyncio
 import logging
 from typing import Optional
 
@@ -29,18 +30,36 @@ class EmbeddingRerankService:
         self.batch_size = int(config.get("batch_size", 32))
         self.enabled = bool(self.api_key)
         self._session = None
+        self._session_loop = None
         self._embed_dim: Optional[int] = None
 
     async def _get_session(self):
+        """按 event loop 缓存 aiohttp session。
+
+        bot 在多个线程/event loop 里跑（QQ 接收循环、dashboard uvicorn 等），
+        跨 loop 复用同一个 aiohttp session 会在内部 asyncio.timeout 处抛
+        "Timeout context manager should be used inside a task"。因此 session 绑定
+        创建它的 loop；换 loop 时重建。旧 session 属于别的 loop，无法安全 await
+        close（会再抛 loop 错误），直接丢弃引用交给 GC 回收连接。
+        """
         import aiohttp
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+        loop = asyncio.get_running_loop()
+        session = self._session
+        if session is not None and not session.closed and self._session_loop is loop:
+            return session
+        self._session = aiohttp.ClientSession()
+        self._session_loop = loop
         return self._session
 
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+        session, self._session = self._session, None
+        if session is not None and not session.closed:
+            try:
+                # 只允许在 session 所属的 loop 里关闭；跨 loop 交给 GC
+                if getattr(self, "_session_loop", None) is asyncio.get_running_loop():
+                    await session.close()
+            except Exception:
+                pass
 
     # ---------- 嵌入 ----------
 
@@ -86,7 +105,6 @@ class EmbeddingRerankService:
             return []
         bs = self.batch_size
         chunks = [texts[i:i + bs] for i in range(0, len(texts), bs)]
-        import asyncio
         results = await asyncio.gather(*(self.embed(c) for c in chunks))
         if any(r is None for r in results):
             return None

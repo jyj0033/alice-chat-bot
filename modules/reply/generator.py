@@ -585,6 +585,15 @@ class ReplyGenerator:
             if emotion_guide:
                 request.add_system(emotion_guide)
 
+        # 被嫌弃/被质疑降级：群友明显对 bot 不满或没看懂（质疑、吐槽、让 bot 别说了）时，
+        # 别嘴硬解释、别重复同一件事，简短道歉/自嘲/转移话题。
+        if self._is_user_frustrated(context_prompt, current_message):
+            request.add_system(
+                "群友似乎没看懂你的话或对你不太满意（可能在质疑、吐槽、让你别说了）。"
+                "这时候别再嘴硬解释、别再强调同一件事、别复述自己的原话；"
+                "简短地道歉一句、自嘲一下或直接转移话题，点到为止。"
+            )
+
         # 添加会话上下文
         if session_context:
             context_info = self._format_session_context(session_context)
@@ -689,6 +698,31 @@ class ReplyGenerator:
             guides.append("你心情不太好，回避沉重话题")
 
         return "，".join(guides) if guides else ""
+
+    # 群友对 bot 不满/没看懂的信号词（命中即降级为道歉/自嘲/转移话题）
+    _FRUSTRATION_MARKERS = (
+        "在说什么", "说什么呢", "听不懂", "不知所云", "没看懂", "没明白",
+        "你没事吧", "气笑了", "破防", "别说了", "别重复", "别解释", "反复强调",
+        "闭嘴", "滚", "烦不烦", "有毛病", "有病", "无语", "又来了",
+        "别气", "再强调", "你干嘛", "别闹", "烦死了", "就这", "离谱",
+    )
+
+    def _is_user_frustrated(self, context_prompt: str, current_message: str) -> bool:
+        """检测群友是否对 bot 不满/没看懂。
+
+        扫描当前消息 + 上下文最后几行（群友刚发的、bot 自己的回复也可能带
+        "别气/闭嘴"等词，命中也不影响——降级只软化语气，不会强制道歉）。
+        """
+        tail = ""
+        if context_prompt:
+            lines = [ln.strip() for ln in context_prompt.splitlines() if ln.strip()]
+            tail = "\n".join(lines[-4:])
+        text = f"{current_message}\n{tail}"
+        hits = [m for m in self._FRUSTRATION_MARKERS if m in text]
+        if hits:
+            logger.debug("[降级] 检测到群友不满信号: %s", hits)
+            return True
+        return False
 
     def _clean_thinking_process(self, text: str) -> str:
         """清理思考过程（如 DeepSeek 的 <think>...</think>）"""
