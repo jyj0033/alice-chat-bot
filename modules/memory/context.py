@@ -127,41 +127,66 @@ class ContextWindow:
         include_bot: bool = True,
         max_messages: int = 30
     ) -> str:
-        """构建对话文本，每条消息带 [时间] 前缀，重名用户用 昵称(id) 区分"""
+        """构建对话文本，每条消息带 [时间] 前缀。
+
+        身份归一：同一 QQ 号改群名片后，窗口里会同时出现"旧名/新名"，
+        若原样输出，LLM 会把一个人当成两个人。这里把每个 QQ 号统一到
+        "最近一次的昵称"，并在 改名/重名 时附加 (QQ尾号) 绑定身份。
+        """
         lines = []
         recent = self.get_recent(max_messages)
         now = datetime.now()
 
-        # 检测重名：同一昵称是否被多个不同 QQ 号使用
+        # id → 窗口内出现过的全部昵称；昵称 → 使用它的全部 id
+        id_to_names: dict[str, set] = {}
         name_to_ids: dict[str, set] = {}
         for msg in recent:
             if msg.is_bot:
                 continue
+            if msg.sender_id:
+                id_to_names.setdefault(msg.sender_id, set()).add(msg.sender_name)
             name_to_ids.setdefault(msg.sender_name, set()).add(msg.sender_id)
-        dup_names = {n for n, ids in name_to_ids.items() if len(ids) > 1}
 
-        # 建立 QQ号→昵称 映射（用于标注消息指向，bot 也在内）
+        # 每个 id 的规范昵称 = 该 id 最近一条消息的昵称（recent 时间正序，覆盖后为最新）
+        canonical_name: dict[str, str] = {}
+        for msg in recent:
+            if not msg.is_bot and msg.sender_id:
+                canonical_name[msg.sender_id] = msg.sender_name
+
+        # 需要加 (QQ尾号) 区分的两种情形：
+        #  1) 重名：同一昵称被多个 id 使用
+        #  2) 改名：同一 id 在窗口内出现多个昵称（群名片变了）→ 用尾号把两个名字绑成同一人
+        dup_names = {n for n, ids in name_to_ids.items() if len(ids) > 1}
+        renamed_ids = {id_ for id_, names in id_to_names.items() if len(names) > 1}
+
+        def display_name(msg) -> str:
+            """消息发言者的显示名：规范昵称，改名/重名时附 (QQ尾号)。"""
+            if msg.is_bot:
+                return bot_name
+            name = canonical_name.get(msg.sender_id, msg.sender_name)
+            if not msg.sender_id:
+                return name
+            if msg.sender_id in renamed_ids or name in dup_names:
+                return f"{name}({msg.sender_id[-4:]})"
+            return name
+
+        # 建立 QQ号→显示名 映射（回复指向标注也用规范名）
         qq_to_name: dict[str, str] = {}
         for msg in recent:
             if msg.sender_id:
-                qq_to_name[msg.sender_id] = bot_name if msg.is_bot else msg.sender_name
+                qq_to_name[msg.sender_id] = display_name(msg)
 
         # message_id → 发送者，用于 reply 段只有消息 ID、没有发送者 QQ 的情况。
         message_id_to_name: dict[str, str] = {}
         for msg in recent:
             if msg.message_id:
-                message_id_to_name[str(msg.message_id)] = (
-                    bot_name if msg.is_bot else msg.sender_name
-                )
+                message_id_to_name[str(msg.message_id)] = display_name(msg)
 
         for msg in recent:
             if not include_bot and msg.is_bot:
                 continue
 
-            speaker = bot_name if msg.is_bot else msg.sender_name
-            # 重名时用 昵称(QQ尾号) 区分，让 LLM 知道是不同的人
-            if not msg.is_bot and msg.sender_name in dup_names and msg.sender_id:
-                speaker = f"{msg.sender_name}({msg.sender_id[-4:]})"
+            speaker = display_name(msg)
 
             # 标注回复指向：这条消息是"回复谁"的（A→B，或 →@bot）
             pointer = ""
@@ -303,10 +328,24 @@ class ContextManager:
 
         # 2. 相关记忆（带发生时间，明确是旧事）
         if memories:
+            # 窗口内每个 id 的最新昵称，用于把记忆里改名前存下的旧昵称改成现在的称呼，
+            # 避免"记忆里叫小明、最近对话里叫明哥"，bot 以为是两个人。
+            id_name: dict[str, str] = {}
+            for m in window.messages:
+                if m.sender_id and not m.is_bot:
+                    id_name[m.sender_id] = m.sender_name
             mem_lines = []
             for m in memories[:5]:
+                content = m.content
+                meta = m.metadata or {}
+                sid = meta.get("sender_id")
+                if sid and sid in id_name:
+                    old = meta.get("sender_name")
+                    new = id_name[sid]
+                    if old and old != new and content.startswith(old + "："):
+                        content = new + content[len(old):]
                 t = format_message_time(m.created_at, now)
-                mem_lines.append(f"- [{t}] {m.content}")
+                mem_lines.append(f"- [{t}] {content}")
             parts.append(
                 "[你的记忆]（这些是你记得的旧事，[时间]是事情发生的时间，越久远的记忆越模糊）\n"
                 + "\n".join(mem_lines)
