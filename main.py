@@ -981,6 +981,9 @@ class GroupChatBot:
                     reply_to_qq=message.sender_id,  # bot 回复的是当前这条消息
                 )
 
+                # bot 的回复也写入长期记忆，让会话历史两侧完整
+                self._store_bot_memory(session_id, sent_reply)
+
                 # 疲劳收尾只在主回复成功后发送；成功后重置，避免连续多轮重复说“先走了”。
                 if (
                     all_segments_sent
@@ -1000,6 +1003,8 @@ class GroupChatBot:
                         )
                         self.fatigue_manager.get_state(session_id).reset()
                         logger.info(f"[疲劳] {closing_msg}")
+                        # 疲劳收尾消息同样入历史
+                        self._store_bot_memory(session_id, closing_msg)
             else:
                 logger.error("Failed to send reply")
                 if direction == "to_bot":
@@ -1206,6 +1211,38 @@ class GroupChatBot:
                 logger.debug(f"Saved long-term memory: importance={memory.importance:.2f}")
             except Exception as e:
                 logger.error(f"Failed to save memory: {e}")
+
+        # 不阻塞消息处理主流程
+        asyncio.create_task(_save())
+
+    def _store_bot_memory(self, session_id: str, content: str) -> None:
+        """把 bot 自己发出的消息写入 SQLite 情景记忆（异步后台执行）。
+
+        用户消息走 _store_long_term_memory（按重要性筛选）；bot 回复全部保存，
+        保证会话历史两侧完整（不依赖内存窗口，重启后仍在）。重要性略低，
+        语义召回时以群友的消息为主，不至于被 bot 闲聊刷屏。
+        """
+        content = content.strip()
+        if not content:
+            return
+        self_id = str(self.config.get("qq", {}).get("self_id", ""))
+        memory = Memory(
+            content=f"{self.personality.name}：{content[:200]}",
+            memory_type="episodic",
+            importance=0.45,
+            source_session=session_id,
+            metadata={
+                "sender_id": self_id,
+                "sender_name": self.personality.name,
+                "is_bot": True,
+            },
+        )
+
+        async def _save():
+            try:
+                await self.memory_storage.store(memory)
+            except Exception as e:
+                logger.error(f"Failed to save bot memory: {e}")
 
         # 不阻塞消息处理主流程
         asyncio.create_task(_save())

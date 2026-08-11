@@ -468,17 +468,22 @@ def _window_msg_to_dict(m) -> dict:
 
 
 def _memory_to_msg_dict(mem) -> dict:
-    """episodic 记忆即一条消息：content 形如「昵称：内容」，metadata 保留发送者信息。"""
+    """episodic 记忆即一条消息：content 形如「昵称：内容」，metadata 保留发送者信息。
+
+    bot 自己发出的消息 metadata 带 is_bot=True，据此渲染为 bot 发言侧。
+    """
     content = mem.content or ""
     meta = mem.metadata or {}
     sender = meta.get("sender_name") or ""
+    is_bot = bool(meta.get("is_bot"))
     body = content
     if sender and content.startswith(sender + "："):
         body = content[len(sender) + 1:]
+    fallback = "爱丽丝" if is_bot else "历史记录"
     return {
-        "sender": sender or "历史记录",
+        "sender": sender or fallback,
         "content": body or content,
-        "is_bot": False,
+        "is_bot": is_bot,
         "timestamp": mem.created_at.isoformat(),
         "from_history": True,
     }
