@@ -259,8 +259,8 @@ class ReplyGenerator:
                 reply = response.content.strip()
             except Exception as e:
                 logger.error(f"LLM error: {e}", exc_info=True)
-                if direction == "group":
-                    # 群友互聊场景 LLM 挂了 → 安静潜水，比说错话好
+                if direction != "to_bot":
+                    # 群友互聊/推断的延续对话场景 LLM 挂了 → 安静潜水，比说错话好
                     return None
                 reply = self._get_fallback_reply()
 
@@ -278,7 +278,7 @@ class ReplyGenerator:
                 logger.error(f"LLM fallback error: {e}", exc_info=True)
                 reply2 = ""
             if self._has_tool_markup(reply2) or not reply2:
-                if direction == "group":
+                if direction != "to_bot":
                     return None
                 reply = self._get_fallback_reply()
             else:
@@ -682,6 +682,15 @@ class ReplyGenerator:
                 "参与规则：当前这条消息是明确对你说的（提到了你、@了你或回复了你）。"
                 "你应该正常回应，自然说话即可，不用沉默。"
             )
+        if direction == "to_bot_implicit":
+            return (
+                "参与规则：对方刚刚还在和你对话，这条消息很可能是接着对你说的，"
+                "但也可能是TA在补完自己上一句话（比如把一句话拆成两条发），"
+                "或者转头和别的群友说话。结合上下文判断：\n"
+                "1. 确实是对你说的 → 自然回应；\n"
+                "2. 更像是TA自己话的一部分、或和你无关 → 请只输出 <silent> 保持沉默"
+                "（必须单独输出，不能夹杂其他文字）。"
+            )
         return (
             "参与规则：当前这条消息是群友之间的话（可能是两人互聊、多人互聊，也可能是一个人自言自语），"
             "不是明确对你说的。\n"
@@ -754,11 +763,12 @@ class ReplyGenerator:
         self._last_frustrated[session_id] = time.time()
 
     def _is_bot_line(self, line: str) -> bool:
-        """判断对话记录里的一行是否是 bot 自己说的（形如「[刚刚] 爱丽丝：...」）。"""
+        """判断对话记录里的一行是否是 bot 自己说的（形如「[刚刚] 爱丽丝(你)：...」）。"""
         if not self.bot_name:
             return False
         return bool(re.match(
-            r"^\[[^\]]+\]\s*" + re.escape(self.bot_name) + r"\s*[：:]", line
+            r"^\[[^\]]+\]\s*" + re.escape(self.bot_name) + r"(?:\(你\))?\s*[：:]",
+            line,
         ))
 
     def _is_user_frustrated(
@@ -779,7 +789,7 @@ class ReplyGenerator:
         - bot 自己的回复常带「离谱」这类词，绝不能把自己的话当成被嫌弃。
         - 富媒体识别摘要不计入（那是描述图片情绪，不是嫌弃 bot）。
         """
-        if direction == "to_bot":
+        if direction in ("to_bot", "to_bot_implicit"):
             current = self._strip_rich_descriptions(current_message)
             hits = [m for m in self._FRUSTRATION_MARKERS if m in current]
             if hits:

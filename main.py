@@ -659,7 +659,7 @@ class GroupChatBot:
         # === 3. 调度回复生成（后台任务，避免阻塞接收循环） ===
         current = self._reply_tasks.get(session_id)
         if current and not current.done():
-            if decision["direction"] == "to_bot":
+            if decision["direction"].startswith("to_bot"):
                 # 正在生成时又来了更强的"对我说"信号 → 取消旧任务改回新消息
                 current.cancel()
                 self._reply_tasks[session_id] = asyncio.create_task(
@@ -822,8 +822,15 @@ class GroupChatBot:
         has_emergency = "紧急" in trigger_reasons
 
         must_reply = is_private or message.mentioned_me or quoted_bot or forced or has_emergency
-        is_addressed = must_reply or (has_name and has_question) or continuing
-        direction = "to_bot" if is_addressed else "group"
+        if must_reply or (has_name and has_question):
+            direction = "to_bot"
+        elif continuing:
+            # 延续对话是推断出来的指向：对方虽然刚和 bot 聊过，但这条也可能是
+            # 在补完自己上一句话（QQ 常见断句打字）或转头和别人说话。
+            # 用 implicit 档让 LLM 结合上下文判断，并保留沉默权。
+            direction = "to_bot_implicit"
+        else:
+            direction = "group"
         logger.debug(f"[指向] {direction} (触发: {trigger_reasons}, 延续对话={continuing})")
 
         return {

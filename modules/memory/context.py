@@ -160,9 +160,14 @@ class ContextWindow:
         renamed_ids = {id_ for id_, names in id_to_names.items() if len(names) > 1}
 
         def display_name(msg) -> str:
-            """消息发言者的显示名：规范昵称，改名/重名时附 (QQ尾号)。"""
+            """消息发言者的显示名：规范昵称，改名/重名时附 (QQ尾号)。
+
+            bot 自己的发言标注「(你)」：不标的话，LLM 容易把「爱丽丝」的
+            历史发言当成别的群友说的，出现自我矛盾（刚说"我还没抽"，
+            下一句像劝别人一样说"抽就完事了"）。
+            """
             if msg.is_bot:
-                return bot_name
+                return f"{bot_name}(你)"
             name = canonical_name.get(msg.sender_id, msg.sender_name)
             if not msg.sender_id:
                 return name
@@ -371,7 +376,9 @@ class ContextManager:
         if conversation:
             parts.append(
                 "[最近对话]（[时间]表示距现在多久，如\"昨天 20:15\"是昨晚的事；"
-                "标注\"回@某人\"表示回复对象，标注\"对你说\"表示消息明确指向你）\n"
+                "标注\"回@某人\"表示回复对象，标注\"对你说\"表示消息明确指向你；"
+                f"「{bot_name}(你)」开头的是你自己说过的话——延续自己的立场，"
+                "不要把自己的话当成别人说的，不要重复或反驳自己）\n"
                 + conversation
             )
 

@@ -307,11 +307,35 @@ class HumanizationLogicTests(unittest.TestCase):
         generator._last_frustrated.clear()
         tail = (
             "[最近对话]\n[刚刚] 小明：百度热搜什么时候能正常点\n"
-            "[刚刚] 爱丽丝：百度热搜是真的离谱\n"
+            "[刚刚] 爱丽丝(你)：百度热搜是真的离谱\n"
             "[刚刚] 小红：确实\n"
             "[刚刚] 小明：晚上吃什么"
         )
         self.assertFalse(generator._is_user_frustrated("g1", tail, "晚上吃什么"))
+
+    def test_bot_own_lines_are_marked_as_self(self):
+        """对话记录里 bot 自己的发言标注「(你)」，并在头部说明，
+        避免 LLM 把自己的历史发言当成别的群友说的话。"""
+        manager = ContextManager()
+        manager.add_message("group_g1", "u1", "小明", "这个是冰之女王", message_id="m1")
+        manager.add_message(
+            "group_g1", "bot", "爱丽丝", "那个我好像还没抽", is_bot=True
+        )
+        text = manager.get_window("group_g1").build_conversation_text("爱丽丝")
+        self.assertIn("爱丽丝(你)：那个我好像还没抽", text)
+
+        prompt = manager.build_context_prompt("group_g1", bot_name="爱丽丝")
+        self.assertIn("你自己说过的话", prompt)
+
+    def test_implicit_direction_allows_silence(self):
+        """延续对话推断出的指向（to_bot_implicit）允许 LLM 判断后沉默；
+        明确对bot说（to_bot）则不给沉默选项。"""
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
+        implicit = generator._build_participation_guide("to_bot_implicit")
+        self.assertIn("<silent>", implicit)
+        self.assertIn("补完自己上一句", implicit)
+        explicit = generator._build_participation_guide("to_bot")
+        self.assertNotIn("<silent>", explicit)
 
     def test_bystander_banter_does_not_trigger_frustration(self):
         """群友互聊里的吐槽（bot 没参与、没被指向）不该让 bot 道歉。"""
