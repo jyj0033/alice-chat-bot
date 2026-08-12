@@ -8,6 +8,7 @@ import json
 import logging
 import random
 import re
+import time
 from typing import Optional, Dict, Any
 
 from modules.llm.base import ChatMessage, ChatRequest, ChatResponse
@@ -186,6 +187,9 @@ class ReplyGenerator:
         self.replies_filtered = 0
         self.search_calls = 0
 
+        # "被嫌弃"降级按 session 冷却，避免道歉一次后反复道歉
+        self._last_frustrated: Dict[str, float] = {}
+
     # 富媒体识别描述（图片/表情包等）不能当搜索词：描述里常含"角色""是什么"等
     # 触发词，会把整段图片描述拿去搜，既无意义又浪费限频额度。
     MEDIA_DESCRIPTION_PREFIXES = (
@@ -227,6 +231,7 @@ class ReplyGenerator:
             session_context,
             direction,
             action_plan,
+            session_id,
         )
 
         # 2. 联网搜索：先让 LLM 判断这条回复是否需要联网（关键词太局限且易误判，
@@ -525,6 +530,7 @@ class ReplyGenerator:
         session_context: Dict[str, Any] = None,
         direction: str = "to_bot",
         action_plan: Dict[str, Any] = None,
+        session_id: str = "",
     ) -> ChatRequest:
         """构建 LLM 请求"""
 
@@ -590,7 +596,7 @@ class ReplyGenerator:
 
         # 被嫌弃/被质疑降级：群友明显对 bot 不满或没看懂（质疑、吐槽、让 bot 别说了）时，
         # 别嘴硬解释、别重复同一件事，简短道歉/自嘲/转移话题。
-        if self._is_user_frustrated(context_prompt, current_message):
+        if self._is_user_frustrated(session_id, context_prompt, current_message):
             request.add_system(
                 "群友似乎没看懂你的话或对你不太满意（可能在质疑、吐槽、让你别说了）。"
                 "这时候别再嘴硬解释、别再强调同一件事、别复述自己的原话；"
@@ -725,20 +731,50 @@ class ReplyGenerator:
         "别气", "再强调", "你干嘛", "别闹", "烦死了", "就这", "离谱",
     )
 
-    def _is_user_frustrated(self, context_prompt: str, current_message: str) -> bool:
+    # 富媒体识别摘要（[图片，内容：...]/[表情包，内容：...]）里常带
+    # "无语/就这/离谱"等情绪词——那是 bot 对图片/表情包的描述文本，
+    # 不是群友在嫌弃 bot。扫描不满信号前先剥掉，避免对一张无关表情包乱道歉。
+    _RICH_DESC_RE = re.compile(r"\[[^\[\]]*，内容：[^\[\]]*\]")
+
+    # 上下文尾巴命中后的冷却：已经按"被嫌弃"降级过一次后，短时间内不再反复道歉。
+    _FRUSTRATION_COOLDOWN = 300.0
+
+    @staticmethod
+    def _strip_rich_descriptions(text: str) -> str:
+        return ReplyGenerator._RICH_DESC_RE.sub("", text or "")
+
+    def _frustration_in_cooldown(self, session_id: str) -> bool:
+        last = self._last_frustrated.get(session_id, 0.0)
+        return (time.time() - last) < self._FRUSTRATION_COOLDOWN
+
+    def _mark_frustrated(self, session_id: str) -> None:
+        self._last_frustrated[session_id] = time.time()
+
+    def _is_user_frustrated(self, session_id: str, context_prompt: str, current_message: str) -> bool:
         """检测群友是否对 bot 不满/没看懂。
 
-        扫描当前消息 + 上下文最后几行（群友刚发的、bot 自己的回复也可能带
-        "别气/闭嘴"等词，命中也不影响——降级只软化语气，不会强制道歉）。
+        当前消息直接命中 → 一定降级；上下文尾巴命中（思考期间群友的质疑）
+        → 降级但带冷却，避免 bot 道歉一次后对后续无关消息反复道歉。
+        富媒体识别摘要不计入（那是描述图片情绪，不是嫌弃 bot）。
         """
+        current = self._strip_rich_descriptions(current_message)
+        hits = [m for m in self._FRUSTRATION_MARKERS if m in current]
+        if hits:
+            logger.debug("[降级] 当前消息命中不满信号: %s", hits)
+            self._mark_frustrated(session_id)
+            return True
+
         tail = ""
         if context_prompt:
             lines = [ln.strip() for ln in context_prompt.splitlines() if ln.strip()]
-            tail = "\n".join(lines[-4:])
-        text = f"{current_message}\n{tail}"
-        hits = [m for m in self._FRUSTRATION_MARKERS if m in text]
-        if hits:
-            logger.debug("[降级] 检测到群友不满信号: %s", hits)
+            tail = "\n".join(self._strip_rich_descriptions(l) for l in lines[-4:])
+        tail_hits = [m for m in self._FRUSTRATION_MARKERS if m in tail]
+        if tail_hits:
+            if self._frustration_in_cooldown(session_id):
+                logger.debug("[降级] 尾巴命中但冷却中，不再重复道歉: %s", tail_hits)
+                return False
+            logger.debug("[降级] 上下文尾巴命中不满信号: %s", tail_hits)
+            self._mark_frustrated(session_id)
             return True
         return False
 

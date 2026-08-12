@@ -272,6 +272,35 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertEqual(reply.reply_to_qq, "7")
         self.assertEqual(reply.content, "回复内容")
 
+    # === "被嫌弃降级" 触发判定 ===
+
+    def test_sticker_description_does_not_trigger_frustration(self):
+        """[表情包，内容：...无语...] 是对图片情绪的描述，不是群友嫌弃 bot。"""
+        generator = ReplyGenerator(llm_provider=None)
+        sticker = (
+            '[表情包，内容：白发角色闭眼捂脸、表情痛苦崩溃，'
+            '表达极度崩溃、无语自闭的情绪，回应仿生猫连歪三次抽卡的惨状]'
+        )
+        self.assertFalse(generator._is_user_frustrated("g1", "", sticker))
+
+    def test_real_frustration_triggers(self):
+        generator = ReplyGenerator(llm_provider=None)
+        self.assertTrue(generator._is_user_frustrated("g1", "", "你在说什么呢"))
+
+    def test_tail_frustration_fires_once_per_session(self):
+        """上下文尾巴命中降级，但同 session 短时间内不反复道歉。"""
+        generator = ReplyGenerator(llm_provider=None)
+        generator._last_frustrated.clear()
+        tail = (
+            "[最近对话]\n[今天 00:00] 小明: 歪三次还抽\n"
+            "[今天 00:00] 爱丽丝: 这卡池有毒吧\n"
+            "[今天 00:00] 小明: TMD爱丽丝\n"
+            "[今天 00:00] 小明: 就这"
+        )
+        self.assertTrue(generator._is_user_frustrated("g1", tail, ""))
+        self.assertFalse(generator._is_user_frustrated("g1", tail, ""))
+        self.assertTrue(generator._is_user_frustrated("g2", tail, ""))
+
 
 if __name__ == "__main__":
     unittest.main()
