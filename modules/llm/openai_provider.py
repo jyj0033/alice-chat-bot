@@ -88,6 +88,16 @@ class OpenAIProvider(LLMProvider):
             # 发送请求
             response = await self.client.chat.completions.create(**kwargs)
 
+            # 端点路径配错（如 base_url 少了 /v1）时，部分网关会用 200 返回
+            # HTML 页面，SDK 会把非 JSON 响应原样返回成字符串。转成可行动的
+            # 报错，而不是让上层看到 'str' object has no attribute 'choices'。
+            if isinstance(response, str):
+                snippet = response[:80].replace("\n", " ")
+                raise ValueError(
+                    f"LLM 端点返回了非 JSON 响应，请检查 base_url 是否缺少 /v1 "
+                    f"路径（当前收到: {snippet}...）"
+                )
+
             message = response.choices[0].message
             # Claude 兼容格式响应解析
             if self.provider_type in ("anthropic", "claude", "minimax"):

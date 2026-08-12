@@ -36,7 +36,10 @@ class ChatMessage:
 class ChatRequest:
     """聊天请求"""
     messages: list[ChatMessage] = field(default_factory=list)
-    model: str = "gpt-4o"
+    # 默认留空：provider 侧统一用 request.model or self.model 兜底到自己
+    # 配置的模型。以前默认 "gpt-4o" 恒为真，会压过 provider 配置，导致
+    # 纪要/画像/测试等未显式传 model 的调用向端点请求 gpt-4o。
+    model: str = ""
     temperature: float = 0.8
     max_tokens: int = 500
     top_p: float = 0.9
