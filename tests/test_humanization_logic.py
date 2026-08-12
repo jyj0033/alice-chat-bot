@@ -8,7 +8,7 @@ from modules.memory.context import ContextManager
 from modules.personality.emotional_state import Emotion, EmotionalManager
 from modules.reply.generator import ReplyGenerator
 from modules.social.attention import AttentionManager
-from modules.social.awareness import SocialContext
+from modules.social.awareness import SocialContext, TopicAnalyzer, TriggerDetector
 from modules.social.enhanced_decider import EnhancedSpeakingDecider
 from modules.social.fatigue import FatigueManager
 
@@ -276,7 +276,7 @@ class HumanizationLogicTests(unittest.TestCase):
 
     def test_sticker_description_does_not_trigger_frustration(self):
         """[表情包，内容：...无语...] 是对图片情绪的描述，不是群友嫌弃 bot。"""
-        generator = ReplyGenerator(llm_provider=None)
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
         sticker = (
             '[表情包，内容：白发角色闭眼捂脸、表情痛苦崩溃，'
             '表达极度崩溃、无语自闭的情绪，回应仿生猫连歪三次抽卡的惨状]'
@@ -284,12 +284,12 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertFalse(generator._is_user_frustrated("g1", "", sticker))
 
     def test_real_frustration_triggers(self):
-        generator = ReplyGenerator(llm_provider=None)
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
         self.assertTrue(generator._is_user_frustrated("g1", "", "你在说什么呢"))
 
     def test_tail_frustration_fires_once_per_session(self):
         """上下文尾巴命中降级，但同 session 短时间内不反复道歉。"""
-        generator = ReplyGenerator(llm_provider=None)
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
         generator._last_frustrated.clear()
         tail = (
             "[最近对话]\n[今天 00:00] 小明: 歪三次还抽\n"
@@ -300,6 +300,84 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertTrue(generator._is_user_frustrated("g1", tail, ""))
         self.assertFalse(generator._is_user_frustrated("g1", tail, ""))
         self.assertTrue(generator._is_user_frustrated("g2", tail, ""))
+
+    def test_bot_own_marker_words_do_not_trigger_frustration(self):
+        """bot 自己的回复常带「离谱」等词，不能把自己的话当成被嫌弃。"""
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
+        generator._last_frustrated.clear()
+        tail = (
+            "[最近对话]\n[刚刚] 小明：百度热搜什么时候能正常点\n"
+            "[刚刚] 爱丽丝：百度热搜是真的离谱\n"
+            "[刚刚] 小红：确实\n"
+            "[刚刚] 小明：晚上吃什么"
+        )
+        self.assertFalse(generator._is_user_frustrated("g1", tail, "晚上吃什么"))
+
+    def test_bystander_banter_does_not_trigger_frustration(self):
+        """群友互聊里的吐槽（bot 没参与、没被指向）不该让 bot 道歉。"""
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
+        generator._last_frustrated.clear()
+        tail = (
+            "[最近对话]\n[刚刚] 小明：这boss设计有病吧\n"
+            "[刚刚] 小红：无语了\n"
+            "[刚刚] 小明：就这就这\n"
+            "[刚刚] 小红：太离谱了"
+        )
+        # 尾巴没有任何一行指向 bot，bot 也没发过言 → 不降级
+        self.assertFalse(generator._is_user_frustrated("g1", tail, ""))
+        # bot 只是随机插话（direction=group）时，当前消息的吐槽词也不降级
+        self.assertFalse(
+            generator._is_user_frustrated("g1", "", "太离谱了", direction="group")
+        )
+        # 但明确对 bot 说的质疑仍然降级
+        self.assertTrue(
+            generator._is_user_frustrated("g1", "", "你在说什么呢", direction="to_bot")
+        )
+
+    def test_directed_line_in_tail_triggers_frustration(self):
+        """尾巴里标注"(对你说)"的质疑行，即使 bot 不是刚发言也算数。"""
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
+        generator._last_frustrated.clear()
+        tail = (
+            "[最近对话]\n[刚刚] 小明：随便聊聊\n"
+            "[刚刚] 小红(对你说)：你在说什么呢\n"
+            "[刚刚] 小明：哈哈\n"
+            "[刚刚] 小红：草"
+        )
+        self.assertTrue(generator._is_user_frustrated("g3", tail, ""))
+
+    # === 话题关键词与紧急词判定 ===
+
+    def test_descriptive_topic_config_matches_keywords(self):
+        """配置里的描述式话题（带括号/斜杠）应拆成关键词参与匹配。"""
+        analyzer = TopicAnalyzer(
+            interested_topics=[
+                "游戏（什么类型都聊，手游端游主机都OK）",
+                "技术/编程",
+            ],
+            bored_topics=["微商/广告/引流", "无脑键政"],
+        )
+        self.assertGreater(analyzer.analyze_relevance("昨晚肝了一晚上手游"), 0.5)
+        self.assertGreater(analyzer.analyze_relevance("最近在学编程"), 0.5)
+        self.assertLess(analyzer.analyze_relevance("有人在群里发广告"), 0.5)
+        self.assertLess(analyzer.analyze_relevance("别在群里键政了"), 0.5)
+        self.assertAlmostEqual(analyzer.analyze_relevance("今晚吃火锅吗"), 0.5)
+
+    def test_meme_urgency_words_are_not_emergency(self):
+        """「他急了」「笑死救命」是玩梗，不能当成紧急求助强制回复。"""
+        detector = TriggerDetector(bot_nickname="爱丽丝")
+        for text in ("他急了他急了", "笑死救命", "救命哈哈哈这也太逗了"):
+            context = SocialContext(message_content=text)
+            result = detector.detect(context)
+            self.assertFalse(context.is_emergency, text)
+            self.assertNotIn("紧急", result["reasons"], text)
+
+    def test_genuine_emergency_still_detected(self):
+        detector = TriggerDetector(bot_nickname="爱丽丝")
+        context = SocialContext(message_content="有人晕倒了救命")
+        result = detector.detect(context)
+        self.assertTrue(context.is_emergency)
+        self.assertIn("紧急", result["reasons"])
 
 
 if __name__ == "__main__":

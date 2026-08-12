@@ -120,13 +120,21 @@ class TriggerDetector:
             priority += 0.3
 
         # 6. 紧急标记
-        emergency_markers = ["救命", "紧急", "SOS", "帮帮忙", "急"]
-        for marker in emergency_markers:
-            if marker in context.message_content:
-                reasons.append("紧急")
-                priority += 0.5
-                context.is_emergency = True
-                break
+        # 「急」「救命」在群聊里多为玩梗（"他急了""笑死救命"），不能一律当紧急：
+        # 单字「急」不再触发；「救命」伴随笑点词时视为玩梗，不算紧急。
+        emergency_markers = ["紧急", "SOS", "帮帮忙"]
+        laugh_markers = ("笑", "哈", "草", "乐", "xs", "hhh")
+        is_emergency = any(
+            marker in context.message_content for marker in emergency_markers
+        )
+        if not is_emergency and "救命" in context.message_content:
+            lowered = context.message_content.lower()
+            if not any(l in lowered for l in laugh_markers):
+                is_emergency = True
+        if is_emergency:
+            reasons.append("紧急")
+            priority += 0.5
+            context.is_emergency = True
 
         # 归一化优先级
         priority = min(1.0, priority)
@@ -196,26 +204,70 @@ class AmbienceAnalyzer:
 
 
 class TopicAnalyzer:
-    """话题分析器"""
+    """话题分析器
+
+    配置里的话题常写成描述句（如「游戏（什么类型都聊，手游端游主机都OK）」），
+    整串子串匹配永远命不中群消息。这里在启动时把每个话题拆成关键词集合
+    （分隔符切分 + jieba 分词），匹配时按关键词命中计算相关度。
+    """
+
+    _TOPIC_SPLIT_RE = re.compile(r"[／/、，,。．.！!？?：:（）()\[\]【】\s]+")
+    # 描述句里的修饰词/口水词，不能当成话题关键词（否则"无脑""能量"会乱命中）
+    _TOPIC_STOPWORDS = {
+        "什么", "类型", "都聊", "都可以", "一些", "有点", "相关", "之类",
+        "东西", "话题", "内容", "偶尔", "各种", "喜欢", "不要", "无脑",
+        "连续", "能量", "ok", "都ok",
+    }
 
     def __init__(self, interested_topics: list[str] = None, bored_topics: list[str] = None):
         self.interested_topics = interested_topics or []
         self.bored_topics = bored_topics or []
+        self._interested_keywords = self._extract_keywords(self.interested_topics)
+        self._bored_keywords = self._extract_keywords(self.bored_topics)
+
+    @classmethod
+    def _extract_keywords(cls, topics: list[str]) -> set[str]:
+        """把话题描述串拆成可匹配的关键词集合。"""
+        keywords: set[str] = set()
+        for topic in topics or []:
+            text = str(topic or "").strip().lower()
+            if not text:
+                continue
+            for frag in cls._TOPIC_SPLIT_RE.split(text):
+                frag = frag.strip()
+                if not frag:
+                    continue
+                # 短片段整体保留（「抽卡」「微商」本身就是关键词）
+                if 2 <= len(frag) <= 6:
+                    keywords.add(frag)
+                for token in cls._tokenize(frag):
+                    if len(token) >= 2:
+                        keywords.add(token)
+        return {k for k in keywords if k not in cls._TOPIC_STOPWORDS}
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        try:
+            import jieba
+            return [w.strip() for w in jieba.cut(text) if w.strip()]
+        except Exception:
+            return [text]
 
     def analyze_relevance(self, message: str) -> float:
-        """分析话题相关性"""
-        message_lower = message.lower()
-        relevance = 0.5  # 默认中等相关
+        """分析话题相关性（0.5 为中性；命中兴趣词升、厌倦词降）"""
+        message_lower = (message or "").lower()
+        relevance = 0.5
 
-        # 检查感兴趣话题
-        for topic in self.interested_topics:
-            if topic.lower() in message_lower:
-                relevance += 0.3
+        interested_hits = sum(
+            1 for kw in self._interested_keywords if kw in message_lower
+        )
+        bored_hits = sum(1 for kw in self._bored_keywords if kw in message_lower)
 
-        # 检查不感兴趣话题
-        for topic in self.bored_topics:
-            if topic.lower() in message_lower:
-                relevance -= 0.3
+        # 首个命中给主要权重，多词命中小幅叠加（封顶，避免一句话多关键词爆表）
+        if interested_hits:
+            relevance += min(0.4, 0.3 + 0.05 * (interested_hits - 1))
+        if bored_hits:
+            relevance -= min(0.4, 0.3 + 0.05 * (bored_hits - 1))
 
         return max(0.0, min(1.0, relevance))
 

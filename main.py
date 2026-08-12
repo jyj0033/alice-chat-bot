@@ -435,6 +435,7 @@ class GroupChatBot:
             speaking_style_manager=self.speaking_style_manager,
             tool_llm_provider=tool_llm,
             search_client=search_client,
+            bot_name=self.personality.name,
         )
 
     def _init_search(self):
@@ -941,90 +942,102 @@ class GroupChatBot:
             from modules.reply.generator import split_reply_into_messages
 
             segments = split_reply_into_messages(reply)
-            # 插话进入群聊讨论时，引用触发消息，让群友明确知道在回应哪一条；
-            # 明确对我说（directed）的消息本来就指向清楚，不用再引用。
-            quote_id = (
-                action_plan.target_message_id
-                if action_plan and not action_plan.directed and action_plan.target_message_id
-                else ""
-            )
-            sent_segments = []
-            for i, seg in enumerate(segments):
-                if i > 0 and action_plan:
-                    cancel, cancel_reason = self.conversation_floor_manager.should_cancel(
-                        action_plan,
-                        self.context_manager.get_window(session_id).get_recent(30),
-                        bot_id=str(self.config.get("qq", {}).get("self_id", "")),
-                    )
-                    if cancel:
-                        logger.info(f"[分段复核] 停止剩余消息：{cancel_reason}")
-                        break
-                success = await self.qq_adapter.send_message(
-                    session_id, seg, reply_to_id=(quote_id if i == 0 else "")
-                )
-                if success:
-                    sent_segments.append(seg)
-                    logger.info(f"[回复段{i+1}/{len(segments)}] {self.personality.name}: {seg[:50]}")
-                    # 段间延迟，模拟真人打字停顿
-                    if i < len(segments) - 1:
-                        await asyncio.sleep(random.uniform(0.6, 2.0))
-                else:
-                    # 保持分段顺序；前一段失败后继续发后一段会显得语义残缺。
-                    break
-
-            if sent_segments:
-                sent_reply = "".join(sent_segments)
-                all_segments_sent = len(sent_segments) == len(segments)
-                logger.info(f"[回复] {self.personality.name}: {sent_reply[:50]}...")
-
-                # Bot回复后状态更新（真实概率：高概率的@/回复不触发冷却，对话可延续）
-                self.speaking_decider.on_bot_reply(
-                    session_id,
-                    group_id,
-                    probability=probability,
-                    user_id=message.sender_id,
-                )
-
-                # 添加回复到上下文
-                self.context_manager.add_message(
-                    session_id=session_id,
-                    sender_id=self.config.get("qq", {}).get("self_id", ""),
-                    sender_name=self.personality.name,
-                    content=sent_reply,
-                    is_bot=True,
-                    message_id="",
-                    reply_to_id=message.message_id,
-                    reply_to_qq=message.sender_id,  # bot 回复的是当前这条消息
-                )
-
-                # bot 的回复也写入长期记忆，让会话历史两侧完整
-                self._store_bot_memory(session_id, sent_reply)
-
-                # 疲劳收尾只在主回复成功后发送；成功后重置，避免连续多轮重复说“先走了”。
-                if (
-                    all_segments_sent
-                    and self.fatigue_manager.should_close_conversation(session_id)
+            # 插话进入群聊讨论时引用触发消息，让群友明确知道在回应哪一条；但
+            # 目标就是当前最新一条时不引用（真人不会引用别人刚说完的那句话），
+            # 只有目标和现在之间隔了新消息才需要指明对象。
+            # 明确对我说（directed）的消息本来就指向清楚，不用引用。
+            quote_id = ""
+            if action_plan and not action_plan.directed and action_plan.target_message_id:
+                target_id = str(action_plan.target_message_id)
+                if any(
+                    not m.is_bot
+                    and str(m.message_id or "") != target_id
+                    and m.timestamp > action_plan.target_timestamp
+                    for m in self.context_manager.get_window(session_id).get_recent(30)
                 ):
-                    closing_msg = self.fatigue_manager.get_closing_message()
-                    closing_sent = await self.qq_adapter.send_message(
-                        session_id, closing_msg
-                    )
-                    if closing_sent:
-                        self.context_manager.add_message(
-                            session_id=session_id,
-                            sender_id=self.config.get("qq", {}).get("self_id", ""),
-                            sender_name=self.personality.name,
-                            content=closing_msg,
-                            is_bot=True,
+                    quote_id = action_plan.target_message_id
+            sent_segments = []
+            try:
+                for i, seg in enumerate(segments):
+                    if i > 0 and action_plan:
+                        cancel, cancel_reason = self.conversation_floor_manager.should_cancel(
+                            action_plan,
+                            self.context_manager.get_window(session_id).get_recent(30),
+                            bot_id=str(self.config.get("qq", {}).get("self_id", "")),
                         )
-                        self.fatigue_manager.get_state(session_id).reset()
-                        logger.info(f"[疲劳] {closing_msg}")
-                        # 疲劳收尾消息同样入历史
-                        self._store_bot_memory(session_id, closing_msg)
-            else:
+                        if cancel:
+                            logger.info(f"[分段复核] 停止剩余消息：{cancel_reason}")
+                            break
+                    success = await self.qq_adapter.send_message(
+                        session_id, seg, reply_to_id=(quote_id if i == 0 else "")
+                    )
+                    if success:
+                        sent_segments.append(seg)
+                        logger.info(f"[回复段{i+1}/{len(segments)}] {self.personality.name}: {seg[:50]}")
+                        # 段间延迟，模拟真人打字停顿
+                        if i < len(segments) - 1:
+                            await asyncio.sleep(random.uniform(0.6, 2.0))
+                    else:
+                        # 保持分段顺序；前一段失败后继续发后一段会显得语义残缺。
+                        break
+            finally:
+                # 任务可能在段间被新的"对我说"消息取消；已经发到群里的内容
+                # 必须记录状态和上下文（全部是同步操作，取消中也能安全执行），
+                # 否则 bot 会忘记自己刚说过的话，下一条回复可能重复或矛盾。
+                if sent_segments:
+                    sent_reply = "".join(sent_segments)
+                    logger.info(f"[回复] {self.personality.name}: {sent_reply[:50]}...")
+
+                    # Bot回复后状态更新（真实概率：高概率的@/回复不触发冷却，对话可延续）
+                    self.speaking_decider.on_bot_reply(
+                        session_id,
+                        group_id,
+                        probability=probability,
+                        user_id=message.sender_id,
+                    )
+
+                    # 添加回复到上下文
+                    self.context_manager.add_message(
+                        session_id=session_id,
+                        sender_id=self.config.get("qq", {}).get("self_id", ""),
+                        sender_name=self.personality.name,
+                        content=sent_reply,
+                        is_bot=True,
+                        message_id="",
+                        reply_to_id=message.message_id,
+                        reply_to_qq=message.sender_id,  # bot 回复的是当前这条消息
+                    )
+
+                    # bot 的回复也写入长期记忆，让会话历史两侧完整
+                    self._store_bot_memory(session_id, sent_reply)
+
+            if not sent_segments:
                 logger.error("Failed to send reply")
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
+                return
+
+            # 疲劳收尾只在主回复完整发送后考虑；成功后重置，避免连续多轮重复说“先走了”。
+            if (
+                len(sent_segments) == len(segments)
+                and self.fatigue_manager.should_close_conversation(session_id)
+            ):
+                closing_msg = self.fatigue_manager.get_closing_message()
+                closing_sent = await self.qq_adapter.send_message(
+                    session_id, closing_msg
+                )
+                if closing_sent:
+                    self.context_manager.add_message(
+                        session_id=session_id,
+                        sender_id=self.config.get("qq", {}).get("self_id", ""),
+                        sender_name=self.personality.name,
+                        content=closing_msg,
+                        is_bot=True,
+                    )
+                    self.fatigue_manager.get_state(session_id).reset()
+                    logger.info(f"[疲劳] {closing_msg}")
+                    # 疲劳收尾消息同样入历史
+                    self._store_bot_memory(session_id, closing_msg)
 
         except asyncio.CancelledError:
             # 被更新的"对我说"消息取代，静默退出
@@ -1713,6 +1726,10 @@ class GroupChatBot:
         logger.info(f"GroupChatBot is running as {self.personality.name}!")
         logger.info("=" * 50)
 
+        # 清理任务必须在连接前启动：connect() 成功后会一直阻塞服务 WebSocket，
+        # 放在它后面的代码在正常运行时永远执行不到。
+        self._tasks.append(asyncio.create_task(self._cleanup_loop()))
+
         # 连接 QQ (可选 - 如果连接失败则继续运行用于测试)
         try:
             await self.qq_adapter.connect()
@@ -1720,9 +1737,6 @@ class GroupChatBot:
             logger.warning(f"QQ连接失败 (可继续运行用于测试): {e}")
             logger.warning("提示: 请确保 NapCat QQ机器人 已启动")
             # 不停止 - 让bot以测试模式运行
-
-        # 启动清理任务
-        self._tasks.append(asyncio.create_task(self._cleanup_loop()))
 
         # 保持运行
         try:
@@ -2076,10 +2090,17 @@ async def main():
 
         # 在线程中连接 QQ 适配器
         async def connect_qq():
+            # 清理循环（记忆衰减/画像提炼/状态清理）必须与消息处理跑在同一个
+            # 事件循环上（即这个 QQ 线程），否则会跨线程访问同一批状态。
+            # 注意 connect() 成功后会一直阻塞，清理任务要在它之前创建。
+            cleanup_task = asyncio.create_task(bot._cleanup_loop())
+            bot._tasks.append(cleanup_task)
             try:
                 await bot.qq_adapter.connect()
             except Exception as e:
                 logger.warning(f"QQ连接失败: {e}")
+                # 连接失败也保持本线程的清理循环运行（测试模式）
+                await asyncio.gather(cleanup_task, return_exceptions=True)
 
         qq_thread = threading.Thread(target=lambda: asyncio.run(connect_qq()), daemon=True)
         qq_thread.start()

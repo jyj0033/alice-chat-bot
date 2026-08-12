@@ -160,6 +160,7 @@ class ReplyGenerator:
         thinking_delay: float = 2.0,
         tool_llm_provider=None,
         search_client=None,
+        bot_name: str = "",
     ):
         """
         初始化
@@ -171,9 +172,11 @@ class ReplyGenerator:
             thinking_delay: 基础思考延迟（秒）
             tool_llm_provider: 支持联网搜索判断/带资料生成的 LLM 提供者
             search_client: 搜索客户端（模块 search.SearchClient）
+            bot_name: bot 在对话记录里的显示名（用于识别上下文中自己说的行）
         """
         self.llm = llm_provider
         self.personality_prompt = personality_prompt
+        self.bot_name = bot_name
         self.style_manager = speaking_style_manager or SpeakingStyleManager(create_default_style())
         self.base_thinking_delay = thinking_delay
         self.response_filter = ResponseFilter()
@@ -596,7 +599,7 @@ class ReplyGenerator:
 
         # 被嫌弃/被质疑降级：群友明显对 bot 不满或没看懂（质疑、吐槽、让 bot 别说了）时，
         # 别嘴硬解释、别重复同一件事，简短道歉/自嘲/转移话题。
-        if self._is_user_frustrated(session_id, context_prompt, current_message):
+        if self._is_user_frustrated(session_id, context_prompt, current_message, direction):
             request.add_system(
                 "群友似乎没看懂你的话或对你不太满意（可能在质疑、吐槽、让你别说了）。"
                 "这时候别再嘴硬解释、别再强调同一件事、别复述自己的原话；"
@@ -750,25 +753,58 @@ class ReplyGenerator:
     def _mark_frustrated(self, session_id: str) -> None:
         self._last_frustrated[session_id] = time.time()
 
-    def _is_user_frustrated(self, session_id: str, context_prompt: str, current_message: str) -> bool:
+    def _is_bot_line(self, line: str) -> bool:
+        """判断对话记录里的一行是否是 bot 自己说的（形如「[刚刚] 爱丽丝：...」）。"""
+        if not self.bot_name:
+            return False
+        return bool(re.match(
+            r"^\[[^\]]+\]\s*" + re.escape(self.bot_name) + r"\s*[：:]", line
+        ))
+
+    def _is_user_frustrated(
+        self,
+        session_id: str,
+        context_prompt: str,
+        current_message: str,
+        direction: str = "to_bot",
+    ) -> bool:
         """检测群友是否对 bot 不满/没看懂。
 
-        当前消息直接命中 → 一定降级；上下文尾巴命中（思考期间群友的质疑）
-        → 降级但带冷却，避免 bot 道歉一次后对后续无关消息反复道歉。
-        富媒体识别摘要不计入（那是描述图片情绪，不是嫌弃 bot）。
+        只有"冲着 bot 来的"不满才降级：
+        - 当前消息命中且明确对 bot 说（direction=to_bot）→ 一定降级；
+          群友互聊里的「离谱/无语」是日常吐槽，bot 随机插话时不该无端道歉。
+        - 上下文尾巴命中 → 该行必须不是 bot 自己说的，且（标注了"(对你说)"/
+          回@bot，或 bot 在它前两行内刚发过言）才算数；命中后带冷却，
+          避免 bot 道歉一次后对后续无关消息反复道歉。
+        - bot 自己的回复常带「离谱」这类词，绝不能把自己的话当成被嫌弃。
+        - 富媒体识别摘要不计入（那是描述图片情绪，不是嫌弃 bot）。
         """
-        current = self._strip_rich_descriptions(current_message)
-        hits = [m for m in self._FRUSTRATION_MARKERS if m in current]
-        if hits:
-            logger.debug("[降级] 当前消息命中不满信号: %s", hits)
-            self._mark_frustrated(session_id)
-            return True
+        if direction == "to_bot":
+            current = self._strip_rich_descriptions(current_message)
+            hits = [m for m in self._FRUSTRATION_MARKERS if m in current]
+            if hits:
+                logger.debug("[降级] 当前消息命中不满信号: %s", hits)
+                self._mark_frustrated(session_id)
+                return True
 
-        tail = ""
-        if context_prompt:
-            lines = [ln.strip() for ln in context_prompt.splitlines() if ln.strip()]
-            tail = "\n".join(self._strip_rich_descriptions(l) for l in lines[-4:])
-        tail_hits = [m for m in self._FRUSTRATION_MARKERS if m in tail]
+        if not context_prompt:
+            return False
+        lines = [ln.strip() for ln in context_prompt.splitlines() if ln.strip()]
+        tail_hits: list = []
+        for i in range(max(0, len(lines) - 4), len(lines)):
+            line = lines[i]
+            if self._is_bot_line(line):
+                continue
+            directed_at_bot = "(对你说)" in line or (
+                bool(self.bot_name) and f"回@{self.bot_name}" in line
+            )
+            after_bot_speech = any(
+                self._is_bot_line(prev) for prev in lines[max(0, i - 2):i]
+            )
+            if not (directed_at_bot or after_bot_speech):
+                continue
+            clean = self._strip_rich_descriptions(line)
+            tail_hits.extend(m for m in self._FRUSTRATION_MARKERS if m in clean)
         if tail_hits:
             if self._frustration_in_cooldown(session_id):
                 logger.debug("[降级] 尾巴命中但冷却中，不再重复道歉: %s", tail_hits)
