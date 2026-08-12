@@ -1312,7 +1312,10 @@ class GroupChatBot:
         importance = 0.3
         if message.mentioned_me:
             importance += 0.2
-        if len(content) > 20:
+        # 长度线放宽到 12 字：20 字对中文口语太苛刻，大多数日常发言进不了
+        # 长期记忆，导致用户画像素材长期不足。episodic 有 14 天半衰期衰减
+        # 和写入去重兜底，放宽不会让库无限膨胀。
+        if len(content) > 12:
             importance += 0.2
         if any(kw in content for kw in self._PERSONAL_KEYWORDS):
             importance += 0.3
@@ -1511,6 +1514,22 @@ class GroupChatBot:
                 break
         return out
 
+    @staticmethod
+    def _is_profile_refusal(summary: str) -> bool:
+        """判断画像提炼输出是否是 LLM 的拒绝文本（素材太散时会答"无法提炼"）。
+
+        拒绝文本存成画像会污染检索：召回时 bot 会"记得"一段关于某人的废话。
+        拒绝语可能藏在句中（如"……从现有发言中难以提炼出明确特征"），所以扫全文；
+        这些短语不会出现在真正的画像里，全文匹配不会误伤。
+        """
+        markers = (
+            "无法提炼", "无法判断", "无法从", "信息不足", "不足以",
+            "难以提炼", "难以判断", "没有足够", "缺乏可识别", "无明确语义",
+            "提炼不出", "无稳定",
+        )
+        text = summary or ""
+        return any(m in text for m in markers)
+
     async def _distill_user_profiles(self, force: bool = False) -> dict:
         """从情景记忆提炼用户画像（semantic 记忆，后台执行）。
 
@@ -1601,7 +1620,9 @@ class GroupChatBot:
                     "- 【自我描述】是TA直接说过的关于自己的话，较可信，直接采用\n"
                     "- 【日常发言】是TA在群里的日常聊天，从中推断兴趣、性格、习惯等长期倾向，"
                     "不要被单条玩笑或偶然话题带偏\n"
-                    "只写稳定事实或长期倾向，不要推测、不要复述原话、不要寒暄。用第三人称。"
+                    "只写稳定事实或长期倾向，不要推测、不要复述原话、不要寒暄。用第三人称。\n"
+                    "如果素材太零散、判断不出任何稳定特征，只输出「无法提炼」四个字，"
+                    "不要解释原因、不要输出其他内容。"
                 )
                 parts = [f"群友「{latest_name}」的资料："]
                 if self_text:
@@ -1611,7 +1632,7 @@ class GroupChatBot:
                 req.add_user("\n".join(parts))
                 resp = await provider.chat(req)
                 summary = (resp.content or "").strip().strip('"\'“”')
-                if not summary:
+                if not summary or self._is_profile_refusal(summary):
                     result["skipped"] += 1
                     continue
 

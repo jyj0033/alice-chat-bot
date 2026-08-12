@@ -327,6 +327,22 @@ class HumanizationLogicTests(unittest.TestCase):
         prompt = manager.build_context_prompt("group_g1", bot_name="爱丽丝")
         self.assertIn("你自己说过的话", prompt)
 
+    def test_profile_refusal_text_is_detected(self):
+        """LLM 素材不足时的"无法提炼"拒绝文本不能存成用户画像。"""
+        from main import GroupChatBot
+        self.assertTrue(GroupChatBot._is_profile_refusal(
+            "无法提炼。提供的日常发言内容过于零散、不连贯"
+        ))
+        self.assertTrue(GroupChatBot._is_profile_refusal("信息不足，难以判断"))
+        # 拒绝语藏在句中、开头伪装成正常画像的情况也要识别
+        self.assertTrue(GroupChatBot._is_profile_refusal(
+            "该用户在群内发言内容多为无明确语义的短句、提问或玩笑话，"
+            "缺乏可识别的职业、兴趣等稳定信息，从现有发言中难以提炼出明确特征"
+        ))
+        self.assertFalse(GroupChatBot._is_profile_refusal(
+            "互联网行业从业者，喜欢打游戏，经常吐槽工作"
+        ))
+
     def test_implicit_direction_allows_silence(self):
         """延续对话推断出的指向（to_bot_implicit）允许 LLM 判断后沉默；
         明确对bot说（to_bot）则不给沉默选项。"""
