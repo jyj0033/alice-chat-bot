@@ -543,7 +543,11 @@ class RichMediaEnricher:
                 "请判断这组图合起来想表达什么、在回应什么，以及当前这张在组里的作用。"
             )
         if conversation_context and self.image_to_text_context:
-            parts.append(f"前文对话：\n{conversation_context}\n结合前文判断这张图在说什么、在回应谁。")
+            parts.append(
+                f"前文对话：\n{conversation_context}\n结合前文判断这张图在说什么、在回应谁。"
+                "描述里不要照抄前文原话（不要加引号复述群友说过的句子），"
+                "用你自己的话概括它在回应什么，否则后续会被当成发言原样复读。"
+            )
         return "\n".join(parts)
 
     async def _vision_chat(self, prompt: str, image_urls: list[str]) -> str:

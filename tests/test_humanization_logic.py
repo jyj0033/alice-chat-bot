@@ -402,6 +402,30 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertIn("偶尔", guide)
         self.assertIn("直接说事", guide)
 
+    # === 复读检测 ===
+
+    def test_parroting_group_message_is_detected(self):
+        """表情包摘要会引用前文原话，短反应档下 LLM 容易抓那句引文当发言。"""
+        recent = [
+            "没玩爽就结束了",
+            '[表情包，内容：一只橙色胖猫眯眼歪头，表情不屑，配字"拽"。'
+            '回应上面"没玩爽就结束了"，表达还没尽兴、很扫兴的情绪。]',
+        ]
+        self.assertTrue(ReplyGenerator.is_parroting("没玩爽就结束了哈哈", recent))
+        self.assertTrue(ReplyGenerator.is_parroting("那个没玩爽就结束了…", recent))
+
+    def test_short_agreement_is_not_parroting(self):
+        """「确实」「哈哈」这类正常附和不能被当成复读。"""
+        recent = ["确实太离谱了", "哈哈哈笑死", "这波操作真的强"]
+        for reply in ("确实", "哈哈确实", "笑死", "牛啊", "确实强"):
+            self.assertFalse(ReplyGenerator.is_parroting(reply, recent), reply)
+
+    def test_original_reply_is_not_parroting(self):
+        """自己组织的话即使用了对方提到的词，也不算复读。"""
+        recent = ["满愿三个阶段一共才射了6箭", "没玩爽就结束了"]
+        for reply in ("对面强度不太够吧这", "才6箭啊那确实亏", "满愿这活动设计有问题"):
+            self.assertFalse(ReplyGenerator.is_parroting(reply, recent), reply)
+
     def test_implicit_direction_allows_silence(self):
         """延续对话推断出的指向（to_bot_implicit）允许 LLM 判断后沉默；
         明确对bot说（to_bot）则不给沉默选项。"""

@@ -920,6 +920,19 @@ class GroupChatBot:
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
                 return
 
+            # 复读兜底：把群友的原话原样说一遍不如不说。表情包识别摘要会引用
+            # 前文原话，短反应档下 LLM 容易直接抓那句引文当自己的发言。
+            recent_texts = [
+                m.content
+                for m in self.context_manager.get_window(session_id).get_recent(12)
+                if not m.is_bot
+            ]
+            if self.reply_generator.is_parroting(reply, recent_texts):
+                logger.info(f"[复读] 放弃回复（复述了群友原话）：{reply[:40]}")
+                if direction == "to_bot":
+                    self.attention_manager.on_no_reply(group_id, message.sender_id)
+                return
+
             # LLM 调用和模拟打字也会耗时，发送前再复核一次群聊局势。
             if action_plan:
                 cancel, cancel_reason = self.conversation_floor_manager.should_cancel(
