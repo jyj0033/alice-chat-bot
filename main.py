@@ -1880,6 +1880,7 @@ class GroupChatBot:
                     "common_words": [],
                     "banned_words": [],
                     "filler_words": ["呃", "嗯", "那个", "这个"],
+                    "filler_frequency": 0.08,
                     "max_reply_length": 60,
                     "use_ellipsis": True,
                     "use_emoji": True,

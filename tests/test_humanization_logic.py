@@ -343,6 +343,65 @@ class HumanizationLogicTests(unittest.TestCase):
             "互联网行业从业者，喜欢打游戏，经常吐槽工作"
         ))
 
+    # === 语气词后处理 ===
+
+    def test_filler_never_prepended_to_colloquial_openings(self):
+        """已经带口语色彩的开头不再叠语气词（避免「这个哈哈哈哈」「那个嗯…」）。"""
+        from modules.personality.speaking_style import (
+            SpeakingStyle,
+            SpeakingStyleManager,
+        )
+        # 频率拉满，只验证护栏是否拦住
+        style = SpeakingStyle(
+            filler_words=["呃", "嗯", "那个", "这个"], filler_frequency=1.0
+        )
+        manager = SpeakingStyleManager(style)
+        for text in (
+            "哈哈哈赵云乱杀也太爽了",
+            "嗯感觉有点憨",
+            "那个等等蕾米是谁啊",
+            "确实，推送算法有时候真的看不懂",
+            "草这也太离谱了吧",
+            "对，乌鸦那个配色确实像",
+        ):
+            self.assertEqual(manager._apply_fillers(text), text, text)
+
+    def test_filler_skips_short_replies(self):
+        """「来了来了」这类短句自成语气，前面加语气词只会拖沓。"""
+        from modules.personality.speaking_style import (
+            SpeakingStyle,
+            SpeakingStyleManager,
+        )
+        style = SpeakingStyle(filler_words=["那个"], filler_frequency=1.0)
+        manager = SpeakingStyleManager(style)
+        self.assertEqual(manager._apply_fillers("来了来了"), "来了来了")
+        # 平铺直叙的长句才是这层该服务的场景
+        self.assertEqual(
+            manager._apply_fillers("限定池是夏活的安洁莉娜和珊比"),
+            "那个限定池是夏活的安洁莉娜和珊比",
+        )
+
+    def test_filler_frequency_defaults_low(self):
+        """默认频率要足够低：历史上 0.2 导致 1/3 回复以语气词开头。"""
+        from modules.personality.speaking_style import (
+            SpeakingStyle,
+            create_default_style,
+        )
+        self.assertLessEqual(SpeakingStyle().filler_frequency, 0.1)
+        self.assertLessEqual(create_default_style().filler_frequency, 0.1)
+
+    def test_style_guide_tells_llm_fillers_are_occasional(self):
+        """发给 LLM 的风格指导不能只列语气词（会被读成"每句都要用"）。"""
+        from modules.personality.speaking_style import (
+            SpeakingStyle,
+            SpeakingStyleManager,
+        )
+        guide = SpeakingStyleManager(
+            SpeakingStyle(filler_words=["呃", "嗯", "那个"])
+        ).get_style_guide()
+        self.assertIn("偶尔", guide)
+        self.assertIn("直接说事", guide)
+
     def test_implicit_direction_allows_silence(self):
         """延续对话推断出的指向（to_bot_implicit）允许 LLM 判断后沉默；
         明确对bot说（to_bot）则不给沉默选项。"""

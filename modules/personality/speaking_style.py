@@ -28,6 +28,10 @@ class SpeakingStyle:
     # 回复长度
     max_reply_length: int = 60     # 单条回复最大字符数（超长会被智能截断）
 
+    # 语气词后处理频率：LLM 本身就会自然使用语气词，这层只是偶尔补一点
+    # 口语感的兜底。给高了会出现「这个哈哈哈哈」这类机械拼接。
+    filler_frequency: float = 0.08
+
     # 标点与格式
     use_ellipsis: bool = True      # 是否使用省略号
     use_emoji: bool = True         # 是否使用emoji
@@ -59,6 +63,7 @@ class SpeakingStyle:
             "max_sentence_length": self.max_sentence_length,
             "avg_sentence_length_range": self.avg_sentence_length_range,
             "max_reply_length": self.max_reply_length,
+            "filler_frequency": self.filler_frequency,
             "use_ellipsis": self.use_ellipsis,
             "use_emoji": self.use_emoji,
             "emoji_frequency": self.emoji_frequency,
@@ -79,12 +84,17 @@ class SpeakingStyleManager:
         self.emoji_set = emoji_set or ["😅", "🤔", "😂", "👍", "🙄", "😏", "🤷", "👀"]
 
     def get_style_guide(self) -> str:
-        """获取风格指南字符串"""
+        """获取风格指南字符串（发给 LLM 的说话风格约束）"""
         parts = []
         if self.style.common_words:
             parts.append(f"常用口头禅：{', '.join(self.style.common_words[:3])}")
         if self.style.filler_words:
-            parts.append(f"语气词：{', '.join(self.style.filler_words[:3])}")
+            # 只列词会被 LLM 读成"要求每句都用"，实测导致 1/3 回复都以
+            # 语气词开头。这里明确说明是"偶尔"，默认直接说事。
+            parts.append(
+                f"语气词（如{('、'.join(self.style.filler_words[:3]))}）偶尔用就行，"
+                "别每句话都以语气词开头，大多数时候直接说事更自然"
+            )
         if self.style.formality:
             parts.append(f"正式程度：{self.style.formality}")
         if self.style.enthusiasm:
@@ -143,15 +153,35 @@ class SpeakingStyleManager:
 
         return text
 
+    # 已经带口语色彩的开头：叹词、语气词、笑声、附和词。这些前面再加语气词
+    # 会拼出「这个哈哈哈哈」「那个嗯…」这种没人会说的话。
+    _NO_FILLER_PREFIXES = (
+        "呃", "嗯", "那个", "这个", "啊", "哦", "噢", "唉", "诶", "欸",
+        "哈", "笑", "草", "绷", "确实", "话说", "对", "是", "不", "行",
+        "好", "我靠", "卧槽", "牛", "6",
+    )
+
     def _apply_fillers(self, text: str) -> str:
-        """句首添加语气词（低频，且避免重复/破坏引号）"""
-        if not self.style.filler_words or random.random() > 0.2:
+        """句首偶尔添加语气词。
+
+        这一层只是"补一点口语感"的兜底，不是语气词的主要来源——LLM 自己
+        就会自然地用。历史上概率给到 0.2 且不看内容，导致 1/3 的回复以
+        「呃/嗯/那个/这个」开头，还会拼出「这个哈哈哈哈」这类机械痕迹。
+        因此：低频率 + 只在平铺直叙的长句前面加。
+        """
+        if not self.style.filler_words:
+            return text
+        if random.random() > max(0.0, min(1.0, self.style.filler_frequency)):
             return text
 
-        filler = random.choice(self.style.filler_words)
-        if text.startswith(filler):
+        stripped = text.lstrip()
+        # 短句自成语气（「来了来了」），前面加语气词只会显得拖沓
+        if len(stripped) < 6:
             return text
-        return filler + text
+        if stripped.startswith(self._NO_FILLER_PREFIXES):
+            return text
+
+        return random.choice(self.style.filler_words) + text
 
     def _apply_punctuation(self, text: str) -> str:
         """处理标点符号"""
@@ -261,6 +291,7 @@ def create_default_style() -> SpeakingStyle:
     return SpeakingStyle(
         common_words=["话说", "其实", "感觉", "好像", "有点"],
         filler_words=["呃", "嗯", "那个"],
+        filler_frequency=0.08,
         min_sentence_length=5,
         max_sentence_length=50,
         avg_sentence_length_range=(10, 30),
