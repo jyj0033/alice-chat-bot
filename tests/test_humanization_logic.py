@@ -529,6 +529,20 @@ class HumanizationLogicTests(unittest.TestCase):
         for word in ("游戏", "技术", "动漫"):
             self.assertIn(word, prompt)
 
+    def test_persona_without_nickname_has_no_alias_line(self):
+        """没有别名时不能凭空写出"熟人喊你…"，也不能留下空称呼。"""
+        prompt = self._persona(nickname="", age_range="18")
+        self.assertIn("你叫爱丽丝，18岁。", prompt)
+        self.assertNotIn("熟人喊你", prompt)
+
+    def test_nickname_trigger_ignores_empty_alias(self):
+        """别名为空时，触发检测不能把空串当成被点名。"""
+        detector = TriggerDetector(bot_nickname="爱丽丝", nicknames=[""])
+        result = detector.detect(SocialContext(message_content="今晚吃什么"))
+        self.assertFalse(any(r.startswith("昵称") for r in result["reasons"]))
+        named = detector.detect(SocialContext(message_content="爱丽丝在吗"))
+        self.assertTrue(any(r.startswith("昵称") for r in named["reasons"]))
+
     def test_implicit_direction_allows_silence(self):
         """延续对话推断出的指向（to_bot_implicit）允许 LLM 判断后沉默；
         明确对bot说（to_bot）则不给沉默选项。"""
