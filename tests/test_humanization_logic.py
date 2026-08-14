@@ -478,6 +478,57 @@ class HumanizationLogicTests(unittest.TestCase):
             "发工资叫必要损失费哈哈哈",
         )
 
+    # === 人格提示词 ===
+
+    def _persona(self, **overrides):
+        from modules.personality.personality import Personality
+        config = {
+            "name": "爱丽丝",
+            "nickname": "小爱",
+            "age_range": "20-24",
+            "traits": {"extraversion": 0.7, "agreeableness": 0.75},
+            "background": "普通大学生，游戏重度爱好者。",
+            "interested_topics": [
+                "游戏（什么类型都聊，手游端游主机都OK）",
+                "技术/编程",
+                "动漫（追番、新番）",
+            ],
+            "bored_topics": ["微商/广告/引流"],
+            "taboo_topics": ["政治宗教"],
+            "catchphrases": ["话说", "好像", "感觉", "有点", "绝了", "笑死"],
+            "humor_style": "self-deprecating",
+            **overrides,
+        }
+        return Personality.from_dict(config).build_persona_prompt()
+
+    def test_persona_prompt_reads_like_a_person_not_a_spec(self):
+        """人格提示词不能是「字段名 + 数值」的规格书——那会把模型推回助手腔。"""
+        prompt = self._persona()
+        for spec_marker in ("===", "agreeableness", "extraversion", "(值:", "行为准则"):
+            self.assertNotIn(spec_marker, prompt, spec_marker)
+        self.assertIn("你叫爱丽丝", prompt)
+
+    def test_persona_does_not_encourage_long_sentences(self):
+        """人格说「句子可以稍长」会和"不超过30字"的硬约束直接打架。"""
+        prompt = self._persona(traits={"extraversion": 0.7})
+        self.assertNotIn("句子可以稍长", prompt)
+        self.assertIn("一句话说完就停", prompt)
+
+    def test_persona_does_not_instruct_bot_to_be_confused(self):
+        """别主动要求"犯迷糊、说错话"——真人偶尔理解错梗是自然发生的。"""
+        prompt = self._persona()
+        self.assertNotIn("犯迷糊、说错话", prompt)
+        self.assertIn("不知道的事就说不知道", prompt)
+
+    def test_persona_topics_strip_config_syntax(self):
+        """话题配置里的括号补充和斜杠不能原样出现在人格介绍里。"""
+        prompt = self._persona()
+        self.assertNotIn("什么类型都聊", prompt)
+        self.assertNotIn("技术/编程", prompt)
+        # 每个配置话题至少有一个词进入提示词，不因截断丢失
+        for word in ("游戏", "技术", "动漫"):
+            self.assertIn(word, prompt)
+
     def test_implicit_direction_allows_silence(self):
         """延续对话推断出的指向（to_bot_implicit）允许 LLM 判断后沉默；
         明确对bot说（to_bot）则不给沉默选项。"""
