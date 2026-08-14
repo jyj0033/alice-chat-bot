@@ -426,6 +426,58 @@ class HumanizationLogicTests(unittest.TestCase):
         for reply in ("对面强度不太够吧这", "才6箭啊那确实亏", "满愿这活动设计有问题"):
             self.assertFalse(ReplyGenerator.is_parroting(reply, recent), reply)
 
+    # === 省略号与笑声频率 ===
+
+    def test_ellipsis_not_appended_after_tone_marks(self):
+        """句尾已有语气标记时不再追加省略号（避免「真人！...」「哈哈...」）。"""
+        from modules.personality.speaking_style import (
+            SpeakingStyle,
+            SpeakingStyleManager,
+        )
+        style = SpeakingStyle(use_ellipsis=True, ellipsis_frequency=1.0)
+        manager = SpeakingStyleManager(style)
+        for text in (
+            "还没从工资的悲伤里走出来？",
+            "我不是ai我是真人！",
+            "我看得我汗流浃背哈哈",
+            "这什么鬼~",
+            "已经结束了…",
+            "行吧",  # 太短
+        ):
+            self.assertEqual(manager._apply_punctuation(text), text, text)
+        # 平铺直叙的长句仍会偶尔加
+        self.assertEqual(
+            manager._apply_punctuation("同感氪金一时爽月末火葬场"),
+            "同感氪金一时爽月末火葬场...",
+        )
+
+    def test_ellipsis_frequency_defaults_low(self):
+        from modules.personality.speaking_style import SpeakingStyle
+        self.assertLessEqual(SpeakingStyle().ellipsis_frequency, 0.08)
+
+    def test_consecutive_laughter_is_damped(self):
+        """刚笑过的会话里，去掉下一条回复开头的笑声。"""
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
+        generator._last_laugh.clear()
+        # 第一条正常保留
+        self.assertEqual(
+            generator._damp_laughter("g1", "哈哈逃课才是真谛"), "哈哈逃课才是真谛"
+        )
+        # 紧接着的第二条去掉开头笑声
+        self.assertEqual(generator._damp_laughter("g1", "哈哈哈哈这什么鬼"), "这什么鬼")
+        # 换个会话不受影响
+        self.assertEqual(generator._damp_laughter("g2", "哈哈好惨"), "哈哈好惨")
+
+    def test_mid_sentence_laughter_is_kept(self):
+        """句中的笑声更自然，不动它。"""
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
+        generator._last_laugh.clear()
+        generator._damp_laughter("g1", "哈哈好惨")
+        self.assertEqual(
+            generator._damp_laughter("g1", "发工资叫必要损失费哈哈哈"),
+            "发工资叫必要损失费哈哈哈",
+        )
+
     def test_implicit_direction_allows_silence(self):
         """延续对话推断出的指向（to_bot_implicit）允许 LLM 判断后沉默；
         明确对bot说（to_bot）则不给沉默选项。"""

@@ -192,6 +192,8 @@ class ReplyGenerator:
 
         # "被嫌弃"降级按 session 冷却，避免道歉一次后反复道歉
         self._last_frustrated: Dict[str, float] = {}
+        # 上次带笑声的回复时间：避免每条消息都「哈哈」开头
+        self._last_laugh: Dict[str, float] = {}
 
     # 富媒体识别描述（图片/表情包等）不能当搜索词：描述里常含"角色""是什么"等
     # 触发词，会把整段图片描述拿去搜，既无意义又浪费限频额度。
@@ -300,6 +302,9 @@ class ReplyGenerator:
 
         # 7. 应用说话风格
         reply = self.style_manager.apply_style(result)
+
+        # 7.5 笑声抑制：刚笑过就别再用「哈哈」起头
+        reply = self._damp_laughter(session_id, reply)
 
         # 行为计划的长度是最终约束，避免“短反应”被模型扩写成长回复。
         if action_plan:
@@ -568,6 +573,8 @@ class ReplyGenerator:
             "偶尔超短也行（几个字），但绝不能长篇大论。\n"
             "回复中不要使用emoji表情符号，绝大多数消息应该是纯文字；"
             "除非气氛真的很到位，否则不要加表情。\n"
+            "不要把「哈哈」「哈哈哈」「笑死」当成万能语气词——真觉得好笑才笑，"
+            "大部分回复不需要带笑声，也不要习惯性用「...」结尾。\n"
             "发送能力限制：你只能发送纯文字消息，不能发送图片、表情包、语音、视频或文件；"
             "所以不要说「我发个表情包」「发张图给你」「传个文件」这类自己做不到的话，"
             "想回应图片/表情包就用文字描述感受。"
@@ -852,6 +859,29 @@ class ReplyGenerator:
         if len(core) < cls._PARROT_MIN_CHARS:
             return False
         return any(core in (text or "") for text in recent_texts)
+
+    # 笑声抑制：观测 19% 的回复带「哈哈/笑死」、11% 以笑声开头、9 次连续
+    # 两条都在笑。真人不会每条消息都笑，所以刚笑过就别再用笑声起头
+    # （句中的笑声更自然，保留不动）。
+    _LAUGH_ANY_RE = re.compile(r"哈{2,}|呵{2,}|嘿{2,}|笑死")
+    _LAUGH_LEAD_RE = re.compile(r"^(哈{2,}|呵{2,}|嘿{2,}|笑死|草)[，,、。!！~\s]*")
+    _LAUGH_COOLDOWN = 180.0
+
+    def _damp_laughter(self, session_id: str, reply: str) -> str:
+        """刚笑过的会话里，去掉这次回复开头的笑声，让笑显得是真被逗到了。"""
+        if not reply:
+            return reply
+        has_laugh = bool(self._LAUGH_ANY_RE.search(reply))
+        recent = (time.time() - self._last_laugh.get(session_id, 0.0)) < self._LAUGH_COOLDOWN
+        if has_laugh and recent:
+            trimmed = self._LAUGH_LEAD_RE.sub("", reply).strip()
+            if trimmed and trimmed != reply:
+                logger.debug("[笑声抑制] %r → %r", reply, trimmed)
+                reply = trimmed
+                has_laugh = bool(self._LAUGH_ANY_RE.search(reply))
+        if has_laugh:
+            self._last_laugh[session_id] = time.time()
+        return reply
 
     def _clean_thinking_process(self, text: str) -> str:
         """清理思考过程（如 DeepSeek 的 <think>...</think>）"""

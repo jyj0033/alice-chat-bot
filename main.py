@@ -1896,6 +1896,7 @@ class GroupChatBot:
                     "filler_frequency": 0.08,
                     "max_reply_length": 60,
                     "use_ellipsis": True,
+                    "ellipsis_frequency": 0.06,
                     "use_emoji": True,
                     "emoji_frequency": 0.2,
                     "formality": 0.3,

@@ -34,6 +34,9 @@ class SpeakingStyle:
 
     # 标点与格式
     use_ellipsis: bool = True      # 是否使用省略号
+    # 省略号后处理频率：给高了会拼出「真人！...」「汗流浃背哈哈...」这类
+    # 机械痕迹（原实现是 15% 盲目追加）。
+    ellipsis_frequency: float = 0.06
     use_emoji: bool = True         # 是否使用emoji
     emoji_frequency: float = 0.2   # emoji使用频率 (0-1)
     use_question_marks: bool = True  # 结尾是否加"？"表示好奇
@@ -65,6 +68,7 @@ class SpeakingStyle:
             "max_reply_length": self.max_reply_length,
             "filler_frequency": self.filler_frequency,
             "use_ellipsis": self.use_ellipsis,
+            "ellipsis_frequency": self.ellipsis_frequency,
             "use_emoji": self.use_emoji,
             "emoji_frequency": self.emoji_frequency,
             "use_question_marks": self.use_question_marks,
@@ -183,12 +187,21 @@ class SpeakingStyleManager:
 
         return random.choice(self.style.filler_words) + text
 
+    # 句尾已经自带语气的情况：再追加省略号会拼出「真人！...」「哈哈...」
+    # 这类没人会写的组合。
+    _NO_ELLIPSIS_TAILS = ("？", "?", "！", "!", "~", "…", "...", "哈", "呵", "嘿")
+
     def _apply_punctuation(self, text: str) -> str:
         """处理标点符号"""
-        # 省略号处理
-        if self.style.use_ellipsis and random.random() < 0.15:
-            if not text.endswith("..."):
-                text = text.rstrip(".。") + "..."
+        # 省略号处理：低频，且只加在"平铺直叙、句尾没有语气标记"的句子后面
+        stripped = text.rstrip()
+        if (
+            self.style.use_ellipsis
+            and len(stripped) >= 6
+            and not stripped.endswith(self._NO_ELLIPSIS_TAILS)
+            and random.random() < max(0.0, min(1.0, self.style.ellipsis_frequency))
+        ):
+            text = stripped.rstrip(".。") + "..."
 
         # 感叹号处理
         if self.style.use_exclamation and self.style.enthusiasm > 0.6:
