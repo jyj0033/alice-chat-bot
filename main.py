@@ -109,6 +109,9 @@ class GroupChatBot:
         self._media_trail: dict[str, deque] = {}
         self._media_trail_limit = 30
 
+        # 提炼不出稳定特征的人 → 记下当时的素材规模，素材没变就不再重复问 LLM
+        self._profile_failed_material: dict[str, tuple] = {}
+
     @property
     def _image_group_config(self) -> dict:
         return self.config.get("image", {}) or {} if self.config else {}
@@ -1539,6 +1542,50 @@ class GroupChatBot:
         "发言活跃", "群内活跃", "热衷于群聊", "关注度高",
     )
 
+    # 画像正文的最大长度：累加机制下画像会一轮轮变长，不设上限最终会膨胀成
+    # 一段小作文，既挤占提示词也没人看得下去。
+    _PROFILE_MAX_CHARS = 120
+    # 模型偶尔会带上元话语开头（"更新后画像：""综合来看："），那不是画像内容
+    _PROFILE_META_PREFIXES = (
+        "更新后画像：", "更新后的画像：", "更新画像：", "画像：", "更新：",
+        "综合来看：", "综合以上：", "总结：", "以下是画像：", "新画像：",
+    )
+
+    @classmethod
+    def _normalize_profile_summary(cls, summary: str) -> str:
+        """清理画像正文：剥掉元话语前缀，并按句子边界收进长度上限。"""
+        text = (summary or "").strip().strip('"\'“”')
+        changed = True
+        while changed:
+            changed = False
+            for prefix in cls._PROFILE_META_PREFIXES:
+                if text.startswith(prefix):
+                    text = text[len(prefix):].strip()
+                    changed = True
+        if len(text) <= cls._PROFILE_MAX_CHARS:
+            return text
+
+        # 超长：按句子边界保留完整句，避免从半句切断
+        import re as _re
+        sentences = _re.split(r"(?<=[。；;！!？?])", text)
+        kept = ""
+        for sentence in sentences:
+            if kept and len(kept) + len(sentence) > cls._PROFILE_MAX_CHARS:
+                break
+            kept += sentence
+        kept = kept.strip()
+        if kept:
+            return kept[:cls._PROFILE_MAX_CHARS].rstrip("，,、;； ")
+        return text[:cls._PROFILE_MAX_CHARS].rstrip("，,、;； ")
+
+    @staticmethod
+    def _strip_profile_prefix(content: str) -> str:
+        """取画像正文（去掉「【用户画像 名字】」前缀），用于喂回给模型做增量修订。"""
+        text = (content or "").strip()
+        if text.startswith("【用户画像") and "】" in text:
+            text = text.split("】", 1)[1]
+        return text.strip()
+
     @classmethod
     def _profile_quality_warnings(cls, summary: str) -> list:
         """标出画像里的可疑表述（推测、性别不明、空话），供人工复核。"""
@@ -1635,6 +1682,17 @@ class GroupChatBot:
                     result["skipped"] += 1
                     continue
 
+                # 提炼不出稳定特征的人：素材没变化就别每轮都再问一次 LLM。
+                # （已有画像的人由下面的"新素材"门槛把关，这条覆盖的是还没有画像的人）
+                material_sig = (len(self_facts), len(daily))
+                if not force and self._profile_failed_material.get(sid) == material_sig:
+                    logger.debug(
+                        "[画像] 跳过 %s：上次提炼不出且素材无变化（自述%d 日常%d）",
+                        latest_name, len(self_facts), len(daily),
+                    )
+                    result["skipped"] += 1
+                    continue
+
                 # 已有画像且没有足够新素材 → 跳过（避免每次发言都刷）
                 if not force and existing and existing.created_at:
                     newest_self = self_facts[0].created_at if self_facts else None
@@ -1664,13 +1722,26 @@ class GroupChatBot:
 
                 self_text = render_section(unique_facts)
                 daily_text = render_section(unique_daily)
+                previous_summary = self._strip_profile_prefix(
+                    existing.content if existing else ""
+                )
 
-                req = ChatRequest(temperature=0.3, max_tokens=150, top_p=0.9)
+                # 累加而非重写：素材窗口只有最近15天，若每次从零重写，
+                # 职业、所在地这类稳定事实会随旧消息滚出窗口而被"忘掉"。
+                # 把已有画像一并给模型，让它在旧结论上修订。
+                req = ChatRequest(temperature=0.3, max_tokens=300, top_p=0.9)
                 req.add_system(
                     "你是用户画像提炼助手。根据群友的【自我描述】和【日常发言】，写出这个人"
-                    "长期稳定的特征（职业、常玩的游戏、作息、习惯、性格、常聊话题等），1-2句话。\n"
+                    "长期稳定的特征（职业、常玩的游戏、作息、习惯、性格、常聊话题等）。\n"
                     "- 【自我描述】是TA直接说过的关于自己的话，较可信\n"
                     "- 【日常发言】是TA的日常聊天，只从反复出现的模式里归纳\n"
+                    "- 【已有画像】是之前根据更早的聊天总结的结论（本次资料里可能不再提到）\n"
+                    "\n给了【已有画像】时，要在它的基础上更新，而不是重写：\n"
+                    "A. 保留仍然成立的稳定事实（职业、所在地、长期爱好），"
+                    "即使这次资料里没再提到也要留着——人不会因为最近没说就不是那样的人。\n"
+                    "B. 新资料和已有画像冲突时以新资料为准，直接改掉旧结论。\n"
+                    "C. 新资料里发现的新的稳定特征，补充进去。\n"
+                    "D. 已有画像里明显是一次性事件、或事后看判断错的，删掉。\n"
                     "\n判断标准：\n"
                     "1. 只写反复出现、多次印证的事。一次性事件（某天加班、家里进水、某次消费）"
                     "是经历不是特征，不要写。\n"
@@ -1680,15 +1751,20 @@ class GroupChatBot:
                     "「发言活跃」。只写能把TA和别人区分开的信息。\n"
                     "5. 不要猜年龄、性别、收入、家境，资料没明说就不写。\n"
                     "6. 用第三人称，不复述原话，不解释你的推理过程。\n"
-                    "7. 只能写这份资料里出现过的内容。资料里没有的职业、地名、游戏名，"
+                    "7. 只能写这份资料或已有画像里出现过的内容。没出现过的职业、地名、游戏名，"
                     "一个字都不能出现——绝对不要把别人的情况套到TA身上。\n"
                     "\n粒度要求：写具体的东西——做什么工作或在哪读书、常玩什么、什么作息或"
-                    "习惯、说话有什么特点，每一项都必须能在资料里找到出处；"
+                    "习惯、说话有什么特点，每一项都必须有出处；"
                     "不要写「是个游戏爱好者」「喜欢和大家聊天」这种笼统评价。\n"
-                    "\n只要能找到一条具体且反复出现的信息，就要写出来。"
-                    "只有当资料里确实找不到任何具体信息时，才输出「无法提炼」四个字。"
+                    "\n输出一段完整画像（不是修改说明、不要分点、不要加「更新后画像：」"
+                    "这类开头），必须控制在120字以内——这是硬性要求，"
+                    "累积的内容变多时要做取舍，只保留最能代表这个人的信息。\n"
+                    "只要能找到一条具体且反复出现的信息，就要写出来。"
+                    "只有当资料和已有画像里都找不到任何具体信息时，才输出「无法提炼」四个字。"
                 )
                 parts = [f"群友「{latest_name}」的资料："]
+                if previous_summary:
+                    parts.append(f"【已有画像】\n{previous_summary}")
                 if self_text:
                     parts.append(f"【自我描述】\n{self_text}")
                 if daily_text:
@@ -1698,13 +1774,22 @@ class GroupChatBot:
                 summary = (resp.content or "").strip().strip('"\'“”')
                 if not summary:
                     logger.info("[画像] 跳过 %s：LLM 返回空", latest_name)
+                    self._profile_failed_material[sid] = material_sig
                     result["skipped"] += 1
                     continue
                 if self._is_profile_refusal(summary):
                     logger.info("[画像] 跳过 %s：素材判断不出稳定特征（%s）",
                                 latest_name, summary[:40])
+                    self._profile_failed_material[sid] = material_sig
                     result["skipped"] += 1
                     continue
+                summary = self._normalize_profile_summary(summary)
+                if not summary:
+                    logger.info("[画像] 跳过 %s：清理后无有效内容", latest_name)
+                    self._profile_failed_material[sid] = material_sig
+                    result["skipped"] += 1
+                    continue
+                self._profile_failed_material.pop(sid, None)
 
                 # 样本里最新一条的来源会话作为画像归属会话
                 sample = unique_facts + unique_daily
@@ -1712,6 +1797,7 @@ class GroupChatBot:
                 warnings = self._profile_quality_warnings(summary)
                 if warnings:
                     logger.info("[画像] %s 质量提示: %s", latest_name, "；".join(warnings))
+                existing_meta = (existing.metadata or {}) if existing else {}
                 new_profile = Memory(
                     content=f"【用户画像 {latest_name}】{summary}",
                     memory_type="semantic",
@@ -1730,6 +1816,13 @@ class GroupChatBot:
                         "source_facts": source_lines(unique_facts),
                         "source_daily": source_lines(unique_daily),
                         "warnings": warnings,
+                        # 累积轨迹：画像是在历次结论上迭代出来的，不是本次素材的快照
+                        "first_distilled_at": (
+                            existing_meta.get("first_distilled_at") or now.isoformat()
+                        ),
+                        "last_distilled_at": now.isoformat(),
+                        "distill_count": int(existing_meta.get("distill_count", 0) or 0) + 1,
+                        "previous_summary": previous_summary,
                     },
                 )
                 if existing and existing.id:

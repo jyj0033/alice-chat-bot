@@ -2960,12 +2960,17 @@
             grid.innerHTML = profiles.map(p => {
                 const name = escapeHtml(p.sender_name) || '未知用户';
                 const initial = (p.sender_name || '?').trim().charAt(0);
-                const created = new Date(p.created_at).toLocaleString('zh-CN', {hour12:false});
-                const updated = new Date(p.last_accessed).toLocaleString('zh-CN', {hour12:false});
+                const fmt = t => t ? new Date(t).toLocaleString('zh-CN', {hour12:false}) : '—';
+                const firstAt = fmt(p.first_distilled_at || p.created_at);
+                const lastAt = fmt(p.last_distilled_at || p.created_at);
+                const recalled = fmt(p.last_accessed);
                 let src = '';
-                if (p.fact_count) src += `基于 ${p.fact_count} 条自述`;
-                if (p.daily_count) src += (src ? ' + ' : '基于 ') + `${p.daily_count} 条日常发言`;
+                if (p.fact_count) src += `本次基于 ${p.fact_count} 条自述`;
+                if (p.daily_count) src += (src ? ' + ' : '本次基于 ') + `${p.daily_count} 条日常发言`;
                 const factCount = src ? `<span class="badge-facts">${src}</span>` : '';
+                const rounds = p.distill_count
+                    ? `<span class="badge-facts" title="画像在历次结论上累积更新，不是单次快照">累积 ${p.distill_count} 次</span>`
+                    : '';
                 const warns = (p.warnings || []).map(w =>
                     `<span class="badge-warn" title="提炼结果可能有问题，请对照原句核对">⚠ ${escapeHtml(w)}</span>`
                 ).join('');
@@ -2974,17 +2979,23 @@
                 body = body.replace(/^【用户画像[^】]*】/, '');
                 const facts = p.source_facts || [];
                 const daily = p.source_daily || [];
+                const prev = p.previous_summary || '';
                 const renderList = (title, items) => items.length
                     ? `<div class="src-group"><div class="src-title">${title}（${items.length}）</div>
                          <ul class="src-list">${items.map(s => `<li>${escapeHtml(s)}</li>`).join('')}</ul></div>`
                     : '';
-                const srcBlock = (facts.length || daily.length)
+                const prevBlock = prev
+                    ? `<div class="src-group"><div class="src-title">上一版画像（本次在它基础上更新）</div>
+                         <ul class="src-list"><li>${escapeHtml(prev)}</li></ul></div>`
+                    : '';
+                const srcBlock = (facts.length || daily.length || prev)
                     ? `<details class="profile-src">
-                         <summary>▸ 查看提炼原句（${facts.length + daily.length} 条）</summary>
-                         ${renderList('自我描述', facts)}
-                         ${renderList('日常发言', daily)}
+                         <summary>▸ 查看提炼依据（${facts.length + daily.length} 条原句${prev ? ' + 上一版画像' : ''}）</summary>
+                         ${prevBlock}
+                         ${renderList('本次自我描述', facts)}
+                         ${renderList('本次日常发言', daily)}
                        </details>`
-                    : `<div class="src-empty">此画像提炼于旧版本，未留存原句；重新提炼后可查看</div>`;
+                    : `<div class="src-empty">此画像提炼于旧版本，未留存依据；重新提炼后可查看</div>`;
                 return `
                     <div class="profile-card">
                         <div class="profile-top">
@@ -2999,7 +3010,11 @@
                         <div class="profile-content">${escapeHtml(body)}</div>
                         ${warns ? `<div class="profile-meta">${warns}</div>` : ''}
                         ${srcBlock}
-                        <div class="profile-meta">${factCount}<span>· 提炼于 ${created}</span><span style="margin-left:auto">更新 ${updated}</span></div>
+                        <div class="profile-meta">${factCount}${rounds}</div>
+                        <div class="profile-meta">
+                            <span>首次提炼 ${firstAt}</span><span>· 最近提炼 ${lastAt}</span>
+                            <span style="margin-left:auto" title="Bot 最近一次在聊天里想起这个人的时间；不代表重新提炼">最近想起 ${recalled}</span>
+                        </div>
                     </div>`;
             }).join('');
         }

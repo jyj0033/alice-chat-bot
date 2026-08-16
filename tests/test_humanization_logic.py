@@ -543,6 +543,34 @@ class HumanizationLogicTests(unittest.TestCase):
         named = detector.detect(SocialContext(message_content="爱丽丝在吗"))
         self.assertTrue(any(r.startswith("昵称") for r in named["reasons"]))
 
+    def test_profile_summary_normalization(self):
+        """剥掉元话语前缀，并把累加变长的画像收进长度上限（按句子边界）。"""
+        from main import GroupChatBot
+        self.assertEqual(
+            GroupChatBot._normalize_profile_summary("更新后画像：在芜湖做电催，常加班"),
+            "在芜湖做电催，常加班",
+        )
+        self.assertEqual(
+            GroupChatBot._normalize_profile_summary("综合来看：总结：常玩原神"),
+            "常玩原神",
+        )
+        long_text = "在芜湖做电催工作，常加班且单休；" * 12
+        out = GroupChatBot._normalize_profile_summary(long_text)
+        self.assertLessEqual(len(out), 120)
+        # 按句子边界收尾，不能停在半句
+        self.assertTrue(out.endswith(("；", "。", "单休")), out)
+
+    def test_profile_prefix_is_stripped_for_incremental_update(self):
+        """已有画像要去掉「【用户画像 名字】」前缀后喂回模型做增量修订。"""
+        from main import GroupChatBot
+        self.assertEqual(
+            GroupChatBot._strip_profile_prefix("【用户画像 龍飛月】在芜湖做电催，常加班"),
+            "在芜湖做电催，常加班",
+        )
+        self.assertEqual(GroupChatBot._strip_profile_prefix(""), "")
+        # 没有前缀时原样返回
+        self.assertEqual(GroupChatBot._strip_profile_prefix("在芜湖做电催"), "在芜湖做电催")
+
     def test_profile_quality_warnings_flag_suspicious_wording(self):
         """推测、性别不明、空话要打标记，交给页面展示以便人工核对原句。"""
         from main import GroupChatBot
