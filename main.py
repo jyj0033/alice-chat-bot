@@ -1527,6 +1527,33 @@ class GroupChatBot:
                 break
         return out
 
+    # 画像里不该出现的用词：prompt 已明令禁止推测，但模型偶尔还是会写。
+    # 这里不直接丢弃（画像其余部分可能是对的），而是打标记交给 Web 端展示，
+    # 方便人工核对原句后修正。
+    _PROFILE_HEDGE_WORDS = (
+        "可能", "似乎", "也许", "大概", "或许", "貌似", "估计", "应该是",
+    )
+    # 对任何人都成立、等于没说的描述
+    _PROFILE_VAGUE_PATTERNS = (
+        "关注游戏话题", "涉及游戏话题", "喜欢和群友互动", "与群友互动",
+        "发言活跃", "群内活跃", "热衷于群聊", "关注度高",
+    )
+
+    @classmethod
+    def _profile_quality_warnings(cls, summary: str) -> list:
+        """标出画像里的可疑表述（推测、性别不明、空话），供人工复核。"""
+        text = summary or ""
+        warnings = []
+        hedges = [w for w in cls._PROFILE_HEDGE_WORDS if w in text]
+        if hedges:
+            warnings.append("含推测用词：" + "、".join(hedges))
+        if "他/她" in text or "TA" in text:
+            warnings.append("性别不明确")
+        vague = [p for p in cls._PROFILE_VAGUE_PATTERNS if p in text]
+        if vague:
+            warnings.append("描述空泛：" + "、".join(vague))
+        return warnings
+
     @staticmethod
     def _is_profile_refusal(summary: str) -> bool:
         """判断画像提炼输出是否是 LLM 的拒绝文本（素材太散时会答"无法提炼"）。
@@ -1601,6 +1628,10 @@ class GroupChatBot:
 
                 # 素材不足：自述少且日常发言也少 → 无可提炼
                 if len(self_facts) < min_facts and len(daily) < daily_min:
+                    logger.debug(
+                        "[画像] 跳过 %s：素材不足（自述%d < %d 且日常%d < %d）",
+                        latest_name, len(self_facts), min_facts, len(daily), daily_min,
+                    )
                     result["skipped"] += 1
                     continue
 
@@ -1623,19 +1654,39 @@ class GroupChatBot:
                         self._strip_speaker(m.content or "")[:cap_len] for m in reversed(msgs)
                     )
 
+                def source_lines(msgs: list, cap_len: int = 120) -> list:
+                    """留存提炼素材原句，供 Web 端追溯"哪句话导致了这个结论"。"""
+                    return [
+                        self._strip_speaker(m.content or "")[:cap_len]
+                        for m in reversed(msgs)
+                        if (m.content or "").strip()
+                    ]
+
                 self_text = render_section(unique_facts)
                 daily_text = render_section(unique_daily)
 
                 req = ChatRequest(temperature=0.3, max_tokens=150, top_p=0.9)
                 req.add_system(
-                    "你是用户画像提炼助手。根据群友的【自我描述】和【日常发言】，提炼这个人的"
-                    "稳定个人特征（职业、喜好、习惯、家庭、性格、生活状态、常聊话题等），输出1-2句话。\n"
-                    "- 【自我描述】是TA直接说过的关于自己的话，较可信，直接采用\n"
-                    "- 【日常发言】是TA在群里的日常聊天，从中推断兴趣、性格、习惯等长期倾向，"
-                    "不要被单条玩笑或偶然话题带偏\n"
-                    "只写稳定事实或长期倾向，不要推测、不要复述原话、不要寒暄。用第三人称。\n"
-                    "如果素材太零散、判断不出任何稳定特征，只输出「无法提炼」四个字，"
-                    "不要解释原因、不要输出其他内容。"
+                    "你是用户画像提炼助手。根据群友的【自我描述】和【日常发言】，写出这个人"
+                    "长期稳定的特征（职业、常玩的游戏、作息、习惯、性格、常聊话题等），1-2句话。\n"
+                    "- 【自我描述】是TA直接说过的关于自己的话，较可信\n"
+                    "- 【日常发言】是TA的日常聊天，只从反复出现的模式里归纳\n"
+                    "\n判断标准：\n"
+                    "1. 只写反复出现、多次印证的事。一次性事件（某天加班、家里进水、某次消费）"
+                    "是经历不是特征，不要写。\n"
+                    "2. 群聊里大量是玩笑、玩梗、反讽，不要当真；被认真提过或多次提到的才算。\n"
+                    "3. 不确定的就不写，不要用「可能」「似乎」「也许」「大概」这类词。\n"
+                    "4. 不要写对谁都成立的空话，例如「关注游戏话题」「喜欢和群友互动」"
+                    "「发言活跃」。只写能把TA和别人区分开的信息。\n"
+                    "5. 不要猜年龄、性别、收入、家境，资料没明说就不写。\n"
+                    "6. 用第三人称，不复述原话，不解释你的推理过程。\n"
+                    "7. 只能写这份资料里出现过的内容。资料里没有的职业、地名、游戏名，"
+                    "一个字都不能出现——绝对不要把别人的情况套到TA身上。\n"
+                    "\n粒度要求：写具体的东西——做什么工作或在哪读书、常玩什么、什么作息或"
+                    "习惯、说话有什么特点，每一项都必须能在资料里找到出处；"
+                    "不要写「是个游戏爱好者」「喜欢和大家聊天」这种笼统评价。\n"
+                    "\n只要能找到一条具体且反复出现的信息，就要写出来。"
+                    "只有当资料里确实找不到任何具体信息时，才输出「无法提炼」四个字。"
                 )
                 parts = [f"群友「{latest_name}」的资料："]
                 if self_text:
@@ -1645,13 +1696,22 @@ class GroupChatBot:
                 req.add_user("\n".join(parts))
                 resp = await provider.chat(req)
                 summary = (resp.content or "").strip().strip('"\'“”')
-                if not summary or self._is_profile_refusal(summary):
+                if not summary:
+                    logger.info("[画像] 跳过 %s：LLM 返回空", latest_name)
+                    result["skipped"] += 1
+                    continue
+                if self._is_profile_refusal(summary):
+                    logger.info("[画像] 跳过 %s：素材判断不出稳定特征（%s）",
+                                latest_name, summary[:40])
                     result["skipped"] += 1
                     continue
 
                 # 样本里最新一条的来源会话作为画像归属会话
                 sample = unique_facts + unique_daily
                 src_session = sample[0].source_session if sample else ""
+                warnings = self._profile_quality_warnings(summary)
+                if warnings:
+                    logger.info("[画像] %s 质量提示: %s", latest_name, "；".join(warnings))
                 new_profile = Memory(
                     content=f"【用户画像 {latest_name}】{summary}",
                     memory_type="semantic",
@@ -1666,6 +1726,10 @@ class GroupChatBot:
                         "sender_name": latest_name,
                         "fact_count": len(unique_facts),
                         "daily_count": len(unique_daily),
+                        # 留存提炼素材：Web 端据此追溯"哪句话导致了这个结论"
+                        "source_facts": source_lines(unique_facts),
+                        "source_daily": source_lines(unique_daily),
+                        "warnings": warnings,
                     },
                 )
                 if existing and existing.id:

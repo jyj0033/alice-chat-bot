@@ -543,6 +543,25 @@ class HumanizationLogicTests(unittest.TestCase):
         named = detector.detect(SocialContext(message_content="爱丽丝在吗"))
         self.assertTrue(any(r.startswith("昵称") for r in named["reasons"]))
 
+    def test_profile_quality_warnings_flag_suspicious_wording(self):
+        """推测、性别不明、空话要打标记，交给页面展示以便人工核对原句。"""
+        from main import GroupChatBot
+        w = GroupChatBot._profile_quality_warnings(
+            "他/她可能家境一般，似乎在做AI相关工作"
+        )
+        self.assertTrue(any("推测用词" in x for x in w))
+        self.assertTrue(any("性别不明确" in x for x in w))
+        self.assertTrue(
+            GroupChatBot._profile_quality_warnings("此人日常关注游戏话题")
+        )
+        # 具体、确定的画像不该被打标
+        self.assertEqual(
+            GroupChatBot._profile_quality_warnings(
+                "在芜湖做电话催收，加班多，常聊原神和工作吐槽"
+            ),
+            [],
+        )
+
     def test_implicit_direction_allows_silence(self):
         """延续对话推断出的指向（to_bot_implicit）允许 LLM 判断后沉默；
         明确对bot说（to_bot）则不给沉默选项。"""

@@ -562,6 +562,10 @@ async def get_profiles():
                 "content": p.content,
                 "fact_count": meta.get("fact_count", 0),
                 "daily_count": meta.get("daily_count", 0),
+                # 提炼素材原句：用于在页面上核对"哪句话导致了这个结论"
+                "source_facts": meta.get("source_facts", []) or [],
+                "source_daily": meta.get("source_daily", []) or [],
+                "warnings": meta.get("warnings", []) or [],
                 "created_at": p.created_at.isoformat(),
                 "last_accessed": p.last_accessed.isoformat(),
                 "source_session": p.source_session,

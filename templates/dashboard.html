@@ -705,6 +705,34 @@
             padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 700;
             background: #ede9fe; color: #6d28d9;
         }
+        .badge-warn {
+            padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 700;
+            background: #fef3c7; color: #b45309;
+        }
+        /* 提炼素材原句：默认折叠，展开后可核对结论是从哪句话来的 */
+        .profile-src > summary {
+            cursor: pointer; font-size: 11.5px; color: var(--muted);
+            list-style: none; user-select: none; padding: 2px 0;
+        }
+        .profile-src > summary::-webkit-details-marker { display: none; }
+        .profile-src > summary:hover { color: #6d28d9; }
+        .profile-src[open] > summary { color: #6d28d9; font-weight: 700; }
+        .src-group { margin-top: 8px; }
+        .src-title {
+            font-size: 11px; font-weight: 700; color: var(--muted);
+            text-transform: none; margin-bottom: 4px;
+        }
+        .src-list {
+            max-height: 220px; overflow-y: auto; margin: 0; padding: 0; list-style: none;
+            border: 1px solid var(--border); border-radius: 9px; background: #fbfbfd;
+        }
+        .src-list li {
+            font-size: 12px; line-height: 1.6; color: var(--text-secondary);
+            padding: 6px 10px; border-bottom: 1px solid var(--border);
+            word-break: break-word;
+        }
+        .src-list li:last-child { border-bottom: none; }
+        .src-empty { font-size: 12px; color: var(--muted); padding: 6px 2px; }
 
         /* ============ 会话聊天 ============ */
         .chat-container {
@@ -2938,9 +2966,25 @@
                 if (p.fact_count) src += `基于 ${p.fact_count} 条自述`;
                 if (p.daily_count) src += (src ? ' + ' : '基于 ') + `${p.daily_count} 条日常发言`;
                 const factCount = src ? `<span class="badge-facts">${src}</span>` : '';
+                const warns = (p.warnings || []).map(w =>
+                    `<span class="badge-warn" title="提炼结果可能有问题，请对照原句核对">⚠ ${escapeHtml(w)}</span>`
+                ).join('');
                 // 内容去掉「【用户画像 名字】」前缀，只显示提炼结果
                 let body = p.content || '';
                 body = body.replace(/^【用户画像[^】]*】/, '');
+                const facts = p.source_facts || [];
+                const daily = p.source_daily || [];
+                const renderList = (title, items) => items.length
+                    ? `<div class="src-group"><div class="src-title">${title}（${items.length}）</div>
+                         <ul class="src-list">${items.map(s => `<li>${escapeHtml(s)}</li>`).join('')}</ul></div>`
+                    : '';
+                const srcBlock = (facts.length || daily.length)
+                    ? `<details class="profile-src">
+                         <summary>▸ 查看提炼原句（${facts.length + daily.length} 条）</summary>
+                         ${renderList('自我描述', facts)}
+                         ${renderList('日常发言', daily)}
+                       </details>`
+                    : `<div class="src-empty">此画像提炼于旧版本，未留存原句；重新提炼后可查看</div>`;
                 return `
                     <div class="profile-card">
                         <div class="profile-top">
@@ -2949,11 +2993,31 @@
                                 <div class="profile-name">${name}</div>
                                 <div class="profile-id">QQ ${escapeHtml(p.sender_id)}</div>
                             </div>
+                            <button class="btn btn-danger btn-sm" style="margin-left:auto"
+                                onclick="deleteProfile(${p.id}, '${escapeHtml(p.sender_name).replace(/'/g, "\\'")}')">删除</button>
                         </div>
                         <div class="profile-content">${escapeHtml(body)}</div>
+                        ${warns ? `<div class="profile-meta">${warns}</div>` : ''}
+                        ${srcBlock}
                         <div class="profile-meta">${factCount}<span>· 提炼于 ${created}</span><span style="margin-left:auto">更新 ${updated}</span></div>
                     </div>`;
             }).join('');
+        }
+
+        async function deleteProfile(id, name) {
+            if (!confirm(`删除「${name}」的画像？\n删除后下次提炼会重新生成。`)) return;
+            try {
+                const res = await fetch(API + '/memories/' + id, { method: 'DELETE' });
+                const data = await res.json();
+                if (data.success) {
+                    showToast('已删除，下次提炼会重新生成', 'success');
+                    loadProfiles();
+                } else {
+                    showToast('删除失败：' + (data.error || data.message || '未知错误'), 'error');
+                }
+            } catch (e) {
+                showToast('删除失败：' + e, 'error');
+            }
         }
 
         async function distillProfiles() {
