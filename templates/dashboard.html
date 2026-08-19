@@ -751,6 +751,41 @@
         .mbti-fill { height: 100%; background: linear-gradient(90deg, #7c6cff, #a78bfa); }
         .mbti-reason { color: var(--text-secondary); flex: 2; min-width: 0; }
         .mbti-low { opacity: .5; }
+        /* ============ 群聊黑话 ============ */
+        .slang-add { display: flex; gap: 10px; padding: 16px 20px; flex-wrap: wrap; }
+        .slang-add input { flex: 1; min-width: 160px; }
+        .slang-row {
+            display: flex; align-items: center; gap: 12px;
+            padding: 12px 20px; border-bottom: 1px solid var(--border);
+        }
+        .slang-row:last-child { border-bottom: none; }
+        .slang-row.off { opacity: .45; }
+        .slang-term {
+            font-weight: 700; font-size: 13.5px; color: var(--text-primary);
+            min-width: 120px; flex-shrink: 0; word-break: break-all;
+        }
+        .slang-meaning { flex: 2; font-size: 13px; color: var(--text-secondary); }
+        .slang-example {
+            flex: 1.4; font-size: 11.5px; color: var(--muted);
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .slang-tags { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+        .slang-acts { display: flex; gap: 6px; flex-shrink: 0; }
+        .badge-manual {
+            padding: 2px 8px; border-radius: 999px; font-size: 10.5px; font-weight: 700;
+            background: #dcfce7; color: #15803d;
+        }
+        .badge-auto {
+            padding: 2px 8px; border-radius: 999px; font-size: 10.5px; font-weight: 700;
+            background: #ede9fe; color: #6d28d9;
+        }
+        .badge-hits {
+            padding: 2px 8px; border-radius: 999px; font-size: 10.5px;
+            background: #f1f5f9; color: #475569; font-family: var(--font-mono);
+        }
+        .slang-row input {
+            font-size: 13px; padding: 6px 10px;
+        }
 
         /* ============ 会话聊天 ============ */
         .chat-container {
@@ -1086,6 +1121,7 @@
                 <div class="nav-item" data-page="speaking"><svg class="icon"><use href="#i-mic"/></svg> 发言设置</div>
                 <div class="nav-item" data-page="memory"><svg class="icon"><use href="#i-layers"/></svg> 记忆设置</div>
                 <div class="nav-item" data-page="profiles"><svg class="icon"><use href="#i-users"/></svg> 用户画像</div>
+                <div class="nav-item" data-page="slang"><svg class="icon"><use href="#i-archive"/></svg> 群聊黑话</div>
                 <div class="nav-item" data-page="behavior"><svg class="icon"><use href="#i-puzzle"/></svg> 高级行为</div>
                 <div class="nav-title">工具</div>
                 <div class="nav-item" data-page="test"><svg class="icon"><use href="#i-flask"/></svg> 测试对话</div>
@@ -2031,6 +2067,44 @@
                 </div>
             </div>
 
+            <!-- 群聊黑话 -->
+            <div id="page-slang" class="page">
+                <div class="header">
+                    <div class="header-text">
+                        <h2>群聊黑话</h2>
+                        <div class="subtitle">群里特有的梗、外号和缩写。Bot 回复时只会带上当前对话里出现的词，避免按字面理解错</div>
+                    </div>
+                    <div class="header-status" style="display: flex; align-items: center; gap: 8px;">
+                        <span class="hint" id="slang-meta"></span>
+                        <button class="btn btn-primary" onclick="extractSlang()"><svg class="icon-sm"><use href="#i-zap"/></svg>立即提取</button>
+                        <button class="btn btn-secondary" onclick="loadSlang()"><svg class="icon-sm"><use href="#i-refresh"/></svg>刷新</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="card-ico"><svg class="icon-sm"><use href="#i-archive"/></svg></span>手动添加</div>
+                    </div>
+                    <div class="slang-add">
+                        <input type="text" id="slang-term" placeholder="黑话（如 舟舟老师）" maxlength="20">
+                        <input type="text" id="slang-meaning" placeholder="在这个群里实际指什么" maxlength="120">
+                        <input type="text" id="slang-session" placeholder="限定会话（留空=全部群）" maxlength="40">
+                        <button class="btn btn-primary" onclick="addSlang()">添加</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="card-ico"><svg class="icon-sm"><use href="#i-archive"/></svg></span>词表
+                            <span class="hint" id="slang-count" style="margin-left:6px"></span>
+                        </div>
+                    </div>
+                    <div id="slang-list">
+                        <div class="hint" style="padding: 14px;">加载中...</div>
+                    </div>
+                </div>
+            </div>
+
             <!-- 高级行为 -->
             <div id="page-behavior" class="page">
                 <div class="header">
@@ -2300,6 +2374,7 @@
                 if (item.dataset.page === 'simulation') loadAdvancedConfig();
                 if (item.dataset.page === 'chat') loadSessions();
                 if (item.dataset.page === 'profiles') loadProfiles();
+                if (item.dataset.page === 'slang') loadSlang();
                 if (item.dataset.page === 'logs') loadLogs();
             });
         });
@@ -3074,6 +3149,111 @@
             } catch (e) {
                 showToast('删除失败：' + e, 'error');
             }
+        }
+
+        async function loadSlang() {
+            const data = await fetch(API + '/slang').then(r => r.json());
+            const list = document.getElementById('slang-list');
+            const rows = data.slang || [];
+            document.getElementById('slang-count').textContent = `共 ${rows.length} 条`;
+            document.getElementById('slang-meta').textContent = '自动提取：每天一次，从最近 48 小时聊天记录中识别';
+            if (!rows.length) {
+                list.innerHTML = `<div class="empty"><div class="empty-ico"><svg class="icon-lg"><use href="#i-archive"/></svg></div>还没有收录黑话。<br>点右上角「立即提取」从最近聊天里识别，也可以在上面手动添加</div>`;
+                return;
+            }
+            list.innerHTML = rows.map(r => {
+                const scope = r.session ? escapeHtml(r.session.replace('group_', '群 ')) : '全部群';
+                return `
+                <div class="slang-row ${r.enabled ? '' : 'off'}" data-id="${r.id}">
+                    <div class="slang-term">${escapeHtml(r.term)}</div>
+                    <div class="slang-meaning">${escapeHtml(r.meaning)}</div>
+                    <div class="slang-example" title="${escapeHtml(r.example || '')}">${escapeHtml(r.example || '')}</div>
+                    <div class="slang-tags">
+                        <span class="${r.source === 'manual' ? 'badge-manual' : 'badge-auto'}">${r.source === 'manual' ? '人工' : '自动'}</span>
+                        <span class="badge-hits" title="被注入回复的次数">${r.hit_count || 0} 次</span>
+                        <span class="hint" style="font-size:11px">${scope}</span>
+                    </div>
+                    <div class="slang-acts">
+                        <button class="btn btn-secondary btn-sm" onclick="editSlangRow(${r.id})">编辑</button>
+                        <button class="btn btn-secondary btn-sm" onclick="toggleSlang(${r.id}, ${r.enabled ? 0 : 1})">${r.enabled ? '停用' : '启用'}</button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteSlang(${r.id}, '${escapeHtml(r.term).replace(/'/g, "\\'")}')">删除</button>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        async function addSlang() {
+            const term = document.getElementById('slang-term').value.trim();
+            const meaning = document.getElementById('slang-meaning').value.trim();
+            const session = document.getElementById('slang-session').value.trim();
+            if (!term || !meaning) { showToast('词和含义都要填', 'error'); return; }
+            const res = await fetch(API + '/slang', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ term, meaning, session })
+            }).then(r => r.json());
+            if (res.success) {
+                showToast('已添加', 'success');
+                document.getElementById('slang-term').value = '';
+                document.getElementById('slang-meaning').value = '';
+                loadSlang();
+            } else showToast('添加失败：' + (res.error || ''), 'error');
+        }
+
+        function editSlangRow(id) {
+            const row = document.querySelector(`.slang-row[data-id="${id}"]`);
+            if (!row || row.dataset.editing) return;
+            row.dataset.editing = '1';
+            const term = row.querySelector('.slang-term').textContent;
+            const meaning = row.querySelector('.slang-meaning').textContent;
+            row.querySelector('.slang-term').innerHTML = `<input type="text" value="${escapeHtml(term)}" style="width:100%">`;
+            row.querySelector('.slang-meaning').innerHTML = `<input type="text" value="${escapeHtml(meaning)}" style="width:100%">`;
+            row.querySelector('.slang-acts').innerHTML =
+                `<button class="btn btn-primary btn-sm" onclick="saveSlangRow(${id})">保存</button>
+                 <button class="btn btn-secondary btn-sm" onclick="loadSlang()">取消</button>`;
+        }
+
+        async function saveSlangRow(id) {
+            const row = document.querySelector(`.slang-row[data-id="${id}"]`);
+            const term = row.querySelector('.slang-term input').value.trim();
+            const meaning = row.querySelector('.slang-meaning input').value.trim();
+            if (!term || !meaning) { showToast('词和含义都要填', 'error'); return; }
+            const res = await fetch(API + '/slang/' + id, {
+                method: 'PUT', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ term, meaning })
+            }).then(r => r.json());
+            showToast(res.success ? '已保存' : '保存失败', res.success ? 'success' : 'error');
+            loadSlang();
+        }
+
+        async function toggleSlang(id, enabled) {
+            const res = await fetch(API + '/slang/' + id, {
+                method: 'PUT', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ enabled })
+            }).then(r => r.json());
+            if (res.success) { showToast(enabled ? '已启用' : '已停用', 'success'); loadSlang(); }
+            else showToast('操作失败', 'error');
+        }
+
+        async function deleteSlang(id, term) {
+            if (!confirm(`删除黑话「${term}」？`)) return;
+            const res = await fetch(API + '/slang/' + id, { method: 'DELETE' }).then(r => r.json());
+            if (res.success) { showToast('已删除', 'success'); loadSlang(); }
+            else showToast('删除失败：' + (res.error || res.message || ''), 'error');
+        }
+
+        async function extractSlang() {
+            const btn = document.querySelector('#page-slang .btn-primary');
+            const old = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<svg class="icon-sm"><use href="#i-zap"/></svg>提取中...';
+            try {
+                const res = await fetch(API + '/slang/extract', { method: 'POST' }).then(r => r.json());
+                if (res.success) {
+                    showToast(`提取完成：扫描 ${res.sessions || 0} 个群，识别 ${res.found || 0} 条，入库 ${res.saved || 0} 条`, 'success');
+                    loadSlang();
+                } else showToast('提取失败：' + (res.error || ''), 'error');
+            } catch (e) { showToast('提取失败：' + e, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = old; }
         }
 
         async function distillProfiles() {

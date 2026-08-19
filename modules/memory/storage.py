@@ -150,7 +150,138 @@ class MemoryStorage:
             ON memories(source_session, memory_type, created_at DESC)
         """)
 
+        # 群聊黑话表：群内特有的梗、内部称呼、缩写。字面意思和实际意思不同，
+        # LLM 单看字面会理解错，所以单独存一份可人工校订的词表。
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS glossary (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                term TEXT NOT NULL,
+                meaning TEXT NOT NULL,
+                session TEXT DEFAULT '',
+                example TEXT DEFAULT '',
+                enabled INTEGER DEFAULT 1,
+                source TEXT DEFAULT 'auto',
+                hit_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(term, session)
+            )
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_glossary_session
+            ON glossary(session, enabled)
+        """)
+
         self.conn.commit()
+
+    # === 群聊黑话（glossary） ===
+
+    def upsert_slang(
+        self,
+        term: str,
+        meaning: str,
+        session: str = "",
+        example: str = "",
+        source: str = "auto",
+    ) -> int:
+        """新增或更新一条黑话。
+
+        人工校订过的词条（source=manual）不会被自动提取覆盖释义，
+        避免每天的定时任务把人改好的解释又冲掉。
+        """
+        term = (term or "").strip()
+        meaning = (meaning or "").strip()
+        if not term or not meaning:
+            return 0
+        now = datetime.now().isoformat(sep=' ')
+        row = self.conn.execute(
+            "SELECT id, source FROM glossary WHERE term = ? AND session = ?",
+            (term, session),
+        ).fetchone()
+        if row:
+            if row["source"] == "manual" and source == "auto":
+                return row["id"]
+            self.conn.execute(
+                "UPDATE glossary SET meaning = ?, example = COALESCE(NULLIF(?, ''), example),"
+                " source = ?, updated_at = ? WHERE id = ?",
+                (meaning, example, source, now, row["id"]),
+            )
+            self.conn.commit()
+            return row["id"]
+        cursor = self.conn.execute(
+            "INSERT INTO glossary (term, meaning, session, example, source, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (term, meaning, session, example, source, now, now),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def list_slang(self, session: str = "", enabled_only: bool = False) -> list[dict]:
+        """列出黑话（session 为空时返回全部，便于 Web 管理）。"""
+        clauses, params = [], []
+        if session:
+            clauses.append("(session = ? OR session = '')")
+            params.append(session)
+        if enabled_only:
+            clauses.append("enabled = 1")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM glossary {where} ORDER BY hit_count DESC, updated_at DESC",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_slang(self, slang_id: int, **fields) -> bool:
+        """更新单条黑话（term/meaning/example/enabled）。"""
+        allowed = {"term", "meaning", "example", "enabled"}
+        sets, params = [], []
+        for key, value in fields.items():
+            if key in allowed and value is not None:
+                sets.append(f"{key} = ?")
+                params.append(int(value) if key == "enabled" else str(value).strip())
+        if not sets:
+            return False
+        sets.append("updated_at = ?")
+        params.append(datetime.now().isoformat(sep=' '))
+        params.append(slang_id)
+        cursor = self.conn.execute(
+            f"UPDATE glossary SET {', '.join(sets)} WHERE id = ?", params
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def delete_slang(self, slang_id: int) -> bool:
+        cursor = self.conn.execute("DELETE FROM glossary WHERE id = ?", (slang_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def match_slang(self, text: str, session: str = "", limit: int = 12) -> list[dict]:
+        """挑出文本里出现过的黑话。
+
+        只注入命中的词条，不是把整张词表塞进提示词——词表会越来越大，
+        全量注入既浪费 token 又会干扰模型。
+        """
+        if not text:
+            return []
+        matched = []
+        for row in self.list_slang(session=session, enabled_only=True):
+            if row["term"] and row["term"] in text:
+                matched.append(row)
+        # 长词优先：命中「舟舟老师」时不必再解释「舟舟」
+        matched.sort(key=lambda r: len(r["term"]), reverse=True)
+        return matched[:limit]
+
+    def bump_slang_hits(self, slang_ids: list) -> int:
+        """记录命中次数，Web 端据此排序，也能看出哪些词是活的。"""
+        ids = [i for i in (slang_ids or []) if i]
+        if not ids:
+            return 0
+        self.conn.executemany(
+            "UPDATE glossary SET hit_count = hit_count + 1 WHERE id = ?",
+            [(i,) for i in ids],
+        )
+        self.conn.commit()
+        return len(ids)
 
     def store(self, memory: Memory) -> int:
         """存储记忆"""
@@ -1012,3 +1143,28 @@ class AsyncMemoryStorage:
         if ok:
             self._storage._embed_cache.pop(memory_id, None)
         return ok
+
+    # === 群聊黑话（异步包装） ===
+
+    async def upsert_slang(self, term: str, meaning: str, session: str = "",
+                           example: str = "", source: str = "auto") -> int:
+        return await asyncio.to_thread(
+            self._storage.upsert_slang, term, meaning, session, example, source
+        )
+
+    async def list_slang(self, session: str = "", enabled_only: bool = False) -> list:
+        return await asyncio.to_thread(self._storage.list_slang, session, enabled_only)
+
+    async def update_slang(self, slang_id: int, **fields) -> bool:
+        return await asyncio.to_thread(
+            lambda: self._storage.update_slang(slang_id, **fields)
+        )
+
+    async def delete_slang(self, slang_id: int) -> bool:
+        return await asyncio.to_thread(self._storage.delete_slang, slang_id)
+
+    async def match_slang(self, text: str, session: str = "", limit: int = 12) -> list:
+        return await asyncio.to_thread(self._storage.match_slang, text, session, limit)
+
+    async def bump_slang_hits(self, slang_ids: list) -> int:
+        return await asyncio.to_thread(self._storage.bump_slang_hits, slang_ids)

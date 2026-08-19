@@ -589,6 +589,69 @@ class HumanizationLogicTests(unittest.TestCase):
 
         self.assertFalse(bot._is_personal_fact(_Mem()))
 
+    # === 群聊黑话 ===
+
+    def test_slang_lines_are_parsed(self):
+        from main import GroupChatBot
+        raw = (
+            "<think>找一下</think>\n"
+            "舟舟老师 | 菜地里定时刷新的稀有物品 | 舟舟老师又出来了\n"
+            "- 农活 | 转发领皮肤口令的行为\n"
+            "霸之意志 | 群里调侃某人硬撑的说法 | 又开始霸之意志了\n"
+        )
+        items = GroupChatBot._parse_slang_lines(raw)
+        self.assertEqual([i["term"] for i in items], ["舟舟老师", "农活", "霸之意志"])
+        self.assertEqual(items[0]["example"], "舟舟老师又出来了")
+        self.assertEqual(items[1]["example"], "")
+
+    def test_common_internet_slang_is_filtered(self):
+        """全网通用词不是"这个群的"黑话，收进词表没意义。"""
+        from main import GroupChatBot
+        raw = "yyds | 永远的神\n绝了 | 表示厉害\n豆撅子 | 群友自制的下饭菜"
+        items = GroupChatBot._parse_slang_lines(raw)
+        self.assertEqual([i["term"] for i in items], ["豆撅子"])
+
+    def test_glossary_guide_only_lists_matched_terms(self):
+        from modules.reply.generator import ReplyGenerator
+        guide = ReplyGenerator._build_glossary_guide([
+            {"term": "舟舟老师", "meaning": "菜地里刷新的稀有物品"},
+            {"term": "农活", "meaning": "转发领皮肤口令"},
+        ])
+        self.assertIn("「舟舟老师」＝菜地里刷新的稀有物品", guide)
+        self.assertIn("不要按字面理解", guide)
+        self.assertEqual(ReplyGenerator._build_glossary_guide([]), "")
+        self.assertEqual(ReplyGenerator._build_glossary_guide(None), "")
+
+    def test_slang_storage_roundtrip(self):
+        """建表、去重、人工词条不被自动提取覆盖、命中匹配。"""
+        import tempfile, os
+        from modules.memory.storage import MemoryStorage
+        path = os.path.join(tempfile.mkdtemp(), "slang.db")
+        store = MemoryStorage(path)
+
+        store.upsert_slang("舟舟老师", "菜地稀有物品", session="group_1", source="auto")
+        store.upsert_slang("舟舟老师", "被人工改过的释义", session="group_1", source="manual")
+        rows = store.list_slang(session="group_1")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["meaning"], "被人工改过的释义")
+
+        # 人工校订过的词条不该被后续自动提取冲掉
+        store.upsert_slang("舟舟老师", "自动生成的新释义", session="group_1", source="auto")
+        self.assertEqual(store.list_slang(session="group_1")[0]["meaning"], "被人工改过的释义")
+
+        # 只返回文本里真正出现的词，且长词优先
+        store.upsert_slang("舟舟", "某群友", session="group_1")
+        store.upsert_slang("农活", "转发口令", session="group_1")
+        matched = store.match_slang("今天舟舟老师又刷出来了", session="group_1")
+        self.assertEqual([m["term"] for m in matched], ["舟舟老师", "舟舟"])
+
+        # 停用后不再注入
+        store.update_slang(rows[0]["id"], enabled=0)
+        self.assertNotIn(
+            "舟舟老师",
+            [m["term"] for m in store.match_slang("舟舟老师来了", session="group_1")],
+        )
+
     def test_mbti_response_is_parsed(self):
         from main import GroupChatBot
         raw = (

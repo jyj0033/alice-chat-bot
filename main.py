@@ -314,6 +314,18 @@ class GroupChatBot:
         logger.info(f"✓ 用户画像: enabled={self._profile_config['enabled']}, "
                     f"每{self._profile_config['interval_minutes']}分钟提炼一次（自述+日常发言）")
 
+        # 群聊黑话：定时从聊天记录提取群内特有的梗/称呼，回复时按需注入
+        slang_cfg = memory_config.get("slang", {}) or {}
+        self._slang_config = {
+            "enabled": bool(slang_cfg.get("enabled", True)),
+            "interval_hours": max(1, int(slang_cfg.get("interval_hours", 24))),
+            "lookback_hours": max(6, int(slang_cfg.get("lookback_hours", 48))),
+            "max_inject": max(1, int(slang_cfg.get("max_inject", 8))),
+        }
+        self._last_slang_extract: float = 0.0
+        logger.info(f"✓ 群聊黑话: enabled={self._slang_config['enabled']}, "
+                    f"每{self._slang_config['interval_hours']}小时提取一次")
+
     def _init_personality(self) -> None:
         """初始化人格系统"""
         speaking_config = self.config.get("speaking", {})
@@ -915,6 +927,26 @@ class GroupChatBot:
                 memories=memories
             )
 
+            # === 命中的群黑话：只注入本轮对话里真正出现的词条 ===
+            glossary = []
+            try:
+                if self._slang_config.get("enabled", True):
+                    glossary = await self.memory_storage.match_slang(
+                        f"{context_prompt}\n{message.content}",
+                        session=session_id,
+                        limit=self._slang_config.get("max_inject", 8),
+                    )
+                    if glossary:
+                        await self.memory_storage.bump_slang_hits(
+                            [g["id"] for g in glossary]
+                        )
+                        logger.info(
+                            "[黑话] 本轮注入 %d 条：%s",
+                            len(glossary), "、".join(g["term"] for g in glossary),
+                        )
+            except Exception as exc:
+                logger.debug("黑话匹配失败: %s", exc)
+
             # === 生成回复（direction 控制是否可沉默） ===
             try:
                 reply = await self.reply_generator.generate(
@@ -924,6 +956,7 @@ class GroupChatBot:
                     direction=direction,
                     action_plan=action_plan.to_dict() if action_plan else None,
                     session_id=session_id,
+                    glossary=glossary,
                 )
             except asyncio.CancelledError:
                 raise
@@ -2079,6 +2112,161 @@ class GroupChatBot:
         self._last_profile_distill = now
         await self._distill_user_profiles(force=False)
 
+    # === 群聊黑话提取 ===
+
+    # 提取结果的过滤：这些是通用网络用语，不是这个群特有的，收进词表没意义
+    _SLANG_TOO_COMMON = {
+        "yyds", "绝了", "笑死", "牛逼", "破防", "emo", "666", "awsl",
+        "无语", "离谱", "摆烂", "内卷", "润", "上头", "真香", "社死",
+    }
+
+    @classmethod
+    def _parse_slang_lines(cls, content: str) -> list[dict]:
+        """解析黑话提取结果：每行 `词 | 含义 | 例句`（例句可省略）。"""
+        import re as _re
+
+        text = _re.sub(r"<think>.*?</think>", "", content or "", flags=_re.DOTALL)
+        items = []
+        seen = set()
+        for line in text.splitlines():
+            line = line.strip().lstrip("-•*0123456789. ").strip()
+            if not line or "|" not in line and "｜" not in line:
+                continue
+            parts = [p.strip() for p in _re.split(r"[|｜]", line)]
+            if len(parts) < 2:
+                continue
+            term, meaning = parts[0].strip("「」\"'`【】 "), parts[1]
+            example = parts[2] if len(parts) > 2 else ""
+            if not term or not meaning or len(term) > 20 or len(meaning) < 2:
+                continue
+            if term.lower() in cls._SLANG_TOO_COMMON:
+                continue
+            # 「词」这一栏偶尔会被写成说明句，明显过长的丢掉
+            if len(term) > 12 and len(term) > len(meaning):
+                continue
+            key = term.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({
+                "term": term,
+                "meaning": meaning[:120],
+                "example": example[:80],
+            })
+        return items
+
+    async def _extract_slang(self, session_id: str, hours: int = 48) -> dict:
+        """从最近的群聊记录里提取这个群特有的黑话，写入词表。"""
+        from datetime import timedelta
+
+        result = {"session": session_id, "found": 0, "saved": 0, "error": ""}
+        provider = self.get_active_provider()
+        if not provider:
+            result["error"] = "no active provider"
+            return result
+        try:
+            since = datetime.now() - timedelta(hours=hours)
+            episodes = await self.memory_storage.get_all(
+                limit=2000, memory_type="episodic"
+            )
+            lines = [
+                (m.content or "").strip()
+                for m in episodes
+                if m.source_session == session_id and m.created_at > since
+            ]
+            # 富媒体占位/识别摘要不是群友说的话，不参与黑话提取
+            lines = [l for l in lines if l and not l.startswith("[")][:120]
+            if len(lines) < 10:
+                result["error"] = f"素材不足（{len(lines)} 条）"
+                return result
+
+            existing = await self.memory_storage.list_slang(session=session_id)
+            known = "、".join(sorted({row["term"] for row in existing}))[:400]
+
+            from modules.llm.base import ChatRequest
+            req = ChatRequest(temperature=0.2, max_tokens=800, top_p=0.9)
+            req.add_system(
+                "你是群聊黑话整理助手。从聊天记录里找出这个群特有的「黑话」——"
+                "外人看了不懂、或者字面意思和实际意思不一样的词。\n"
+                "算黑话的：群内绰号和外号（谁被叫什么）、这个群自造的梗和缩写、"
+                "反复出现的固定说法、把普通词用成别的意思。\n"
+                "不算黑话的：全网通用的网络用语（yyds、绝了、破防、摆烂这些）、"
+                "游戏和动漫的官方名词（角色名、装备名、副本名）、普通中文词、"
+                "只出现过一次且看不出含义的怪话。\n"
+                "\n每行输出一条，格式为「词 | 含义 | 例句」：\n"
+                "含义要写清楚它在这个群里实际指什么（20字以内）；"
+                "例句从记录里摘一句原话（可省略）。\n"
+                "只输出这些行，不要编号、不要解释、不要总结。"
+                "找不到任何群特有的黑话就输出「无」。"
+            )
+            user_parts = [f"【群聊记录】\n" + "\n".join(lines)]
+            if known:
+                user_parts.append(
+                    f"\n【已收录的黑话】\n{known}\n"
+                    "这些已经收录了：含义如果和记录里的用法不符可以重新给出，否则不用重复输出。"
+                )
+            req.add_user("\n".join(user_parts))
+
+            resp = await provider.chat(req)
+            items = self._parse_slang_lines(resp.content if resp else "")
+            result["found"] = len(items)
+            for item in items:
+                saved = await self.memory_storage.upsert_slang(
+                    term=item["term"],
+                    meaning=item["meaning"],
+                    session=session_id,
+                    example=item["example"],
+                    source="auto",
+                )
+                if saved:
+                    result["saved"] += 1
+            if items:
+                logger.info(
+                    "[黑话] %s 提取 %d 条：%s",
+                    session_id, len(items),
+                    "、".join(i["term"] for i in items[:8]),
+                )
+        except Exception as exc:
+            logger.error("黑话提取失败: %s", exc, exc_info=True)
+            result["error"] = str(exc)
+        return result
+
+    async def extract_slang_all(self, hours: int = 48) -> dict:
+        """对所有活跃会话跑一遍黑话提取（供定时任务和 Web 手动触发）。"""
+        summary = {"sessions": 0, "found": 0, "saved": 0}
+        sessions = set(self.context_manager._windows.keys())
+        try:
+            episodes = await self.memory_storage.get_all(limit=2000, memory_type="episodic")
+            from datetime import timedelta
+            since = datetime.now() - timedelta(hours=hours)
+            sessions |= {
+                m.source_session for m in episodes
+                if m.source_session and m.created_at > since
+            }
+        except Exception as exc:
+            logger.debug("列出活跃会话失败: %s", exc)
+        for session_id in sorted(sessions):
+            if not str(session_id).startswith("group_"):
+                continue  # 黑话是群内共识，私聊没有这个概念
+            result = await self._extract_slang(session_id, hours=hours)
+            summary["sessions"] += 1
+            summary["found"] += result["found"]
+            summary["saved"] += result["saved"]
+        return summary
+
+    async def _maybe_extract_slang(self) -> None:
+        """按配置间隔（默认每天）触发一次黑话提取。"""
+        if not self._slang_config.get("enabled", True):
+            return
+        interval_hours = max(1, int(self._slang_config.get("interval_hours", 24)))
+        now = time.time()
+        if self._last_slang_extract and (now - self._last_slang_extract) < interval_hours * 3600:
+            return
+        self._last_slang_extract = now
+        await self.extract_slang_all(
+            hours=int(self._slang_config.get("lookback_hours", 48))
+        )
+
     async def _retrieve_memories(self, query: str, session_id: str, limit: int = None,
                                  exclude_id: str = "") -> list:
         """检索相关长期记忆：
@@ -2182,6 +2370,7 @@ class GroupChatBot:
             self.context_manager.cleanup_inactive(max_inactive_minutes=60)
             await self._maybe_decay_memories()
             await self._maybe_distill_profiles()
+            await self._maybe_extract_slang()
             logger.debug("Cleaned up expired states")
 
     async def _maybe_decay_memories(self) -> None:
@@ -2427,6 +2616,12 @@ class GroupChatBot:
                     "interval_messages": 20,
                     "min_messages": 10,
                     "max_tokens": 200
+                },
+                "slang": {
+                    "enabled": True,
+                    "interval_hours": 24,
+                    "lookback_hours": 48,
+                    "max_inject": 8
                 },
                 "profile": {
                     "enabled": True,

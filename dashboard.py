@@ -597,6 +597,89 @@ async def distill_profiles():
         return {"success": False, "error": str(e)}
 
 
+@app.get("/api/slang")
+async def get_slang():
+    """群聊黑话词表（Web 管理用，返回全部含停用项）"""
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"slang": [], "total": 0}
+    try:
+        rows = await bot_instance.memory_storage.list_slang()
+        return {"slang": rows, "total": len(rows)}
+    except Exception as e:
+        logger.error(f"Failed to load slang: {e}")
+        return {"slang": [], "total": 0}
+
+
+@app.post("/api/slang")
+async def create_slang(request: Request):
+    """手动新增一条黑话（source=manual，不会被自动提取覆盖）"""
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        data = await request.json()
+        term = (data.get("term") or "").strip()
+        meaning = (data.get("meaning") or "").strip()
+        if not term or not meaning:
+            return {"success": False, "error": "词和含义都不能为空"}
+        slang_id = await bot_instance.memory_storage.upsert_slang(
+            term=term,
+            meaning=meaning,
+            session=(data.get("session") or "").strip(),
+            example=(data.get("example") or "").strip(),
+            source="manual",
+        )
+        return {"success": bool(slang_id), "id": slang_id}
+    except Exception as e:
+        logger.error(f"Create slang failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.put("/api/slang/{slang_id}")
+async def edit_slang(slang_id: int, request: Request):
+    """修改黑话（含启用/停用）"""
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        data = await request.json()
+        ok = await bot_instance.memory_storage.update_slang(
+            slang_id,
+            term=data.get("term"),
+            meaning=data.get("meaning"),
+            example=data.get("example"),
+            enabled=data.get("enabled"),
+        )
+        return {"success": ok}
+    except Exception as e:
+        logger.error(f"Update slang failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.delete("/api/slang/{slang_id}")
+async def remove_slang(slang_id: int):
+    """删除一条黑话"""
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        ok = await bot_instance.memory_storage.delete_slang(slang_id)
+        return {"success": ok, "message": "已删除" if ok else "词条不存在"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/slang/extract")
+async def extract_slang_now():
+    """立即从最近聊天记录提取黑话"""
+    if not bot_instance:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        hours = int(bot_instance._slang_config.get("lookback_hours", 48))
+        result = await bot_instance.extract_slang_all(hours=hours)
+        return {"success": True, **result}
+    except Exception as e:
+        logger.error(f"Manual slang extract failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
 @app.delete("/api/memories/{memory_id}")
 async def delete_memory(memory_id: int):
     """删除一条长期记忆"""

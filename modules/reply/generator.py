@@ -211,6 +211,7 @@ class ReplyGenerator:
         direction: str = "to_bot",
         action_plan: Dict[str, Any] = None,
         session_id: str = "",
+        glossary: list = None,
     ) -> Optional[str]:
         """
         生成回复
@@ -237,6 +238,7 @@ class ReplyGenerator:
             direction,
             action_plan,
             session_id,
+            glossary,
         )
 
         # 2. 联网搜索：先让 LLM 判断这条回复是否需要联网（关键词太局限且易误判，
@@ -539,6 +541,7 @@ class ReplyGenerator:
         direction: str = "to_bot",
         action_plan: Dict[str, Any] = None,
         session_id: str = "",
+        glossary: list = None,
     ) -> ChatRequest:
         """构建 LLM 请求"""
 
@@ -596,6 +599,11 @@ class ReplyGenerator:
         if action_plan:
             request.add_system(self._build_action_guide(action_plan))
 
+        # 群黑话：只带本轮对话里出现过的词条，让 bot 不会按字面理解
+        glossary_guide = self._build_glossary_guide(glossary)
+        if glossary_guide:
+            request.add_system(glossary_guide)
+
         # 添加说话风格指导
         style_guide = self.style_manager.get_style_guide()
         if style_guide:
@@ -632,6 +640,27 @@ class ReplyGenerator:
             request.add_user(f"{current_message}")
 
         return request
+
+    @staticmethod
+    def _build_glossary_guide(glossary: list) -> str:
+        """把命中的群黑话翻译成一段简短说明。
+
+        只传本轮对话里真正出现的词——词表会越来越大，全量注入既费 token
+        又会让模型硬凑着去用这些梗。
+        """
+        entries = []
+        for item in glossary or []:
+            term = str((item or {}).get("term", "")).strip()
+            meaning = str((item or {}).get("meaning", "")).strip()
+            if term and meaning:
+                entries.append(f"「{term}」＝{meaning}")
+        if not entries:
+            return ""
+        return (
+            "这个群的黑话（当前对话里出现了这些词，按这里的意思理解，不要按字面理解）：\n"
+            + "；".join(entries)
+            + "。\n知道意思就行，回复时不用刻意去用这些词，也不要解释它们。"
+        )
 
     @staticmethod
     def _build_action_guide(action_plan: Dict[str, Any]) -> str:
