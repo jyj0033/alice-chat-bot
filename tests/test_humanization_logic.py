@@ -545,6 +545,50 @@ class HumanizationLogicTests(unittest.TestCase):
 
     # === MBTI 倾向解析 ===
 
+    # === 自述判别（切词误伤 / 反讽 / 讲别人） ===
+
+    def test_real_self_statements_are_kept(self):
+        from main import GroupChatBot
+        for text in (
+            "因为我是水母", "我是电催", "我在芜湖", "我是玩周瑜的",
+            "我家已经淹了", "给我家乌龟吃", "谁跟我住的近", "薰姐和我是无业游民",
+        ):
+            self.assertTrue(GroupChatBot._is_self_statement(text), text)
+
+    def test_dismissive_reply_is_not_self_statement(self):
+        """「我喜欢个🥚」形式像自述，意思是否定，不能当成"喜欢某物"。"""
+        from main import GroupChatBot
+        for text in ("我喜欢个🥚", "我喜欢个屁", "我爱个鬼", "我喜欢才怪"):
+            self.assertFalse(GroupChatBot._is_self_statement(text), text)
+
+    def test_mis_segmented_pronoun_is_not_self_statement(self):
+        """「对我|是吧」「帮我|在群里」「我|是说」是切词误伤，不是自述。"""
+        from main import GroupChatBot
+        for text in (
+            "就这么对我是吧", "我是说专武", "我看看我是要抽谁",
+            "爱丽丝，帮我在群里所有人的手机里下载原神",
+            "我在看我朋友聊", "我在想要不要拿这个潜能",
+        ):
+            self.assertFalse(GroupChatBot._is_self_statement(text), text)
+
+    def test_talking_about_others_is_not_self_statement(self):
+        """讲朋友、同事的话不是关于自己的事实。"""
+        from main import GroupChatBot
+        for text in ("和我朋友一样啊", "我同事走的也很快"):
+            self.assertFalse(GroupChatBot._is_self_statement(text), text)
+
+    def test_high_importance_does_not_bypass_self_statement_check(self):
+        """importance 会被检索反馈抬高，不能让它把普通消息顶成"自述"。"""
+        from main import GroupChatBot
+        bot = GroupChatBot.__new__(GroupChatBot)
+
+        class _Mem:
+            content = "我在想要不要拿这个潜能"
+            importance = 0.95
+            metadata: dict = {}
+
+        self.assertFalse(bot._is_personal_fact(_Mem()))
+
     def test_mbti_response_is_parsed(self):
         from main import GroupChatBot
         raw = (
@@ -585,8 +629,9 @@ class HumanizationLogicTests(unittest.TestCase):
         """习惯说「俺」「咱」的人，自述不能永远匹配不上。"""
         from main import GroupChatBot
         kws = GroupChatBot._PERSONAL_KEYWORDS
-        for word in ("我在", "俺在", "咱家", "俺同事", "咱喜欢"):
+        for word in ("我在", "俺在", "咱家", "俺住", "咱喜欢"):
             self.assertIn(word, kws, word)
+        self.assertTrue(GroupChatBot._is_self_statement("俺在芜湖"))
 
     def test_promo_forward_text_is_excluded(self):
         """群里转发的领取口令模板不是本人发言，不该进记忆也不该参与画像。"""

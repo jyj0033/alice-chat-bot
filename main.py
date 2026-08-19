@@ -51,8 +51,9 @@ logger = logging.getLogger(__name__)
 FIRST_PERSON_PRONOUNS = ("我", "俺", "咱")
 _SELF_PREDICATES = (
     "叫", "是", "喜欢", "爱", "的生日", "在", "住", "养", "家",
-    "的工作", "今年", "朋友", "对象", "男票", "女票", "老婆", "老公",
-    "同事", "同学",
+    "的工作", "今年", "对象", "男票", "女票", "老婆", "老公",
+    # 家庭成员：家庭构成是关于这个人生活的稳定事实
+    "爸", "妈", "爸妈", "父母",
 )
 PERSONAL_KEYWORDS = [
     pronoun + predicate
@@ -1365,7 +1366,7 @@ class GroupChatBot:
         if len(content) > 12:
             importance += 0.2
         if any(kw in content for kw in self._PERSONAL_KEYWORDS):
-            importance += 0.3
+            importance += 0.3 if self._is_self_statement(content) else 0.1
 
         if importance < 0.5:
             return
@@ -1512,14 +1513,74 @@ class GroupChatBot:
     def _is_personal_fact(self, memory) -> bool:
         """判断一条 episodic 记忆是否包含"关于发送者自己的事实"。
 
-        - 命中个人信息关键词（我叫/我喜欢/我的工作…）
-        - 或高重要性且含第一人称"我"（倾向于是自我描述）
+        判据只有句式（见 _is_self_statement）。曾经还有一条"高重要性且含第一
+        人称即算自述"的兜底，但 importance 会被检索反馈反复抬高（每次召回
+        +0.01，封顶 0.95），结果是"被想起得多"的普通消息漂到 0.7 以上就冒充
+        自述（如「我在想要不要拿这个潜能」imp=0.80）。判不准的留给日常发言，
+        信息不丢。
         """
-        content = memory.content or ""
-        if any(kw in content for kw in self._PERSONAL_KEYWORDS):
+        return self._is_self_statement(memory.content or "")
+
+    # 「我是/我在」极易切错：「对我|是吧」「帮我|在群里」「我|是说」都会命中，
+    # 但都不是在讲自己的身份或所在地。命中这类词时要看后面接的是不是名词性成分。
+    _AMBIGUOUS_SELF_PREDICATES = ("是", "在")
+    # 使役/受益动词后面的「我」是宾语（帮我…、让我…），不是在讲自己
+    _OBJECT_MARKERS = ("帮", "让", "叫", "替", "陪", "请")
+    # 否定/反讽式回应：形式像自述，意思正相反（「我喜欢个🥚」＝一点也不喜欢）
+    _DISMISSIVE_MARKERS = (
+        "个屁", "个鬼", "个头", "个球", "个毛", "个蛋", "个锤", "个🥚", "才怪",
+    )
+    # 名词性词性（含数词、时间词，覆盖「我是95年的」这类）
+    _NOUNISH_POS = ("n", "j", "eng", "m", "t", "s", "f")
+
+    @classmethod
+    def _is_self_statement(cls, content: str) -> bool:
+        """判断文本是否真的在描述发送者自己。
+
+        群聊里的单条消息是孤立片段，很可能是在回别人的话，所以不能只做
+        子串匹配——「就这么对我是吧」「我喜欢个🥚」形式上都能命中。
+        判不准的不算自述，但仍会作为日常发言参与提炼，信息不会丢。
+        """
+        text = (content or "").strip()
+        if not text or any(mark in text for mark in cls._DISMISSIVE_MARKERS):
+            return False
+        hits = [kw for kw in PERSONAL_KEYWORDS if kw in text]
+        if not hits:
+            return False
+        # 非歧义关键词（我家/我住/我老婆…）命中即可
+        if any(kw[1:] not in cls._AMBIGUOUS_SELF_PREDICATES for kw in hits):
             return True
-        if memory.importance >= 0.7 and any(p in content for p in self._FIRST_PERSON):
+        return any(cls._is_identity_statement(text, kw) for kw in hits)
+
+    @classmethod
+    def _is_identity_statement(cls, text: str, keyword: str) -> bool:
+        """「我是X」「我在X」中的 X 是否是名词性成分（身份、所在地）。"""
+        index = text.find(keyword)
+        while index >= 0:
+            preceded_by_object_marker = (
+                index > 0 and text[index - 1] in cls._OBJECT_MARKERS
+            )
+            if not preceded_by_object_marker:
+                tail = text[index + len(keyword):].strip()
+                if tail and cls._tail_is_nounish(tail):
+                    return True
+            index = text.find(keyword, index + 1)
+        return False
+
+    @classmethod
+    def _tail_is_nounish(cls, tail: str) -> bool:
+        """判断「我是/我在」后面接的是不是名词性成分。"""
+        # 「我是…的」是典型判断句（我是玩周瑜的），照样算身份陈述
+        if tail.rstrip("。！!？?～~ ").endswith("的"):
             return True
+        try:
+            import jieba.posseg as pseg
+            for word, flag in pseg.cut(tail):
+                if not word.strip():
+                    continue
+                return flag.startswith(cls._NOUNISH_POS)
+        except Exception:
+            return True  # 没有 jieba 就不做这层过滤，保持旧行为
         return False
 
     def _is_meaningful_chat(self, memory) -> bool:
@@ -1888,6 +1949,8 @@ class GroupChatBot:
                     "长期稳定的特征（职业、常玩的游戏、作息、习惯、性格、常聊话题等）。\n"
                     "- 【自我描述】是TA直接说过的关于自己的话，较可信\n"
                     "- 【日常发言】是TA的日常聊天，只从反复出现的模式里归纳\n"
+                    "- 两类素材都是从群聊里摘出来的孤立单句，很多是在回别人的话，"
+                    "看不到上下文。读不懂或像是在接别人话茬的，直接跳过，不要硬解释。\n"
                     "- 【已有画像】是之前根据更早的聊天总结的结论（本次资料里可能不再提到）\n"
                     "\n给了【已有画像】时，要在它的基础上更新，而不是重写：\n"
                     "A. 保留仍然成立的稳定事实（职业、所在地、长期爱好），"
