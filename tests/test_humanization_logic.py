@@ -543,6 +543,44 @@ class HumanizationLogicTests(unittest.TestCase):
         named = detector.detect(SocialContext(message_content="爱丽丝在吗"))
         self.assertTrue(any(r.startswith("昵称") for r in named["reasons"]))
 
+    # === MBTI 倾向解析 ===
+
+    def test_mbti_response_is_parsed(self):
+        from main import GroupChatBot
+        raw = (
+            "<think>先看发言频率</think>\n"
+            "E/I: I | 0.65 | 很少主动开话题，多是被点到才回\n"
+            "S/N: S | 0.6 | 聊的多是具体操作和数值\n"
+            "T/F: F | 0.55 | 常安慰群友，情绪表达多\n"
+            "J/P: P | 0.7 | 作息随意，临时起意组队。\n"
+        )
+        parsed = GroupChatBot._parse_mbti_response(raw)
+        self.assertEqual(parsed["type"], "ISFP")
+        self.assertEqual(len(parsed["dimensions"]), 4)
+        first = parsed["dimensions"][0]
+        self.assertEqual((first["axis"], first["letter"]), ("E/I", "I"))
+        self.assertAlmostEqual(first["confidence"], 0.65)
+        self.assertNotIn("。", parsed["dimensions"][3]["reason"][-1:])
+
+    def test_incomplete_mbti_response_is_rejected(self):
+        """缺维度就不显示，宁可没有也不猜。"""
+        from main import GroupChatBot
+        self.assertIsNone(GroupChatBot._parse_mbti_response("E/I: I | 0.6 | 话少"))
+        self.assertIsNone(GroupChatBot._parse_mbti_response(""))
+        self.assertIsNone(GroupChatBot._parse_mbti_response("无法判断"))
+
+    def test_mbti_confidence_is_clamped(self):
+        """置信度一栏容错：百分比、负数、非数字都不能让整条解析失败。"""
+        from main import GroupChatBot
+        raw = (
+            "E/I: E | 1.8 | a\nS/N: N | 65% | b\n"
+            "T/F: T | abc | c\nJ/P: J | 0.5 | d"
+        )
+        parsed = GroupChatBot._parse_mbti_response(raw)
+        self.assertEqual(parsed["type"], "ENTJ")
+        vals = [d["confidence"] for d in parsed["dimensions"]]
+        self.assertEqual(vals, [0.02, 0.65, 0.0, 0.5])
+
     def test_dialect_first_person_counts_as_self_description(self):
         """习惯说「俺」「咱」的人，自述不能永远匹配不上。"""
         from main import GroupChatBot

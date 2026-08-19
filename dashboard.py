@@ -571,6 +571,7 @@ async def get_profiles():
                 "last_distilled_at": meta.get("last_distilled_at", "") or p.created_at.isoformat(),
                 "distill_count": meta.get("distill_count", 0) or 0,
                 "previous_summary": meta.get("previous_summary", "") or "",
+                "mbti": meta.get("mbti") or None,
                 "created_at": p.created_at.isoformat(),
                 # 注意：last_accessed 是"最近被检索召回"的时间（记忆保鲜会刷新它），
                 # 不代表重新提炼过，前端不要再标成"更新"

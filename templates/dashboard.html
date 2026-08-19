@@ -733,6 +733,24 @@
         }
         .src-list li:last-child { border-bottom: none; }
         .src-empty { font-size: 12px; color: var(--muted); padding: 6px 2px; }
+        /* MBTI 性格倾向 */
+        .mbti-badge {
+            padding: 3px 10px; border-radius: 8px; font-size: 13px; font-weight: 800;
+            font-family: var(--font-mono); letter-spacing: .5px;
+            background: linear-gradient(135deg, #7c6cff, #a78bfa); color: #fff;
+        }
+        .mbti-dims { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
+        .mbti-row { display: flex; align-items: center; gap: 8px; font-size: 11.5px; }
+        .mbti-axis { font-family: var(--font-mono); color: var(--muted); width: 30px; flex-shrink: 0; }
+        .mbti-letter {
+            width: 20px; height: 20px; border-radius: 6px; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 800; font-size: 11px; background: #ede9fe; color: #6d28d9;
+        }
+        .mbti-bar { flex: 1; height: 5px; border-radius: 999px; background: #eee9fb; overflow: hidden; }
+        .mbti-fill { height: 100%; background: linear-gradient(90deg, #7c6cff, #a78bfa); }
+        .mbti-reason { color: var(--text-secondary); flex: 2; min-width: 0; }
+        .mbti-low { opacity: .5; }
 
         /* ============ 会话聊天 ============ */
         .chat-container {
@@ -2996,12 +3014,34 @@
                          ${renderList('本次日常发言', daily)}
                        </details>`
                     : `<div class="src-empty">此画像提炼于旧版本，未留存依据；重新提炼后可查看</div>`;
+                const mbti = p.mbti;
+                const mbtiBadge = mbti && mbti.type
+                    ? `<span class="mbti-badge" title="根据群聊行为推测的性格倾向，娱乐向参考">${escapeHtml(mbti.type)}</span>`
+                    : '';
+                const mbtiBlock = mbti && mbti.dimensions && mbti.dimensions.length
+                    ? `<details class="profile-src">
+                         <summary>▸ MBTI 倾向依据（${escapeHtml(mbti.type)}）</summary>
+                         <div class="mbti-dims">
+                           ${mbti.dimensions.map(d => {
+                               const pct = Math.round((d.confidence || 0) * 100);
+                               const low = pct < 40 ? ' mbti-low' : '';
+                               return `<div class="mbti-row${low}" title="${pct < 40 ? '依据不足，仅供参考' : ''}">
+                                    <span class="mbti-axis">${escapeHtml(d.axis)}</span>
+                                    <span class="mbti-letter">${escapeHtml(d.letter)}</span>
+                                    <span class="mbti-bar"><span class="mbti-fill" style="width:${pct}%"></span></span>
+                                    <span class="mbti-reason">${escapeHtml(d.reason || '')}</span>
+                                  </div>`;
+                           }).join('')}
+                         </div>
+                         <div class="src-empty">MBTI 不是严谨测量，这里只是从群聊行为看倾向，娱乐向参考</div>
+                       </details>`
+                    : '';
                 return `
                     <div class="profile-card">
                         <div class="profile-top">
                             <div class="profile-avatar">${escapeHtml(initial)}</div>
                             <div>
-                                <div class="profile-name">${name}</div>
+                                <div class="profile-name">${name} ${mbtiBadge}</div>
                                 <div class="profile-id">QQ ${escapeHtml(p.sender_id)}</div>
                             </div>
                             <button class="btn btn-danger btn-sm" style="margin-left:auto"
@@ -3009,6 +3049,7 @@
                         </div>
                         <div class="profile-content">${escapeHtml(body)}</div>
                         ${warns ? `<div class="profile-meta">${warns}</div>` : ''}
+                        ${mbtiBlock}
                         ${srcBlock}
                         <div class="profile-meta">${factCount}${rounds}</div>
                         <div class="profile-meta">

@@ -306,6 +306,8 @@ class GroupChatBot:
             "daily_window_days": max(3, int(profile_cfg.get("daily_window_days", 15))),
             # 已有画像后，日常新增消息达到该数量才重炼（避免每次发言都刷）
             "refresh_daily_count": max(1, int(profile_cfg.get("refresh_daily_count", 5))),
+            # MBTI 性格倾向分析（与画像共用素材，每次更新画像多一次 LLM 调用）
+            "mbti_enabled": bool(profile_cfg.get("mbti_enabled", True)),
         }
         self._last_profile_distill: float = 0.0
         logger.info(f"✓ 用户画像: enabled={self._profile_config['enabled']}, "
@@ -1610,6 +1612,124 @@ class GroupChatBot:
             return kept[:cls._PROFILE_MAX_CHARS].rstrip("，,、;； ")
         return text[:cls._PROFILE_MAX_CHARS].rstrip("，,、;； ")
 
+    # === MBTI 性格倾向分析（与画像共用素材） ===
+    # 说明：MBTI 本身不是严谨心理测量，这里只作为"从群聊行为看性格倾向"的
+    # 娱乐向分析展示，不参与回复生成，避免 bot 在群里给人贴标签。
+    _MBTI_AXES = (
+        ("E", "I", "E/I"),
+        ("S", "N", "S/N"),
+        ("T", "F", "T/F"),
+        ("J", "P", "J/P"),
+    )
+    # 素材太少时四个维度基本靠猜，不如不给
+    _MBTI_MIN_SAMPLES = 8
+
+    @staticmethod
+    def _parse_confidence(raw: str) -> float:
+        """宽松解析置信度：兼容 0.65 / 65% / 「0.6（中）」等写法，解析不出按 0 处理。"""
+        import re as _re
+
+        text = (raw or "").strip()
+        match = _re.search(r"\d+(?:\.\d+)?", text)
+        if not match:
+            return 0.0
+        try:
+            value = float(match.group(0))
+        except ValueError:
+            return 0.0
+        if "%" in text or value > 1.0:
+            value = value / 100 if value > 1.0 else value
+        return max(0.0, min(1.0, value))
+
+    @classmethod
+    def _parse_mbti_response(cls, content: str) -> Optional[dict]:
+        """解析 MBTI 四行输出；任一维度缺失就返回 None（宁可不显示也不猜）。
+
+        期望格式（每行）：`E/I: I | 0.65 | 很少主动开话题，多是被点名才回`
+        置信度一栏容错：模型偶尔写成百分比或带注释，解析不出按 0 处理。
+        """
+        import re as _re
+
+        text = _re.sub(r"<think>.*?</think>", "", content or "", flags=_re.DOTALL)
+        dimensions = []
+        letters = []
+        for first, second, label in cls._MBTI_AXES:
+            pattern = (
+                rf"{first}\s*/\s*{second}\s*[:：]\s*([{first}{second}])"
+                rf"\s*[|｜]\s*([^|｜\n]*)[|｜]\s*(.+)"
+            )
+            match = _re.search(pattern, text, _re.IGNORECASE)
+            if not match:
+                return None
+            letter = match.group(1).upper()
+            dimensions.append({
+                "axis": label,
+                "letter": letter,
+                "confidence": round(cls._parse_confidence(match.group(2)), 2),
+                "reason": match.group(3).strip().strip("。").strip()[:60],
+            })
+            letters.append(letter)
+        return {"type": "".join(letters), "dimensions": dimensions}
+
+    async def _analyze_mbti(
+        self,
+        provider,
+        name: str,
+        profile_summary: str,
+        self_text: str,
+        daily_text: str,
+    ) -> Optional[dict]:
+        """根据群聊行为判断 MBTI 四维倾向。失败返回 None，不影响画像本身。"""
+        from modules.llm.base import ChatRequest
+
+        req = ChatRequest(temperature=0.2, max_tokens=400, top_p=0.9)
+        req.add_system(
+            "你是性格倾向分析助手。根据群友在群聊里的实际行为判断 MBTI 四个维度。\n"
+            "维度按群聊行为理解，不是做量表题：\n"
+            "E/I 外向-内向：主动开话题、拉人互动、发言频繁 vs 多为被动回应、话少\n"
+            "S/N 实感-直觉：聊具体的事、细节、操作和数值 vs 聊想法、联想、类比、玩抽象梗\n"
+            "T/F 思考-情感：就事论事、讲道理、直接指出问题 vs 照顾对方感受、情绪表达多\n"
+            "J/P 判断-知觉：有计划、守时守规律、说到做到 vs 随性、临时起意、作息不定\n"
+            "\n校准（很重要）：\n"
+            "- 群聊场景天然显得随意，不要因为「在群里闲聊」就一律判 P。"
+            "有固定作息、按计划推进的事、长期坚持的习惯、守时守约，这些都是 J 的证据。\n"
+            "- 资料里只有TA说过的话，不要因为「有发言」就默认判 E。"
+            "要看是否主动发起话题、拉人互动；多为被动接话、被点名才出现的是 I。\n"
+            "- 四个维度要分别独立判断，不要为了凑成常见类型而互相迁就。\n"
+            "\n严格输出四行，每行格式为「维度: 字母 | 置信度 | 依据」，不要输出其他内容：\n"
+            "E/I: X | 0.65 | 依据\n"
+            "S/N: X | 0.6 | 依据\n"
+            "T/F: X | 0.55 | 依据\n"
+            "J/P: X | 0.7 | 依据\n"
+            "\n置信度是 0 到 1 的小数。依据必须是资料里出现过的具体行为，20字以内，"
+            "不要复述原话。某个维度资料不足以判断时，仍要给字母，但置信度填 0.3 以下。"
+        )
+        parts = [f"群友「{name}」的资料："]
+        if profile_summary:
+            parts.append(f"【已有画像】\n{profile_summary}")
+        if self_text:
+            parts.append(f"【自我描述】\n{self_text}")
+        if daily_text:
+            parts.append(f"【日常发言】\n{daily_text}")
+        req.add_user("\n".join(parts))
+
+        try:
+            resp = await provider.chat(req)
+        except Exception as exc:
+            logger.warning("[MBTI] %s 分析失败: %s", name, exc)
+            return None
+        parsed = self._parse_mbti_response(resp.content if resp else "")
+        if not parsed:
+            logger.info("[MBTI] %s 输出无法解析，跳过", name)
+            return None
+        parsed["analyzed_at"] = datetime.now().isoformat()
+        logger.info(
+            "[MBTI] %s: %s（%s）",
+            name, parsed["type"],
+            "、".join(f"{d['axis']}{d['letter']}{d['confidence']}" for d in parsed["dimensions"]),
+        )
+        return parsed
+
     @staticmethod
     def _strip_profile_prefix(content: str) -> str:
         """取画像正文（去掉「【用户画像 名字】」前缀），用于喂回给模型做增量修订。"""
@@ -1665,6 +1785,7 @@ class GroupChatBot:
         daily_min = self._profile_config.get("daily_min_messages", 8)
         window_days = self._profile_config.get("daily_window_days", 15)
         refresh_daily = self._profile_config.get("refresh_daily_count", 5)
+        mbti_enabled = self._profile_config.get("mbti_enabled", True)
         try:
             episodes = await self.memory_storage.get_all(limit=2000, memory_type="episodic")
             profiles = await self.memory_storage.get_profiles()
@@ -1830,6 +1951,19 @@ class GroupChatBot:
                 if warnings:
                     logger.info("[画像] %s 质量提示: %s", latest_name, "；".join(warnings))
                 existing_meta = (existing.metadata or {}) if existing else {}
+
+                # MBTI：与画像共用素材，只在画像确实更新且素材足够时才分析。
+                # 失败或素材不足时沿用上一次的结果，不影响画像写入。
+                mbti = existing_meta.get("mbti")
+                sample_size = len(unique_facts) + len(unique_daily)
+                if mbti_enabled and sample_size >= self._MBTI_MIN_SAMPLES:
+                    fresh = await self._analyze_mbti(
+                        provider, latest_name, summary, self_text, daily_text
+                    )
+                    if fresh:
+                        fresh["sample_size"] = sample_size
+                        mbti = fresh
+
                 new_profile = Memory(
                     content=f"【用户画像 {latest_name}】{summary}",
                     memory_type="semantic",
@@ -1855,6 +1989,7 @@ class GroupChatBot:
                         "last_distilled_at": now.isoformat(),
                         "distill_count": int(existing_meta.get("distill_count", 0) or 0) + 1,
                         "previous_summary": previous_summary,
+                        "mbti": mbti,
                     },
                 )
                 if existing and existing.id:
@@ -2236,7 +2371,8 @@ class GroupChatBot:
                     "min_facts": 2,
                     "daily_min_messages": 8,
                     "daily_window_days": 15,
-                    "refresh_daily_count": 5
+                    "refresh_daily_count": 5,
+                    "mbti_enabled": True
                 }
             },
             "search": {
