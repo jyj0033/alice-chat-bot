@@ -543,6 +543,22 @@ class HumanizationLogicTests(unittest.TestCase):
         named = detector.detect(SocialContext(message_content="爱丽丝在吗"))
         self.assertTrue(any(r.startswith("昵称") for r in named["reasons"]))
 
+    def test_dialect_first_person_counts_as_self_description(self):
+        """习惯说「俺」「咱」的人，自述不能永远匹配不上。"""
+        from main import GroupChatBot
+        kws = GroupChatBot._PERSONAL_KEYWORDS
+        for word in ("我在", "俺在", "咱家", "俺同事", "咱喜欢"):
+            self.assertIn(word, kws, word)
+
+    def test_promo_forward_text_is_excluded(self):
+        """群里转发的领取口令模板不是本人发言，不该进记忆也不该参与画像。"""
+        from main import GroupChatBot
+        ad = "【王者荣耀送新史诗皮肤】好农活!价值747农友钱，复制粘贴这条口令接取：D9KXHK"
+        self.assertTrue(GroupChatBot._is_promo_text(ad))
+        # 正常聊到兑换码不能被误杀
+        for normal in ("这游戏兑换码在哪领啊", "俺要去排位了", "今天口令红包抢到没"):
+            self.assertFalse(GroupChatBot._is_promo_text(normal), normal)
+
     def test_profile_summary_normalization(self):
         """剥掉元话语前缀，并把累加变长的画像收进长度上限（按句子边界）。"""
         from main import GroupChatBot

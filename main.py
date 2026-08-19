@@ -46,6 +46,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 第一人称代词：只认「我」会漏掉习惯说「俺」「咱」的人——他们的自述永远
+# 匹配不上，画像里就只剩零碎日常，提炼不出东西。
+FIRST_PERSON_PRONOUNS = ("我", "俺", "咱")
+_SELF_PREDICATES = (
+    "叫", "是", "喜欢", "爱", "的生日", "在", "住", "养", "家",
+    "的工作", "今年", "朋友", "对象", "男票", "女票", "老婆", "老公",
+    "同事", "同学",
+)
+PERSONAL_KEYWORDS = [
+    pronoun + predicate
+    for pronoun in FIRST_PERSON_PRONOUNS
+    for predicate in _SELF_PREDICATES
+] + ["记得我", "我叫什么"]
+
 
 class GroupChatBot:
     """
@@ -1300,11 +1314,23 @@ class GroupChatBot:
         )
 
     # 个人信息关键词 - 出现时消息有较高记忆价值
-    _PERSONAL_KEYWORDS = [
-        "我叫", "我是", "我喜欢", "我爱", "我的生日", "我在", "我住", "我养",
-        "我家", "我的工作", "我今年", "我朋友", "我对象", "我男票", "我女票",
-        "我老婆", "我老公", "我同事", "我同学", "记得我", "我叫什么",
-    ]
+    # （在模块级构建：类体内的列表推导访问不到同级类变量）
+    _FIRST_PERSON = FIRST_PERSON_PRONOUNS
+    _PERSONAL_KEYWORDS = PERSONAL_KEYWORDS
+
+    # 群里转发的领取口令/拉人广告：文本是模板，不代表发送者本人，
+    # 既没有记忆价值也会稀释画像素材。
+    _PROMO_MARKERS = ("复制粘贴", "口令接取", "农友钱", "扫码领取", "点击领取")
+
+    @classmethod
+    def _is_promo_text(cls, content: str) -> bool:
+        """判断是否是转发的领取口令/推广模板文本。"""
+        text = content or ""
+        if "复制粘贴" in text and ("口令" in text or "接取" in text):
+            return True
+        if any(marker in text for marker in cls._PROMO_MARKERS[1:]):
+            return True
+        return "【" in text and "价值" in text and "领取" in text
 
     def _store_long_term_memory(self, message: Message, session_id: str) -> None:
         """把有记忆价值的消息写入 SQLite 情景记忆（异步后台执行）
@@ -1323,6 +1349,9 @@ class GroupChatBot:
         if message.rich_type:
             content = f"{content} [{message.rich_type}]".strip()
         if not content or len(content) < 4:
+            return
+        # 转发的领取口令/推广模板不是这个人说的话，不进长期记忆
+        if self._is_promo_text(content):
             return
 
         importance = 0.3
@@ -1487,7 +1516,7 @@ class GroupChatBot:
         content = memory.content or ""
         if any(kw in content for kw in self._PERSONAL_KEYWORDS):
             return True
-        if memory.importance >= 0.7 and "我" in content:
+        if memory.importance >= 0.7 and any(p in content for p in self._FIRST_PERSON):
             return True
         return False
 
@@ -1503,6 +1532,9 @@ class GroupChatBot:
         if len(content) < 8:
             return False
         if content.startswith("[") and content.endswith("]"):
+            return False
+        # 历史库里已存的口令广告：模板文本，不参与画像提炼
+        if self._is_promo_text(content):
             return False
         return True
 
