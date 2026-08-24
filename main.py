@@ -27,6 +27,7 @@ from modules.llm.openai_provider import create_provider, LLMProvider
 from modules.memory.storage import MemoryStorage, AsyncMemoryStorage, Memory
 from modules.memory.context import ContextManager
 from modules.group_analysis import GroupDailyAnalysis
+from modules.meme_manager import MemeManager
 
 from modules.personality.personality import Personality
 from modules.personality.emotional_state import EmotionalManager
@@ -109,6 +110,7 @@ class GroupChatBot:
         self.reply_generator: Optional[ReplyGenerator] = None
         self.thinking_delay: Optional[ThinkingDelay] = None
         self.response_filter: Optional[ResponseFilter] = None
+        self.meme_manager: Optional[MemeManager] = None
 
         # 状态
         self._running = False
@@ -117,6 +119,7 @@ class GroupChatBot:
         # 每会话正在进行的回复生成任务（同一会话同时只生成一条回复）
         self._reply_tasks: dict[str, asyncio.Task] = {}
         self._rich_media_tasks: set[asyncio.Task] = set()
+        self._meme_collect_tasks: set[asyncio.Task] = set()
         # 用户消息、Bot 回复等轻量记忆写入任务。单独跟踪，停止时等待/取消，
         # 避免 create_task 后进程退出导致最后几条记忆丢失。
         self._memory_tasks: set[asyncio.Task] = set()
@@ -166,6 +169,10 @@ class GroupChatBot:
         # 4. 初始化记忆系统
         self._init_memory()
         logger.info("✓ Memory system initialized")
+
+        # 4.5 初始化本地表情库；素材不进入普通记忆和 LLM 召回。
+        self._init_meme_manager()
+        logger.info("✓ Meme library initialized")
 
         # 5. 初始化人格系统
         self._init_personality()
@@ -412,6 +419,20 @@ class GroupChatBot:
                     f"自动清理={self._slang_config['cleanup']['enabled']}，"
                     f"每{self._slang_config['cleanup']['interval_hours']}小时检查一次")
 
+    def _init_meme_manager(self) -> None:
+        """初始化本地表情包素材库。"""
+        self.meme_manager = MemeManager(
+            self.config.get("meme_manager", {}) or {},
+            base_dir=Path(__file__).resolve().parent,
+        )
+        logger.info(
+            "✓ 表情库: enabled=%s, auto_collect=%s, auto_send=%s, total=%d",
+            self.meme_manager.enabled,
+            self.meme_manager.auto_collect_enabled,
+            self.meme_manager.auto_send_enabled,
+            self.meme_manager.stats().get("total", 0),
+        )
+
     def _init_personality(self) -> None:
         """初始化人格系统"""
         speaking_config = self.config.get("speaking", {})
@@ -556,6 +577,7 @@ class GroupChatBot:
             search_client=search_client,
             bot_name=self.personality.name,
             taboo_topics=self.personality.taboo_topics,
+            meme_manager=self.meme_manager,
         )
 
     def _init_search(self):
@@ -779,6 +801,22 @@ class GroupChatBot:
             self._rich_media_tasks.add(enrichment_task)
             enrichment_task.add_done_callback(self._rich_media_tasks.discard)
 
+        # 表情自动收集放在富媒体增强之后：如果视觉识别已经给出简短描述，
+        # 描述会一并写进素材元数据；整个过程独立于回复任务，不拖慢发言决策。
+        if (
+            self.meme_manager
+            and self.meme_manager.auto_collect_enabled
+            and any(
+                getattr(segment, "type", "") in {"image", "mface"}
+                for segment in (message.segments or [])
+            )
+        ):
+            collect_task = asyncio.create_task(
+                self._collect_meme_after_enrichment(message, enrichment_task)
+            )
+            self._meme_collect_tasks.add(collect_task)
+            collect_task.add_done_callback(self._meme_collect_tasks.discard)
+
         # === 2. 发言决策（快，无 LLM 调用） ===
         decision = self._decide_reply(message, is_reply_to_bot, continuing)
         if not decision:
@@ -801,6 +839,68 @@ class GroupChatBot:
             self._reply_tasks[session_id] = asyncio.create_task(
                 self._compose_and_send(message, decision)
             )
+
+    async def _collect_meme_after_enrichment(
+        self,
+        message: Message,
+        enrichment_task: asyncio.Task | None = None,
+    ) -> None:
+        """等待图片增强完成后，把直接图片交给本地表情库。"""
+        try:
+            if enrichment_task:
+                await enrichment_task
+            if self.meme_manager and self.qq_adapter:
+                await self.meme_manager.collect_message(message, self.qq_adapter)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("表情自动收集任务失败: %s", exc)
+
+    async def send_meme(
+        self,
+        session_id: str,
+        *,
+        meme_id: str = "",
+        category: str = "",
+        reply_to_id: str = "",
+        automatic: bool = False,
+    ) -> dict[str, Any]:
+        """发送一张表情包；Web 手动发送和 LLM 自动发送共用此链路。"""
+        manager = self.meme_manager
+        if not manager or not manager.enabled or not self.qq_adapter:
+            return {"success": False, "error": "表情包功能未启用"}
+        if automatic and not manager.auto_send_enabled:
+            return {"success": False, "error": "自动发送未启用"}
+        session_id = str(session_id or "").strip()
+        if not session_id.startswith(("group_", "private_")):
+            return {"success": False, "error": "会话格式不正确"}
+
+        if meme_id:
+            item = await asyncio.to_thread(manager.resolve, meme_id)
+            if not item:
+                return {"success": False, "error": "指定的表情包不存在"}
+        else:
+            item = await asyncio.to_thread(manager.choose, category, session_id)
+        if not item:
+            return {"success": False, "error": "没有找到可发送的表情包"}
+        payload = await asyncio.to_thread(manager.get_bytes, item.get("id", ""))
+        if not payload:
+            return {"success": False, "error": "表情文件不存在"}
+        _, image_bytes = payload
+        try:
+            success = await self.qq_adapter.send_image(
+                session_id,
+                image_bytes,
+                reply_to_id=(reply_to_id or None),
+            )
+        except Exception as exc:
+            logger.warning("[表情库] 发送失败: %s", exc)
+            return {"success": False, "error": str(exc)}
+        if not success:
+            return {"success": False, "error": "QQ 适配器发送失败", "item": item}
+        await asyncio.to_thread(manager.record_use, item.get("id", ""))
+        logger.info("[表情库] 发送成功: %s -> %s", item.get("category", ""), session_id)
+        return {"success": True, "item": item}
 
     def _decide_reply(
         self,
@@ -1183,6 +1283,15 @@ class GroupChatBot:
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
                 return
 
+            # 表情包选择标记只在内部流转，不能进入群聊文本、记忆或日报。
+            meme_category = None
+            meme_id = ""
+            if self.meme_manager:
+                reply, meme_category = self.meme_manager.extract_directive(reply)
+                if isinstance(meme_category, str) and meme_category.startswith("@id:"):
+                    meme_id = meme_category[4:]
+                    meme_category = ""
+
             # 复读兜底：把群友的原话原样说一遍不如不说。表情包识别摘要会引用
             # 前文原话，短反应档下 LLM 容易直接抓那句引文当自己的发言。
             recent_texts = [
@@ -1190,7 +1299,7 @@ class GroupChatBot:
                 for m in self.context_manager.get_window(session_id).get_recent(12)
                 if not m.is_bot
             ]
-            if self.reply_generator.is_parroting(reply, recent_texts):
+            if reply and self.reply_generator.is_parroting(reply, recent_texts):
                 logger.info(f"[复读] 放弃回复（复述了群友原话）：{reply[:40]}")
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
@@ -1208,7 +1317,11 @@ class GroupChatBot:
                     return
 
             # === 过滤回复 ===
-            passed, result = self.response_filter.filter(reply)
+            passed, result = (
+                (True, "")
+                if not reply and meme_category is not None
+                else self.response_filter.filter(reply)
+            )
             if not passed:
                 logger.info(f"回复被过滤: {result}")
                 if direction == "to_bot":
@@ -1218,7 +1331,7 @@ class GroupChatBot:
 
             # === 应用错字生成 ===
             typing_config = self.config.get("typing_style", {})
-            if typing_config.get("enable_typo_generator", True):
+            if reply and typing_config.get("enable_typo_generator", True):
                 reply = self.typo_generator.apply_typo(reply)
 
             # === 发送回复（拆成多条，模拟真人分段发送） ===
@@ -1240,6 +1353,8 @@ class GroupChatBot:
                 ):
                     quote_id = action_plan.target_message_id
             sent_segments = []
+            meme_sent = False
+            meme_item = None
             try:
                 for i, seg in enumerate(segments):
                     if i > 0 and action_plan:
@@ -1263,12 +1378,30 @@ class GroupChatBot:
                     else:
                         # 保持分段顺序；前一段失败后继续发后一段会显得语义残缺。
                         break
+
+                # 文本完整发送后再发图，避免一条回复被拆成“半句文字 + 表情”。
+                text_complete = len(sent_segments) == len(segments)
+                if meme_category is not None and text_complete:
+                    meme_result = await self.send_meme(
+                        session_id,
+                        meme_id=meme_id,
+                        category=meme_category,
+                        reply_to_id=(quote_id if not segments else ""),
+                        automatic=True,
+                    )
+                    meme_sent = bool(meme_result.get("success"))
+                    meme_item = meme_result.get("item")
+                    if not meme_sent:
+                        logger.info("[表情库] 本轮没有可发送的表情: %s", meme_result.get("error", "未知原因"))
             finally:
                 # 任务可能在段间被新的"对我说"消息取消；已经发到群里的内容
                 # 必须记录状态和上下文（全部是同步操作，取消中也能安全执行），
                 # 否则 bot 会忘记自己刚说过的话，下一条回复可能重复或矛盾。
-                if sent_segments:
+                if sent_segments or meme_sent:
                     sent_reply = "".join(sent_segments)
+                    if meme_sent:
+                        meme_label = (meme_item or {}).get("category", "表情")
+                        sent_reply = f"{sent_reply} [发送表情包：{meme_label}]".strip()
                     logger.info(f"[回复] {self.personality.name}: {sent_reply[:50]}...")
 
                     # Bot回复后状态更新（真实概率：高概率的@/回复不触发冷却，对话可延续）
@@ -1295,7 +1428,7 @@ class GroupChatBot:
                     self._store_bot_memory(session_id, sent_reply)
                     self._store_group_analysis_bot_message(session_id, sent_reply)
 
-            if not sent_segments:
+            if not sent_segments and not meme_sent:
                 logger.error("Failed to send reply")
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
@@ -1304,6 +1437,7 @@ class GroupChatBot:
             # 疲劳收尾只在主回复完整发送后考虑；成功后重置，避免连续多轮重复说“先走了”。
             if (
                 len(sent_segments) == len(segments)
+                and (meme_category is None or meme_sent)
                 and self.fatigue_manager.should_close_conversation(session_id)
             ):
                 closing_msg = self.fatigue_manager.get_closing_message()
@@ -3598,6 +3732,7 @@ class GroupChatBot:
         background_tasks = (
             list(self._reply_tasks.values())
             + list(self._rich_media_tasks)
+            + list(self._meme_collect_tasks)
             + list(self._digest_tasks.values())
             + list(self._group_analysis_tasks.values())
         )
@@ -3609,6 +3744,7 @@ class GroupChatBot:
         self._tasks.clear()
         self._reply_tasks.clear()
         self._rich_media_tasks.clear()
+        self._meme_collect_tasks.clear()
         self._digest_tasks.clear()
         self._group_analysis_tasks.clear()
         self._memory_tasks.clear()
@@ -3697,6 +3833,19 @@ class GroupChatBot:
                 "ws_port": 3001,
                 "access_token": "",
                 "self_id": ""
+            },
+            "meme_manager": {
+                "enabled": True,
+                "storage_path": "data/memes",
+                "auto_collect_enabled": False,
+                "auto_send_enabled": False,
+                "collect_private": False,
+                "collect_scope": [],
+                "default_category": "待整理",
+                "max_image_bytes": 8388608,
+                "max_images_per_message": 2,
+                "daily_collect_limit": 80,
+                "collect_cooldown_seconds": 15,
             },
             "speaking": {
                 "base_probability": 0.02,

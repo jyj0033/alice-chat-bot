@@ -371,8 +371,13 @@ class QQAdapter(PlatformAdapter):
             logger.error(f"Failed to send: {e}")
             return False
 
-    async def send_image(self, session_id: str, image_bytes: bytes) -> bool:
-        """发送内嵌 PNG，使用 OneBot 的 base64 图片段，不依赖公网文件地址。"""
+    async def send_image(
+        self,
+        session_id: str,
+        image_bytes: bytes,
+        reply_to_id: str | None = None,
+    ) -> bool:
+        """发送内嵌图片，使用 OneBot 的 base64 图片段，不依赖公网文件地址。"""
         if not self._clients:
             logger.error("No NapCat connected")
             return False
@@ -381,10 +386,13 @@ class QQAdapter(PlatformAdapter):
 
         try:
             encoded = base64.b64encode(image_bytes).decode("ascii")
-            message_array = [{
+            message_array = []
+            if reply_to_id:
+                message_array.append({"type": "reply", "data": {"id": reply_to_id}})
+            message_array.append({
                 "type": "image",
                 "data": {"file": f"base64://{encoded}"},
-            }]
+            })
             if session_id.startswith("group_"):
                 group_id = int(session_id.replace("group_", ""))
                 message_data = {

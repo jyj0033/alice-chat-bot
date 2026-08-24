@@ -172,6 +172,12 @@ async def update_config(request: Request):
                 data['memory']['embedding'] = new_emb
             current['memory'] = deep_merge(current_mem, data['memory'])
 
+        # 本地表情库配置
+        if 'meme_manager' in data:
+            current['meme_manager'] = deep_merge(
+                current.get('meme_manager', {}), data['meme_manager']
+            )
+
         # Bot 基本信息
         if 'bot' in data:
             current['bot'] = {**current.get('bot', {}), **data['bot']}
@@ -248,6 +254,11 @@ async def update_config(request: Request):
             current['search'] = deep_merge(current_search, new_search)
 
         save_config(current)
+        # 表情库的开关和收集参数可以在运行中立即生效；其他配置仍按原有逻辑在重启后完整加载。
+        if 'meme_manager' in data and bot_instance:
+            manager = getattr(bot_instance, 'meme_manager', None)
+            if manager:
+                manager.update_config(current.get('meme_manager', {}))
         return {"success": True, "message": "配置已保存"}
     except Exception as e:
         return {"success": False, "error": str(e) if e else "Unknown error"}
@@ -707,6 +718,170 @@ async def run_group_analysis(request: Request):
     except Exception as e:
         logger.error(f"Manual group analysis failed: {e}")
         return {"success": False, "error": str(e)}
+
+
+def _get_meme_manager():
+    return getattr(bot_instance, "meme_manager", None) if bot_instance else None
+
+
+@app.get("/api/memes")
+async def get_memes(
+    category: str = "",
+    q: str = "",
+    page: int = 1,
+    page_size: int = 48,
+):
+    """分页读取本地表情库元数据。"""
+    manager = _get_meme_manager()
+    if not manager:
+        return {"memes": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+    try:
+        items, total = await asyncio.to_thread(
+            manager.list_memes,
+            category=category,
+            query=q,
+            page=page,
+            page_size=page_size,
+        )
+        page = max(1, int(page))
+        page_size = max(1, min(100, int(page_size)))
+        for item in items:
+            item["image_url"] = f"/api/memes/image/{item.get('id', '')}"
+        total_pages = (total + page_size - 1) // page_size if total else 0
+        return {
+            "memes": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "has_more": page < total_pages,
+        }
+    except Exception as exc:
+        logger.error("Failed to load memes: %s", exc)
+        return {"memes": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0, "error": str(exc)}
+
+
+@app.get("/api/memes/categories")
+async def get_meme_categories():
+    manager = _get_meme_manager()
+    if not manager:
+        return {"categories": [], "stats": {}}
+    try:
+        return {
+            "categories": await asyncio.to_thread(manager.categories),
+            "stats": await asyncio.to_thread(manager.stats),
+        }
+    except Exception as exc:
+        logger.error("Failed to load meme categories: %s", exc)
+        return {"categories": [], "stats": {}, "error": str(exc)}
+
+
+@app.get("/api/memes/image/{meme_id}")
+async def get_meme_image(meme_id: str):
+    manager = _get_meme_manager()
+    if not manager:
+        raise HTTPException(status_code=404, detail="表情库未初始化")
+    result = await asyncio.to_thread(manager.get_bytes, meme_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="表情不存在")
+    item, content = result
+    media_types = {
+        "PNG": "image/png",
+        "JPEG": "image/jpeg",
+        "GIF": "image/gif",
+        "WEBP": "image/webp",
+    }
+    return Response(content=content, media_type=media_types.get(item.get("format"), "application/octet-stream"))
+
+
+@app.post("/api/memes/upload")
+async def upload_meme(request: Request):
+    manager = _get_meme_manager()
+    if not manager:
+        return {"success": False, "error": "表情库未初始化"}
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            return {"success": False, "error": "请求格式不正确"}
+        item = await asyncio.to_thread(
+            manager.add_data_url,
+            data.get("data_url", ""),
+            category=data.get("category", "待整理"),
+            meaning=data.get("meaning", data.get("description", "")),
+            tags=data.get("tags", []),
+        )
+        item["image_url"] = f"/api/memes/image/{item.get('id', '')}"
+        return {"success": True, "item": item}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/memes/category")
+async def create_meme_category(request: Request):
+    manager = _get_meme_manager()
+    if not manager:
+        return {"success": False, "error": "表情库未初始化"}
+    try:
+        data = await request.json()
+        item = await asyncio.to_thread(
+            manager.create_category,
+            (data or {}).get("name", ""),
+            (data or {}).get("description", ""),
+        )
+        return {"success": True, "category": item}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/memes/{meme_id}")
+async def update_meme(meme_id: str, request: Request):
+    manager = _get_meme_manager()
+    if not manager:
+        return {"success": False, "error": "表情库未初始化"}
+    try:
+        data = await request.json()
+        item = await asyncio.to_thread(
+            manager.update,
+            meme_id,
+            category=(data or {}).get("category"),
+            meaning=(data or {}).get("meaning", (data or {}).get("description")),
+            tags=(data or {}).get("tags"),
+        )
+        if not item:
+            return {"success": False, "error": "表情不存在"}
+        item["image_url"] = f"/api/memes/image/{item.get('id', '')}"
+        return {"success": True, "item": item}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.delete("/api/memes/{meme_id}")
+async def delete_meme(meme_id: str):
+    manager = _get_meme_manager()
+    if not manager:
+        return {"success": False, "error": "表情库未初始化"}
+    try:
+        deleted = await asyncio.to_thread(manager.delete, meme_id)
+        return {"success": deleted, "error": "表情不存在" if not deleted else ""}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/memes/send")
+async def send_meme(request: Request):
+    if not bot_instance:
+        return {"success": False, "error": "Bot 未初始化"}
+    try:
+        data = await request.json()
+        data = data if isinstance(data, dict) else {}
+        return await bot_instance.send_meme(
+            str(data.get("session") or ""),
+            meme_id=str(data.get("meme_id") or ""),
+            category=str(data.get("category") or ""),
+        )
+    except Exception as exc:
+        logger.error("Manual meme send failed: %s", exc)
+        return {"success": False, "error": str(exc)}
 
 
 @app.get("/api/slang")

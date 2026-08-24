@@ -75,6 +75,17 @@ class DashboardSurfaceTests(unittest.TestCase):
             "profile-next",
             "profile-page-meta",
             "profile-search",
+            # 表情包素材库
+            "page-memes",
+            "meme-enabled",
+            "meme-auto-collect",
+            "meme-auto-send",
+            "meme-upload-file",
+            "meme-upload-meaning",
+            "meme-category-filter",
+            "meme-pagination",
+            "meme-prev",
+            "meme-next",
             # 联网搜索（LLM 页）
             "search-enabled",
             "search-primary",
@@ -97,6 +108,17 @@ class DashboardSurfaceTests(unittest.TestCase):
         self.assertIn("/profiles?", self.html)
         self.assertIn("scheduleLoadProfiles", self.html)
         self.assertIn("共 ${profileState.total} 个", self.html)
+
+    def test_meme_library_has_upload_send_and_pagination(self):
+        self.assertIn("/api/memes", self.dashboard_source)
+        self.assertIn("/api/memes/upload", self.dashboard_source)
+        self.assertIn("/api/memes/send", self.dashboard_source)
+        self.assertIn("loadMemePage", self.html)
+        self.assertIn("uploadMeme", self.html)
+        self.assertIn("sendMeme", self.html)
+        self.assertIn("updateMemeMeaning", self.html)
+        self.assertIn("大致含义 / 适用场景", self.html)
+        self.assertIn("MEME_PAGE_SIZE = 48", self.html)
 
     def test_group_analysis_controls_and_report_api_are_exposed(self):
         self.assertIn("/api/group-analysis/reports", self.dashboard_source)

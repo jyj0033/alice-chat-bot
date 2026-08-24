@@ -162,6 +162,7 @@ class ReplyGenerator:
         search_client=None,
         bot_name: str = "",
         taboo_topics: list[str] = None,
+        meme_manager=None,
     ):
         """
         初始化
@@ -175,6 +176,7 @@ class ReplyGenerator:
             search_client: 搜索客户端（模块 search.SearchClient）
             bot_name: bot 在对话记录里的显示名（用于识别上下文中自己说的行）
             taboo_topics: 不主动讨论或展开的禁忌话题
+            meme_manager: 可选的本地表情包管理器，用于注入内部选图标记
         """
         self.llm = llm_provider
         self.personality_prompt = personality_prompt
@@ -191,6 +193,7 @@ class ReplyGenerator:
         # 联网搜索
         self.tool_llm = tool_llm_provider
         self.search_client = search_client
+        self.meme_manager = meme_manager
 
         # 统计
         self.replies_generated = 0
@@ -618,6 +621,17 @@ class ReplyGenerator:
             emoji_guide = "不要使用 emoji，保持纯文字。"
 
         # 回复长度硬约束 - 群聊回复必须简短才像真人
+        meme_guide = ""
+        meme_capability = "发送能力限制：你只能发送纯文字消息，不能发送图片、表情包、语音、视频或文件；"
+        if self.meme_manager:
+            try:
+                meme_guide = self.meme_manager.build_prompt_guide()
+            except Exception:
+                meme_guide = ""
+            if meme_guide:
+                meme_capability = (
+                    "发送能力：普通情况下发送纯文字；如果真的适合，可以按下面的表情包规则选择一张图片。"
+                )
         request.add_system(
             f"回复长度要求：优先用一条短句，确需说明时再用两句，通常不超过{max_reply_length}个中文字符。"
             "如果本轮行为计划给了更短上限，以行为计划为准。"
@@ -626,10 +640,11 @@ class ReplyGenerator:
             f"{emoji_guide}\n"
             "不要把「哈哈」「哈哈哈」「笑死」当成万能语气词——真觉得好笑才笑，"
             "大部分回复不需要带笑声，也不要习惯性用「...」结尾。\n"
-            "发送能力限制：你只能发送纯文字消息，不能发送图片、表情包、语音、视频或文件；"
-            "所以不要说「我发个表情包」「发张图给你」「传个文件」这类自己做不到的话，"
-            "想回应图片/表情包就用文字描述感受。"
+            f"{meme_capability}"
+            "所以不要声称已经发送了自己没有选择的素材；没有表情包能力时，想回应图片/表情包就用文字描述感受。"
         )
+        if self.meme_manager and meme_guide:
+            request.add_system(meme_guide)
 
         # 参与规则 - 根据消息指向决定「该不该插嘴」
         request.add_system(self._build_participation_guide(direction))
@@ -755,6 +770,20 @@ class ReplyGenerator:
         """按行为计划限制长度，优先保留完整短句；单句超长时按词边界截断。"""
         if not text or max_chars <= 0 or len(text) <= max_chars:
             return text
+
+        # 表情包标记是内部动作，不应被短反应的字符上限截掉；真正发给群友的
+        # 文字会在 GroupChatBot 中先移除标记，再按行为上限发送。
+        directive_match = re.search(
+            r"(?P<marker>\[\[\s*(?:表情|表情包|meme)\s*(?::|：)[^\]]+\]\]|"
+            r"&&\s*meme\s*(?::|：)[^&]+&&)\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if directive_match:
+            body = text[:directive_match.start()].rstrip()
+            marker = directive_match.group("marker").strip()
+            limited_body = ReplyGenerator._limit_action_length(body, max_chars)
+            return f"{limited_body} {marker}".strip()
 
         sentences = re.split(r"(?<=[。！？!?~…])", text)
         result = ""
