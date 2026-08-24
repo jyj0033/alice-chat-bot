@@ -1605,13 +1605,20 @@ class GroupChatBot:
 
         try:
             rows = await self.memory_storage.get_session_messages(
-                session_id, limit=restore_limit
+                session_id,
+                limit=restore_limit * 4,  # 较大的取样窗口，供下面过滤“仅上下文”与低价值
             )
             cutoff = datetime.now() - window.max_age
+            restored_count = 0
             for memory in rows:  # 数据库按新到旧；头插后自然变成时间正序
                 if memory.created_at < cutoff:
                     break
                 meta = memory.metadata or {}
+                # 只恢复「有实义内容」的消息：纯应声/仅上下文的历史不是一个
+                # 可衔接的对话（见写入端的 meaningful 标记），跳过它们，
+                # 避免重启后窗口被“嗯”“好”“对”刷满而挤掉真人对话。
+                if meta.get("profile_context_only") or not meta.get("meaningful"):
+                    continue
                 message_id = str(meta.get("message_id") or "")
                 if current_message_id and message_id == str(current_message_id):
                     continue
@@ -1637,6 +1644,9 @@ class GroupChatBot:
                     message_id=message_id,
                     timestamp=memory.created_at,
                 )
+                restored_count += 1
+                if restored_count >= restore_limit:
+                    break
         except Exception as exc:
             # 恢复失败不能阻塞当前消息；下次新建窗口时仍可再尝试。
             window.restored_from_storage = False
@@ -2016,6 +2026,10 @@ class GroupChatBot:
                 "reply_to_id": message.reply_to_id,
                 "reply_to_qq": message.reply_to_qq,
                 "profile_context_only": context_only,
+                # 有实义内容（非纯应声）：重启恢复会话窗口时只取这类消息，
+                # 避免“嗯”“好”“对”把真人对话挤出窗口。
+                "meaningful": not context_only
+                and (message.mentioned_me or self_statement or len(content) > 20),
             },
         )
 
@@ -2066,6 +2080,9 @@ class GroupChatBot:
                 "sender_id": self_id,
                 "sender_name": self.personality.name,
                 "is_bot": True,
+                # 有实义内容才能参与重启后的会话窗口恢复
+                "meaningful": len(content) >= 8
+                or any(mark in content for mark in ("?", "？", "!", "！")),
             },
         )
 
