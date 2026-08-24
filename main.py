@@ -7,6 +7,7 @@ import logging
 import random
 import signal
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -129,6 +130,8 @@ class GroupChatBot:
 
         # 提炼不出稳定特征的人 → 记下当时的素材规模，素材没变就不再重复问 LLM
         self._profile_failed_material: dict[tuple, tuple] = {}
+        # Dashboard 和 QQ 可能在不同事件循环；用线程锁防止手动/定时提炼并发覆盖画像。
+        self._profile_distill_guard = threading.Lock()
         # 黑话自动清理的上次执行时间（进程内首次启动时立即检查）
         self._last_slang_cleanup: float = 0.0
 
@@ -332,8 +335,20 @@ class GroupChatBot:
             "daily_window_days": max(3, int(profile_cfg.get("daily_window_days", 15))),
             # 已有画像后，日常新增消息达到该数量才重炼（避免每次发言都刷）
             "refresh_daily_count": max(1, int(profile_cfg.get("refresh_daily_count", 5))),
+            # MBTI 是额外的娱乐向分析；已有结果时积累更多新素材再刷新，降低调用量。
+            "mbti_refresh_daily_count": max(
+                1, int(profile_cfg.get("mbti_refresh_daily_count", 12))
+            ),
             # MBTI 性格倾向分析（与画像共用素材，每次更新画像多一次 LLM 调用）
             "mbti_enabled": bool(profile_cfg.get("mbti_enabled", True)),
+            # 对短句/回复句补充同会话上下文，只用于消歧，不作为目标用户证据
+            "context_enabled": bool(profile_cfg.get("context_enabled", True)),
+            "context_neighbors": max(
+                1, min(3, int(profile_cfg.get("context_neighbors", 2)))
+            ),
+            "context_max_targets": max(
+                1, min(20, int(profile_cfg.get("context_max_targets", 12)))
+            ),
         }
         self._last_profile_distill: float = 0.0
         logger.info(f"✓ 用户画像: enabled={self._profile_config['enabled']}, "
@@ -1593,6 +1608,7 @@ class GroupChatBot:
         - 消息 > 20 字（分享/吐槽）→ +0.2
         - 含个人信息关键词（我叫/我喜欢/我的生日…）→ +0.3
         - 超过阈值 0.5 才值得长期记住
+        - 带引用但不满足画像条件的短句以低重要性保存，仅作对话上下文
         """
         if not getattr(self, "long_term_memory_enabled", True):
             return
@@ -1603,7 +1619,10 @@ class GroupChatBot:
         content = (message.outer_text or message.content).strip()
         if message.rich_type:
             content = f"{content} [{message.rich_type}]".strip()
-        if not content or len(content) < 4:
+        has_reply = bool(message.reply_to_id or message.reply_to_qq)
+        # 明确回复的“我也是”“对”等极短接话也要留下，方便画像提炼时读取前后文；
+        # 它们会被标记为仅上下文，不会进入画像事实或普通记忆召回。
+        if not content or (len(content) < 4 and not has_reply):
             return
         # 转发的领取口令/推广模板不是这个人说的话，不进长期记忆
         if self._is_promo_text(content):
@@ -1611,11 +1630,15 @@ class GroupChatBot:
 
         self_statement = self._is_self_statement(content)
         # 普通短闲聊不进长期库，避免“说过一句就记住”；明确对 bot 说、
-        # 自我描述和较完整的分享/吐槽仍然保留。
-        if not (message.mentioned_me or self_statement or len(content) > 20):
+        # 自我描述和较完整的分享/吐槽仍然保留。带引用的短句另存为“仅上下文”，
+        # 供画像理解前后文，但不会作为这个人的画像证据。
+        context_only = has_reply and not (
+            message.mentioned_me or self_statement or len(content) > 20
+        )
+        if not (message.mentioned_me or self_statement or len(content) > 20 or context_only):
             return
 
-        importance = 0.3
+        importance = 0.25 if context_only else 0.3
         if message.mentioned_me:
             importance += 0.2
         if len(content) > 20:
@@ -1623,7 +1646,7 @@ class GroupChatBot:
         if any(kw in content for kw in self._PERSONAL_KEYWORDS):
             importance += 0.3 if self_statement else 0.1
 
-        if importance < 0.5:
+        if not context_only and importance < 0.5:
             return
 
         memory = Memory(
@@ -1636,6 +1659,9 @@ class GroupChatBot:
                 "sender_name": message.sender_name,
                 "mentioned_me": message.mentioned_me,
                 "message_id": message.message_id,  # 检索时排除当前消息自召回
+                "reply_to_id": message.reply_to_id,
+                "reply_to_qq": message.reply_to_qq,
+                "profile_context_only": context_only,
             },
         )
 
@@ -1797,7 +1823,7 @@ class GroupChatBot:
         结果是「被保存/命中得多」的普通消息漂到高重要性后冒充自述。
         判不准的留给日常发言，信息不丢。
         """
-        return self._is_self_statement(memory.content or "")
+        return self._is_self_statement(self._strip_speaker(memory.content or ""))
 
     # 「我是/我在」极易切错：「对我|是吧」「帮我|在群里」「我|是说」都会命中，
     # 但都不是在讲自己的身份或所在地。命中这类词时要看后面接的是不是名词性成分。
@@ -1867,7 +1893,7 @@ class GroupChatBot:
         - 太短 / 纯富媒体占位（图片、表情包、转发、链接摘要）没有稳定信号
         - 只留正常聊天内容，供画像从"常聊话题 / 说话风格 / 行为习惯"中推断
         """
-        content = (memory.content or "").strip()
+        content = self._strip_speaker(memory.content or "")
         if (memory.metadata or {}).get("is_bot"):
             return False
         if len(content) < 8:
@@ -1894,7 +1920,7 @@ class GroupChatBot:
         out: list = []
         seen: set = set()
         for m in msgs:  # 调用方已按时间倒序
-            key = (m.content or "")[:30]
+            key = GroupChatBot._strip_speaker(m.content or "")[:30]
             if key in seen:
                 continue
             seen.add(key)
@@ -1902,6 +1928,86 @@ class GroupChatBot:
             if len(out) >= cap:
                 break
         return out
+
+    # 这些消息即使字数不短，也常常只是接话、附和或指代前文；补上下文后再交给
+    # 模型判断，避免把别人刚说的兴趣/经历套到目标用户身上。
+    _PROFILE_CONTEXT_MARKERS = (
+        "我也是", "我也", "俺也", "我呢", "同上", "一样", "你说的",
+        "这个", "那个", "这样", "那样", "上面", "楼上", "刚才", "刚刚",
+        "确实", "对啊", "是啊", "不是吧", "笑死", "他说", "她说",
+        "他们", "她们", "别人", "对方", "那个人",
+    )
+
+    @classmethod
+    def _needs_profile_context(cls, memory) -> bool:
+        """判断一条目标发言是否可能脱离前后文就无法准确理解。"""
+        content = cls._strip_speaker(memory.content or "")
+        if not content:
+            return False
+        metadata = memory.metadata or {}
+        if metadata.get("reply_to_id") or metadata.get("reply_to_qq"):
+            return True
+        if len(content) <= 24:
+            return True
+        return any(marker in content for marker in cls._PROFILE_CONTEXT_MARKERS)
+
+    async def _render_profile_context(
+        self,
+        targets: list,
+        before: int = 2,
+        after: int = 2,
+        max_targets: int = 12,
+        since: Optional[datetime] = None,
+    ) -> str:
+        """渲染少量消歧上下文；上下文中的他人发言永远不作为画像证据。"""
+        reader = getattr(self.memory_storage, "get_profile_context", None)
+        if not callable(reader):
+            return ""
+        selected = sorted(
+            [m for m in (targets or []) if getattr(m, "id", None)],
+            key=lambda m: m.created_at,
+            reverse=True,
+        )[:max(1, int(max_targets))]
+        blocks = []
+        seen_ids = set()
+        for target in selected:
+            if target.id in seen_ids:
+                continue
+            seen_ids.add(target.id)
+            try:
+                rows = await reader(
+                    target.id, before=before, after=after, since=since
+                )
+            except Exception as exc:
+                logger.debug("[画像] 读取对话上下文失败 #%s: %s", target.id, exc)
+                continue
+            if len(rows) <= 1:
+                continue
+            lines = []
+            has_target = False
+            for row in rows:
+                content = self._strip_speaker(row.content or "")[:120]
+                if not content:
+                    continue
+                metadata = row.metadata or {}
+                sender = (
+                    metadata.get("sender_name")
+                    or (
+                        getattr(getattr(self, "personality", None), "name", "Bot")
+                        if metadata.get("is_bot") else "群友"
+                    )
+                    or metadata.get("sender_id")
+                    or "群友"
+                )
+                if row.id == target.id:
+                    label = "目标发言"
+                    has_target = True
+                else:
+                    label = "上下文"
+                lines.append(f"[{label}] {sender}：{content}")
+            if has_target and len(lines) > 1:
+                blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
 
     # 画像里不该出现的用词：prompt 已明令禁止推测，但模型偶尔还是会写。
     # 这里不直接丢弃（画像其余部分可能是对的），而是打标记交给 Web 端展示，
@@ -2117,21 +2223,30 @@ class GroupChatBot:
         已有画像且没有"新自述 + 足够新日常发言"时跳过；force=True 强制重炼。
         画像存为 semantic 记忆，语义检索时可被召回。
         """
-        result = {"distilled": 0, "skipped": 0, "error": ""}
+        result = {"distilled": 0, "skipped": 0, "failed": 0, "error": ""}
         if (
             not getattr(self, "long_term_memory_enabled", True)
             or not self._profile_config.get("enabled", True)
         ):
             return result
+        guard = getattr(self, "_profile_distill_guard", None)
+        if guard is None:
+            guard = threading.Lock()
+            self._profile_distill_guard = guard
+        if not guard.acquire(blocking=False):
+            result["error"] = "profile distillation already running"
+            result["skipped"] += 1
+            return result
         min_facts = self._profile_config.get("min_facts", 2)
         daily_min = self._profile_config.get("daily_min_messages", 8)
         window_days = self._profile_config.get("daily_window_days", 15)
         refresh_daily = self._profile_config.get("refresh_daily_count", 5)
+        mbti_refresh_daily = self._profile_config.get("mbti_refresh_daily_count", 12)
         mbti_enabled = self._profile_config.get("mbti_enabled", True)
+        context_enabled = self._profile_config.get("context_enabled", True)
+        context_neighbors = self._profile_config.get("context_neighbors", 2)
+        context_max_targets = self._profile_config.get("context_max_targets", 12)
         try:
-            # 画像素材按最近消息取，不能用 get_all 的重要性排序：否则大量旧的
-            # 高重要性消息会把近期日常发言挤出 2000 条窗口。
-            episodes = await self.memory_storage.get_recent("episodic", limit=2000)
             profiles = await self.memory_storage.get_profiles()
             profile_by_scope = {}
             for p in profiles:
@@ -2140,26 +2255,67 @@ class GroupChatBot:
                     continue
                 scope = p.source_session or (p.metadata or {}).get("profile_session", "")
                 key = (str(sender_id), "" if self.memory_share_across_sessions else scope)
-                profile_by_scope[key] = p
+                # get_profiles 按最近访问/更新倒序；旧库若存在重复画像，保留最新的一条。
+                if key not in profile_by_scope:
+                    profile_by_scope[key] = p
 
-            # 按发送者分组：自述 + 有信息量的日常发言
+            # 先列出有素材的用户/会话，再分别取每个范围自己的最近 2000 条。
+            # 不能用全局最近 2000 条，否则活跃群会把冷门用户挤出画像素材。
+            scopes = await self.memory_storage.get_profile_scopes(
+                share_across_sessions=self.memory_share_across_sessions,
+            )
+            suppressions = await self.memory_storage.get_profile_suppressions()
+            profile_attempts = await self.memory_storage.get_profile_attempts()
+
+            async def remember_profile_attempt(scope_key, material_sig) -> None:
+                """持久化无结果/失败的素材签名，避免重启后重复问同一批素材。"""
+                self._profile_failed_material[scope_key] = material_sig
+                try:
+                    await self.memory_storage.set_profile_attempt(
+                        scope_key[0],
+                        scope_key[1],
+                        material_sig[0],
+                        material_sig[1],
+                    )
+                except Exception as exc:
+                    # 记录失败不能反过来阻断其它用户画像；内存标记仍然有效。
+                    logger.debug("[画像] 保存提炼尝试记录失败: %s", exc)
+
             by_scope: dict[tuple, dict] = {}
-            for m in episodes:
-                meta = m.metadata or {}
-                sid = meta.get("sender_id")
-                if not sid or meta.get("is_bot"):
+            for sid, source_scope in scopes:
+                scope_key = (
+                    str(sid),
+                    "" if self.memory_share_across_sessions else source_scope,
+                )
+                try:
+                    materials = await self.memory_storage.get_profile_materials(
+                        sid,
+                        source_session=source_scope,
+                        share_across_sessions=self.memory_share_across_sessions,
+                        limit=2000,
+                        after=suppressions.get(scope_key),
+                    )
+                except Exception as exc:
+                    logger.warning("[画像] %s 素材读取失败，跳过本范围: %s", sid, exc)
+                    result["failed"] += 1
+                    if not result["error"]:
+                        result["error"] = str(exc)
                     continue
-                source_scope = m.source_session or ""
-                scope_key = (str(sid), "" if self.memory_share_across_sessions else source_scope)
+                if not materials:
+                    continue
                 entry = by_scope.setdefault(
                     scope_key, {"self": [], "daily": [], "latest_name": ""}
                 )
-                if meta.get("sender_name"):
-                    entry["latest_name"] = meta["sender_name"]
-                if self._is_personal_fact(m):
-                    entry["self"].append(m)
-                elif self._is_meaningful_chat(m):
-                    entry["daily"].append(m)
+                for m in materials:
+                    meta = m.metadata or {}
+                    if meta.get("is_bot") or meta.get("profile_context_only"):
+                        continue
+                    if meta.get("sender_name"):
+                        entry["latest_name"] = meta["sender_name"]
+                    if self._is_personal_fact(m):
+                        entry["self"].append(m)
+                    elif self._is_meaningful_chat(m):
+                        entry["daily"].append(m)
 
             provider = self.get_active_provider()
             if not provider:
@@ -2191,7 +2347,10 @@ class GroupChatBot:
                 # 提炼不出稳定特征的人：素材没变化就别每轮都再问一次 LLM。
                 # （已有画像的人由下面的"新素材"门槛把关，这条覆盖的是还没有画像的人）
                 material_sig = (len(self_facts), len(daily))
-                if not force and self._profile_failed_material.get(scope_key) == material_sig:
+                failed_sig = self._profile_failed_material.get(scope_key)
+                if failed_sig is None:
+                    failed_sig = profile_attempts.get(scope_key)
+                if not force and failed_sig == material_sig:
                     logger.debug(
                         "[画像] 跳过 %s：上次提炼不出且素材无变化（自述%d 日常%d）",
                         latest_name, len(self_facts), len(daily),
@@ -2228,7 +2387,23 @@ class GroupChatBot:
 
                 self_text = render_section(unique_facts)
                 daily_text = render_section(unique_daily)
-                previous_summary = self._strip_profile_prefix(
+                context_text = ""
+                if context_enabled:
+                    context_targets = [
+                        item for item in unique_facts + unique_daily
+                        if self._needs_profile_context(item)
+                    ]
+                    context_text = await self._render_profile_context(
+                        context_targets,
+                        before=context_neighbors,
+                        after=context_neighbors,
+                        max_targets=context_max_targets,
+                        since=suppressions.get(scope_key),
+                    )
+                existing_meta = (existing.metadata or {}) if existing else {}
+                # 带质量警告的旧画像仅供面板复核，不能当作可信结论回灌给 LLM，
+                # 否则一次错误推测会在后续增量更新中反复自我强化。
+                previous_summary = "" if existing_meta.get("warnings") else self._strip_profile_prefix(
                     existing.content if existing else ""
                 )
 
@@ -2243,6 +2418,8 @@ class GroupChatBot:
                     "- 【日常发言】是TA的日常聊天，只从反复出现的模式里归纳\n"
                     "- 两类素材都是从群聊里摘出来的孤立单句，很多是在回别人的话，"
                     "看不到上下文。读不懂或像是在接别人话茬的，直接跳过，不要硬解释。\n"
+                    "- 【对话上下文】只用于理解【目标发言】的指代和语气；上下文里的其他人"
+                    "说过的兴趣、经历、身份和观点，绝对不能归到TA身上。\n"
                     "- 【已有画像】是之前根据更早的聊天总结的结论（本次资料里可能不再提到）\n"
                     "\n给了【已有画像】时，要在它的基础上更新，而不是重写：\n"
                     "A. 保留仍然成立的稳定事实（职业、所在地、长期爱好），"
@@ -2277,24 +2454,36 @@ class GroupChatBot:
                     parts.append(f"【自我描述】\n{self_text}")
                 if daily_text:
                     parts.append(f"【日常发言】\n{daily_text}")
+                if context_text:
+                    parts.append(
+                        "【对话上下文（仅用于消歧，非画像证据）】\n" + context_text
+                    )
                 req.add_user("\n".join(parts))
-                resp = await provider.chat(req)
-                summary = (resp.content or "").strip().strip('"\'“”')
+                try:
+                    resp = await provider.chat(req)
+                except Exception as exc:
+                    logger.warning("[画像] %s 提炼失败，继续处理其他用户: %s", latest_name, exc)
+                    result["failed"] += 1
+                    await remember_profile_attempt(scope_key, material_sig)
+                    if not result["error"]:
+                        result["error"] = str(exc)
+                    continue
+                summary = (getattr(resp, "content", "") or "").strip().strip('"\'“”')
                 if not summary:
                     logger.info("[画像] 跳过 %s：LLM 返回空", latest_name)
-                    self._profile_failed_material[scope_key] = material_sig
+                    await remember_profile_attempt(scope_key, material_sig)
                     result["skipped"] += 1
                     continue
                 if self._is_profile_refusal(summary):
                     logger.info("[画像] 跳过 %s：素材判断不出稳定特征（%s）",
                                 latest_name, summary[:40])
-                    self._profile_failed_material[scope_key] = material_sig
+                    await remember_profile_attempt(scope_key, material_sig)
                     result["skipped"] += 1
                     continue
                 summary = self._normalize_profile_summary(summary)
                 if not summary:
                     logger.info("[画像] 跳过 %s：清理后无有效内容", latest_name)
-                    self._profile_failed_material[scope_key] = material_sig
+                    await remember_profile_attempt(scope_key, material_sig)
                     result["skipped"] += 1
                     continue
                 self._profile_failed_material.pop(scope_key, None)
@@ -2309,19 +2498,45 @@ class GroupChatBot:
                 warnings = self._profile_quality_warnings(summary)
                 if warnings:
                     logger.info("[画像] %s 质量提示: %s", latest_name, "；".join(warnings))
-                existing_meta = (existing.metadata or {}) if existing else {}
-
                 # MBTI：与画像共用素材，只在画像确实更新且素材足够时才分析。
                 # 失败或素材不足时沿用上一次的结果，不影响画像写入。
                 mbti = existing_meta.get("mbti")
                 sample_size = len(unique_facts) + len(unique_daily)
-                if mbti_enabled and sample_size >= self._MBTI_MIN_SAMPLES:
+                new_material_count = (
+                    sample_size
+                    if not existing
+                    else sum(
+                        1 for item in unique_facts + unique_daily
+                        if item.created_at > existing.created_at
+                    )
+                )
+                refresh_mbti = (
+                    not mbti
+                    or force
+                    or new_material_count >= mbti_refresh_daily
+                )
+                if mbti_enabled and sample_size >= self._MBTI_MIN_SAMPLES and refresh_mbti:
                     fresh = await self._analyze_mbti(
                         provider, latest_name, summary, self_text, daily_text
                     )
                     if fresh:
                         fresh["sample_size"] = sample_size
                         mbti = fresh
+
+                # 面板删除画像与本轮提炼可能并发；删除端会持有同一把锁，
+                # 这里再读一次抑制点，兼容其它直接调用 storage.delete 的路径。
+                try:
+                    latest_suppressions = await self.memory_storage.get_profile_suppressions()
+                except Exception as exc:
+                    logger.warning("[画像] %s 保存前无法确认删除抑制，跳过本轮: %s", latest_name, exc)
+                    result["failed"] += 1
+                    if not result["error"]:
+                        result["error"] = str(exc)
+                    continue
+                if latest_suppressions.get(scope_key):
+                    logger.info("[画像] %s 已在提炼期间被删除，跳过本轮写回", latest_name)
+                    result["skipped"] += 1
+                    continue
 
                 new_profile = Memory(
                     content=f"【用户画像 {latest_name}】{summary}",
@@ -2352,16 +2567,27 @@ class GroupChatBot:
                         "mbti": mbti,
                     },
                 )
-                if existing and existing.id:
-                    new_profile.id = existing.id
-                    await self.memory_storage.update_memory(new_profile)
-                else:
-                    await self.memory_storage.store(new_profile)
+                try:
+                    if existing and existing.id:
+                        new_profile.id = existing.id
+                        await self.memory_storage.update_memory(new_profile)
+                    else:
+                        await self.memory_storage.store(new_profile)
+                    await self.memory_storage.clear_profile_suppression(sid, profile_scope)
+                    await self.memory_storage.clear_profile_attempt(sid, profile_scope)
+                except Exception as exc:
+                    logger.warning("[画像] %s 保存失败，继续处理其他用户: %s", latest_name, exc)
+                    result["failed"] += 1
+                    if not result["error"]:
+                        result["error"] = str(exc)
+                    continue
                 result["distilled"] += 1
                 logger.info(f"[画像] {latest_name}: {summary[:50]}...")
         except Exception as e:
             logger.error(f"User profile distillation failed: {e}", exc_info=True)
             result["error"] = str(e)
+        finally:
+            guard.release()
         return result
 
     async def _maybe_distill_profiles(self) -> None:
@@ -2864,6 +3090,17 @@ class GroupChatBot:
             digest_ids = {d.id for d in digests}
             memories = (digests + [m for m in memories if m.id not in digest_ids])[:limit]
 
+        # 只刷新真正命中的画像访问时间；不提升 importance，也不把无关召回当成强化。
+        profile_ids = [
+            m.id for m in memories
+            if m.id and (m.metadata or {}).get("profile")
+        ]
+        if profile_ids:
+            try:
+                await self.memory_storage.update_access_many(profile_ids)
+            except Exception as e:
+                logger.debug(f"Profile access update skipped: {e}")
+
         return memories
 
     async def run(self) -> None:
@@ -3242,7 +3479,11 @@ class GroupChatBot:
                     "daily_min_messages": 8,
                     "daily_window_days": 15,
                     "refresh_daily_count": 5,
-                    "mbti_enabled": True
+                    "mbti_refresh_daily_count": 12,
+                    "mbti_enabled": True,
+                    "context_enabled": True,
+                    "context_neighbors": 2,
+                    "context_max_targets": 12
                 }
             },
             "search": {

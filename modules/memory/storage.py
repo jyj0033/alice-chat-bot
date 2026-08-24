@@ -195,6 +195,30 @@ class MemoryStorage:
             ON glossary(session, enabled)
         """)
 
+        # 删除画像时保留一个"从何时起不再自动重建"的标记；新素材出现后才允许
+        # 重新生成，避免用户刚删掉的旧画像在下一轮提炼中立刻复活。
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS profile_suppressions (
+                sender_id TEXT NOT NULL,
+                source_session TEXT NOT NULL DEFAULT '',
+                suppressed_at TIMESTAMP NOT NULL,
+                PRIMARY KEY(sender_id, source_session)
+            )
+        """)
+        # 记录同一批素材已经尝试过画像提炼。LLM 返回空/拒绝或调用失败时，
+        # 重启后也不要因为定时任务再次对完全相同的素材重复收费；有新素材或
+        # 手动 force 时由画像提炼逻辑显式解除这个抑制。
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS profile_attempts (
+                sender_id TEXT NOT NULL,
+                source_session TEXT NOT NULL DEFAULT '',
+                self_count INTEGER NOT NULL DEFAULT 0,
+                daily_count INTEGER NOT NULL DEFAULT 0,
+                attempted_at TIMESTAMP NOT NULL,
+                PRIMARY KEY(sender_id, source_session)
+            )
+        """)
+
         self.conn.commit()
 
     # === 群聊黑话（glossary） ===
@@ -410,6 +434,251 @@ class MemoryStorage:
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
     @_db_locked
+    def get_profile_scopes(
+        self, limit: Optional[int] = None, share_across_sessions: bool = False
+    ) -> list[tuple[str, str]]:
+        """列出有情景素材的用户/会话范围，不用全局消息上限挤掉冷门用户。"""
+        if limit is not None:
+            limit = max(1, min(int(limit), 100000))
+        limit_sql = " LIMIT ?" if limit is not None else ""
+        if share_across_sessions:
+            group_sql = "CAST(json_extract(metadata, '$.sender_id') AS TEXT)"
+            select_sql = f"""
+                SELECT {group_sql} AS sender_id, '' AS source_session
+                FROM memories
+                WHERE memory_type = 'episodic'
+                  AND json_valid(metadata)
+                  AND json_extract(metadata, '$.sender_id') IS NOT NULL
+                  AND COALESCE(json_extract(metadata, '$.is_bot'), 0) = 0
+                  AND COALESCE(json_extract(metadata, '$.profile_context_only'), 0) = 0
+                GROUP BY {group_sql}
+                ORDER BY MAX(created_at) DESC
+                {limit_sql}
+            """
+        else:
+            sender_sql = "CAST(json_extract(metadata, '$.sender_id') AS TEXT)"
+            select_sql = f"""
+                SELECT {sender_sql} AS sender_id, source_session
+                FROM memories
+                WHERE memory_type = 'episodic'
+                  AND json_valid(metadata)
+                  AND json_extract(metadata, '$.sender_id') IS NOT NULL
+                  AND COALESCE(json_extract(metadata, '$.is_bot'), 0) = 0
+                  AND COALESCE(json_extract(metadata, '$.profile_context_only'), 0) = 0
+                GROUP BY {sender_sql}, source_session
+                ORDER BY MAX(created_at) DESC
+                {limit_sql}
+            """
+        try:
+            params = (limit,) if limit is not None else ()
+            rows = self.conn.execute(select_sql, params).fetchall()
+            return [
+                (str(row["sender_id"] or ""), row["source_session"] or "")
+                for row in rows
+                if row["sender_id"]
+            ]
+        except sqlite3.OperationalError:
+            # 极旧 SQLite 没有 JSON1 时保留兼容路径；正常环境走上面的精确查询。
+            rows = self.conn.execute("""
+                SELECT source_session, metadata, MAX(created_at) AS latest
+                FROM memories
+                WHERE memory_type = 'episodic'
+                GROUP BY source_session, metadata
+                ORDER BY latest DESC
+            """).fetchall()
+            scopes = []
+            seen = set()
+            for row in rows:
+                try:
+                    metadata = json.loads(row["metadata"] or "{}") or {}
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    if metadata.get("is_bot") or metadata.get("profile_context_only"):
+                        continue
+                    sender_id = str(metadata.get("sender_id") or "")
+                except (TypeError, ValueError):
+                    sender_id = ""
+                scope = "" if share_across_sessions else (row["source_session"] or "")
+                key = (sender_id, scope)
+                if sender_id and key not in seen:
+                    seen.add(key)
+                    scopes.append(key)
+                    if limit is not None and len(scopes) >= limit:
+                        break
+            return scopes
+
+    @_db_locked
+    def get_profile_materials(
+        self,
+        sender_id: str,
+        source_session: str = "",
+        share_across_sessions: bool = False,
+        limit: int = 2000,
+        after: Optional[datetime] = None,
+    ) -> list[Memory]:
+        """按用户（及默认会话范围）取画像素材，避免全局最近消息截断用户。"""
+        sender_id = str(sender_id or "").strip()
+        if not sender_id:
+            return []
+        limit = max(1, min(int(limit), 5000))
+        clauses = [
+            "memory_type = 'episodic'",
+            "json_valid(metadata)",
+            "CAST(json_extract(metadata, '$.sender_id') AS TEXT) = ?",
+            "COALESCE(json_extract(metadata, '$.is_bot'), 0) = 0",
+            "COALESCE(json_extract(metadata, '$.profile_context_only'), 0) = 0",
+        ]
+        params: list = [sender_id]
+        if not share_across_sessions:
+            clauses.append("source_session = ?")
+            params.append(source_session or "")
+        if after is not None:
+            clauses.append("created_at > ?")
+            params.append(after.isoformat(sep=" "))
+        where = " AND ".join(clauses)
+        sql = f"""
+            SELECT * FROM memories
+            WHERE {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+        """
+        try:
+            rows = self.conn.execute(sql, (*params, limit)).fetchall()
+        except sqlite3.OperationalError:
+            # JSON1 不可用时退化为按会话取候选，再用 Python 检查 sender_id。
+            fallback_clauses = ["memory_type = 'episodic'"]
+            fallback_params: list = []
+            if not share_across_sessions:
+                fallback_clauses.append("source_session = ?")
+                fallback_params.append(source_session or "")
+            if after is not None:
+                fallback_clauses.append("created_at > ?")
+                fallback_params.append(after.isoformat(sep=" "))
+            fallback_where = " AND ".join(fallback_clauses)
+            rows = self.conn.execute(f"""
+                SELECT * FROM memories
+                WHERE {fallback_where}
+                ORDER BY created_at DESC, id DESC
+            """, fallback_params).fetchall()
+            return [
+                memory for memory in (self._row_to_memory(row) for row in rows)
+                if str((memory.metadata or {}).get("sender_id") or "") == sender_id
+                and not (memory.metadata or {}).get("is_bot")
+                and not (memory.metadata or {}).get("profile_context_only")
+            ][:limit]
+        return [self._row_to_memory(row) for row in rows]
+
+    @_db_locked
+    def get_profile_context(
+        self,
+        memory_id: int,
+        before: int = 2,
+        after: int = 2,
+        since: Optional[datetime] = None,
+    ) -> list[Memory]:
+        """读取一条画像候选在同一会话的前后文，用于消歧，不改变素材归属。"""
+        try:
+            memory_id = int(memory_id)
+        except (TypeError, ValueError):
+            return []
+        target_row = self.conn.execute(
+            "SELECT * FROM memories WHERE id = ? AND memory_type = 'episodic'",
+            (memory_id,),
+        ).fetchone()
+        if not target_row:
+            return []
+
+        try:
+            before = max(0, min(int(before), 5))
+        except (TypeError, ValueError):
+            before = 2
+        try:
+            after = max(0, min(int(after), 5))
+        except (TypeError, ValueError):
+            after = 2
+        session = target_row["source_session"] or ""
+        created_at = target_row["created_at"] or ""
+        rows = []
+        if before:
+            before_sql = """
+                SELECT * FROM memories
+                WHERE memory_type = 'episodic'
+                  AND source_session = ?
+                  AND (created_at < ? OR (created_at = ? AND id < ?))
+            """
+            before_params = [session, created_at, created_at, memory_id]
+            if since is not None:
+                before_sql += " AND created_at > ?"
+                before_params.append(since.isoformat(sep=" "))
+            before_sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+            before_params.append(before)
+            rows.extend(self.conn.execute(before_sql, before_params).fetchall())
+        rows.reverse()
+        rows.append(target_row)
+        if after:
+            after_sql = """
+                SELECT * FROM memories
+                WHERE memory_type = 'episodic'
+                  AND source_session = ?
+                  AND (created_at > ? OR (created_at = ? AND id > ?))
+            """
+            after_params = [session, created_at, created_at, memory_id]
+            if since is not None:
+                after_sql += " AND created_at > ?"
+                after_params.append(since.isoformat(sep=" "))
+            after_sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
+            after_params.append(after)
+            rows.extend(self.conn.execute(after_sql, after_params).fetchall())
+
+        # 如果消息保存了引用消息 ID，优先把被引用消息补进来；历史数据没有该字段
+        # 时仍依靠前后邻居，不影响旧库兼容。
+        try:
+            target_meta = json.loads(target_row["metadata"] or "{}") or {}
+        except (TypeError, ValueError):
+            target_meta = {}
+        if not isinstance(target_meta, dict):
+            target_meta = {}
+        reply_to_id = str(target_meta.get("reply_to_id") or "").strip()
+        if reply_to_id:
+            try:
+                reply_sql = """
+                    SELECT * FROM memories
+                    WHERE memory_type = 'episodic'
+                      AND source_session = ?
+                      AND json_valid(metadata)
+                      AND CAST(json_extract(metadata, '$.message_id') AS TEXT) = ?
+                """
+                reply_params = [session, reply_to_id]
+                if since is not None:
+                    reply_sql += " AND created_at > ?"
+                    reply_params.append(since.isoformat(sep=" "))
+                reply_sql += " ORDER BY created_at DESC, id DESC LIMIT 1"
+                reply_row = self.conn.execute(reply_sql, reply_params).fetchone()
+            except sqlite3.OperationalError:
+                reply_row = None
+                candidates = self.conn.execute("""
+                    SELECT * FROM memories
+                    WHERE memory_type = 'episodic' AND source_session = ?
+                """, (session,)).fetchall()
+                for candidate in candidates:
+                    if since is not None and (candidate["created_at"] or "") <= since.isoformat(sep=" "):
+                        continue
+                    try:
+                        candidate_meta = json.loads(candidate["metadata"] or "{}") or {}
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(candidate_meta, dict):
+                        continue
+                    if str(candidate_meta.get("message_id") or "") == reply_to_id:
+                        reply_row = candidate
+                        break
+            if reply_row and not any(row["id"] == reply_row["id"] for row in rows):
+                rows.append(reply_row)
+
+        rows.sort(key=lambda row: (row["created_at"] or "", row["id"]))
+        return [self._row_to_memory(row) for row in rows]
+
+    @_db_locked
     def get_profiles(self) -> list[Memory]:
         """所有用户画像（semantic 记忆且 metadata.profile=True），按最近更新排序。
 
@@ -424,6 +693,118 @@ class MemoryStorage:
         ]
         profiles.sort(key=lambda m: m.last_accessed, reverse=True)
         return profiles
+
+    @_db_locked
+    def get_profiles_page(
+        self, limit: int = 30, offset: int = 0, query: str = ""
+    ) -> tuple[list[Memory], int]:
+        """分页读取用户画像，供 Dashboard 使用，可按 QQ/昵称/画像内容检索。"""
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+        query = str(query or "").strip()[:80]
+        where = (
+            "memory_type = 'semantic' AND json_valid(metadata) "
+            "AND json_extract(metadata, '$.profile') = 1"
+        )
+        params: list = []
+        if query:
+            like = f"%{query}%"
+            where += " AND (content LIKE ? OR metadata LIKE ?)"
+            params.extend([like, like])
+        try:
+            total = self.conn.execute(
+                f"SELECT COUNT(*) FROM memories WHERE {where}", params
+            ).fetchone()[0]
+            rows = self.conn.execute(f"""
+                SELECT * FROM memories
+                WHERE {where}
+                ORDER BY last_accessed DESC, id DESC
+                LIMIT ? OFFSET ?
+            """, (*params, limit, offset)).fetchall()
+        except sqlite3.OperationalError:
+            profiles = self.get_profiles()
+            if query:
+                needle = query.casefold()
+                profiles = [
+                    p for p in profiles
+                    if needle in (p.content or "").casefold()
+                    or needle in str((p.metadata or {}).get("sender_id") or "").casefold()
+                    or needle in str((p.metadata or {}).get("sender_name") or "").casefold()
+                ]
+            return profiles[offset:offset + limit], len(profiles)
+        return [self._row_to_memory(row) for row in rows], total
+
+    @_db_locked
+    def get_profile_suppressions(self) -> dict[tuple[str, str], datetime]:
+        """读取已删除画像的重建抑制时间。"""
+        rows = self.conn.execute(
+            "SELECT sender_id, source_session, suppressed_at FROM profile_suppressions"
+        ).fetchall()
+        result = {}
+        for row in rows:
+            try:
+                result[(str(row["sender_id"]), row["source_session"] or "")] = datetime.fromisoformat(
+                    row["suppressed_at"]
+                )
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    @_db_locked
+    def clear_profile_suppression(self, sender_id: str, source_session: str = "") -> None:
+        self.conn.execute(
+            "DELETE FROM profile_suppressions WHERE sender_id = ? AND source_session = ?",
+            (str(sender_id), source_session or ""),
+        )
+        self.conn.commit()
+
+    @_db_locked
+    def get_profile_attempts(self) -> dict[tuple[str, str], tuple[int, int]]:
+        """读取每个画像范围最近一次失败/无结果的素材计数。"""
+        rows = self.conn.execute(
+            "SELECT sender_id, source_session, self_count, daily_count FROM profile_attempts"
+        ).fetchall()
+        result = {}
+        for row in rows:
+            try:
+                result[(str(row["sender_id"]), row["source_session"] or "")] = (
+                    int(row["self_count"] or 0),
+                    int(row["daily_count"] or 0),
+                )
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    @_db_locked
+    def set_profile_attempt(
+        self,
+        sender_id: str,
+        source_session: str = "",
+        self_count: int = 0,
+        daily_count: int = 0,
+    ) -> None:
+        """保存最近一次画像提炼尝试，避免无变化时重复调用 LLM。"""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO profile_attempts "
+            "(sender_id, source_session, self_count, daily_count, attempted_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                str(sender_id),
+                source_session or "",
+                max(0, int(self_count)),
+                max(0, int(daily_count)),
+                datetime.now().isoformat(sep=" "),
+            ),
+        )
+        self.conn.commit()
+
+    @_db_locked
+    def clear_profile_attempt(self, sender_id: str, source_session: str = "") -> None:
+        self.conn.execute(
+            "DELETE FROM profile_attempts WHERE sender_id = ? AND source_session = ?",
+            (str(sender_id), source_session or ""),
+        )
+        self.conn.commit()
 
     @_db_locked
     def update_memory(self, memory: Memory) -> bool:
@@ -461,7 +842,10 @@ class MemoryStorage:
             ORDER BY importance DESC, created_at DESC
             LIMIT ?
         """, (*params, limit))
-        return [self._row_to_memory(row) for row in cursor.fetchall()]
+        return [
+            memory for memory in (self._row_to_memory(row) for row in cursor.fetchall())
+            if self._is_retrievable_memory(memory)
+        ]
 
     @_db_locked
     def get_memories_page(
@@ -599,7 +983,10 @@ class MemoryStorage:
                 LIMIT ?
             """, (session, limit))
 
-        return [self._row_to_memory(row) for row in cursor.fetchall()]
+        return [
+            memory for memory in (self._row_to_memory(row) for row in cursor.fetchall())
+            if self._is_retrievable_memory(memory)
+        ]
 
     @_db_locked
     def count_session_messages(
@@ -687,10 +1074,26 @@ class MemoryStorage:
     @_db_locked
     def update_access(self, memory_id: int) -> None:
         """更新访问时间"""
+        now = datetime.now().isoformat(sep=" ")
         self.conn.execute("""
-            UPDATE memories SET last_accessed = CURRENT_TIMESTAMP WHERE id = ?
-        """, (memory_id,))
+            UPDATE memories SET last_accessed = ? WHERE id = ?
+        """, (now, memory_id))
         self.conn.commit()
+
+    @_db_locked
+    def update_access_many(self, memory_ids: list[int]) -> int:
+        """批量刷新实际被召回记忆的访问时间，不改变重要性。"""
+        ids = sorted({int(mid) for mid in (memory_ids or []) if mid})
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        now = datetime.now().isoformat(sep=" ")
+        cursor = self.conn.execute(
+            f"UPDATE memories SET last_accessed = ? WHERE id IN ({placeholders})",
+            (now, *ids),
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     @_db_locked
     def bump_memories(self, memory_ids: list[int], importance_boost: float = 0.01) -> int:
@@ -724,7 +1127,27 @@ class MemoryStorage:
 
     @_db_locked
     def delete(self, memory_id: int) -> bool:
-        """删除记忆"""
+        """删除记忆；删除用户画像时记录重建抑制点。"""
+        row = self.conn.execute(
+            "SELECT memory_type, source_session, metadata FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        if row and row["memory_type"] == "semantic":
+            try:
+                metadata = json.loads(row["metadata"] or "{}") or {}
+            except (TypeError, ValueError):
+                metadata = {}
+            if metadata.get("profile") and metadata.get("sender_id"):
+                scope = "" if self.share_across_sessions else (row["source_session"] or "")
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO profile_suppressions "
+                    "(sender_id, source_session, suppressed_at) VALUES (?, ?, ?)",
+                    (str(metadata["sender_id"]), scope, datetime.now().isoformat(sep=" ")),
+                )
+                self.conn.execute(
+                    "DELETE FROM profile_attempts WHERE sender_id = ? AND source_session = ?",
+                    (str(metadata["sender_id"]), scope),
+                )
         cursor = self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         self.conn.commit()
         return cursor.rowcount > 0
@@ -1020,8 +1443,10 @@ class MemoryStorage:
 
     @staticmethod
     def _is_retrievable_memory(memory: Memory) -> bool:
-        """带质量警告的画像保留在管理面板，但不直接喂给回复模型。"""
+        """管理用上下文素材保留在数据库，但不直接喂给回复模型。"""
         meta = memory.metadata or {}
+        if meta.get("profile_context_only"):
+            return False
         return not (
             memory.memory_type == "semantic"
             and meta.get("profile")
@@ -1138,9 +1563,95 @@ class AsyncMemoryStorage:
         """异步获取最近记忆"""
         return await asyncio.to_thread(self._storage.get_recent, memory_type, limit)
 
+    async def get_profile_scopes(
+        self, limit: Optional[int] = None, share_across_sessions: bool = False
+    ) -> list[tuple[str, str]]:
+        """异步列出有画像素材的用户/会话范围。"""
+        return await asyncio.to_thread(
+            self._storage.get_profile_scopes, limit, share_across_sessions
+        )
+
+    async def get_profile_materials(
+        self,
+        sender_id: str,
+        source_session: str = "",
+        share_across_sessions: bool = False,
+        limit: int = 2000,
+        after: Optional[datetime] = None,
+    ) -> list[Memory]:
+        """异步读取单个用户/会话的画像素材。"""
+        return await asyncio.to_thread(
+            self._storage.get_profile_materials,
+            sender_id,
+            source_session,
+            share_across_sessions,
+            limit,
+            after,
+        )
+
+    async def get_profile_context(
+        self,
+        memory_id: int,
+        before: int = 2,
+        after: int = 2,
+        since: Optional[datetime] = None,
+    ) -> list[Memory]:
+        """异步读取画像候选的同会话前后文。"""
+        return await asyncio.to_thread(
+            self._storage.get_profile_context, memory_id, before, after, since
+        )
+
     async def get_profiles(self) -> list[Memory]:
         """异步获取所有用户画像（semantic 记忆）"""
         return await asyncio.to_thread(self._storage.get_profiles)
+
+    async def get_profiles_page(
+        self, limit: int = 30, offset: int = 0, query: str = ""
+    ) -> tuple[list[Memory], int]:
+        """异步分页获取用户画像。"""
+        return await asyncio.to_thread(
+            self._storage.get_profiles_page, limit, offset, query
+        )
+
+    async def get_profile_suppressions(self) -> dict[tuple[str, str], datetime]:
+        """异步读取画像删除抑制记录。"""
+        return await asyncio.to_thread(self._storage.get_profile_suppressions)
+
+    async def clear_profile_suppression(
+        self, sender_id: str, source_session: str = ""
+    ) -> None:
+        """异步清除画像删除抑制记录。"""
+        await asyncio.to_thread(
+            self._storage.clear_profile_suppression, sender_id, source_session
+        )
+
+    async def get_profile_attempts(self) -> dict[tuple[str, str], tuple[int, int]]:
+        """异步读取画像提炼尝试记录。"""
+        return await asyncio.to_thread(self._storage.get_profile_attempts)
+
+    async def set_profile_attempt(
+        self,
+        sender_id: str,
+        source_session: str = "",
+        self_count: int = 0,
+        daily_count: int = 0,
+    ) -> None:
+        """异步保存画像提炼尝试记录。"""
+        await asyncio.to_thread(
+            self._storage.set_profile_attempt,
+            sender_id,
+            source_session,
+            self_count,
+            daily_count,
+        )
+
+    async def clear_profile_attempt(
+        self, sender_id: str, source_session: str = ""
+    ) -> None:
+        """异步清除画像提炼尝试记录。"""
+        await asyncio.to_thread(
+            self._storage.clear_profile_attempt, sender_id, source_session
+        )
 
     async def update_memory(self, memory: Memory) -> bool:
         """异步整条更新已有记忆（用户画像复用原 id）"""
@@ -1398,6 +1909,10 @@ class AsyncMemoryStorage:
     async def update_access(self, memory_id: int) -> None:
         """异步更新访问"""
         await asyncio.to_thread(self._storage.update_access, memory_id)
+
+    async def update_access_many(self, memory_ids: list[int]) -> int:
+        """异步批量更新实际召回记忆的访问时间。"""
+        return await asyncio.to_thread(self._storage.update_access_many, memory_ids)
 
     async def bump_memories(self, memory_ids: list[int], importance_boost: float = 0.01) -> int:
         """异步检索反馈强化"""

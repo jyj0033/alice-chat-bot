@@ -1,6 +1,7 @@
 """
 爱丽丝 (Alice) - Web 管理面板
 """
+import asyncio
 import logging
 from collections import deque
 from pathlib import Path
@@ -575,12 +576,26 @@ async def get_memories(
 
 
 @app.get("/api/profiles")
-async def get_profiles():
-    """所有用户画像（semantic 记忆，按最近更新排序）"""
+async def get_profiles(page: int = 1, page_size: int = 30, q: str = ""):
+    """分页获取用户画像，避免画像数量增长后一次性渲染全部卡片。"""
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), 100))
+    q = (q or "").strip()[:80]
+    empty = {
+        "profiles": [],
+        "total": 0,
+        "page": page,
+        "page_size": page_size,
+        "q": q,
+        "total_pages": 0,
+        "has_more": False,
+    }
     if not bot_instance or not bot_instance.memory_storage:
-        return {"profiles": [], "total": 0}
+        return empty
     try:
-        profiles = await bot_instance.memory_storage.get_profiles()
+        profiles, total = await bot_instance.memory_storage.get_profiles_page(
+            limit=page_size, offset=(page - 1) * page_size, query=q
+        )
         result = []
         for p in profiles:
             meta = p.metadata or {}
@@ -607,10 +622,19 @@ async def get_profiles():
                 "last_accessed": p.last_accessed.isoformat(),
                 "source_session": p.source_session,
             })
-        return {"profiles": result, "total": len(result)}
+        total_pages = (total + page_size - 1) // page_size if total else 0
+        return {
+            "profiles": result,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "q": q,
+            "total_pages": total_pages,
+            "has_more": page < total_pages,
+        }
     except Exception as e:
         logger.error(f"Failed to load profiles: {e}")
-        return {"profiles": [], "total": 0}
+        return empty
 
 
 @app.post("/api/profiles/distill")
@@ -735,11 +759,22 @@ async def delete_memory(memory_id: int):
     """删除一条长期记忆"""
     if not bot_instance or not bot_instance.memory_storage:
         return {"success": False, "error": "Bot not initialized"}
+    # 用户画像提炼可能跨多个 await；删除若在其中间插入，提炼结果会把刚删掉的
+    # 画像重新写回来。与提炼共用同一把锁，普通记忆删除也顺便保持数据库操作顺序。
+    profile_guard = getattr(bot_instance, "_profile_distill_guard", None)
+    guard_acquired = False
     try:
+        if profile_guard is not None:
+            while not profile_guard.acquire(blocking=False):
+                await asyncio.sleep(0.05)
+            guard_acquired = True
         ok = await bot_instance.memory_storage.delete(memory_id)
         return {"success": ok, "message": "已删除" if ok else "记忆不存在"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+    finally:
+        if guard_acquired:
+            profile_guard.release()
 
 
 @app.post("/api/embedding/test")

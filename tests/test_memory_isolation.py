@@ -6,7 +6,7 @@ import unittest
 import asyncio
 from datetime import datetime, timedelta
 
-from modules.memory.storage import Memory, MemoryStorage
+from modules.memory.storage import AsyncMemoryStorage, Memory, MemoryStorage
 from modules.social.attention import AttentionManager
 
 
@@ -145,6 +145,201 @@ class MemoryIsolationTests(unittest.TestCase):
         self.assertTrue({m.id for m in first}.isdisjoint({m.id for m in second}))
         self.assertTrue(all(m.source_session == "group_111" for m in first + second))
 
+    def test_profile_materials_are_scoped_per_user_and_session(self):
+        for index in range(3):
+            self.storage.store(Memory(
+                content=f"甲的画像素材 {index}",
+                memory_type="episodic",
+                source_session="group_profile_a",
+                metadata={"sender_id": "u1", "sender_name": "甲"},
+            ))
+        self.storage.store(Memory(
+            content="乙的画像素材",
+            memory_type="episodic",
+            source_session="group_profile_b",
+            metadata={"sender_id": "u2", "sender_name": "乙"},
+        ))
+        self.storage.store(Memory(
+            content="Bot：这是机器人自己的话",
+            memory_type="episodic",
+            source_session="group_profile_a",
+            metadata={"sender_id": "bot", "sender_name": "爱丽丝", "is_bot": True},
+        ))
+        self.storage.store(Memory(
+            content="甲：我也是",
+            memory_type="episodic",
+            source_session="group_profile_a",
+            metadata={
+                "sender_id": "u1",
+                "sender_name": "甲",
+                "profile_context_only": True,
+            },
+        ))
+
+        scopes = set(self.storage.get_profile_scopes(limit=10))
+        self.assertIn(("u1", "group_profile_a"), scopes)
+        self.assertIn(("u2", "group_profile_b"), scopes)
+        self.assertNotIn(("bot", "group_profile_a"), scopes)
+
+        materials = self.storage.get_profile_materials(
+            "u1", source_session="group_profile_a", limit=2
+        )
+        self.assertEqual(len(materials), 2)
+        self.assertTrue(all(m.metadata.get("sender_id") == "u1" for m in materials))
+        self.assertTrue(all(m.source_session == "group_profile_a" for m in materials))
+        self.assertTrue(all(not m.metadata.get("profile_context_only") for m in materials))
+        self.assertEqual(
+            self.storage.get_profile_materials("bot", "group_profile_a"), []
+        )
+
+    def test_profile_context_returns_neighbors_and_reply_target(self):
+        base = datetime.now()
+        reply_target = Memory(
+            content="乙：最近在学 Rust",
+            memory_type="episodic",
+            source_session="group_context",
+            created_at=base - timedelta(minutes=10),
+            metadata={
+                "sender_id": "u2",
+                "sender_name": "乙",
+                "message_id": "reply-target",
+            },
+        )
+        before = Memory(
+            content="甲：你最近在学什么？",
+            memory_type="episodic",
+            source_session="group_context",
+            created_at=base - timedelta(minutes=2),
+            metadata={"sender_id": "u1", "sender_name": "甲"},
+        )
+        target = Memory(
+            content="甲：我也是",
+            memory_type="episodic",
+            source_session="group_context",
+            created_at=base - timedelta(minutes=1),
+            metadata={
+                "sender_id": "u1",
+                "sender_name": "甲",
+                "reply_to_id": "reply-target",
+            },
+        )
+        after = Memory(
+            content="丙：那还挺巧",
+            memory_type="episodic",
+            source_session="group_context",
+            created_at=base,
+            metadata={"sender_id": "u3", "sender_name": "丙"},
+        )
+        unrelated = Memory(
+            content="其他会话不应混入",
+            memory_type="episodic",
+            source_session="group_other",
+            created_at=base,
+            metadata={"sender_id": "u9", "sender_name": "己"},
+        )
+        for memory in (reply_target, before, target, after, unrelated):
+            self.storage.store(memory)
+
+        context = self.storage.get_profile_context(target.id, before=1, after=1)
+        self.assertEqual(
+            [memory.content for memory in context],
+            [reply_target.content, before.content, target.content, after.content],
+        )
+        self.assertNotIn(unrelated.content, [memory.content for memory in context])
+        recent_context = self.storage.get_profile_context(
+            target.id,
+            before=1,
+            after=1,
+            since=base - timedelta(minutes=5),
+        )
+        self.assertNotIn(reply_target.content, [memory.content for memory in recent_context])
+
+    def test_profile_pages_and_delete_suppression(self):
+        now = datetime.now()
+        profiles = []
+        for index in range(3):
+            profile = Memory(
+                content=f"【用户画像 用户{index}】长期特征",
+                memory_type="semantic",
+                source_session="group_profile",
+                created_at=now - timedelta(minutes=index),
+                last_accessed=now - timedelta(minutes=index),
+                metadata={
+                    "profile": True,
+                    "sender_id": f"profile-{index}",
+                    "sender_name": f"用户{index}",
+                },
+            )
+            self.storage.store(profile)
+            profiles.append(profile)
+
+        first, total = self.storage.get_profiles_page(limit=2, offset=0)
+        second, second_total = self.storage.get_profiles_page(limit=2, offset=2)
+        self.assertEqual(total, 3)
+        self.assertEqual(second_total, 3)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 1)
+
+        filtered, filtered_total = self.storage.get_profiles_page(
+            limit=10, offset=0, query="用户1"
+        )
+        self.assertEqual(filtered_total, 1)
+        self.assertEqual([p.metadata["sender_id"] for p in filtered], ["profile-1"])
+
+        old_material = Memory(
+            content="旧画像素材",
+            memory_type="episodic",
+            source_session="group_profile",
+            created_at=now - timedelta(minutes=1),
+            metadata={"sender_id": "profile-0", "sender_name": "用户0"},
+        )
+        self.storage.store(old_material)
+        self.assertTrue(self.storage.delete(profiles[0].id))
+        suppressions = self.storage.get_profile_suppressions()
+        suppression_time = suppressions[("profile-0", "group_profile")]
+        self.assertEqual(
+            self.storage.get_profile_materials(
+                "profile-0", "group_profile", after=suppression_time
+            ),
+            [],
+        )
+
+        new_material = Memory(
+            content="删除后新增的画像素材",
+            memory_type="episodic",
+            source_session="group_profile",
+            created_at=suppression_time + timedelta(seconds=1),
+            metadata={"sender_id": "profile-0", "sender_name": "用户0"},
+        )
+        self.storage.store(new_material)
+        self.assertEqual(
+            [m.content for m in self.storage.get_profile_materials(
+                "profile-0", "group_profile", after=suppression_time
+            )],
+            ["删除后新增的画像素材"],
+        )
+
+    def test_profile_attempts_survive_round_trip(self):
+        self.storage.set_profile_attempt("u1", "group_profile", 2, 8)
+        self.assertEqual(
+            self.storage.get_profile_attempts()[("u1", "group_profile")],
+            (2, 8),
+        )
+        self.storage.clear_profile_attempt("u1", "group_profile")
+        self.assertNotIn(("u1", "group_profile"), self.storage.get_profile_attempts())
+
+    def test_async_profile_attempt_wrappers(self):
+        async_storage = AsyncMemoryStorage(self.storage)
+
+        async def run():
+            await async_storage.set_profile_attempt("u2", "group_profile", 1, 3)
+            attempts = await async_storage.get_profile_attempts()
+            self.assertEqual(attempts[("u2", "group_profile")], (1, 3))
+            await async_storage.clear_profile_attempt("u2", "group_profile")
+
+        asyncio.run(run())
+        self.assertNotIn(("u2", "group_profile"), self.storage.get_profile_attempts())
+
     def test_disabled_long_term_memory_skips_retrieval(self):
         from main import GroupChatBot
 
@@ -186,6 +381,45 @@ class MemoryIsolationTests(unittest.TestCase):
 
         asyncio.run(run())
         self.assertEqual(len(storage.stored), 1)
+
+    def test_short_reply_is_persisted_as_context_only(self):
+        from core.adapter.base import Message
+        from main import GroupChatBot
+
+        class _Storage:
+            def __init__(self):
+                self.stored = []
+
+            async def find_similar(self, *args):
+                return None
+
+            async def store(self, memory):
+                self.stored.append(memory)
+
+        storage = _Storage()
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.long_term_memory_enabled = True
+        bot.memory_storage = storage
+        bot._memory_tasks = set()
+
+        async def run():
+            bot._store_long_term_memory(
+                Message(
+                    message_id="m2",
+                    message_type="group",
+                    sender_id="u1",
+                    sender_name="甲",
+                    content="我也是",
+                    reply_to_id="m1",
+                ),
+                "group_111",
+            )
+            await asyncio.gather(*list(bot._memory_tasks))
+
+        asyncio.run(run())
+        self.assertEqual(len(storage.stored), 1)
+        self.assertTrue(storage.stored[0].metadata["profile_context_only"])
+        self.assertEqual(storage.stored[0].importance, 0.25)
 
     def test_recent_persistent_messages_restore_in_chronological_order(self):
         from main import GroupChatBot

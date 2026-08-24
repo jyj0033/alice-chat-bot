@@ -393,6 +393,27 @@ class HumanizationLogicTests(unittest.TestCase):
             "互联网行业从业者，喜欢打游戏，经常吐槽工作"
         ))
 
+    def test_ambiguous_profile_lines_request_dialogue_context(self):
+        from main import GroupChatBot
+
+        class _Memory:
+            def __init__(self, content, metadata=None):
+                self.content = content
+                self.metadata = metadata or {}
+
+        self.assertTrue(GroupChatBot._needs_profile_context(
+            _Memory("甲：我也是")
+        ))
+        self.assertTrue(GroupChatBot._needs_profile_context(
+            _Memory("甲：我在这个方面确实挺喜欢的")
+        ))
+        self.assertTrue(GroupChatBot._needs_profile_context(
+            _Memory("甲：最近回复", {"reply_to_id": "m1"})
+        ))
+        self.assertFalse(GroupChatBot._needs_profile_context(
+            _Memory("甲：我长期在芜湖从事电催工作，平时常玩原神和绝区零，已经坚持很多年了")
+        ))
+
     # === 语气词后处理 ===
 
     def test_filler_never_prepended_to_colloquial_openings(self):

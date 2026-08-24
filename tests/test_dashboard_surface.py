@@ -62,6 +62,11 @@ class DashboardSurfaceTests(unittest.TestCase):
             "memory-prev",
             "memory-next",
             "memory-page-meta",
+            "profile-pagination",
+            "profile-prev",
+            "profile-next",
+            "profile-page-meta",
+            "profile-search",
             # 联网搜索（LLM 页）
             "search-enabled",
             "search-primary",
@@ -78,6 +83,12 @@ class DashboardSurfaceTests(unittest.TestCase):
         self.assertIn("scheduleLoadMemories", self.html)
         self.assertIn("AbortController", self.html)
         self.assertIn("共 ${memoryState.total} 条", self.html)
+
+    def test_profile_list_uses_server_pagination(self):
+        self.assertIn("PROFILE_PAGE_SIZE = 30", self.html)
+        self.assertIn("/profiles?", self.html)
+        self.assertIn("scheduleLoadProfiles", self.html)
+        self.assertIn("共 ${profileState.total} 个", self.html)
 
     def test_session_messages_are_html_escaped(self):
         self.assertIn("escapeHtml(m.sender)", self.html)
