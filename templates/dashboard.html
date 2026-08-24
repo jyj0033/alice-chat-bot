@@ -2014,15 +2014,15 @@
                         <div class="header-status" style="display: flex; align-items: center; gap: 8px;">
                             <div style="position: relative;">
                                 <svg class="icon-sm" style="position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--muted);"><use href="#i-search"/></svg>
-                                <input type="text" id="memory-search" placeholder="搜索记忆内容..." style="width: 220px; padding: 9px 14px 9px 36px; border: 1px solid var(--border-strong); border-radius: 10px; font-size: 13.5px; background: #fff;" oninput="loadMemories()">
-                            </div>
-                            <button class="btn btn-secondary btn-sm" onclick="loadMemories()"><svg class="icon-sm"><use href="#i-refresh"/></svg>刷新</button>
+                                 <input type="text" id="memory-search" placeholder="搜索记忆内容..." style="width: 220px; padding: 9px 14px 9px 36px; border: 1px solid var(--border-strong); border-radius: 10px; font-size: 13.5px; background: #fff;" oninput="scheduleLoadMemories()">
+                             </div>
+                            <button class="btn btn-secondary btn-sm" onclick="loadMemories(1)"><svg class="icon-sm"><use href="#i-refresh"/></svg>刷新</button>
                         </div>
                     </div>
                     <div class="form-grid" style="margin-bottom: 8px;">
                         <div class="form-group">
                             <label>记忆类型</label>
-                            <select id="memory-type-filter" onchange="loadMemories()">
+                            <select id="memory-type-filter" onchange="loadMemories(1)">
                                 <option value="all">全部（长期记忆 + 群聊纪要）</option>
                                 <option value="memory">仅长期记忆</option>
                                 <option value="digest">仅群聊纪要</option>
@@ -2030,13 +2030,20 @@
                         </div>
                         <div class="form-group">
                             <label>按会话筛选</label>
-                            <select id="memory-session-filter" onchange="loadMemories()">
+                            <select id="memory-session-filter" onchange="loadMemories(1)">
                                 <option value="">全部会话</option>
                             </select>
                         </div>
                     </div>
                     <div id="memories-list" class="memories-list">
                         <div class="hint" style="padding: 14px;">加载中...</div>
+                    </div>
+                    <div id="memory-pagination" style="display:none; align-items:center; justify-content:space-between; gap:12px; margin-top:14px; padding-top:12px; border-top:1px solid var(--border);">
+                        <span class="hint" id="memory-page-meta"></span>
+                        <div class="btn-group" style="margin:0;">
+                            <button class="btn btn-secondary btn-sm" id="memory-prev" onclick="loadMemories(memoryState.page - 1)">上一页</button>
+                            <button class="btn btn-secondary btn-sm" id="memory-next" onclick="loadMemories(memoryState.page + 1)">下一页</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2948,8 +2955,23 @@
         }
 
         // 加载记忆设置
+        const MEMORY_PAGE_SIZE = 30;
+        let memoryState = {
+            page: 1,
+            total: 0,
+            totalPages: 0,
+            hasMore: false,
+            loading: false,
+            requestId: 0,
+            searchTimer: null,
+            controller: null
+        };
+
         async function loadMemoryConfig() {
-            const config = await fetch(API + '/config').then(r => r.json());
+            const [config, sessionData] = await Promise.all([
+                fetch(API + '/config').then(r => r.json()),
+                fetch(API + '/sessions').then(r => r.json())
+            ]);
             const mem = config.memory || {};
             document.getElementById('memory-window').value = mem.context_window_size || 50;
             document.getElementById('memory-age').value = mem.context_max_age_hours || 2;
@@ -2968,70 +2990,133 @@
             } else {
                 st.innerHTML = '<span class="badge gray">未配置（TF-IDF）</span>';
             }
-            loadMemories();
+            populateMemorySessions(sessionData.sessions || []);
+            await loadMemories(1);
         }
 
-        // 加载长期记忆列表
-        async function loadMemories() {
+        function populateMemorySessions(sessions) {
+            const sel = document.getElementById('memory-session-filter');
+            const current = sel.value;
+            sel.innerHTML = '<option value="">全部会话</option>';
+            for (const item of sessions) {
+                const session = typeof item === 'string' ? item : (item.session || '');
+                if (!session) continue;
+                const opt = document.createElement('option');
+                opt.value = session;
+                opt.textContent = session;
+                sel.appendChild(opt);
+            }
+            if ([...sel.options].some(option => option.value === current)) {
+                sel.value = current;
+            }
+        }
+
+        function scheduleLoadMemories() {
+            clearTimeout(memoryState.searchTimer);
+            memoryState.searchTimer = setTimeout(() => loadMemories(1), 280);
+        }
+
+        function renderMemoryPagination() {
+            const wrap = document.getElementById('memory-pagination');
+            const meta = document.getElementById('memory-page-meta');
+            const prev = document.getElementById('memory-prev');
+            const next = document.getElementById('memory-next');
+            const total = memoryState.total;
+            const page = memoryState.page;
+            const totalPages = memoryState.totalPages;
+            wrap.style.display = total ? 'flex' : 'none';
+            if (!total) return;
+            const start = (page - 1) * MEMORY_PAGE_SIZE + 1;
+            const end = Math.min(page * MEMORY_PAGE_SIZE, total);
+            meta.textContent = `第 ${page} / ${totalPages} 页 · ${start}-${end} / ${total} 条`;
+            prev.disabled = memoryState.loading || page <= 1;
+            next.disabled = memoryState.loading || !memoryState.hasMore;
+        }
+
+        // 加载长期记忆列表（服务端分页，搜索请求防抖）
+        async function loadMemories(page = 1) {
+            page = Math.max(1, Number(page) || 1);
+            if (memoryState.controller) memoryState.controller.abort();
+            const controller = new AbortController();
+            const requestId = ++memoryState.requestId;
+            memoryState.controller = controller;
+            memoryState.loading = true;
+            renderMemoryPagination();
+
             const q = document.getElementById('memory-search').value.trim();
             const session = document.getElementById('memory-session-filter').value;
             const type = document.getElementById('memory-type-filter').value;
-            const params = new URLSearchParams({ limit: '200' });
+            const params = new URLSearchParams({
+                page: String(page),
+                page_size: String(MEMORY_PAGE_SIZE)
+            });
             if (q) params.set('q', q);
             if (session) params.set('session', session);
             if (type) params.set('type', type);
 
-            const data = await fetch(API + '/memories?' + params).then(r => r.json());
-            const list = document.getElementById('memories-list');
-            const mems = data.memories || [];
+            try {
+                const data = await fetch(API + '/memories?' + params, { signal: controller.signal })
+                    .then(r => r.json());
+                if (requestId !== memoryState.requestId) return;
 
-            document.getElementById('memory-count').textContent = `共 ${mems.length} 条`;
+                const list = document.getElementById('memories-list');
+                const mems = data.memories || [];
+                memoryState.page = data.page || page;
+                memoryState.total = data.total || 0;
+                memoryState.totalPages = data.total_pages || 0;
+                memoryState.hasMore = data.has_more === true;
+                document.getElementById('memory-count').textContent = `共 ${memoryState.total} 条`;
 
-            // 填充会话过滤下拉（只建一次）
-            const sel = document.getElementById('memory-session-filter');
-            const sessions = [...new Set(mems.map(m => m.source_session).filter(Boolean))];
-            if (sel.options.length <= 1) {
-                sessions.forEach(s => {
-                    const opt = document.createElement('option');
-                    opt.value = s;
-                    opt.textContent = s;
-                    sel.appendChild(opt);
-                });
+                if (!mems.length && memoryState.total && page > memoryState.totalPages) {
+                    await loadMemories(memoryState.totalPages);
+                    return;
+                }
+                if (!mems.length) {
+                    const emptyText = type === 'digest'
+                        ? '暂无群聊纪要。Bot 会在群聊消息达到设定条数后自动滚动总结，隔天也能记得群里聊过什么'
+                        : '暂无长期记忆。<br>当群里出现有价值的消息（提到 Bot / 个人信息 / 长吐槽）后会自动积累';
+                    list.innerHTML = `<div class="empty"><div class="empty-ico"><svg class="icon-lg"><use href="#i-${type === 'digest' ? 'file' : 'archive'}"/></svg></div>${emptyText}</div>`;
+                    renderMemoryPagination();
+                    return;
+                }
+
+                list.innerHTML = mems.map(m => {
+                    const imp = (m.effective_importance * 100).toFixed(0);
+                    const created = new Date(m.created_at).toLocaleString('zh-CN', {hour12:false});
+                    const lastAcc = new Date(m.last_accessed).toLocaleString('zh-CN', {hour12:false});
+                    const isDigest = m.memory_type === 'session_summary';
+                    const sender = m.sender_name ? `<span class="badge">${escapeHtml(m.sender_name)}</span> ` : '';
+                    const typeTag = isDigest
+                        ? '<span class="badge amber"><svg class="icon-xs"><use href="#i-clock"/></svg>群聊纪要</span>'
+                        : `<span class="memory-type">${m.memory_type === 'episodic' ? '事件记忆' : '语义记忆'}</span>`;
+                    return `
+                        <div class="memory-item" id="mem-${m.id}">
+                            <div class="memory-head">
+                                <span class="memory-imp" style="background:${impColor(imp)}">${imp}%</span>
+                                ${typeTag}
+                                ${sender}
+                                <span class="memory-session" title="${escapeAttr(m.source_session)}">${escapeHtml(m.source_session)}</span>
+                                <span class="memory-time">记于 ${created}</span>
+                            </div>
+                            <div class="memory-content">${escapeHtml(m.content)}</div>
+                            <div class="memory-foot">
+                                <span class="hint">最近想起 ${lastAcc} · 基础重要性 ${(m.importance*100).toFixed(0)}%</span>
+                                <button class="btn btn-danger btn-sm" onclick="deleteMemory(${m.id})"><svg class="icon-xs"><use href="#i-trash"/></svg>删除</button>
+                            </div>
+                        </div>`;
+                }).join('');
+                renderMemoryPagination();
+            } catch (e) {
+                if (e.name !== 'AbortError' && requestId === memoryState.requestId) {
+                    document.getElementById('memories-list').innerHTML = '<div class="empty">加载长期记忆失败，请稍后重试</div>';
+                }
+            } finally {
+                if (requestId === memoryState.requestId) {
+                    memoryState.loading = false;
+                    memoryState.controller = null;
+                    renderMemoryPagination();
+                }
             }
-
-            if (!mems.length) {
-                const emptyText = type === 'digest'
-                    ? '暂无群聊纪要。Bot 会在群聊消息达到设定条数后自动滚动总结，隔天也能记得群里聊过什么'
-                    : '暂无长期记忆。<br>当群里出现有价值的消息（提到 Bot / 个人信息 / 长吐槽）后会自动积累';
-                list.innerHTML = `<div class="empty"><div class="empty-ico"><svg class="icon-lg"><use href="#i-${type === 'digest' ? 'file' : 'archive'}"/></svg></div>${emptyText}</div>`;
-                return;
-            }
-
-            list.innerHTML = mems.map(m => {
-                const imp = (m.effective_importance * 100).toFixed(0);
-                const created = new Date(m.created_at).toLocaleString('zh-CN', {hour12:false});
-                const lastAcc = new Date(m.last_accessed).toLocaleString('zh-CN', {hour12:false});
-                const isDigest = m.memory_type === 'session_summary';
-                const sender = m.sender_name ? `<span class="badge">${escapeHtml(m.sender_name)}</span> ` : '';
-                const typeTag = isDigest
-                    ? '<span class="badge amber"><svg class="icon-xs"><use href="#i-clock"/></svg>群聊纪要</span>'
-                    : `<span class="memory-type">${m.memory_type === 'episodic' ? '事件记忆' : '语义记忆'}</span>`;
-                return `
-                    <div class="memory-item" id="mem-${m.id}">
-                        <div class="memory-head">
-                            <span class="memory-imp" style="background:${impColor(imp)}">${imp}%</span>
-                            ${typeTag}
-                            ${sender}
-                            <span class="memory-session" title="${escapeAttr(m.source_session)}">${escapeHtml(m.source_session)}</span>
-                            <span class="memory-time">记于 ${created}</span>
-                        </div>
-                        <div class="memory-content">${escapeHtml(m.content)}</div>
-                        <div class="memory-foot">
-                            <span class="hint">最近想起 ${lastAcc} · 基础重要性 ${(m.importance*100).toFixed(0)}%</span>
-                            <button class="btn btn-danger btn-sm" onclick="deleteMemory(${m.id})"><svg class="icon-xs"><use href="#i-trash"/></svg>删除</button>
-                        </div>
-                    </div>`;
-            }).join('');
         }
 
         async function deleteMemory(id) {
@@ -3039,7 +3124,7 @@
             const res = await fetch(API + '/memories/' + id, { method: 'DELETE' });
             const data = await res.json();
             showToast(data.message || (data.success ? '已删除' : '删除失败'), data.success ? 'success' : 'error');
-            loadMemories();
+            await loadMemories(memoryState.page);
         }
 
         async function loadProfiles() {

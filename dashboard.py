@@ -490,48 +490,66 @@ def _memory_to_msg_dict(mem) -> dict:
 
 
 @app.get("/api/memories")
-async def get_memories(session: str = "", q: str = "", type: str = "all", limit: int = 100):
-    """获取长期记忆列表（支持按会话/关键词/类型过滤，含时间衰减后的有效重要性）
+async def get_memories(
+    session: str = "",
+    q: str = "",
+    type: str = "all",
+    page: int = 1,
+    page_size: int = 30,
+    limit: int = 0,
+):
+    """分页获取长期记忆（支持按会话/关键词/类型过滤）。
+
+    ``limit`` 保留给旧版前端兼容；新版使用 ``page/page_size``。筛选、排序、
+    总数统计都在 SQLite 层完成，避免每次打开页面都把整个记忆库读入内存。
     type: all=长期记忆+群聊纪要, memory=仅长期记忆, digest=仅群聊纪要
     """
+    page = max(1, int(page))
+    if limit > 0:
+        page_size = limit
+    page_size = max(1, min(int(page_size), 100))
+    empty = {
+        "memories": [],
+        "total": 0,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": 0,
+        "has_more": False,
+    }
     if not bot_instance or not bot_instance.memory_storage:
-        return {"memories": [], "total": 0}
-
-    from datetime import datetime
+        return empty
 
     try:
         if type == "digest":
-            all_mem = await bot_instance.memory_storage.get_all(limit=1000, memory_type="session_summary")
             allowed_types = {"session_summary"}
         elif type == "memory":
-            all_mem = await bot_instance.memory_storage.get_all(limit=1000)
             allowed_types = {"episodic", "semantic"}
         else:
-            regular = await bot_instance.memory_storage.get_all(limit=1000)
-            digests = await bot_instance.memory_storage.get_all(limit=1000, memory_type="session_summary")
-            all_mem = list(regular) + list(digests)
             allowed_types = {"episodic", "semantic", "session_summary"}
+        decay_presets = getattr(bot_instance, "memory_decay_presets", {}) or {}
+        half_life_days = getattr(bot_instance, "memory_half_life_days", 30)
+        memories, total = await bot_instance.memory_storage.get_memories_page(
+            session=session,
+            query=q,
+            memory_types=sorted(allowed_types),
+            limit=page_size,
+            offset=(page - 1) * page_size,
+            half_life_days=half_life_days,
+            decay_presets=decay_presets,
+        )
     except Exception as e:
         logger.error(f"Failed to load memories: {e}")
-        return {"memories": [], "total": 0}
+        return empty
 
+    from datetime import datetime
     now = datetime.now()
     result = []
-    q_lower = (q or "").strip().lower()
-    for m in all_mem:
-        if m.memory_type not in allowed_types:
-            continue
-        if session and m.source_session != session:
-            continue
-        if q_lower and q_lower not in m.content.lower():
-            continue
+    for m in memories:
         decay_presets = getattr(bot_instance, "memory_decay_presets", {}) or {}
         half_life = decay_presets.get(m.memory_type, {}).get(
-            "half_life_days", bot_instance.memory_half_life_days
+            "half_life_days", half_life_days
         )
-        eff = bot_instance.memory_storage._storage._effective_importance(
-            m, now, half_life
-        )
+        eff = bot_instance.memory_storage._storage._effective_importance(m, now, half_life)
         result.append({
             "id": m.id,
             "content": m.content,
@@ -545,10 +563,15 @@ async def get_memories(session: str = "", q: str = "", type: str = "all", limit:
             "sender_name": (m.metadata or {}).get("sender_name", ""),
         })
 
-    # 默认按有效重要性排序
-    result.sort(key=lambda x: x["effective_importance"], reverse=True)
-    result = result[:limit]
-    return {"memories": result, "total": len(result)}
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    return {
+        "memories": result,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "has_more": page < total_pages,
+    }
 
 
 @app.get("/api/profiles")

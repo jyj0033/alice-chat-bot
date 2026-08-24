@@ -58,6 +58,10 @@ class DashboardSurfaceTests(unittest.TestCase):
             "style-common-words",
             "style-max-reply",
             "typing-min-length",
+            "memory-pagination",
+            "memory-prev",
+            "memory-next",
+            "memory-page-meta",
             # 联网搜索（LLM 页）
             "search-enabled",
             "search-primary",
@@ -68,6 +72,12 @@ class DashboardSurfaceTests(unittest.TestCase):
         self.assertNotIn("qq-ws-url", self.parser.ids)
         # OCR 已被视觉模型取代，不应再暴露单独配置
         self.assertNotIn("rich-ocr-enabled", self.parser.ids)
+
+    def test_memory_list_uses_server_pagination_and_search_debounce(self):
+        self.assertIn("page_size", self.html)
+        self.assertIn("scheduleLoadMemories", self.html)
+        self.assertIn("AbortController", self.html)
+        self.assertIn("共 ${memoryState.total} 条", self.html)
 
     def test_session_messages_are_html_escaped(self):
         self.assertIn("escapeHtml(m.sender)", self.html)

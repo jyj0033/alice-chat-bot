@@ -114,6 +114,37 @@ class MemoryIsolationTests(unittest.TestCase):
         )
         self.assertEqual(results, [])
 
+    def test_memory_page_filters_and_counts_before_pagination(self):
+        for index in range(3):
+            self.storage.store(Memory(
+                content=f"分页测试消息 {index}",
+                memory_type="episodic",
+                importance=0.5 + index * 0.1,
+                source_session="group_111",
+            ))
+
+        first, total = self.storage.get_memories_page(
+            session="group_111",
+            query="分页测试",
+            memory_types=["episodic"],
+            limit=2,
+            offset=0,
+        )
+        second, second_total = self.storage.get_memories_page(
+            session="group_111",
+            query="分页测试",
+            memory_types=["episodic"],
+            limit=2,
+            offset=2,
+        )
+
+        self.assertEqual(total, 3)
+        self.assertEqual(second_total, 3)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 1)
+        self.assertTrue({m.id for m in first}.isdisjoint({m.id for m in second}))
+        self.assertTrue(all(m.source_session == "group_111" for m in first + second))
+
     def test_disabled_long_term_memory_skips_retrieval(self):
         from main import GroupChatBot
 

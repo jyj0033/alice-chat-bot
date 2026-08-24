@@ -464,6 +464,104 @@ class MemoryStorage:
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
     @_db_locked
+    def get_memories_page(
+        self,
+        session: str = "",
+        query: str = "",
+        memory_types: Optional[list[str]] = None,
+        limit: int = 30,
+        offset: int = 0,
+        half_life_days: float = 30.0,
+        decay_presets: Optional[dict] = None,
+    ) -> tuple[list[Memory], int]:
+        """按筛选条件分页读取长期记忆，并返回未截断的总数。
+
+        排序在 SQLite 层完成，避免 Dashboard 为了显示一页数据把整个记忆库
+        读入 Python。优先按动态有效重要性排序；极旧 SQLite 不支持数学函数时
+        回退到基础重要性排序，不影响分页和筛选。
+        """
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+
+        selected_types = []
+        for value in memory_types or []:
+            value = str(value).strip()
+            if value and value not in selected_types:
+                selected_types.append(value)
+
+        clauses = []
+        filter_params = []
+        if selected_types:
+            placeholders = ", ".join("?" for _ in selected_types)
+            clauses.append(f"memory_type IN ({placeholders})")
+            filter_params.extend(selected_types)
+        else:
+            clauses.append("memory_type IN ('episodic', 'semantic', 'session_summary')")
+
+        if session:
+            clauses.append("source_session = ?")
+            filter_params.append(session)
+
+        query = (query or "").strip()
+        if query:
+            clauses.append("content LIKE ?")
+            filter_params.append(f"%{query}%")
+
+        where = " AND ".join(clauses)
+        total = self.conn.execute(
+            f"SELECT COUNT(*) FROM memories WHERE {where}",
+            tuple(filter_params),
+        ).fetchone()[0]
+
+        order_types = selected_types or ["episodic", "semantic", "session_summary"]
+        order_params = []
+        case_parts = []
+        fallback_half_life = max(0.1, float(half_life_days))
+        presets = decay_presets or {}
+        for memory_type in order_types:
+            preset = presets.get(memory_type, {}) or {}
+            if not isinstance(preset, dict):
+                preset = {}
+            try:
+                type_half_life = max(
+                    0.1, float(preset.get("half_life_days", fallback_half_life))
+                )
+            except (TypeError, ValueError):
+                type_half_life = fallback_half_life
+            case_parts.append("WHEN ? THEN ?")
+            order_params.extend([memory_type, type_half_life])
+        order_params.append(fallback_half_life)
+        half_life_case = " ".join(case_parts)
+        effective_order = (
+            "importance * pow(0.5, max(0.0, julianday('now') - "
+            "julianday(COALESCE(last_accessed, CURRENT_TIMESTAMP))) / "
+            f"CASE memory_type {half_life_case} ELSE ? END) DESC"
+        )
+
+        select_sql = f"""
+            SELECT * FROM memories
+            WHERE {where}
+            ORDER BY {effective_order}, created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+        """
+        try:
+            cursor = self.conn.execute(
+                select_sql,
+                (*filter_params, *order_params, limit, offset),
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such function" not in str(exc).lower():
+                raise
+            cursor = self.conn.execute(f"""
+                SELECT * FROM memories
+                WHERE {where}
+                ORDER BY importance DESC, created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+            """, (*filter_params, limit, offset))
+
+        return [self._row_to_memory(row) for row in cursor.fetchall()], total
+
+    @_db_locked
     def list_sessions(self, limit: int = 50) -> list[dict]:
         """列出所有出现过消息的会话（含私聊），按最近活跃排序。
 
@@ -1051,6 +1149,28 @@ class AsyncMemoryStorage:
     async def get_all(self, limit: int = 1000, memory_type: Optional[str] = None) -> list[Memory]:
         """异步获取长期记忆（默认情景+语义；指定类型时只返回该类型）"""
         return await asyncio.to_thread(self._storage.get_all, limit, memory_type)
+
+    async def get_memories_page(
+        self,
+        session: str = "",
+        query: str = "",
+        memory_types: Optional[list[str]] = None,
+        limit: int = 30,
+        offset: int = 0,
+        half_life_days: float = 30.0,
+        decay_presets: Optional[dict] = None,
+    ) -> tuple[list[Memory], int]:
+        """异步分页获取长期记忆。"""
+        return await asyncio.to_thread(
+            self._storage.get_memories_page,
+            session,
+            query,
+            memory_types,
+            limit,
+            offset,
+            half_life_days,
+            decay_presets,
+        )
 
     async def list_sessions(self, limit: int = 50) -> list[dict]:
         """异步列出所有出现过消息的会话，按最近活跃排序（Web 会话管理用）"""
