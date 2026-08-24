@@ -489,21 +489,23 @@ class MemoryIsolationTests(unittest.TestCase):
         now = datetime.now()
 
         class _Storage:
-            async def get_session_messages(self, session, limit=30, offset=0, before=None):
+            async def get_session_messages(self, session, limit=120, offset=0, before=None):
                 return [
                     Memory(
                         content="小红：刚刚的新消息",
                         memory_type="episodic",
                         source_session=session,
                         created_at=now - timedelta(minutes=1),
-                        metadata={"sender_id": "u2", "sender_name": "小红", "message_id": "m2"},
+                        metadata={"sender_id": "u2", "sender_name": "小红", "message_id": "m2",
+                                  "meaningful": True},
                     ),
                     Memory(
                         content="小明：前一条旧消息",
                         memory_type="episodic",
                         source_session=session,
                         created_at=now - timedelta(minutes=2),
-                        metadata={"sender_id": "u1", "sender_name": "小明", "message_id": "m1"},
+                        metadata={"sender_id": "u1", "sender_name": "小明", "message_id": "m1",
+                                  "meaningful": True},
                     ),
                 ]
 
@@ -520,6 +522,57 @@ class MemoryIsolationTests(unittest.TestCase):
     def test_global_retrieval_still_returns_everything(self):
         candidates = self.storage._get_candidates("", top_k=200)
         self.assertEqual(len(candidates), 3)
+
+    def test_restore_skips_low_value_and_context_only_messages(self):
+        """重启恢复窗口只取有实义内容的消息，跳过纯应声 / 仅上下文。"""
+        from main import GroupChatBot
+        from modules.memory.context import ContextManager
+
+        now = datetime.now()
+
+        class _Storage:
+            async def get_session_messages(self, session, limit=120, offset=0, before=None):
+                # 新→旧
+                return [
+                    Memory(
+                        content="小红：嗯嗯",
+                        memory_type="episodic",
+                        source_session=session,
+                        created_at=now - timedelta(minutes=1),
+                        metadata={"sender_id": "u2", "sender_name": "小红",
+                                  "message_id": "m5", "meaningful": False},
+                    ),
+                    Memory(
+                        content="小明：我也是",
+                        memory_type="episodic",
+                        source_session=session,
+                        created_at=now - timedelta(minutes=2),
+                        metadata={"sender_id": "u1", "sender_name": "小明",
+                                  "message_id": "m4", "meaningful": True,
+                                  "profile_context_only": True},
+                    ),
+                    Memory(
+                        content="小红：晚上开黑吗",
+                        memory_type="episodic",
+                        source_session=session,
+                        created_at=now - timedelta(minutes=3),
+                        metadata={"sender_id": "u2", "sender_name": "小红",
+                                  "message_id": "m3", "meaningful": True},
+                    ),
+                ]
+
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.long_term_memory_enabled = True
+        bot.memory_storage = _Storage()
+        bot.context_manager = ContextManager(max_messages=5, max_age_hours=2)
+        bot.personality = type("P", (), {"name": "爱丽丝"})()
+
+        asyncio.run(bot._restore_recent_context("group_111"))
+        restored = [
+            m.content for m in bot.context_manager.get_window("group_111").get_recent(5)
+        ]
+        # 只有带 meaningful=True 且非仅上下文的 m3 被恢复
+        self.assertEqual(restored, ["晚上开黑吗"])
 
 
 class AttentionIsolationTests(unittest.TestCase):
