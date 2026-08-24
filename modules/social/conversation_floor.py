@@ -285,13 +285,13 @@ class ConversationFloorManager:
         if floor.bot_has_floor:
             if is_question:
                 action = ActionType.ANSWER
-                tone, max_chars = "直接、自然地回答", 30
+                tone, max_chars = "直接、自然地回答", 20
             elif continuing:
                 action = ActionType.FOLLOW_UP
-                tone, max_chars = "像正在对聊一样自然延续", 28
+                tone, max_chars = "像正在对聊一样自然延续", 18
             else:
                 action = ActionType.REPLY
-                tone, max_chars = "自然回应，不要客服腔", 30
+                tone, max_chars = "自然回应，不要客服腔", 20
             confidence = 0.98 if is_private else 0.94
             reason = "bot拥有明确发言权"
             wait_multiplier = 0.85
@@ -306,7 +306,7 @@ class ConversationFloorManager:
                 # 两人连续对聊但话题与人格高度相关且非消息爆发：允许偶尔自然
                 # 加入讨论，不硬性沉默。真正开不开口由决策概率 + 发送复核把关。
                 action = ActionType.REPLY
-                tone, max_chars = "像加入讨论一样自然地接一句，不抢主导权", 24
+                tone, max_chars = "像加入讨论一样自然地接一句，不抢主导权", 18
                 confidence = 0.45
                 reason = "两人连续对聊，话题相关可自然融入"
                 wait_multiplier = 1.2
@@ -336,13 +336,13 @@ class ConversationFloorManager:
             wait_multiplier = 0.75
         elif is_question and topic_relevance >= 0.65:
             action = ActionType.ANSWER
-            tone, max_chars = "简短提供有用答案，不抢主导权", 30
+            tone, max_chars = "简短提供有用答案，不抢主导权", 20
             confidence = 0.68
             reason = "面向群里的问题且话题相关"
             wait_multiplier = 1.05
         else:
             action = ActionType.REPLY
-            tone, max_chars = "像普通群友一样随意接一句", 26
+            tone, max_chars = "像普通群友一样随意接一句", 18
             confidence = max(0.35, 1.0 - floor.interruption_cost)
             reason = "存在自然接话机会，由概率系统最终决定"
             wait_multiplier = 1.15 if floor.fast_burst else 1.0

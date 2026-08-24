@@ -46,6 +46,56 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertTrue(decision.should_speak)
         self.assertEqual(decision.probability, 0.98)
 
+    def test_forced_trigger_bypasses_random_cooldown(self):
+        """紧急/强制触发不能被普通插话冷却挡住。"""
+        import time
+
+        fatigue = FatigueManager()
+        fatigue._cooldowns["group_g1"] = time.time() + 60
+        decider = EnhancedSpeakingDecider(fatigue_manager=fatigue)
+        context = SocialContext(
+            message_content="bot 快看",
+            sender_id="u1",
+            group_id="g1",
+            session_id="group_g1",
+        )
+        context.extra["trigger"] = {
+            "forced_trigger": True,
+            "priority": 0.7,
+            "reasons": ["关键词「bot」"],
+        }
+
+        decision = decider.decide(context)
+
+        self.assertTrue(decision.should_speak)
+        self.assertEqual(decision.probability, 0.95)
+
+    def test_explicit_silent_reply_falls_back_without_second_delay(self):
+        """明确对 bot 的消息不能被 <silent> 吞掉，生成器也不应重复等待。"""
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from modules.llm.base import ChatResponse
+
+        class _Provider:
+            model = "test"
+
+            async def chat(self, request):
+                return ChatResponse(content="<silent>", model=self.model)
+
+        async def run():
+            generator = ReplyGenerator(llm_provider=_Provider())
+            with patch("modules.reply.generator.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                reply = await generator.generate(
+                    context_prompt="[刚刚] 小明(对你说)：在吗",
+                    current_message="在吗",
+                    direction="to_bot",
+                )
+                return reply, sleep
+
+        reply, sleep = asyncio.run(run())
+        self.assertTrue(reply)
+        sleep.assert_not_awaited()
+
     def test_conversation_is_committed_only_after_successful_send(self):
         decider = EnhancedSpeakingDecider()
         context = SocialContext(
@@ -402,6 +452,78 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertIn("偶尔", guide)
         self.assertIn("直接说事", guide)
 
+    def test_empty_emoji_set_is_respected(self):
+        """清空 emoji 配置后不能偷偷恢复默认表情，也不能随机选择空列表。"""
+        from modules.personality.speaking_style import SpeakingStyle, SpeakingStyleManager
+
+        manager = SpeakingStyleManager(
+            SpeakingStyle(use_emoji=True, emoji_frequency=1.0), emoji_set=[]
+        )
+        self.assertEqual(manager.emoji_set, [])
+        self.assertEqual(manager._apply_emoji("确实"), "确实")
+
+        plain_manager = SpeakingStyleManager(
+            SpeakingStyle(use_emoji=False), emoji_set=["😂"]
+        )
+        self.assertNotIn("😂", plain_manager.apply_style("这也太离谱了😂"))
+
+    def test_personality_yaml_ignores_side_fields(self):
+        """YAML 里带 speaking_style 等旁支配置时，核心人格仍应正常加载。"""
+        import os
+        import tempfile
+        from modules.personality.personality import Personality
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".yaml", delete=False
+        ) as handle:
+            handle.write(
+                "name: 爱丽丝\n"
+                "background: 普通大学生\n"
+                "speaking_style:\n"
+                "  max_reply_length: 30\n"
+            )
+            path = handle.name
+        try:
+            personality = Personality.from_yaml(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(personality.name, "爱丽丝")
+        self.assertEqual(personality.background, "普通大学生")
+
+    def test_reply_prompt_uses_style_limits_and_taboo_boundary(self):
+        """生成提示词应和面板风格配置一致，并明确说明禁忌话题的处理方式。"""
+        from modules.personality.speaking_style import SpeakingStyle, SpeakingStyleManager
+
+        generator = ReplyGenerator(
+            llm_provider=None,
+            speaking_style_manager=SpeakingStyleManager(
+                SpeakingStyle(max_reply_length=42, use_emoji=False)
+            ),
+            taboo_topics=["政治", "宗教"],
+        )
+        request = generator._build_request(
+            context_prompt="[刚刚] 小明：随便聊聊",
+            current_message="随便聊聊",
+            direction="to_bot",
+        )
+        system_text = "\n".join(
+            message.content for message in request.messages if message.role == "system"
+        )
+        self.assertIn("通常不超过42", system_text)
+        self.assertIn("不要使用 emoji", system_text)
+        self.assertIn("「政治」", system_text)
+        self.assertIn("不要联网搜索", system_text)
+
+    def test_emotion_guide_surfaces_current_emotion(self):
+        """短期情绪应影响实际语气提示，而不只是影响概率。"""
+        from modules.personality.emotional_state import Emotion, EmotionalState
+
+        state = EmotionalState()
+        state.current_emotion = Emotion.BORED
+        state.emotion_intensity = 0.6
+        guide = ReplyGenerator(llm_provider=None)._get_emotion_guide(state)
+        self.assertIn("提不起劲", guide)
+
     # === 复读检测 ===
 
     def test_parroting_group_message_is_detected(self):
@@ -509,7 +631,7 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertIn("你叫爱丽丝", prompt)
 
     def test_persona_does_not_encourage_long_sentences(self):
-        """人格说「句子可以稍长」会和"不超过30字"的硬约束直接打架。"""
+        """人格说「句子可以稍长」会和短句硬约束直接打架。"""
         prompt = self._persona(traits={"extraversion": 0.7})
         self.assertNotIn("句子可以稍长", prompt)
         self.assertIn("一句话说完就停", prompt)
@@ -534,6 +656,12 @@ class HumanizationLogicTests(unittest.TestCase):
         prompt = self._persona(nickname="", age_range="18")
         self.assertIn("你叫爱丽丝，18岁。", prompt)
         self.assertNotIn("熟人喊你", prompt)
+
+    def test_persona_avatar_description_is_injected(self):
+        """外观设定不能只停留在配置里，且不应让 bot 主动介绍自己。"""
+        prompt = self._persona(avatar_description="总是一副没睡醒的样子，戴圆框眼镜")
+        self.assertIn("没睡醒", prompt)
+        self.assertIn("不要主动介绍自己的外貌", prompt)
 
     def test_nickname_trigger_ignores_empty_alias(self):
         """别名为空时，触发检测不能把空串当成被点名。"""
@@ -611,6 +739,20 @@ class HumanizationLogicTests(unittest.TestCase):
         items = GroupChatBot._parse_slang_lines(raw)
         self.assertEqual([i["term"] for i in items], ["豆撅子"])
 
+    def test_slang_cleanup_only_accepts_explicit_delete_ids(self):
+        from main import GroupChatBot
+
+        raw = (
+            "<think>审核中</think>\n"
+            "保留 101：近期证据不足\n"
+            "删除 102 | 含义与聊天记录不符\n"
+            "删除 999 | 不在本批词条中"
+        )
+        self.assertEqual(
+            GroupChatBot._parse_slang_cleanup_ids(raw, [101, 102]),
+            [102],
+        )
+
     def test_glossary_guide_only_lists_matched_terms(self):
         from modules.reply.generator import ReplyGenerator
         guide = ReplyGenerator._build_glossary_guide([
@@ -651,6 +793,18 @@ class HumanizationLogicTests(unittest.TestCase):
             "舟舟老师",
             [m["term"] for m in store.match_slang("舟舟老师来了", session="group_1")],
         )
+
+        # 自动清理只能删除自动词条，不能借批量 ID 误删人工词条
+        auto_id = store.upsert_slang("明显坏词", "错误释义", session="group_1", source="auto")
+        edited_auto_id = store.upsert_slang("人工改过的自动词", "旧释义", session="group_1", source="auto")
+        store.update_slang(edited_auto_id, meaning="人工确认的释义")
+        edited_row = next(row for row in store.list_slang(session="group_1") if row["id"] == edited_auto_id)
+        self.assertEqual(edited_row["source"], "manual")
+        manual_id = store.upsert_slang("人工保留", "人工释义", session="group_1", source="manual")
+        self.assertEqual(store.delete_auto_slang([auto_id, manual_id]), 1)
+        remaining_terms = [row["term"] for row in store.list_slang(session="group_1")]
+        self.assertIn("人工保留", remaining_terms)
+        self.assertNotIn("明显坏词", remaining_terms)
 
     def test_mbti_response_is_parsed(self):
         from main import GroupChatBot

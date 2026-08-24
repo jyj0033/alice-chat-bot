@@ -2077,6 +2077,7 @@
                     <div class="header-status" style="display: flex; align-items: center; gap: 8px;">
                         <span class="hint" id="slang-meta"></span>
                         <button class="btn btn-primary" onclick="extractSlang()"><svg class="icon-sm"><use href="#i-zap"/></svg>立即提取</button>
+                        <button class="btn btn-secondary" onclick="cleanupSlang()"><svg class="icon-sm"><use href="#i-trash"/></svg>清理错误</button>
                         <button class="btn btn-secondary" onclick="loadSlang()"><svg class="icon-sm"><use href="#i-refresh"/></svg>刷新</button>
                     </div>
                 </div>
@@ -2178,6 +2179,7 @@
                         <div class="form-group"><label>检索条数</label><input type="number" id="retrieval-top-k" min="1" max="30"></div>
                         <div class="form-group"><label>记忆半衰期（天）</label><input type="number" id="memory-half-life" min="1" max="365"></div>
                         <div class="form-group"><label>相似度权重</label><input type="number" id="memory-similarity-weight" min="0" max="1" step="0.01"></div>
+                        <div class="form-group"><label>跨会话共享记忆</label><div class="toggle-row" style="padding-top: 6px; max-width: 120px;"><label class="toggle"><input type="checkbox" id="memory-share-sessions"><span class="toggle-slider"></span></label></div><div class="hint">关闭可避免群聊/私聊之间泄漏个人信息</div></div>
                     </div>
                 </div>
 
@@ -3156,7 +3158,12 @@
             const list = document.getElementById('slang-list');
             const rows = data.slang || [];
             document.getElementById('slang-count').textContent = `共 ${rows.length} 条`;
-            document.getElementById('slang-meta').textContent = '自动提取：每天一次，从最近 48 小时聊天记录中识别';
+            const cleanup = data.cleanup || {};
+            const cleanupText = cleanup.enabled === false
+                ? '自动清理已关闭'
+                : `每 ${Number(cleanup.interval_hours || 24)} 小时审核自动词条（人工词条不动）`;
+            document.getElementById('slang-meta').textContent =
+                `自动提取：每天一次，从最近 48 小时聊天记录中识别；${cleanupText}`;
             if (!rows.length) {
                 list.innerHTML = `<div class="empty"><div class="empty-ico"><svg class="icon-lg"><use href="#i-archive"/></svg></div>还没有收录黑话。<br>点右上角「立即提取」从最近聊天里识别，也可以在上面手动添加</div>`;
                 return;
@@ -3253,6 +3260,21 @@
                     loadSlang();
                 } else showToast('提取失败：' + (res.error || ''), 'error');
             } catch (e) { showToast('提取失败：' + e, 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = old; }
+        }
+
+        async function cleanupSlang() {
+            const btn = document.querySelector('#page-slang .btn-secondary');
+            const old = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<svg class="icon-sm"><use href="#i-trash"/></svg>清理中...';
+            try {
+                const res = await fetch(API + '/slang/cleanup', { method: 'POST' }).then(r => r.json());
+                if (res.success) {
+                    showToast(`清理完成：检查 ${res.checked || 0} 条，删除 ${res.deleted || 0} 条`, 'success');
+                    loadSlang();
+                } else showToast('清理失败：' + (res.error || ''), 'error');
+            } catch (e) { showToast('清理失败：' + e, 'error'); }
             finally { btn.disabled = false; btn.innerHTML = old; }
         }
 
@@ -3362,6 +3384,7 @@
             document.getElementById('retrieval-top-k').value = memory.retrieval_top_k ?? 5;
             document.getElementById('memory-half-life').value = memory.half_life_days ?? 30;
             document.getElementById('memory-similarity-weight').value = memory.similarity_weight ?? 0.85;
+            document.getElementById('memory-share-sessions').checked = memory.share_across_sessions === true;
 
             const speaking = config.speaking || {};
             document.getElementById('behavior-probability-duration').value = speaking.probability_duration ?? 120;
@@ -3401,7 +3424,7 @@
             document.getElementById('style-common-words').value = (style.common_words || []).join(', ');
             document.getElementById('style-filler-words').value = (style.filler_words || ['呃', '嗯', '那个', '这个']).join(', ');
             document.getElementById('style-banned-words').value = (style.banned_words || []).join(', ');
-            document.getElementById('style-max-reply').value = style.max_reply_length ?? 60;
+            document.getElementById('style-max-reply').value = style.max_reply_length ?? 20;
             document.getElementById('style-use-emoji').checked = style.use_emoji !== false;
             document.getElementById('style-emoji-frequency').value = style.emoji_frequency ?? 0.2;
             document.getElementById('style-use-ellipsis').checked = style.use_ellipsis !== false;
@@ -3455,6 +3478,7 @@
                     retrieval_top_k: parseInt(document.getElementById('retrieval-top-k').value),
                     half_life_days: parseFloat(document.getElementById('memory-half-life').value),
                     similarity_weight: parseFloat(document.getElementById('memory-similarity-weight').value),
+                    share_across_sessions: document.getElementById('memory-share-sessions').checked,
                     digest: {
                         enabled: document.getElementById('digest-enabled').checked,
                         interval_messages: parseInt(document.getElementById('digest-interval').value),

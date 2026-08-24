@@ -115,6 +115,9 @@ class GroupChatBot:
         # 每会话正在进行的回复生成任务（同一会话同时只生成一条回复）
         self._reply_tasks: dict[str, asyncio.Task] = {}
         self._rich_media_tasks: set[asyncio.Task] = set()
+        # 用户消息、Bot 回复等轻量记忆写入任务。单独跟踪，停止时等待/取消，
+        # 避免 create_task 后进程退出导致最后几条记忆丢失。
+        self._memory_tasks: set[asyncio.Task] = set()
         # 群聊纪要（滚动总结）：每 N 条消息把新聊天压缩成一条长期记忆，隔天也不会忘
         self._digest_config: dict = {}
         self._last_digest_at: dict[str, float] = {}  # session -> 上次纪要覆盖到的消息时间戳
@@ -125,7 +128,9 @@ class GroupChatBot:
         self._media_trail_limit = 30
 
         # 提炼不出稳定特征的人 → 记下当时的素材规模，素材没变就不再重复问 LLM
-        self._profile_failed_material: dict[str, tuple] = {}
+        self._profile_failed_material: dict[tuple, tuple] = {}
+        # 黑话自动清理的上次执行时间（进程内首次启动时立即检查）
+        self._last_slang_cleanup: float = 0.0
 
     @property
     def _image_group_config(self) -> dict:
@@ -258,9 +263,24 @@ class GroupChatBot:
     def _init_memory(self) -> None:
         """初始化记忆系统"""
         memory_config = self.config.get("memory", {})
+        self.long_term_memory_enabled = bool(
+            memory_config.get("enable_long_term_memory", True)
+        )
+        self.memory_share_across_sessions = bool(
+            memory_config.get("share_across_sessions", False)
+        )
 
         self.memory_storage = AsyncMemoryStorage(
-            MemoryStorage(memory_config.get("db_path", "data/memory.db"))
+            MemoryStorage(
+                memory_config.get("db_path", "data/memory.db"),
+                share_across_sessions=self.memory_share_across_sessions,
+            )
+        )
+
+        logger.info(
+            "✓ 长期记忆: enabled=%s, 跨会话共享=%s",
+            self.long_term_memory_enabled,
+            self.memory_share_across_sessions,
         )
 
         # 嵌入+重排服务（无 key 时自动回退 TF-IDF）
@@ -282,6 +302,11 @@ class GroupChatBot:
         self.memory_search_top_k = memory_config.get("retrieval_top_k", 5)
         self.memory_half_life_days = memory_config.get("half_life_days", 30)
         self.memory_similarity_weight = memory_config.get("similarity_weight", 0.85)
+        self.memory_decay_presets = {
+            "semantic": {"half_life_days": 90, "max_age_days": 365},
+            "session_summary": {"half_life_days": 45, "max_age_days": 180},
+            "episodic": {"half_life_days": 14, "max_age_days": 90},
+        }
         # 衰减清理任务的上次执行时间（初始为"从未"）
         self._last_decay_run: float = 0.0
 
@@ -316,15 +341,24 @@ class GroupChatBot:
 
         # 群聊黑话：定时从聊天记录提取群内特有的梗/称呼，回复时按需注入
         slang_cfg = memory_config.get("slang", {}) or {}
+        cleanup_cfg = slang_cfg.get("cleanup", {}) or {}
         self._slang_config = {
             "enabled": bool(slang_cfg.get("enabled", True)),
             "interval_hours": max(1, int(slang_cfg.get("interval_hours", 24))),
             "lookback_hours": max(6, int(slang_cfg.get("lookback_hours", 48))),
             "max_inject": max(1, int(slang_cfg.get("max_inject", 8))),
+            "cleanup": {
+                "enabled": bool(cleanup_cfg.get("enabled", True)),
+                "interval_hours": max(1, int(cleanup_cfg.get("interval_hours", 24))),
+                "lookback_hours": max(24, int(cleanup_cfg.get("lookback_hours", 168))),
+                "max_entries": max(1, int(cleanup_cfg.get("max_entries", 40))),
+            },
         }
         self._last_slang_extract: float = 0.0
         logger.info(f"✓ 群聊黑话: enabled={self._slang_config['enabled']}, "
-                    f"每{self._slang_config['interval_hours']}小时提取一次")
+                    f"每{self._slang_config['interval_hours']}小时提取一次；"
+                    f"自动清理={self._slang_config['cleanup']['enabled']}，"
+                    f"每{self._slang_config['cleanup']['interval_hours']}小时检查一次")
 
     def _init_personality(self) -> None:
         """初始化人格系统"""
@@ -421,7 +455,8 @@ class GroupChatBot:
         self.social_awareness = SocialAwarenessManager(
             bot_nickname=bot_nickname,
             interested_topics=self.personality.interested_topics,
-            bored_topics=self.personality.bored_topics
+            bored_topics=self.personality.bored_topics,
+            taboo_topics=self.personality.taboo_topics,
         )
 
         # 群聊发言权：判断谁在和谁说话、当前插嘴成本以及候选行为。
@@ -468,6 +503,7 @@ class GroupChatBot:
             tool_llm_provider=tool_llm,
             search_client=search_client,
             bot_name=self.personality.name,
+            taboo_topics=self.personality.taboo_topics,
         )
 
     def _init_search(self):
@@ -626,6 +662,12 @@ class GroupChatBot:
             or continuing
         )
         try:
+            # 进程重启后，先恢复该会话最近仍在上下文有效期内的 episodic 消息，
+            # 再追加当前消息；这样首条消息不会让 Bot 突然失去刚才的对话。
+            await self._restore_recent_context(
+                session_id, current_message_id=message.message_id
+            )
+
             # 疲劳/注意力更新。注意：注意力按 group_id 键控，私聊没有群号，
             # 用 session_id（private_xxx）作键，避免所有私聊共用同一个注意力桶。
             self.speaking_decider.on_message(
@@ -765,6 +807,13 @@ class GroupChatBot:
         context.message_content = message.content
         context = self.social_awareness.analyze(context)
 
+        # 话题兴趣不仅影响“想不想插话”，极端厌烦/禁忌话题还应让情绪和
+        # 发言权系统看到；明确问到时仍允许生成一条边界回复。
+        if context.topic_relevance >= 0.75:
+            self.emotional_manager.trigger_event(session_id, "interesting")
+        elif context.topic_relevance <= 0.25:
+            self.emotional_manager.trigger_event(session_id, "boring")
+
         # 发言权和行为计划。当前消息已在快速路径进入上下文，因此可直接分析消息拓扑。
         window = self.context_manager.get_window(session_id)
         recent_context_messages = window.get_recent(12)
@@ -873,6 +922,100 @@ class GroupChatBot:
             "action_plan": action_plan,
         }
 
+    def _refresh_action_plan_after_wait(
+        self,
+        message: Message,
+        direction: str,
+        action_plan,
+    ) -> tuple[object, bool]:
+        """思考延迟后用最新群聊重新校验非定向行为计划。
+
+        定向回复由新消息到达时的任务替换机制负责；普通插话则可能在等待期间
+        迎来新群消息。此时沿用旧的 REACT/REPLY 计划容易出现"按旧消息组织，
+        却对新上下文作答"，所以在未过期时将计划切换到最新群友消息。
+        """
+        if not action_plan or action_plan.directed or direction != "group":
+            return action_plan, False
+
+        recent = self.context_manager.get_window(message.session_id).get_recent(30)
+        newer = [
+            item for item in recent
+            if not item.is_bot and item.timestamp > action_plan.target_timestamp
+        ]
+        if not newer:
+            return action_plan, False
+
+        cancel, cancel_reason = self.conversation_floor_manager.should_cancel(
+            action_plan,
+            recent,
+            bot_id=str(self.config.get("qq", {}).get("self_id", "")),
+        )
+        if cancel:
+            logger.info(f"[发送复核] 放弃回复：{cancel_reason}")
+            return None, True
+
+        latest = newer[-1]
+        self_id = str(self.config.get("qq", {}).get("self_id", ""))
+        if latest.directed_to_bot or (
+            latest.reply_to_qq and self_id
+            and str(latest.reply_to_qq) == self_id
+        ):
+            # 新的定向消息应该由 _handle_message 创建的新任务负责，旧插话不抢答。
+            logger.info("[发送复核] 新消息已明确对 bot 说，放弃旧插话")
+            return None, True
+
+        try:
+            topic_relevance = self.social_awareness.topic_analyzer.analyze_relevance(
+                latest.content
+            )
+        except Exception:
+            topic_relevance = 0.5
+
+        latest_probe = SocialContext(message_content=latest.content)
+        try:
+            self.trigger_detector.detect(latest_probe)
+        except Exception:
+            pass
+        rich_markers = (
+            "[链接", "[卡片", "[小程序", "[图片", "[表情包", "[动画表情",
+            "[视频", "[合并转发",
+        )
+        rich_message_only = latest.content.lstrip().startswith(rich_markers)
+        rich_type = ""
+        if latest.content.lstrip().startswith("[图片"):
+            rich_type = "image"
+        elif latest.content.lstrip().startswith(("[表情包", "[动画表情")):
+            rich_type = "mface"
+        elif latest.content.lstrip().startswith("[视频"):
+            rich_type = "video"
+
+        # 最新消息本身已经由快速路径写入上下文；这里仅重新计算发言权计划，
+        # 不重新抽一次随机概率，避免同一条候选回复被随机数重复改变。
+        _, refreshed = self.conversation_floor_manager.analyze(
+            latest,
+            recent,
+            bot_id=self_id,
+            is_private=False,
+            directed_to_bot=False,
+            continuing=False,
+            mentioned_others=[],
+            topic_relevance=topic_relevance,
+            is_question=latest_probe.is_direct_question,
+            rich_message_only=rich_message_only,
+            rich_type=rich_type,
+        )
+        if refreshed.action.value == "silent":
+            logger.info("[发送复核] 最新上下文不适合插话，放弃旧回复")
+            return None, True
+
+        logger.info(
+            "[发送复核] 插话计划更新：%s → %s，目标=%s",
+            action_plan.action.value,
+            refreshed.action.value,
+            latest.message_id or latest.sender_id,
+        )
+        return refreshed, False
+
     async def _compose_and_send(self, message: Message, decision: dict) -> None:
         """慢路径：思考延迟 → 用最新上下文生成回复 → 发送"""
         session_id = message.session_id
@@ -907,16 +1050,25 @@ class GroupChatBot:
                 )
             )
 
-            # 思考期间群聊可能已经向前发展；非定向插话过期时直接放弃。
-            if action_plan:
-                cancel, cancel_reason = self.conversation_floor_manager.should_cancel(
-                    action_plan,
-                    self.context_manager.get_window(session_id).get_recent(30),
-                    bot_id=str(self.config.get("qq", {}).get("self_id", "")),
-                )
-                if cancel:
-                    logger.info(f"[发送复核] 放弃回复：{cancel_reason}")
-                    return
+            # 思考期间群聊可能已经向前发展；普通插话过期时放弃，仍适合时
+            # 把行为计划切换到最新群友消息，避免旧计划套新上下文。
+            action_plan, plan_cancelled = self._refresh_action_plan_after_wait(
+                message, direction, action_plan
+            )
+            if plan_cancelled:
+                return
+
+            # 如果插话计划已经切到等待期间的新消息，搜索判断、挫败检测等仍使用
+            # 旧触发消息会造成“计划回 m2、搜索却搜 m1”的错位。保持定向回复的
+            # 原始消息语义不变，只对非定向插话同步当前目标内容。
+            generation_message = message.content
+            if action_plan and not action_plan.directed and action_plan.target_message_id:
+                for candidate in reversed(
+                    self.context_manager.get_window(session_id).get_recent(30)
+                ):
+                    if str(candidate.message_id or "") == str(action_plan.target_message_id):
+                        generation_message = candidate.content
+                        break
 
             # === 构建提示词（此刻的上下文 = 思考期间的最新消息，不会回旧话题） ===
             context_prompt = self.context_manager.build_context_prompt(
@@ -930,7 +1082,10 @@ class GroupChatBot:
             # === 命中的群黑话：只注入本轮对话里真正出现的词条 ===
             glossary = []
             try:
-                if self._slang_config.get("enabled", True):
+                if (
+                    getattr(self, "long_term_memory_enabled", True)
+                    and self._slang_config.get("enabled", True)
+                ):
                     glossary = await self.memory_storage.match_slang(
                         f"{context_prompt}\n{message.content}",
                         session=session_id,
@@ -951,7 +1106,7 @@ class GroupChatBot:
             try:
                 reply = await self.reply_generator.generate(
                     context_prompt=context_prompt,
-                    current_message=message.content,
+                    current_message=generation_message,
                     emotional_state=emotional_state,
                     direction=direction,
                     action_plan=action_plan.to_dict() if action_plan else None,
@@ -1368,6 +1523,68 @@ class GroupChatBot:
             return True
         return "【" in text and "价值" in text and "领取" in text
 
+    async def _restore_recent_context(
+        self, session_id: str, current_message_id: str = ""
+    ) -> None:
+        """从 SQLite 恢复重启前仍有效的近期对话到工作记忆窗口。
+
+        SQLite 里的 episodic 记录不是完整聊天日志，只恢复其中已经被长期
+        记忆筛选留下的消息；窗口仍以当前配置的消息数和时间范围为上限。
+        """
+        if not getattr(self, "long_term_memory_enabled", True):
+            return
+        if not self.memory_storage or not self.context_manager:
+            return
+
+        window = self.context_manager.get_window(session_id)
+        if window.restored_from_storage:
+            return
+        # 先标记，避免同一会话的并发首条消息重复恢复。
+        window.restored_from_storage = True
+
+        restore_limit = max(0, self.context_manager.max_messages - 1)
+        if restore_limit <= 0:
+            return
+
+        try:
+            rows = await self.memory_storage.get_session_messages(
+                session_id, limit=restore_limit
+            )
+            cutoff = datetime.now() - window.max_age
+            for memory in rows:  # 数据库按新到旧；头插后自然变成时间正序
+                if memory.created_at < cutoff:
+                    break
+                meta = memory.metadata or {}
+                message_id = str(meta.get("message_id") or "")
+                if current_message_id and message_id == str(current_message_id):
+                    continue
+
+                bot_name = getattr(self.personality, "name", "爱丽丝")
+                sender_name = str(
+                    meta.get("sender_name")
+                    or (bot_name if meta.get("is_bot") else "历史用户")
+                )
+                content = (memory.content or "").strip()
+                prefix = f"{sender_name}："
+                if content.startswith(prefix):
+                    content = content[len(prefix):].strip()
+                if not content:
+                    continue
+
+                self.context_manager.prepend_message(
+                    session_id=session_id,
+                    sender_id=str(meta.get("sender_id") or ""),
+                    sender_name=sender_name,
+                    content=content,
+                    is_bot=bool(meta.get("is_bot")),
+                    message_id=message_id,
+                    timestamp=memory.created_at,
+                )
+        except Exception as exc:
+            # 恢复失败不能阻塞当前消息；下次新建窗口时仍可再尝试。
+            window.restored_from_storage = False
+            logger.debug("恢复近期记忆失败: %s", exc)
+
     def _store_long_term_memory(self, message: Message, session_id: str) -> None:
         """把有记忆价值的消息写入 SQLite 情景记忆（异步后台执行）
 
@@ -1377,6 +1594,8 @@ class GroupChatBot:
         - 含个人信息关键词（我叫/我喜欢/我的生日…）→ +0.3
         - 超过阈值 0.5 才值得长期记住
         """
+        if not getattr(self, "long_term_memory_enabled", True):
+            return
         # 卡片/转发是外部引用材料，不把其内容误记成发送者自己的事实。
         # 如果外层另有文字，只记外层文字和附件类型。
         if message.rich_only:
@@ -1390,16 +1609,19 @@ class GroupChatBot:
         if self._is_promo_text(content):
             return
 
+        self_statement = self._is_self_statement(content)
+        # 普通短闲聊不进长期库，避免“说过一句就记住”；明确对 bot 说、
+        # 自我描述和较完整的分享/吐槽仍然保留。
+        if not (message.mentioned_me or self_statement or len(content) > 20):
+            return
+
         importance = 0.3
         if message.mentioned_me:
             importance += 0.2
-        # 长度线放宽到 12 字：20 字对中文口语太苛刻，大多数日常发言进不了
-        # 长期记忆，导致用户画像素材长期不足。episodic 有 14 天半衰期衰减
-        # 和写入去重兜底，放宽不会让库无限膨胀。
-        if len(content) > 12:
+        if len(content) > 20:
             importance += 0.2
         if any(kw in content for kw in self._PERSONAL_KEYWORDS):
-            importance += 0.3 if self._is_self_statement(content) else 0.1
+            importance += 0.3 if self_statement else 0.1
 
         if importance < 0.5:
             return
@@ -1437,17 +1659,22 @@ class GroupChatBot:
                 logger.error(f"Failed to save memory: {e}")
 
         # 不阻塞消息处理主流程
-        asyncio.create_task(_save())
+        self._track_memory_task(_save())
 
     def _store_bot_memory(self, session_id: str, content: str) -> None:
         """把 bot 自己发出的消息写入 SQLite 情景记忆（异步后台执行）。
 
-        用户消息走 _store_long_term_memory（按重要性筛选）；bot 回复全部保存，
-        保证会话历史两侧完整（不依赖内存窗口，重启后仍在）。重要性略低，
-        语义召回时以群友的消息为主，不至于被 bot 闲聊刷屏。
+        用户消息走 _store_long_term_memory（按重要性筛选）；bot 的极短应声/表情
+        不进长期库，避免 bot 自己的闲聊把会话记忆刷满；有实际内容的回复仍会
+        保存，保证重启后可以恢复有意义的对话片段。
         """
+        if not getattr(self, "long_term_memory_enabled", True):
+            return
         content = content.strip()
-        if not content:
+        if not content or (
+            len(content) < 8
+            and not any(mark in content for mark in ("?", "？", "!", "！"))
+        ):
             return
         self_id = str(self.config.get("qq", {}).get("self_id", ""))
         memory = Memory(
@@ -1464,16 +1691,35 @@ class GroupChatBot:
 
         async def _save():
             try:
+                if self_id:
+                    dup = await self.memory_storage.find_similar(
+                        session_id, self_id, content
+                    )
+                    if dup is not None:
+                        await self.memory_storage.bump_memories(
+                            [dup.id], importance_boost=0.02
+                        )
+                        return
                 await self.memory_storage.store(memory)
             except Exception as e:
                 logger.error(f"Failed to save bot memory: {e}")
 
         # 不阻塞消息处理主流程
-        asyncio.create_task(_save())
+        self._track_memory_task(_save())
+
+    def _track_memory_task(self, coroutine) -> asyncio.Task:
+        """创建并跟踪轻量记忆后台任务。"""
+        task = asyncio.create_task(coroutine)
+        self._memory_tasks.add(task)
+        task.add_done_callback(self._memory_tasks.discard)
+        return task
 
     def _maybe_schedule_digest(self, session_id: str) -> None:
         """检查是否该生成群聊纪要：距上次纪要的新消息达到固定条数就调度后台总结"""
-        if not self._digest_config.get("enabled", True):
+        if (
+            not getattr(self, "long_term_memory_enabled", True)
+            or not self._digest_config.get("enabled", True)
+        ):
             return
         if session_id in self._digest_tasks and not self._digest_tasks[session_id].done():
             return  # 已有纪要任务在跑，等它结束后重新计数
@@ -1547,10 +1793,9 @@ class GroupChatBot:
         """判断一条 episodic 记忆是否包含"关于发送者自己的事实"。
 
         判据只有句式（见 _is_self_statement）。曾经还有一条"高重要性且含第一
-        人称即算自述"的兜底，但 importance 会被检索反馈反复抬高（每次召回
-        +0.01，封顶 0.95），结果是"被想起得多"的普通消息漂到 0.7 以上就冒充
-        自述（如「我在想要不要拿这个潜能」imp=0.80）。判不准的留给日常发言，
-        信息不丢。
+        人称即算自述"的兜底，但普通消息的 importance 可能因重复写入强化而升高，
+        结果是「被保存/命中得多」的普通消息漂到高重要性后冒充自述。
+        判不准的留给日常发言，信息不丢。
         """
         return self._is_self_statement(memory.content or "")
 
@@ -1873,7 +2118,10 @@ class GroupChatBot:
         画像存为 semantic 记忆，语义检索时可被召回。
         """
         result = {"distilled": 0, "skipped": 0, "error": ""}
-        if not self._profile_config.get("enabled", True):
+        if (
+            not getattr(self, "long_term_memory_enabled", True)
+            or not self._profile_config.get("enabled", True)
+        ):
             return result
         min_facts = self._profile_config.get("min_facts", 2)
         daily_min = self._profile_config.get("daily_min_messages", 8)
@@ -1881,21 +2129,31 @@ class GroupChatBot:
         refresh_daily = self._profile_config.get("refresh_daily_count", 5)
         mbti_enabled = self._profile_config.get("mbti_enabled", True)
         try:
-            episodes = await self.memory_storage.get_all(limit=2000, memory_type="episodic")
+            # 画像素材按最近消息取，不能用 get_all 的重要性排序：否则大量旧的
+            # 高重要性消息会把近期日常发言挤出 2000 条窗口。
+            episodes = await self.memory_storage.get_recent("episodic", limit=2000)
             profiles = await self.memory_storage.get_profiles()
-            profile_by_sender = {
-                p.metadata.get("sender_id"): p
-                for p in profiles if p.metadata.get("sender_id")
-            }
+            profile_by_scope = {}
+            for p in profiles:
+                sender_id = (p.metadata or {}).get("sender_id")
+                if not sender_id:
+                    continue
+                scope = p.source_session or (p.metadata or {}).get("profile_session", "")
+                key = (str(sender_id), "" if self.memory_share_across_sessions else scope)
+                profile_by_scope[key] = p
 
             # 按发送者分组：自述 + 有信息量的日常发言
-            by_sender: dict[str, dict] = {}
+            by_scope: dict[tuple, dict] = {}
             for m in episodes:
                 meta = m.metadata or {}
                 sid = meta.get("sender_id")
                 if not sid or meta.get("is_bot"):
                     continue
-                entry = by_sender.setdefault(sid, {"self": [], "daily": [], "latest_name": ""})
+                source_scope = m.source_session or ""
+                scope_key = (str(sid), "" if self.memory_share_across_sessions else source_scope)
+                entry = by_scope.setdefault(
+                    scope_key, {"self": [], "daily": [], "latest_name": ""}
+                )
                 if meta.get("sender_name"):
                     entry["latest_name"] = meta["sender_name"]
                 if self._is_personal_fact(m):
@@ -1914,10 +2172,11 @@ class GroupChatBot:
             now = datetime.now()
             cutoff = now - timedelta(days=window_days)
 
-            for sid, entry in by_sender.items():
+            for scope_key, entry in by_scope.items():
+                sid, profile_scope = scope_key
                 self_facts = sorted(entry["self"], key=lambda m: m.created_at, reverse=True)
                 daily = sorted(entry["daily"], key=lambda m: m.created_at, reverse=True)
-                existing = profile_by_sender.get(sid)
+                existing = profile_by_scope.get(scope_key)
                 latest_name = entry["latest_name"] or "该用户"
 
                 # 素材不足：自述少且日常发言也少 → 无可提炼
@@ -1932,7 +2191,7 @@ class GroupChatBot:
                 # 提炼不出稳定特征的人：素材没变化就别每轮都再问一次 LLM。
                 # （已有画像的人由下面的"新素材"门槛把关，这条覆盖的是还没有画像的人）
                 material_sig = (len(self_facts), len(daily))
-                if not force and self._profile_failed_material.get(sid) == material_sig:
+                if not force and self._profile_failed_material.get(scope_key) == material_sig:
                     logger.debug(
                         "[画像] 跳过 %s：上次提炼不出且素材无变化（自述%d 日常%d）",
                         latest_name, len(self_facts), len(daily),
@@ -2023,26 +2282,30 @@ class GroupChatBot:
                 summary = (resp.content or "").strip().strip('"\'“”')
                 if not summary:
                     logger.info("[画像] 跳过 %s：LLM 返回空", latest_name)
-                    self._profile_failed_material[sid] = material_sig
+                    self._profile_failed_material[scope_key] = material_sig
                     result["skipped"] += 1
                     continue
                 if self._is_profile_refusal(summary):
                     logger.info("[画像] 跳过 %s：素材判断不出稳定特征（%s）",
                                 latest_name, summary[:40])
-                    self._profile_failed_material[sid] = material_sig
+                    self._profile_failed_material[scope_key] = material_sig
                     result["skipped"] += 1
                     continue
                 summary = self._normalize_profile_summary(summary)
                 if not summary:
                     logger.info("[画像] 跳过 %s：清理后无有效内容", latest_name)
-                    self._profile_failed_material[sid] = material_sig
+                    self._profile_failed_material[scope_key] = material_sig
                     result["skipped"] += 1
                     continue
-                self._profile_failed_material.pop(sid, None)
+                self._profile_failed_material.pop(scope_key, None)
 
                 # 样本里最新一条的来源会话作为画像归属会话
                 sample = unique_facts + unique_daily
-                src_session = sample[0].source_session if sample else ""
+                src_session = (
+                    profile_scope
+                    if not self.memory_share_across_sessions
+                    else (sample[0].source_session if sample else "")
+                )
                 warnings = self._profile_quality_warnings(summary)
                 if warnings:
                     logger.info("[画像] %s 质量提示: %s", latest_name, "；".join(warnings))
@@ -2072,6 +2335,7 @@ class GroupChatBot:
                         "profile": True,
                         "sender_id": sid,
                         "sender_name": latest_name,
+                        "profile_session": src_session,
                         "fact_count": len(unique_facts),
                         "daily_count": len(unique_daily),
                         # 留存提炼素材：Web 端据此追溯"哪句话导致了这个结论"
@@ -2102,7 +2366,10 @@ class GroupChatBot:
 
     async def _maybe_distill_profiles(self) -> None:
         """定时触发画像提炼（按 interval_minutes 节流，避免频繁调用 LLM）"""
-        if not self._profile_config.get("enabled", True):
+        if (
+            not getattr(self, "long_term_memory_enabled", True)
+            or not self._profile_config.get("enabled", True)
+        ):
             return
         import time
         interval = max(5, self._profile_config.get("interval_minutes", 30))
@@ -2154,6 +2421,246 @@ class GroupChatBot:
                 "example": example[:80],
             })
         return items
+
+    @classmethod
+    def _parse_slang_cleanup_ids(cls, content: str, valid_ids) -> list[int]:
+        """解析黑话审核结果，只接受明确标记为删除的词条 ID。"""
+        import json as _json
+        import re as _re
+
+        allowed = set()
+        for value in valid_ids or []:
+            try:
+                allowed.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        if not allowed:
+            return []
+
+        text = _re.sub(r"<think>.*?</think>", "", content or "", flags=_re.DOTALL)
+        deleted = set()
+
+        def add(value) -> None:
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                return
+            if value in allowed:
+                deleted.add(value)
+
+        # 兼容模型偶尔返回的 JSON：{"delete_ids": [1, 2]} 或
+        # [{"id": 1, "action": "delete"}]。
+        def collect_json(value) -> None:
+            if isinstance(value, dict):
+                for key in ("delete_ids", "remove_ids", "删除", "移除"):
+                    values = value.get(key)
+                    if isinstance(values, (list, tuple)):
+                        for item in values:
+                            add(item)
+                action = str(
+                    value.get("action") or value.get("status")
+                    or value.get("decision") or ""
+                ).lower()
+                if value.get("id") is not None and any(
+                    word in action for word in ("delete", "remove", "invalid", "删除", "移除")
+                ):
+                    add(value.get("id"))
+                for nested in value.values():
+                    if isinstance(nested, (dict, list, tuple)):
+                        collect_json(nested)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if isinstance(item, (dict, list, tuple)):
+                        collect_json(item)
+
+        for block in _re.findall(r"```(?:json)?\s*(.*?)```", text, flags=_re.I | _re.S):
+            try:
+                collect_json(_json.loads(block.strip()))
+            except (TypeError, ValueError, _json.JSONDecodeError):
+                pass
+
+        # 约定格式：`删除 12 | 原因`。只解析包含删除动作的行，避免把原因里的
+        # 普通数字误当成词条 ID。
+        for line in text.splitlines():
+            if not _re.search(r"删除|移除|清理|delete|remove|invalid|wrong", line, _re.I):
+                continue
+            match = _re.search(
+                r"(?:删除|移除|清理|delete|remove|invalid|wrong)"
+                r"[^0-9]{0,20}(\d+)",
+                line,
+                flags=_re.I,
+            )
+            if match:
+                add(match.group(1))
+
+        return sorted(deleted)
+
+    @classmethod
+    def _is_obviously_invalid_slang(cls, row: dict) -> bool:
+        """过滤数据库里历史遗留的明显坏词条，人工词条由调用方先排除。"""
+        import re as _re
+
+        term = str(row.get("term") or "").strip()
+        meaning = str(row.get("meaning") or "").strip()
+        normalized = _re.sub(r"\s+", "", term).casefold()
+        common = {
+            _re.sub(r"\s+", "", str(item)).casefold()
+            for item in cls._SLANG_TOO_COMMON
+        }
+        return (
+            not term
+            or not meaning
+            or len(term) > 20
+            or len(meaning) < 2
+            or normalized in common
+            or (len(term) > 12 and len(term) > len(meaning))
+        )
+
+    async def _review_slang_batch(
+        self, session_id: str, entries: list[dict], lines: list[str]
+    ) -> int:
+        """让 LLM 复核一批自动词条，证据不足时保留。"""
+        provider = self.get_active_provider()
+        if not provider or not entries or len(lines) < 10:
+            return 0
+
+        from modules.llm.base import ChatRequest
+
+        req = ChatRequest(temperature=0.1, max_tokens=900, top_p=0.9)
+        req.add_system(
+            "你是群聊黑话词表审核员。请根据近期真实群聊记录，审核下面的自动提取词条。\n"
+            "只有在以下情况明确成立时才删除：词条在记录中没有依据、含义与实际用法明显不符、"
+            "它只是普通词/全网通用网络用语/游戏官方名词，或明显是模型臆造。\n"
+            "证据不足时保留，不要因为近期没出现就删除；不要修改含义。人工词条不会出现在本批。\n"
+            "只输出需要删除的行，格式严格为：删除 <ID> | 原因。没有需要删除的就输出：无。"
+        )
+        entry_text = "\n".join(
+            f"ID={row['id']} | 词={row.get('term', '')} | 含义={row.get('meaning', '')}"
+            f" | 例句={row.get('example') or '无'}"
+            for row in entries
+        )
+        req.add_user(
+            f"【会话】{session_id or '全部群'}\n"
+            "【近期群聊记录】\n"
+            + "\n".join(lines)
+            + "\n【待审核自动词条】\n"
+            + entry_text
+        )
+
+        resp = await provider.chat(req)
+        ids = self._parse_slang_cleanup_ids(
+            resp.content if resp else "", [row["id"] for row in entries]
+        )
+        deleted = await self.memory_storage.delete_auto_slang(ids)
+        if deleted:
+            logger.info(
+                "[黑话清理] %s 删除 %d 条明显不符合语境的自动词条：%s",
+                session_id or "全部群",
+                deleted,
+                "、".join(str(item) for item in ids[:8]),
+            )
+        return deleted
+
+    async def cleanup_slang_all(self, hours: int = None) -> dict:
+        """清理明显错误的自动黑话；人工词条永远不参与自动删除。"""
+        cleanup_cfg = self._slang_config.get("cleanup", {}) or {}
+        lookback_hours = max(
+            24, int(hours if hours is not None else cleanup_cfg.get("lookback_hours", 168))
+        )
+        result = {
+            "sessions": 0,
+            "checked": 0,
+            "deleted": 0,
+            "obvious_deleted": 0,
+            "skipped": 0,
+            "error": "",
+        }
+
+        try:
+            rows = await self.memory_storage.list_slang()
+        except Exception as exc:
+            result["error"] = str(exc)
+            logger.error("列出黑话供自动清理失败: %s", exc, exc_info=True)
+            return result
+
+        auto_rows = [
+            row for row in rows
+            if row.get("source") == "auto" and row.get("enabled", 1)
+        ]
+        obvious_ids = [
+            row["id"] for row in auto_rows if self._is_obviously_invalid_slang(row)
+        ]
+        if obvious_ids:
+            result["obvious_deleted"] = await self.memory_storage.delete_auto_slang(obvious_ids)
+            result["deleted"] += result["obvious_deleted"]
+            removed = set(obvious_ids)
+            auto_rows = [row for row in auto_rows if row.get("id") not in removed]
+
+        if not auto_rows:
+            return result
+
+        provider = self.get_active_provider()
+        if not provider:
+            result["error"] = "no active provider"
+            return result
+
+        from datetime import timedelta
+
+        try:
+            episodes = await self.memory_storage.get_all(
+                limit=4000, memory_type="episodic"
+            )
+            since = datetime.now() - timedelta(hours=lookback_hours)
+            lines_by_session: dict[str, list[str]] = {}
+            all_lines: list[str] = []
+            for memory in episodes:
+                if not memory.source_session or memory.created_at <= since:
+                    continue
+                line = (memory.content or "").strip()
+                if not line or line.startswith("["):
+                    continue
+                lines_by_session.setdefault(memory.source_session, []).append(line)
+                if str(memory.source_session).startswith("group_"):
+                    all_lines.append(line)
+            for lines in lines_by_session.values():
+                lines.reverse()
+            all_lines.reverse()
+        except Exception as exc:
+            result["error"] = str(exc)
+            logger.error("读取黑话清理素材失败: %s", exc, exc_info=True)
+            return result
+
+        max_entries = max(1, int(cleanup_cfg.get("max_entries", 40)))
+        reviewed_sessions = set()
+        for session_id, session_rows in self._group_slang_rows(auto_rows).items():
+            lines = lines_by_session.get(session_id, []) if session_id else all_lines
+            if len(lines) < 10:
+                result["skipped"] += len(session_rows)
+                continue
+            reviewed_sessions.add(session_id or "__all__")
+            for start in range(0, len(session_rows), max_entries):
+                batch = session_rows[start:start + max_entries]
+                result["checked"] += len(batch)
+                try:
+                    result["deleted"] += await self._review_slang_batch(
+                        session_id, batch, lines[:160]
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "黑话自动审核失败（%s）: %s", session_id, exc, exc_info=True
+                    )
+                    if not result["error"]:
+                        result["error"] = str(exc)
+        result["sessions"] = len(reviewed_sessions)
+        return result
+
+    @staticmethod
+    def _group_slang_rows(rows: list[dict]) -> dict[str, list[dict]]:
+        """按词条所属会话分组，避免不同群的同名黑话互相影响。"""
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            grouped.setdefault(str(row.get("session") or ""), []).append(row)
+        return grouped
 
     async def _extract_slang(self, session_id: str, hours: int = 48) -> dict:
         """从最近的群聊记录里提取这个群特有的黑话，写入词表。"""
@@ -2256,7 +2763,10 @@ class GroupChatBot:
 
     async def _maybe_extract_slang(self) -> None:
         """按配置间隔（默认每天）触发一次黑话提取。"""
-        if not self._slang_config.get("enabled", True):
+        if (
+            not getattr(self, "long_term_memory_enabled", True)
+            or not self._slang_config.get("enabled", True)
+        ):
             return
         interval_hours = max(1, int(self._slang_config.get("interval_hours", 24)))
         now = time.time()
@@ -2266,6 +2776,36 @@ class GroupChatBot:
         await self.extract_slang_all(
             hours=int(self._slang_config.get("lookback_hours", 48))
         )
+
+    async def _maybe_cleanup_slang(self) -> None:
+        """按配置间隔审核并删除明显错误的自动黑话。"""
+        if not getattr(self, "long_term_memory_enabled", True):
+            return
+        cleanup_cfg = self._slang_config.get("cleanup", {}) or {}
+        if not cleanup_cfg.get("enabled", True):
+            return
+        interval_hours = max(1, int(cleanup_cfg.get("interval_hours", 24)))
+        now = time.time()
+        if self._last_slang_cleanup and (now - self._last_slang_cleanup) < interval_hours * 3600:
+            return
+        self._last_slang_cleanup = now
+        try:
+            result = await self.cleanup_slang_all(
+                hours=int(cleanup_cfg.get("lookback_hours", 168))
+            )
+        except Exception as exc:
+            logger.error("[黑话清理] 定时任务失败: %s", exc, exc_info=True)
+            return
+        if result["deleted"] or result["checked"]:
+            logger.info(
+                "[黑话清理] 检查 %d 个会话、%d 条自动词条，删除 %d 条（明显格式问题 %d 条）",
+                result["sessions"],
+                result["checked"],
+                result["deleted"],
+                result["obvious_deleted"],
+            )
+        if result["error"]:
+            logger.warning("[黑话清理] %s", result["error"])
 
     async def _retrieve_memories(self, query: str, session_id: str, limit: int = None,
                                  exclude_id: str = "") -> list:
@@ -2277,6 +2817,9 @@ class GroupChatBot:
         检索发生在写入之后，若不排除，刚发的这条会把自己的内容召回——等于让 bot
         复述自己刚说的话。这里通过 memory_id 映射排除。
         """
+        if not getattr(self, "long_term_memory_enabled", True):
+            return []
+
         limit = limit or self.memory_search_top_k
 
         memories: list = []
@@ -2287,14 +2830,17 @@ class GroupChatBot:
                 limit=limit,
                 half_life_days=self.memory_half_life_days,
                 similarity_weight=self.memory_similarity_weight,
+                decay_presets=self.memory_decay_presets,
             )
         except Exception as e:
             logger.error(f"Semantic search failed: {e}")
 
         if not memories:
-            # 兜底：该会话最近的高价值记忆
+            # 兜底只取该会话最近的消息，不按重要性拿一条无关的旧画像/旧事实。
             try:
-                memories = await self.memory_storage.retrieve_session_recent(session_id, limit=limit)
+                memories = await self.memory_storage.retrieve_session_recent(
+                    session_id, limit=limit, memory_type="episodic"
+                )
             except Exception as e:
                 logger.error(f"Failed to retrieve memories: {e}")
                 memories = []
@@ -2307,29 +2853,16 @@ class GroupChatBot:
                 memories = [m for m in memories if m.id not in excluded]
 
         # 最近纪要作为"近况"放最前，细节记忆在后（去重避免重复出现）
-
-        # 最近纪要作为"近况"放最前，细节记忆在后（去重避免重复出现）
         try:
             digests = await self.memory_storage.retrieve_session_recent(
-                session_id, limit=2, memory_type="session_summary"
+                session_id, limit=1, memory_type="session_summary"
             )
         except Exception as e:
             logger.debug(f"Digest retrieval skipped: {e}")
             digests = []
         if digests:
             digest_ids = {d.id for d in digests}
-            memories = digests + [m for m in memories if m.id not in digest_ids]
-
-        # 检索反馈强化：被召回的每一条记忆刷新 last_accessed + 轻微提升 importance。
-        # 时间衰减只看 last_accessed —— 不刷新的话，常用记忆会随写入时间一起老化，
-        # bot 会"忘记"明明刚用过的信息。刷新后常用记忆保持新鲜，冷门记忆自然淡出。
-        # 这是记忆系统的「回忆 → 强化」闭环。
-        try:
-            memory_ids = [m.id for m in memories if m.id]
-            if memory_ids:
-                await self.memory_storage.bump_memories(memory_ids)
-        except Exception as e:
-            logger.debug(f"Memory access bump skipped: {e}")
+            memories = (digests + [m for m in memories if m.id not in digest_ids])[:limit]
 
         return memories
 
@@ -2371,10 +2904,13 @@ class GroupChatBot:
             await self._maybe_decay_memories()
             await self._maybe_distill_profiles()
             await self._maybe_extract_slang()
+            await self._maybe_cleanup_slang()
             logger.debug("Cleaned up expired states")
 
     async def _maybe_decay_memories(self) -> None:
         """定期对长期记忆应用时间衰减（每6小时一次，避免频繁写库）"""
+        if not getattr(self, "long_term_memory_enabled", True):
+            return
         import time
         now = time.time()
         # 距上次执行不足6小时则跳过；进程内首次运行时直接执行一次
@@ -2388,13 +2924,9 @@ class GroupChatBot:
                 half_life_days=self.memory_half_life_days,
                 min_importance=0.1,
                 max_age_days=180,
-                presets={
-                    "semantic": {"half_life_days": 90, "max_age_days": 365},
-                    "session_summary": {"half_life_days": 45, "max_age_days": 180},
-                    "episodic": {"half_life_days": 14, "max_age_days": 90},
-                },
+                presets=self.memory_decay_presets,
             )
-            if result["decayed"] or result["deleted"]:
+            if result["deleted"]:
                 logger.info(f"[记忆衰减] {result}")
         except Exception as e:
             logger.error(f"Memory decay failed: {e}")
@@ -2404,21 +2936,87 @@ class GroupChatBot:
         logger.info("Stopping GroupChatBot...")
         self._running = False
 
-        # 取消所有任务
-        for task in self._tasks:
-            task.cancel()
+        current_loop = asyncio.get_running_loop()
+
+        async def finish_group(tasks: list[asyncio.Task], preserve_memory: bool = False) -> None:
+            """在任务所属事件循环中取消/等待任务。"""
+            pending = [task for task in tasks if not task.done()]
+            if not pending:
+                return
+            if preserve_memory:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=5.0,
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    # 超时后仍要把未完成的写入任务收掉，避免关闭 SQLite 时撞上后台写入。
+                    pass
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        async def finish_tasks(tasks: list[asyncio.Task], preserve_memory: bool = False) -> None:
+            """兼容普通模式和 Dashboard/QQ 双事件循环模式。"""
+            unique = list(dict.fromkeys(task for task in tasks if task is not None))
+            by_loop: dict[asyncio.AbstractEventLoop, list[asyncio.Task]] = {}
+            for task in unique:
+                try:
+                    task_loop = task.get_loop()
+                except RuntimeError:
+                    continue
+                by_loop.setdefault(task_loop, []).append(task)
+
+            for task_loop, group in by_loop.items():
+                if task_loop is current_loop:
+                    await finish_group(group, preserve_memory=preserve_memory)
+                    continue
+                if task_loop.is_closed():
+                    continue
+
+                async def runner(group=group):
+                    await finish_group(group, preserve_memory=preserve_memory)
+
+                runner_coro = runner()
+                try:
+                    future = asyncio.run_coroutine_threadsafe(runner_coro, task_loop)
+                except RuntimeError:
+                    runner_coro.close()
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        asyncio.wrap_future(future),
+                        timeout=6.0 if preserve_memory else 3.0,
+                    )
+                except (asyncio.TimeoutError, RuntimeError):
+                    future.cancel()
+                    # 事件循环仍在运行时，跨线程取消是安全的；若刚好已关闭则忽略。
+                    for task in group:
+                        if task.done():
+                            continue
+                        try:
+                            task_loop.call_soon_threadsafe(task.cancel)
+                        except RuntimeError:
+                            pass
+
+        # 先停掉清理/回复/纪要任务，防止它们在退出阶段继续创建记忆写入。
         background_tasks = (
             list(self._reply_tasks.values())
             + list(self._rich_media_tasks)
             + list(self._digest_tasks.values())
         )
-        for task in background_tasks:
-            task.cancel()
-        if background_tasks:
-            await asyncio.gather(*background_tasks, return_exceptions=True)
+        await finish_tasks(list(self._tasks) + background_tasks)
+
+        # 记忆写入是退出前必须尽量保住的数据；先等待，超时才取消。
+        memory_tasks = list(self._memory_tasks)
+        await finish_tasks(memory_tasks, preserve_memory=True)
+        self._tasks.clear()
         self._reply_tasks.clear()
         self._rich_media_tasks.clear()
         self._digest_tasks.clear()
+        self._memory_tasks.clear()
 
         # 停止事件总线
         if self.event_bus:
@@ -2433,6 +3031,13 @@ class GroupChatBot:
             svc = self.memory_storage._storage._embedding_service
             if svc:
                 await svc.close()
+        except Exception:
+            pass
+
+        # SQLite 连接也要显式关闭；Dashboard 与 QQ 共用它时尤其重要。
+        try:
+            if self.memory_storage:
+                await self.memory_storage.close()
         except Exception:
             pass
 
@@ -2470,7 +3075,7 @@ class GroupChatBot:
                     "banned_words": [],
                     "filler_words": ["呃", "嗯", "那个", "这个"],
                     "filler_frequency": 0.08,
-                    "max_reply_length": 60,
+                    "max_reply_length": 20,
                     "use_ellipsis": True,
                     "ellipsis_frequency": 0.06,
                     "use_emoji": True,
@@ -2607,6 +3212,7 @@ class GroupChatBot:
                 "context_window_size": 50,
                 "context_max_age_hours": 2.0,
                 "enable_long_term_memory": True,
+                "share_across_sessions": False,
                 "db_path": "data/memory.db",
                 "retrieval_top_k": 5,
                 "half_life_days": 30,
@@ -2621,7 +3227,13 @@ class GroupChatBot:
                     "enabled": True,
                     "interval_hours": 24,
                     "lookback_hours": 48,
-                    "max_inject": 8
+                    "max_inject": 8,
+                    "cleanup": {
+                        "enabled": True,
+                        "interval_hours": 24,
+                        "lookback_hours": 168,
+                        "max_entries": 40
+                    }
                 },
                 "profile": {
                     "enabled": True,

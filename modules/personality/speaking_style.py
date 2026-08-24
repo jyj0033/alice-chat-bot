@@ -10,6 +10,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+_EMOJI_RE = re.compile(
+    r'[\U0001F000-\U0001FAFF☀-➿️‍⭐❤❣☮☯〰©®㊗㊙]'
+)
+
 
 @dataclass
 class SpeakingStyle:
@@ -26,7 +30,7 @@ class SpeakingStyle:
     avg_sentence_length_range: tuple[int, int] = (10, 30)  # 平均句长范围
 
     # 回复长度
-    max_reply_length: int = 60     # 单条回复最大字符数（超长会被智能截断）
+    max_reply_length: int = 20     # 单条回复最大字符数（超长会被智能截断）
 
     # 语气词后处理频率：LLM 本身就会自然使用语气词，这层只是偶尔补一点
     # 口语感的兜底。给高了会出现「这个哈哈哈哈」这类机械拼接。
@@ -85,7 +89,12 @@ class SpeakingStyleManager:
 
     def __init__(self, style: SpeakingStyle, emoji_set: list[str] = None):
         self.style = style
-        self.emoji_set = emoji_set or ["😅", "🤔", "😂", "👍", "🙄", "😏", "🤷", "👀"]
+        # 空列表表示用户明确关闭/清空 emoji，不应被 `or` 当成未配置而恢复默认值。
+        self.emoji_set = (
+            list(emoji_set)
+            if emoji_set is not None
+            else ["😅", "🤔", "😂", "👍", "🙄", "😏", "🤷", "👀"]
+        )
 
     def get_style_guide(self) -> str:
         """获取风格指南字符串（发给 LLM 的说话风格约束）"""
@@ -99,10 +108,18 @@ class SpeakingStyleManager:
                 f"语气词（如{('、'.join(self.style.filler_words[:3]))}）偶尔用就行，"
                 "别每句话都以语气词开头，大多数时候直接说事更自然"
             )
-        if self.style.formality:
-            parts.append(f"正式程度：{self.style.formality}")
-        if self.style.enthusiasm:
-            parts.append(f"热情程度：{self.style.enthusiasm}")
+        if self.style.formality >= 0.7:
+            parts.append("用词相对稳重，但不要写成公文")
+        elif self.style.formality <= 0.3:
+            parts.append("用熟人聊天的随意口吻，不要客服腔")
+        else:
+            parts.append("语气自然，正式和随意之间保持平衡")
+        if self.style.enthusiasm >= 0.7:
+            parts.append("有兴致时语气活一点，但别每句都大惊小怪")
+        elif self.style.enthusiasm <= 0.3:
+            parts.append("情绪表达克制，不需要强行热闹")
+        else:
+            parts.append("语气有温度，但不刻意卖热情")
         return "；".join(parts) if parts else ""
 
     def apply_style(self, text: str) -> str:
@@ -137,6 +154,11 @@ class SpeakingStyleManager:
 
         # 6. 移除禁用词
         result = self._remove_banned_words(result)
+
+        # 关闭 emoji 时，既不自动追加，也不保留模型自行生成的 emoji，
+        # 这样面板配置和最终消息不会互相打架。
+        if not self.style.use_emoji or not self.emoji_set:
+            result = _EMOJI_RE.sub("", result)
 
         return result
 
@@ -212,7 +234,7 @@ class SpeakingStyleManager:
 
     def _apply_emoji(self, text: str) -> str:
         """添加 emoji（低频，像真人偶尔发一个）"""
-        if not self.style.use_emoji:
+        if not self.style.use_emoji or not self.emoji_set:
             return text
 
         # 兼容 0-1 概率与 0-10 刻度（配置文件里可能是面板刻度值）
@@ -307,6 +329,7 @@ def create_default_style() -> SpeakingStyle:
         filler_frequency=0.08,
         min_sentence_length=5,
         max_sentence_length=50,
+        max_reply_length=20,
         avg_sentence_length_range=(10, 30),
         use_ellipsis=True,
         use_emoji=True,

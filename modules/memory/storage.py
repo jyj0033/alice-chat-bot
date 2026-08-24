@@ -8,13 +8,31 @@ import logging
 import math
 import re
 import sqlite3
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _db_locked(method):
+    """Serialize access to the shared SQLite connection.
+
+    The async facade runs synchronous storage methods in a thread pool, while
+    the dashboard may use the same storage from another event loop.  SQLite
+    connections are not safe to use concurrently just because
+    ``check_same_thread`` is disabled, so every database-facing method uses a
+    process-local re-entrant lock.
+    """
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._db_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 def _strip_speaker(content: str) -> str:
@@ -81,8 +99,10 @@ class Memory:
 class MemoryStorage:
     """记忆存储"""
 
-    def __init__(self, db_path: str = "data/memory.db"):
+    def __init__(self, db_path: str = "data/memory.db", share_across_sessions: bool = False):
         self.db_path = db_path
+        self.share_across_sessions = bool(share_across_sessions)
+        self._db_lock = threading.RLock()
         self._ensure_dir()
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -96,17 +116,19 @@ class MemoryStorage:
 
     def _cache_embed(self, memory_id: int, vector: list) -> None:
         """写向量缓存（LRU 淘汰最旧，避免无限增长）"""
-        self._embed_cache[memory_id] = vector
-        self._embed_cache.move_to_end(memory_id)
-        while len(self._embed_cache) > self._embed_cache_max:
-            self._embed_cache.popitem(last=False)
+        with self._db_lock:
+            self._embed_cache[memory_id] = vector
+            self._embed_cache.move_to_end(memory_id)
+            while len(self._embed_cache) > self._embed_cache_max:
+                self._embed_cache.popitem(last=False)
 
     def _get_embed(self, memory_id: int) -> Optional[list]:
         """读向量缓存（命中即刷新为最近使用）"""
-        v = self._embed_cache.get(memory_id)
-        if v is not None:
-            self._embed_cache.move_to_end(memory_id)
-        return v
+        with self._db_lock:
+            v = self._embed_cache.get(memory_id)
+            if v is not None:
+                self._embed_cache.move_to_end(memory_id)
+            return v
 
     def set_embedding_service(self, service) -> None:
         """注入嵌入+重排服务"""
@@ -116,6 +138,7 @@ class MemoryStorage:
         """确保目录存在"""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
+    @_db_locked
     def _init_tables(self) -> None:
         """初始化数据库表"""
         self.conn.execute("""
@@ -176,6 +199,7 @@ class MemoryStorage:
 
     # === 群聊黑话（glossary） ===
 
+    @_db_locked
     def upsert_slang(
         self,
         term: str,
@@ -216,6 +240,7 @@ class MemoryStorage:
         self.conn.commit()
         return cursor.lastrowid
 
+    @_db_locked
     def list_slang(self, session: str = "", enabled_only: bool = False) -> list[dict]:
         """列出黑话（session 为空时返回全部，便于 Web 管理）。"""
         clauses, params = [], []
@@ -231,16 +256,23 @@ class MemoryStorage:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @_db_locked
     def update_slang(self, slang_id: int, **fields) -> bool:
-        """更新单条黑话（term/meaning/example/enabled）。"""
+        """更新单条黑话；人工编辑内容后将词条标记为 manual。"""
         allowed = {"term", "meaning", "example", "enabled"}
         sets, params = [], []
+        content_edited = False
         for key, value in fields.items():
             if key in allowed and value is not None:
                 sets.append(f"{key} = ?")
                 params.append(int(value) if key == "enabled" else str(value).strip())
+                if key != "enabled":
+                    content_edited = True
         if not sets:
             return False
+        # 人工编辑过释义/例句的自动词条，后续审核也必须保护起来；单纯启停不改变来源。
+        if content_edited:
+            sets.append("source = 'manual'")
         sets.append("updated_at = ?")
         params.append(datetime.now().isoformat(sep=' '))
         params.append(slang_id)
@@ -250,11 +282,32 @@ class MemoryStorage:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    @_db_locked
     def delete_slang(self, slang_id: int) -> bool:
         cursor = self.conn.execute("DELETE FROM glossary WHERE id = ?", (slang_id,))
         self.conn.commit()
         return cursor.rowcount > 0
 
+    @_db_locked
+    def delete_auto_slang(self, slang_ids: list[int]) -> int:
+        """批量删除自动提取的词条，绝不触碰人工词条。"""
+        ids = set()
+        for value in slang_ids or []:
+            try:
+                ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        cursor = self.conn.execute(
+            f"DELETE FROM glossary WHERE source = 'auto' AND id IN ({placeholders})",
+            tuple(sorted(ids)),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    @_db_locked
     def match_slang(self, text: str, session: str = "", limit: int = 12) -> list[dict]:
         """挑出文本里出现过的黑话。
 
@@ -271,6 +324,7 @@ class MemoryStorage:
         matched.sort(key=lambda r: len(r["term"]), reverse=True)
         return matched[:limit]
 
+    @_db_locked
     def bump_slang_hits(self, slang_ids: list) -> int:
         """记录命中次数，Web 端据此排序，也能看出哪些词是活的。"""
         ids = [i for i in (slang_ids or []) if i]
@@ -283,6 +337,7 @@ class MemoryStorage:
         self.conn.commit()
         return len(ids)
 
+    @_db_locked
     def store(self, memory: Memory) -> int:
         """存储记忆"""
         cursor = self.conn.execute("""
@@ -303,6 +358,7 @@ class MemoryStorage:
         logger.debug(f"Stored memory: {memory.id}, type={memory.memory_type}")
         return memory.id
 
+    @_db_locked
     def retrieve(
         self,
         query: str = "",
@@ -335,10 +391,13 @@ class MemoryStorage:
         cursor = self.conn.execute(sql, params)
         memories = []
         for row in cursor.fetchall():
-            memories.append(self._row_to_memory(row))
+            memory = self._row_to_memory(row)
+            if self._is_retrievable_memory(memory):
+                memories.append(memory)
 
         return memories
 
+    @_db_locked
     def get_recent(self, memory_type: str, limit: int = 50) -> list[Memory]:
         """获取最近的记忆"""
         cursor = self.conn.execute("""
@@ -350,6 +409,7 @@ class MemoryStorage:
 
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
+    @_db_locked
     def get_profiles(self) -> list[Memory]:
         """所有用户画像（semantic 记忆且 metadata.profile=True），按最近更新排序。
 
@@ -365,6 +425,7 @@ class MemoryStorage:
         profiles.sort(key=lambda m: m.last_accessed, reverse=True)
         return profiles
 
+    @_db_locked
     def update_memory(self, memory: Memory) -> bool:
         """整条更新已有记忆的字段（用户画像重新提炼时复用原 id，不产生孤儿记录）。"""
         if not memory.id:
@@ -387,6 +448,7 @@ class MemoryStorage:
         self.conn.commit()
         return True
 
+    @_db_locked
     def get_all(self, limit: int = 1000, memory_type: Optional[str] = None) -> list[Memory]:
         """获取长期记忆（默认情景+语义；指定类型时只返回该类型），按重要性排序"""
         if memory_type:
@@ -401,6 +463,7 @@ class MemoryStorage:
         """, (*params, limit))
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
+    @_db_locked
     def list_sessions(self, limit: int = 50) -> list[dict]:
         """列出所有出现过消息的会话（含私聊），按最近活跃排序。
 
@@ -418,6 +481,7 @@ class MemoryStorage:
         """, (limit,))
         return [dict(row) for row in cursor.fetchall()]
 
+    @_db_locked
     def retrieve_session_recent(
         self, session: str, limit: int = 5, memory_type: Optional[str] = None
     ) -> list[Memory]:
@@ -439,6 +503,7 @@ class MemoryStorage:
 
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
+    @_db_locked
     def count_session_messages(
         self, session: str, before: Optional[datetime] = None
     ) -> int:
@@ -456,6 +521,7 @@ class MemoryStorage:
             """, (session,))
         return cursor.fetchone()[0]
 
+    @_db_locked
     def get_session_messages(
         self,
         session: str,
@@ -486,6 +552,7 @@ class MemoryStorage:
 
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
+    @_db_locked
     def find_similar(self, session: str, sender_id: str, content: str,
                      memory_type: str = "episodic", lookback: int = 300) -> Optional[Memory]:
         """写入去重：在同会话同发送者的已有记忆中找与 content 高度近似的一条。
@@ -519,6 +586,7 @@ class MemoryStorage:
                 break
         return best if best_ratio >= 0.85 else None
 
+    @_db_locked
     def update_access(self, memory_id: int) -> None:
         """更新访问时间"""
         self.conn.execute("""
@@ -526,6 +594,7 @@ class MemoryStorage:
         """, (memory_id,))
         self.conn.commit()
 
+    @_db_locked
     def bump_memories(self, memory_ids: list[int], importance_boost: float = 0.01) -> int:
         """检索反馈强化：批量刷新被召回记忆的 last_accessed 并轻微提升 importance。
 
@@ -547,6 +616,7 @@ class MemoryStorage:
         self.conn.commit()
         return len(ids)
 
+    @_db_locked
     def update_importance(self, memory_id: int, importance: float) -> None:
         """更新重要性"""
         self.conn.execute("""
@@ -554,12 +624,14 @@ class MemoryStorage:
         """, (importance, memory_id))
         self.conn.commit()
 
+    @_db_locked
     def delete(self, memory_id: int) -> bool:
         """删除记忆"""
         cursor = self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         self.conn.commit()
         return cursor.rowcount > 0
 
+    @_db_locked
     def cleanup_old(self, days: int = 30) -> int:
         """清理旧记忆"""
         cursor = self.conn.execute("""
@@ -655,14 +727,23 @@ class MemoryStorage:
         """
         now = now or datetime.now()
         age_days = max(0.0, (now - last_accessed).total_seconds()) / 86400.0
-        return 0.5 ** (age_days / half_life_days)
+        return 0.5 ** (age_days / max(0.1, float(half_life_days)))
 
-    def _effective_importance(self, memory: Memory, now: datetime = None, half_life_days: float = 30.0) -> float:
+    def _effective_importance(
+        self,
+        memory: Memory,
+        now: datetime = None,
+        half_life_days: float = 30.0,
+        presets: Optional[dict] = None,
+    ) -> float:
         """有效重要性 = 基础 importance × 时间衰减"""
+        preset = (presets or {}).get(memory.memory_type, {})
+        half_life_days = preset.get("half_life_days", half_life_days)
         return memory.importance * self._decay_factor(memory.last_accessed, now, half_life_days)
 
     # ---------- 嵌入向量持久化 ----------
 
+    @_db_locked
     def get_embedding(self, memory_id: int) -> Optional[list]:
         """从数据库读取某条记忆的嵌入向量"""
         try:
@@ -675,6 +756,7 @@ class MemoryStorage:
             pass
         return None
 
+    @_db_locked
     def update_embedding(self, memory_id: int, vector: list) -> None:
         """持久化某条记忆的嵌入向量"""
         try:
@@ -689,12 +771,14 @@ class MemoryStorage:
 
     def clear_embed_cache(self, ids: set = None) -> None:
         """清理向量缓存（删除记忆后调用）"""
-        if ids is None:
-            self._embed_cache.clear()
-        else:
-            for mid in ids:
-                self._embed_cache.pop(mid, None)
+        with self._db_lock:
+            if ids is None:
+                self._embed_cache.clear()
+            else:
+                for mid in ids:
+                    self._embed_cache.pop(mid, None)
 
+    @_db_locked
     def semantic_search(
         self,
         query: str,
@@ -703,13 +787,13 @@ class MemoryStorage:
         top_k_candidates: int = 200,
         half_life_days: float = 30.0,
         similarity_weight: float = 0.85,
+        decay_presets: Optional[dict] = None,
     ) -> list[Memory]:
         """语义检索：TF-IDF + 余弦相似度，结合时间衰减后的重要性排序。
 
-        排序策略（两段式）：
-        - 有相似度命中（sim > 阈值）的记忆：score = weight×sim + (1-weight)×有效重要性
-        - 完全无关的记忆（sim≈0）排在命中记忆之后，按有效重要性排序
-        这样精确相关的记忆不会被"高重要性但无关"的记忆挤掉。
+        排序策略：
+        - 只返回有相似度命中的记忆：score = weight×sim + (1-weight)×有效重要性
+        - 完全无关的记忆不伪装成召回结果，由调用方决定是否使用会话最近记忆兜底
 
         无 jieba/numpy 时退回 LIKE 检索。
         """
@@ -764,12 +848,9 @@ class MemoryStorage:
         # 余弦相似度
         q_norm = numpy.linalg.norm(q)
         if q_norm == 0:
-            # 查询词完全不在记忆词典里（全为新词）：按有效重要性兜底返回
-            scored = sorted(
-                ((self._effective_importance(m, now, half_life_days), m) for m in candidates),
-                key=lambda x: x[0], reverse=True,
-            )
-            return [m for _, m in scored[:limit]]
+            # 查询词完全不在记忆词典里时，不能把高重要性但无关的内容
+            # 冒充相关记忆；调用方会走“会话最近记忆”兜底。
+            return []
 
         row_norms = numpy.linalg.norm(X, axis=1)
         denom = row_norms * q_norm
@@ -777,33 +858,41 @@ class MemoryStorage:
         mask = denom > 1e-9
         similarities[mask] = numpy.sum(X[mask] * q, axis=1) / denom[mask]
 
-        # 两段式排序：命中的优先，无关记忆按有效重要性垫底
+        # 只保留命中记忆；无关内容交给上层的会话近期消息兜底。
         HIT_THRESHOLD = 0.05
         hits = []
-        misses = []
         for i, m in enumerate(candidates):
             sim = float(similarities[i])
-            eff_imp = self._effective_importance(m, now, half_life_days)
+            eff_imp = self._effective_importance(
+                m, now, half_life_days, presets=decay_presets
+            )
             if sim > HIT_THRESHOLD:
                 score = similarity_weight * sim + (1 - similarity_weight) * eff_imp
                 hits.append((score, m))
-            else:
-                misses.append((eff_imp, m))
 
         hits.sort(key=lambda x: x[0], reverse=True)
-        misses.sort(key=lambda x: x[0], reverse=True)
+        return [m for _, m in hits[:limit]]
 
-        result = [m for _, m in hits[:limit]]
-        if len(result) < limit:
-            result.extend(m for _, m in misses[: limit - len(result)])
-        return result
-
+    @_db_locked
     def _get_candidates(self, session: str = "", top_k: int = 200) -> list[Memory]:
-        """取候选记忆：会话内优先，不足补其他会话。
+        """取候选记忆：默认只取当前会话，显式共享时才补其他会话。
 
-        会话隔离：群会话不检索私聊来源的记忆（私事不外泄）；私聊会话仍可检索
-        群聊记忆（更贴心）；跨群记忆共享保持不变（爱丽丝是统一人格）。
+        默认严格按会话隔离，避免个人信息和群内话题跨边界泄漏。若显式开启
+        ``share_across_sessions``，才恢复旧的跨会话共享策略。
         """
+        if session and not self.share_across_sessions:
+            cursor = self.conn.execute("""
+                SELECT * FROM memories
+                WHERE memory_type IN ('episodic', 'semantic', 'session_summary')
+                  AND source_session = ?
+                ORDER BY importance DESC, last_accessed DESC
+                LIMIT ?
+            """, (session, top_k))
+            return [
+                memory for memory in (self._row_to_memory(r) for r in cursor.fetchall())
+                if self._is_retrievable_memory(memory)
+            ]
+
         cursor = self.conn.execute("""
             SELECT * FROM memories
             WHERE memory_type IN ('episodic', 'semantic', 'session_summary')
@@ -811,7 +900,10 @@ class MemoryStorage:
             LIMIT ?
         """, (top_k,))
         rows = cursor.fetchall()
-        memories = [self._row_to_memory(r) for r in rows]
+        memories = [
+            memory for memory in (self._row_to_memory(r) for r in rows)
+            if self._is_retrievable_memory(memory)
+        ]
 
         if not session:
             return memories
@@ -828,6 +920,17 @@ class MemoryStorage:
         # 会话内优先，剩余名额补齐
         return session_mem + others[:max(0, top_k - len(session_mem))]
 
+    @staticmethod
+    def _is_retrievable_memory(memory: Memory) -> bool:
+        """带质量警告的画像保留在管理面板，但不直接喂给回复模型。"""
+        meta = memory.metadata or {}
+        return not (
+            memory.memory_type == "semantic"
+            and meta.get("profile")
+            and meta.get("warnings")
+        )
+
+    @_db_locked
     def apply_time_decay(
         self,
         half_life_days: float = 30.0,
@@ -835,9 +938,13 @@ class MemoryStorage:
         max_age_days: float = 180.0,
         presets: Optional[dict] = None,
     ) -> dict:
-        """批量应用时间衰减：
-        - 每条记忆 importance 按 last_accessed 半衰期衰减
-        - 衰减后 importance < min_importance 且超过 max_age_days 的删除
+        """批量检查时间衰减并删除已经失效的记忆。
+
+        有效重要性在检索时按 ``importance × 时间因子`` 动态计算，不能把
+        衰减后的值再次写回 importance；否则每次定时任务都会重复乘一次，
+        造成远快于配置的指数衰减。
+
+        - 有效重要性 < min_importance 且超过 max_age_days 的删除
         - 返回 {'decayed': n, 'deleted': n}
 
         支持按 memory_type 分级（presets），让不同性质的记忆寿命不同：
@@ -851,7 +958,6 @@ class MemoryStorage:
 
         decayed = 0
         deleted = 0
-        updates: list[tuple] = []
         deletes: list[int] = []
         for row in rows:
             preset = (presets or {}).get(row["memory_type"], {})
@@ -868,31 +974,26 @@ class MemoryStorage:
             last_acc = last_acc or now
 
             age_days = max(0.0, (now - last_acc).total_seconds()) / 86400.0
-            new_importance = importance * (0.5 ** (age_days / hl))
+            new_importance = importance * (0.5 ** (age_days / max(0.1, hl)))
 
             if new_importance < min_importance and age_days > ma:
                 deletes.append(mid)
                 deleted += 1
                 self._embed_cache.pop(mid, None)
-            elif abs(new_importance - importance) > 1e-6:
-                updates.append((round(new_importance, 4), mid))
+            elif new_importance < importance - 1e-6:
                 decayed += 1
 
-        # 批量执行，避免逐条 UPDATE 的开销
-        if updates:
-            self.conn.executemany(
-                "UPDATE memories SET importance = ? WHERE id = ?", updates
-            )
         if deletes:
             self.conn.executemany(
                 "DELETE FROM memories WHERE id = ?", [(mid,) for mid in deletes]
             )
 
         self.conn.commit()
-        if decayed or deleted:
-            logger.info(f"Time decay applied: {decayed} decayed, {deleted} deleted")
+        if deleted:
+            logger.info(f"Time decay checked: {decayed} stale, {deleted} deleted")
         return {"decayed": decayed, "deleted": deleted}
 
+    @_db_locked
     def close(self) -> None:
         """关闭连接"""
         self.conn.close()
@@ -916,7 +1017,9 @@ class AsyncMemoryStorage:
             try:
                 vecs = await service.embed([memory.content])
                 if vecs and vecs[0]:
-                    self._storage.update_embedding(mid, vecs[0])
+                    # 数据库写入也放到线程池，不能在事件循环里直接操作
+                    # 与 QQ/Dashboard 共享的 SQLite 连接。
+                    await asyncio.to_thread(self._storage.update_embedding, mid, vecs[0])
             except Exception as e:
                 logger.debug(f"Embedding on store skipped: {e}")
         return mid
@@ -988,7 +1091,8 @@ class AsyncMemoryStorage:
         limit: int = 5,
         top_k_candidates: int = 200,
         half_life_days: float = 30.0,
-        similarity_weight: float = 0.6,
+        similarity_weight: float = 0.85,
+        decay_presets: Optional[dict] = None,
     ) -> list[Memory]:
         """两阶段语义检索：
         1. 有嵌入服务：向量召回 top-30 → 重排 → top-N
@@ -998,7 +1102,8 @@ class AsyncMemoryStorage:
         if service and service.enabled:
             try:
                 result = await self._vector_search(
-                    query, session, limit, top_k_candidates
+                    query, session, limit, top_k_candidates,
+                    half_life_days, similarity_weight, decay_presets,
                 )
                 if result is not None:
                     return result
@@ -1007,16 +1112,27 @@ class AsyncMemoryStorage:
 
         return await asyncio.to_thread(
             self._storage.semantic_search, query, session, limit,
-            top_k_candidates, half_life_days, similarity_weight,
+            top_k_candidates, half_life_days, similarity_weight, decay_presets,
         )
 
     async def _vector_search(
-        self, query: str, session: str, limit: int, top_k_candidates: int
+        self,
+        query: str,
+        session: str,
+        limit: int,
+        top_k_candidates: int,
+        half_life_days: float,
+        similarity_weight: float,
+        decay_presets: Optional[dict],
     ) -> Optional[list[Memory]]:
         """向量召回 + 重排。任一环节失败返回 None（调用方回退 TF-IDF）"""
         service = self._storage._embedding_service
         if not service or not service.enabled:
             return None
+        try:
+            similarity_weight = min(1.0, max(0.0, float(similarity_weight)))
+        except (TypeError, ValueError):
+            similarity_weight = 0.85
 
         candidates = await asyncio.to_thread(
             self._storage._get_candidates, session, top_k_candidates
@@ -1047,9 +1163,10 @@ class AsyncMemoryStorage:
         mask = denom > 1e-9
         sims[mask] = np.sum(M[mask] * q, axis=1) / denom[mask]
 
-        # 会话内优先，再按相似度排序取候选
+        # 先按相似度取候选；跨会话共享开启时也不能让无关的本会话内容
+        # 抢走真正相关的其他会话记忆。
         order = list(range(len(candidates)))
-        order.sort(key=lambda i: (candidates[i].source_session != session, -sims[i]))
+        order.sort(key=lambda i: -sims[i])
         vec_recalled = [candidates[i] for i in order[:self.VECTOR_RECALL_K]]
 
         # 3.5 词法召回（TF-IDF）与向量召回合并：人名/游戏黑话等专有名词靠字面匹配兜底
@@ -1058,7 +1175,8 @@ class AsyncMemoryStorage:
             lexical = await asyncio.to_thread(
                 self._storage.semantic_search, query, session,
                 limit=self.VECTOR_RECALL_K, top_k_candidates=top_k_candidates,
-                half_life_days=30.0, similarity_weight=0.85,
+                half_life_days=half_life_days, similarity_weight=similarity_weight,
+                decay_presets=decay_presets,
             )
             for m in lexical:
                 if m.id not in recalled_by_id:
@@ -1071,11 +1189,41 @@ class AsyncMemoryStorage:
         docs = [m.content for m in recalled]
         reranked_idx = await service.rerank(query, docs, top_n=limit)
         if reranked_idx is not None:
-            ranked = [recalled[i] for i in reranked_idx if i < len(recalled)]
+            ranked = [recalled[i] for i in reranked_idx if 0 <= i < len(recalled)]
+            # 重排服务只返回顺序，不一定返回分数；用排名近似相关度，
+            # 再混入有效重要性，让 half_life/similarity_weight 在嵌入模式下
+            # 仍然生效，避免冷门旧记忆永远压过新事实。
+            now = datetime.now()
+            denom = max(1, len(ranked) - 1)
+            ranked = [
+                memory for _, memory in sorted(
+                    enumerate(ranked),
+                    key=lambda item: (
+                        similarity_weight * (1.0 - item[0] / denom)
+                        + (1.0 - similarity_weight)
+                        * self._storage._effective_importance(
+                            item[1], now, half_life_days, presets=decay_presets
+                        )
+                    ),
+                    reverse=True,
+                )
+            ]
             return ranked[:limit]
 
         # 重排失败：退回向量相似度排序
-        ordered = sorted(recalled, key=lambda m: sims[candidates.index(m)], reverse=True)
+        now = datetime.now()
+        weight = similarity_weight
+        ordered = sorted(
+            recalled,
+            key=lambda m: (
+                weight * sims[candidates.index(m)]
+                + (1.0 - weight)
+                * self._storage._effective_importance(
+                    m, now, half_life_days, presets=decay_presets
+                )
+            ),
+            reverse=True,
+        )
         return ordered[:limit]
 
     async def _ensure_vectors(self, memories: list) -> Optional[list]:
@@ -1108,7 +1256,7 @@ class AsyncMemoryStorage:
                     return None
                 for m, v in zip(missing, new_vecs):
                     if v:
-                        storage.update_embedding(m.id, v)  # 内部走 _cache_embed
+                        await asyncio.to_thread(storage.update_embedding, m.id, v)
             # 填回
             for k, i in enumerate(missing_idx):
                 v = storage._get_embed(missing[k].id)
@@ -1141,8 +1289,12 @@ class AsyncMemoryStorage:
         """异步删除（同时清理向量缓存）"""
         ok = await asyncio.to_thread(self._storage.delete, memory_id)
         if ok:
-            self._storage._embed_cache.pop(memory_id, None)
+            self._storage.clear_embed_cache({memory_id})
         return ok
+
+    async def close(self) -> None:
+        """异步关闭底层 SQLite 连接。"""
+        await asyncio.to_thread(self._storage.close)
 
     # === 群聊黑话（异步包装） ===
 
@@ -1162,6 +1314,9 @@ class AsyncMemoryStorage:
 
     async def delete_slang(self, slang_id: int) -> bool:
         return await asyncio.to_thread(self._storage.delete_slang, slang_id)
+
+    async def delete_auto_slang(self, slang_ids: list[int]) -> int:
+        return await asyncio.to_thread(self._storage.delete_auto_slang, slang_ids)
 
     async def match_slang(self, text: str, session: str = "", limit: int = 12) -> list:
         return await asyncio.to_thread(self._storage.match_slang, text, session, limit)

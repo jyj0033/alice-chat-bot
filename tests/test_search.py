@@ -124,6 +124,19 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
             "[表情包，内容：白发红瞳的动漫角色闭眼咧嘴笑着…，回复：笑死]", ""))
         tool_llm.chat.assert_not_awaited()
 
+    async def test_group_short_reaction_skips_search_judge(self):
+        """群聊短反应即使含有问句词，也不应先触发联网判断。"""
+        tool_llm = MagicMock()
+        tool_llm.chat = AsyncMock(return_value=ChatResponse(content="YES", model="test"))
+        gen = self._make_generator(tool_llm, MagicMock())
+        gen.search_client.available = True
+        self.assertFalse(await gen._judge_need_search(
+            "现在是什么", "[刚刚] 小明：现在是什么",
+            direction="group",
+            action_plan={"action": "react"},
+        ))
+        tool_llm.chat.assert_not_awaited()
+
     async def test_judge_failure_conservative_no(self):
         """判断调用异常 → 按不需要搜索处理，保证回复不中断。"""
         tool_llm = MagicMock()

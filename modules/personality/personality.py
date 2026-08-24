@@ -51,8 +51,10 @@ class Personality:
         """从 YAML 文件加载"""
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f)
-            return cls(**data)
+                data = yaml.safe_load(f) or {}
+            # 配置文件通常还会包含 speaking_style 等人格旁支字段，不能直接
+            # `cls(**data)`，否则一个未知字段就让整个人格回退成默认值。
+            return cls.from_dict(data if isinstance(data, dict) else {})
         except Exception as e:
             logger.error(f"Failed to load personality from {path}: {e}")
             return cls()
@@ -110,6 +112,12 @@ class Personality:
 
         if self.background:
             parts.append(self.background.strip())
+
+        if self.avatar_description:
+            parts.append(
+                f"外在给人的感觉是：{self.avatar_description.strip()}。"
+                "这是角色背景，除非别人问到，不要主动介绍自己的外貌。"
+            )
 
         traits = self._describe_traits()
         if traits:
@@ -234,7 +242,7 @@ class Personality:
             parts.append("说话简短随意，不铺陈")
 
         if self.emoji_set:
-            parts.append("基本不用 emoji，绝大多数时候是纯文字")
+            parts.append("偶尔会用一个 emoji，但不是每句都带")
 
         if self.catchphrases:
             parts.append(

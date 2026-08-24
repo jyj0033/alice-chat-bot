@@ -1,11 +1,12 @@
 """群聊发言权与发送前复核的离线场景测试。"""
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 import unittest
 
-from modules.memory.context import ContextMessage
+from modules.memory.context import ContextManager, ContextMessage
 from modules.reply.generator import ReplyGenerator
-from modules.social.awareness import SocialContext
+from modules.social.awareness import SocialAwarenessManager, SocialContext, TriggerDetector
 from modules.social.conversation_floor import (
     ActionPlan,
     ActionType,
@@ -236,6 +237,23 @@ class ConversationFloorTests(unittest.TestCase):
         self.assertFalse(decision.should_speak)
         self.assertEqual(decision.probability, 0.0)
 
+    def test_taboo_group_topic_does_not_trigger_unsolicited_interjection(self):
+        """禁忌话题在群友互聊时不主动插话，明确问 bot 时交给生成器做边界回复。"""
+        awareness = SocialAwarenessManager(taboo_topics=["政治宗教"])
+        context = SocialContext(
+            message_content="群里又聊到政治宗教了",
+            sender_id="u1",
+            group_id="g1",
+            session_id="group_g1",
+        )
+        awareness.analyze(context)
+        self.assertTrue(context.extra["taboo_topic"])
+        self.assertEqual(context.topic_relevance, 0.0)
+
+        decision = EnhancedSpeakingDecider().decide(context)
+        self.assertFalse(decision.should_speak)
+        self.assertIn("禁忌", decision.reason)
+
     def test_action_plan_constrains_prompt_and_final_length(self):
         plan = {
             "action": "react",
@@ -257,6 +275,46 @@ class ConversationFloorTests(unittest.TestCase):
         cut = generator._limit_action_length("确实有点太离谱了", 6)
         self.assertLessEqual(len(cut), 6)
         self.assertEqual(cut, "确实有点太")
+
+    def test_reply_plan_refreshes_to_latest_undirected_message(self):
+        """思考期间群聊前进但未过期时，计划应跟随最新消息而不是旧目标。"""
+        from main import GroupChatBot
+
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.config = {"qq": {"self_id": "bot"}}
+        bot.context_manager = ContextManager()
+        bot.conversation_floor_manager = ConversationFloorManager()
+        bot.social_awareness = SocialAwarenessManager()
+        bot.trigger_detector = TriggerDetector(bot_nickname="爱丽丝")
+
+        original = self.message("u1", "今晚吃什么", 0, message_id="m1")
+        newer = self.message("u2", "笑死哈哈哈", 2, message_id="m2")
+        window = bot.context_manager.get_window("group_g1")
+        window.add(original)
+        window.add(newer)
+
+        plan = ActionPlan(
+            action=ActionType.REPLY,
+            target_message_id="m1",
+            target_user_id="u1",
+            confidence=0.5,
+            interruption_cost=0.28,
+            reason="存在自然接话机会",
+            tone="像普通群友一样随意接一句",
+            max_chars=26,
+            wait_multiplier=1.0,
+            directed=False,
+            is_question=False,
+            target_timestamp=original.timestamp,
+        )
+
+        refreshed, cancelled = bot._refresh_action_plan_after_wait(
+            SimpleNamespace(session_id="group_g1"), "group", plan
+        )
+
+        self.assertFalse(cancelled)
+        self.assertEqual(refreshed.target_message_id, "m2")
+        self.assertEqual(refreshed.action, ActionType.REACT)
 
 
 if __name__ == "__main__":

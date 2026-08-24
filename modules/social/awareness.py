@@ -219,11 +219,18 @@ class TopicAnalyzer:
         "连续", "能量", "ok", "都ok",
     }
 
-    def __init__(self, interested_topics: list[str] = None, bored_topics: list[str] = None):
+    def __init__(
+        self,
+        interested_topics: list[str] = None,
+        bored_topics: list[str] = None,
+        taboo_topics: list[str] = None,
+    ):
         self.interested_topics = interested_topics or []
         self.bored_topics = bored_topics or []
+        self.taboo_topics = taboo_topics or []
         self._interested_keywords = self._extract_keywords(self.interested_topics)
         self._bored_keywords = self._extract_keywords(self.bored_topics)
+        self._taboo_keywords = self._extract_keywords(self.taboo_topics)
 
     @classmethod
     def _extract_keywords(cls, topics: list[str]) -> set[str]:
@@ -258,6 +265,9 @@ class TopicAnalyzer:
         message_lower = (message or "").lower()
         relevance = 0.5
 
+        if self.is_taboo(message):
+            return 0.0
+
         interested_hits = sum(
             1 for kw in self._interested_keywords if kw in message_lower
         )
@@ -270,6 +280,13 @@ class TopicAnalyzer:
             relevance -= min(0.4, 0.3 + 0.05 * (bored_hits - 1))
 
         return max(0.0, min(1.0, relevance))
+
+    def is_taboo(self, message: str) -> bool:
+        """判断消息是否触及配置的禁忌话题。"""
+        text = (message or "").lower()
+        if not text:
+            return False
+        return any(keyword in text for keyword in self._taboo_keywords)
 
     def analyze_familiarity(self, message: str) -> float:
         """
@@ -307,12 +324,17 @@ class SocialAwarenessManager:
         self,
         bot_nickname: str = "",
         interested_topics: list[str] = None,
-        bored_topics: list[str] = None
+        bored_topics: list[str] = None,
+        taboo_topics: list[str] = None,
     ):
         # 注意：不创建内部的 trigger_detector，避免循环调用
         self._bot_nickname = bot_nickname
         self.ambience_analyzer = AmbienceAnalyzer()
-        self.topic_analyzer = TopicAnalyzer(interested_topics, bored_topics)
+        self.topic_analyzer = TopicAnalyzer(
+            interested_topics,
+            bored_topics,
+            taboo_topics,
+        )
 
     def analyze(self, context: SocialContext) -> SocialContext:
         """完整分析社交上下文"""
@@ -333,5 +355,6 @@ class SocialAwarenessManager:
         # 话题分析
         context.topic_relevance = self.topic_analyzer.analyze_relevance(context.message_content)
         context.topic_familiarity = self.topic_analyzer.analyze_familiarity(context.message_content)
+        context.extra["taboo_topic"] = self.topic_analyzer.is_taboo(context.message_content)
 
         return context

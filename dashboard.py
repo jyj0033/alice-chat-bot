@@ -525,7 +525,13 @@ async def get_memories(session: str = "", q: str = "", type: str = "all", limit:
             continue
         if q_lower and q_lower not in m.content.lower():
             continue
-        eff = bot_instance.memory_storage._storage._effective_importance(m, now, bot_instance.memory_half_life_days)
+        decay_presets = getattr(bot_instance, "memory_decay_presets", {}) or {}
+        half_life = decay_presets.get(m.memory_type, {}).get(
+            "half_life_days", bot_instance.memory_half_life_days
+        )
+        eff = bot_instance.memory_storage._storage._effective_importance(
+            m, now, half_life
+        )
         result.append({
             "id": m.id,
             "content": m.content,
@@ -601,13 +607,18 @@ async def distill_profiles():
 async def get_slang():
     """群聊黑话词表（Web 管理用，返回全部含停用项）"""
     if not bot_instance or not bot_instance.memory_storage:
-        return {"slang": [], "total": 0}
+        return {"slang": [], "total": 0, "cleanup": {}}
     try:
         rows = await bot_instance.memory_storage.list_slang()
-        return {"slang": rows, "total": len(rows)}
+        slang_config = getattr(bot_instance, "_slang_config", {}) or {}
+        return {
+            "slang": rows,
+            "total": len(rows),
+            "cleanup": slang_config.get("cleanup", {}) or {},
+        }
     except Exception as e:
         logger.error(f"Failed to load slang: {e}")
-        return {"slang": [], "total": 0}
+        return {"slang": [], "total": 0, "cleanup": {}}
 
 
 @app.post("/api/slang")
@@ -677,6 +688,22 @@ async def extract_slang_now():
         return {"success": True, **result}
     except Exception as e:
         logger.error(f"Manual slang extract failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/slang/cleanup")
+async def cleanup_slang_now():
+    """立即审核并清理明显错误的自动黑话（人工词条不会删除）。"""
+    if not bot_instance:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        cleanup_cfg = (getattr(bot_instance, "_slang_config", {}) or {}).get("cleanup", {}) or {}
+        result = await bot_instance.cleanup_slang_all(
+            hours=int(cleanup_cfg.get("lookback_hours", 168))
+        )
+        return {"success": not result["error"], **result}
+    except Exception as e:
+        logger.error(f"Manual slang cleanup failed: {e}")
         return {"success": False, "error": str(e)}
 
 

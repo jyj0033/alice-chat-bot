@@ -87,11 +87,17 @@ class ContextWindow:
         self.max_messages = max_messages
         self.max_age = max_age
         self._last_cleanup = datetime.now()
+        # 标记是否已经尝试从 SQLite 恢复过最近历史；新窗口只尝试一次。
+        self.restored_from_storage = False
 
     def add(self, message: ContextMessage) -> None:
         """添加消息"""
         self.messages.append(message)
         self._maybe_cleanup()
+
+    def prepend(self, message: ContextMessage) -> None:
+        """在窗口头部补入历史消息，保持当前实时消息仍在末尾。"""
+        self.messages.appendleft(message)
 
     def _maybe_cleanup(self) -> None:
         """定期清理过期消息"""
@@ -291,6 +297,7 @@ class ContextManager:
         reply_to_id: Optional[str] = None,
         reply_to_qq: Optional[str] = None,
         directed_to_bot: bool = False,
+        timestamp: Optional[datetime] = None,
     ) -> None:
         """添加消息到上下文"""
         window = self.get_window(session_id)
@@ -303,6 +310,28 @@ class ContextManager:
             reply_to_id=reply_to_id,
             reply_to_qq=reply_to_qq,
             directed_to_bot=directed_to_bot,
+            timestamp=timestamp or datetime.now(),
+        ))
+
+    def prepend_message(
+        self,
+        session_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        is_bot: bool = False,
+        message_id: str = "",
+        timestamp: Optional[datetime] = None,
+    ) -> None:
+        """把持久化历史消息补到会话窗口头部。"""
+        window = self.get_window(session_id)
+        window.prepend(ContextMessage(
+            sender_id=sender_id,
+            sender_name=sender_name,
+            content=content,
+            is_bot=is_bot,
+            message_id=message_id,
+            timestamp=timestamp or datetime.now(),
         ))
 
     def update_message_content(

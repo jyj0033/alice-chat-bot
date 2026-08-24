@@ -150,6 +150,21 @@ rich_media:
 - QQ WebSocket 监听地址与端口配置
 - 实时日志
 
+群聊黑话默认每天自动审核一次自动提取的词条，参考最近 7 天群聊，清理明显没有依据、释义不符或属于通用词的记录。手动添加或人工编辑过的词条不会被自动删除。可在配置中调整：
+
+```yaml
+memory:
+  enable_long_term_memory: true
+  # 默认不把个人信息和群聊内容带到其他会话；确有统一记忆需求时再开启
+  share_across_sessions: false
+  slang:
+    cleanup:
+      enabled: true
+      interval_hours: 24
+      lookback_hours: 168
+      max_entries: 40
+```
+
 除状态查看和连接测试外，配置保存到 `config/config.yaml`，重启 Bot 后生效。
 
 ## 许可

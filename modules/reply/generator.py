@@ -161,6 +161,7 @@ class ReplyGenerator:
         tool_llm_provider=None,
         search_client=None,
         bot_name: str = "",
+        taboo_topics: list[str] = None,
     ):
         """
         初始化
@@ -173,10 +174,16 @@ class ReplyGenerator:
             tool_llm_provider: 支持联网搜索判断/带资料生成的 LLM 提供者
             search_client: 搜索客户端（模块 search.SearchClient）
             bot_name: bot 在对话记录里的显示名（用于识别上下文中自己说的行）
+            taboo_topics: 不主动讨论或展开的禁忌话题
         """
         self.llm = llm_provider
         self.personality_prompt = personality_prompt
         self.bot_name = bot_name
+        self.taboo_topics = [
+            str(topic).strip()
+            for topic in (taboo_topics or [])
+            if str(topic).strip()
+        ]
         self.style_manager = speaking_style_manager or SpeakingStyleManager(create_default_style())
         self.base_thinking_delay = thinking_delay
         self.response_filter = ResponseFilter()
@@ -246,7 +253,12 @@ class ReplyGenerator:
         #    再把资料注入上下文用一次干净调用生成回复。
         #    （不用 function calling 工具循环：MiniMax 工具协议不稳定——
         #    内容泄漏、空回复、原生 <invoke> 标记——LLM 判断 + 预搜索 + 注入更可靠。）
-        need_search = await self._judge_need_search(current_message, context_prompt)
+        need_search = await self._judge_need_search(
+            current_message,
+            context_prompt,
+            direction=direction,
+            action_plan=action_plan,
+        )
         if need_search:
             try:
                 response = await self._generate_with_search(
@@ -288,10 +300,15 @@ class ReplyGenerator:
             else:
                 reply = reply2
 
-        # 5. 参与决策：LLM 有权选择沉默（群友互聊/自言自语时）
+        # 5. 参与决策：LLM 有权选择沉默（群友互聊/自言自语时）。
+        # 明确对 bot 的消息不能被模型偶发输出的 <silent> 吞掉，异常时使用
+        # 和网络/模型失败相同的短兜底回复；只有隐式延续和普通插话保留沉默权。
         if self._is_silent(reply):
-            logger.debug(f"LLM 选择沉默（direction={direction}）")
-            return None
+            if direction != "to_bot":
+                logger.debug(f"LLM 选择沉默（direction={direction}）")
+                return None
+            logger.warning("明确对 bot 的消息被 LLM 判为沉默，使用兜底回复")
+            reply = self._get_fallback_reply()
 
         # 6. 过滤回复
         passed, result = self.response_filter.filter(reply)
@@ -318,9 +335,8 @@ class ReplyGenerator:
         # 8. emoji 兜底：最多保留 1 个
         reply = limit_emoji(reply, max_emoji=1)
 
-        # 9. 添加随机延迟（模拟打字）
-        delay = self._calculate_delay(emotional_state)
-        await asyncio.sleep(delay)
+        # 9. 思考/打字延迟由 GroupChatBot._compose_and_send 统一处理。
+        # 这里不再重复等待，避免一次回复串行等待两套延迟。
 
         return reply
 
@@ -333,7 +349,13 @@ class ReplyGenerator:
 
     # === 联网搜索（LLM 判断是否需要搜索） ===
 
-    async def _judge_need_search(self, current_message: str, context_prompt: str = "") -> bool:
+    async def _judge_need_search(
+        self,
+        current_message: str,
+        context_prompt: str = "",
+        direction: str = "",
+        action_plan: Dict[str, Any] = None,
+    ) -> bool:
         """让 LLM 判断这条回复是否需要联网搜索（替代关键词匹配）。
 
         只有 bot 决策层已经决定要回复的消息才会走到 generate()，所以每次
@@ -346,7 +368,16 @@ class ReplyGenerator:
         """
         if not self.tool_llm or not self.search_client or not self.search_client.available:
             return False
+        # 短反应/明确旁观本身不需要实时资料；尤其是群聊插话，先做一次搜索
+        # 判断再让主 LLM 输出 <silent> 会白费一次工具调用和等待时间。
+        if direction != "to_bot" and (action_plan or {}).get("action") in {
+            "react", "silent"
+        }:
+            return False
         text = (current_message or "").strip()
+        if self._matches_taboo(text):
+            # 禁忌话题只需要做边界回复，不要为了它额外联网扩展上下文。
+            return False
         # 富媒体识别描述不判断也不搜索（描述里常带"角色""是什么"等字眼，实为图片内容）
         if text.startswith(self.MEDIA_DESCRIPTION_PREFIXES):
             return False
@@ -569,13 +600,30 @@ class ReplyGenerator:
         if self.personality_prompt:
             request.add_system(self.personality_prompt)
 
+        style = self.style_manager.style
+        try:
+            max_reply_length = max(1, int(style.max_reply_length or 20))
+        except (TypeError, ValueError):
+            max_reply_length = 20
+        emoji_frequency = style.emoji_frequency
+        if emoji_frequency > 1:
+            emoji_frequency /= 10
+        emoji_frequency = max(0.0, min(1.0, emoji_frequency))
+        if style.use_emoji and self.style_manager.emoji_set and emoji_frequency > 0:
+            emoji_guide = (
+                f"emoji 不是必需，只有语气真的合适时偶尔使用（约{round(emoji_frequency * 100)}%回复），"
+                "不要连续使用或为了装可爱硬加。"
+            )
+        else:
+            emoji_guide = "不要使用 emoji，保持纯文字。"
+
         # 回复长度硬约束 - 群聊回复必须简短才像真人
         request.add_system(
-            "回复长度要求：必须是简短的口语回复，一般1-2句话、不超过30个中文字符。"
+            f"回复长度要求：优先用一条短句，确需说明时再用两句，通常不超过{max_reply_length}个中文字符。"
+            "如果本轮行为计划给了更短上限，以行为计划为准。"
             "能用一句话说清就别用两句；不要分点、不要加解释、不要复述对方的话；"
             "偶尔超短也行（几个字），但绝不能长篇大论。\n"
-            "回复中不要使用emoji表情符号，绝大多数消息应该是纯文字；"
-            "除非气氛真的很到位，否则不要加表情。\n"
+            f"{emoji_guide}\n"
             "不要把「哈哈」「哈哈哈」「笑死」当成万能语气词——真觉得好笑才笑，"
             "大部分回复不需要带笑声，也不要习惯性用「...」结尾。\n"
             "发送能力限制：你只能发送纯文字消息，不能发送图片、表情包、语音、视频或文件；"
@@ -595,6 +643,10 @@ class ReplyGenerator:
             "描述里若引用了群友说过的话（带引号的句子），那是在说明这张图在回应什么，"
             "绝不能把那句话当成自己的发言复述出去——要用你自己的话反应。"
         )
+
+        taboo_guide = self._build_taboo_guide()
+        if taboo_guide:
+            request.add_system(taboo_guide)
 
         if action_plan:
             request.add_system(self._build_action_guide(action_plan))
@@ -662,12 +714,28 @@ class ReplyGenerator:
             + "。\n知道意思就行，回复时不用刻意去用这些词，也不要解释它们。"
         )
 
+    def _matches_taboo(self, text: str) -> bool:
+        """判断当前消息是否触及配置的禁忌话题。"""
+        lowered = (text or "").lower()
+        return bool(lowered and any(topic.lower() in lowered for topic in self.taboo_topics))
+
+    def _build_taboo_guide(self) -> str:
+        """把禁忌配置转成可执行的边界，而不是只有一句模糊的“不聊”。"""
+        if not self.taboo_topics:
+            return ""
+        topics = "、".join(f"「{topic}」" for topic in self.taboo_topics[:12])
+        return (
+            f"话题边界：{topics}属于你不主动讨论或展开的内容。"
+            "如果消息只是顺带提到，不要主动接这个点；如果对方明确问你，"
+            "简短表示不聊或自然换个话题，不要补充细节、评价立场，也不要联网搜索。"
+        )
+
     @staticmethod
     def _build_action_guide(action_plan: Dict[str, Any]) -> str:
         """把结构化行为计划翻译成简短、明确的生成约束。"""
         action = action_plan.get("action", "reply")
         tone = action_plan.get("tone", "自然口语")
-        max_chars = int(action_plan.get("max_chars", 30) or 30)
+        max_chars = int(action_plan.get("max_chars", 20) or 20)
         guides = {
             "react": "只做一个很短的即时反应，不解释、不展开新话题",
             "answer": "直接回答问题，先给结论，不复述提问",
@@ -755,6 +823,18 @@ class ReplyGenerator:
     def _get_emotion_guide(self, state: EmotionalState) -> str:
         """根据情感状态生成指导"""
         guides = []
+
+        emotion_guides = {
+            "happy": "你现在心情不错，语气可以轻松一点",
+            "excited": "你现在有点兴奋，表达可以更有活力，但别失控刷屏",
+            "bored": "你现在对话题有点提不起劲，保持简短，不要硬装热情",
+            "tired": "你现在有点累，能短说就别展开",
+            "anxious": "你现在有点不安，语气谨慎一点，不要把情绪迁怒给别人",
+            "calm": "你现在比较平静，按平常语气说话",
+        }
+        emotion = getattr(getattr(state, "current_emotion", None), "value", "neutral")
+        if state.emotion_intensity >= 0.15 and emotion in emotion_guides:
+            guides.append(emotion_guides[emotion])
 
         if state.energy > 0.8:
             guides.append("你精力充沛，回复可以更积极热情")

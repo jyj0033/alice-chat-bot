@@ -107,14 +107,20 @@ class EnhancedSpeakingDecider:
         """
         session_id = context.session_id
         modifiers = {}
+        trigger_result = context.extra.get("trigger", {})
+        action_plan = context.extra.get("action_plan")
 
         # === 1. 检查冷却（@ / 引用 / 当前正延续对话时跳过）===
         # 冷却用于限制“低概率随机插话”刷屏；明确对我说或 bot 刚回复过对方、
         # 对方正自然延续对话时，不应被冷却挡住，否则会错过真人之间 30-60s 的接话。
         if self.fatigue_manager.is_in_cooldown(session_id) and not (
-            context.mentioned_me
+            context.extra.get("is_private", False)
+            or context.mentioned_me
             or context.reply_to_me
             or self.is_conversation_with(session_id, context.sender_id)
+            or context.is_emergency
+            or trigger_result.get("forced_trigger", False)
+            or (action_plan is not None and action_plan.directed)
         ):
             remaining = self.fatigue_manager.get_cooldown_remaining(session_id)
             return SpeakingDecision(
@@ -143,7 +149,6 @@ class EnhancedSpeakingDecider:
                 modifiers={"private": True},
             )
 
-        action_plan = context.extra.get("action_plan")
         if (
             context.extra.get("rich_message_only", False)
             and context.extra.get("rich_type") not in ("image", "mface", "face", "video")
@@ -156,6 +161,20 @@ class EnhancedSpeakingDecider:
                 probability=0.0,
                 reason="无人提问的链接、卡片或转发不主动点评",
                 modifiers={"rich_message_only": True},
+            )
+        if (
+            context.extra.get("taboo_topic", False)
+            and not context.mentioned_me
+            and not context.reply_to_me
+            and not context.is_emergency
+            and not trigger_result.get("forced_trigger", False)
+            and not (action_plan is not None and action_plan.directed)
+        ):
+            return SpeakingDecision(
+                should_speak=False,
+                probability=0.0,
+                reason="禁忌话题不主动插话",
+                modifiers={"taboo_topic": True},
             )
         if (
             action_plan
@@ -175,7 +194,6 @@ class EnhancedSpeakingDecider:
             )
 
         # === 3. 强制触发检查 ===
-        trigger_result = context.extra.get("trigger", {})
         if trigger_result.get("forced_trigger", False):
             reasons = trigger_result.get("reasons", ["强制触发"])
             return SpeakingDecision(
