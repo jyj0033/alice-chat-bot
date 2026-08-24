@@ -1946,6 +1946,51 @@
 
                 <div class="card">
                     <div class="card-header">
+                        <div class="card-title"><span class="card-ico"><svg class="icon-sm"><use href="#i-activity"/></svg></span>群聊日报</div>
+                        <span class="badge gray">轻量分析</span>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>启用群聊日报</label>
+                            <div class="toggle-row" style="padding-top: 6px; max-width: 120px;">
+                                <label class="toggle"><input type="checkbox" id="group-analysis-enabled" checked><span class="toggle-slider"></span></label>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>自动发送日报</label>
+                            <div class="toggle-row" style="padding-top: 6px; max-width: 120px;">
+                                <label class="toggle"><input type="checkbox" id="group-analysis-auto"><span class="toggle-slider"></span></label>
+                            </div>
+                            <div class="hint">默认关闭，避免突然增加 LLM 调用</div>
+                        </div>
+                        <div class="form-group">
+                            <label>自动时间</label>
+                            <input type="text" id="group-analysis-times" placeholder="23:50，可填多个，用逗号分隔">
+                        </div>
+                        <div class="form-group">
+                            <label>最少群友消息</label>
+                            <input type="number" id="group-analysis-min" min="3" max="5000" value="10">
+                        </div>
+                        <div class="form-group">
+                            <label>原始消息保留天数</label>
+                            <input type="number" id="group-analysis-retention" min="3" max="365" value="30">
+                        </div>
+                        <div class="form-group full">
+                            <label>手动生成日报</label>
+                            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                                <select id="group-analysis-session" style="min-width:220px;padding:9px 12px;border:1px solid var(--border-strong);border-radius:10px;background:#fff;color:var(--text);">
+                                    <option value="">选择群聊...</option>
+                                </select>
+                                <button class="btn btn-primary" type="button" onclick="runGroupAnalysis()"><svg class="icon-sm"><use href="#i-zap"/></svg>立即生成</button>
+                            </div>
+                            <div class="hint">只分析今天 00:00 至今的消息。日报会发送到所选群；只能从这里手动触发，群内聊天不会触发日报。</div>
+                        </div>
+                    </div>
+                    <div id="group-analysis-reports" style="margin-top:14px;"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
                         <div class="card-title"><span class="card-ico"><svg class="icon-sm"><use href="#i-database"/></svg></span>数据库</div>
                     </div>
                     <div class="form-grid">
@@ -2977,15 +3022,24 @@
         };
 
         async function loadMemoryConfig() {
-            const [config, sessionData] = await Promise.all([
+            const [config, sessionData, analysisSessionData] = await Promise.all([
                 fetch(API + '/config').then(r => r.json()),
-                fetch(API + '/sessions').then(r => r.json())
+                fetch(API + '/sessions').then(r => r.json()),
+                fetch(API + '/group-analysis/sessions').then(r => r.json())
             ]);
             const mem = config.memory || {};
             document.getElementById('memory-window').value = mem.context_window_size || 50;
             document.getElementById('memory-age').value = mem.context_max_age_hours || 2;
             document.getElementById('memory-long-term').checked = mem.enable_long_term_memory !== false;
             document.getElementById('memory-db-path').value = mem.db_path || 'data/memory.db';
+            const groupAnalysis = mem.group_analysis || {};
+            document.getElementById('group-analysis-enabled').checked = groupAnalysis.enabled !== false;
+            document.getElementById('group-analysis-auto').checked = groupAnalysis.auto_enabled === true;
+            const analysisTimes = Array.isArray(groupAnalysis.auto_times)
+                ? groupAnalysis.auto_times : [groupAnalysis.auto_time || '23:50'];
+            document.getElementById('group-analysis-times').value = analysisTimes.join(', ');
+            document.getElementById('group-analysis-min').value = groupAnalysis.min_messages ?? 10;
+            document.getElementById('group-analysis-retention').value = groupAnalysis.retention_days ?? 30;
             const emb = mem.embedding || {};
             document.getElementById('embed-api-key').value = emb.api_key || '';
             document.getElementById('embed-base-url').value = emb.base_url || 'https://api.siliconflow.cn/v1';
@@ -3000,6 +3054,11 @@
                 st.innerHTML = '<span class="badge gray">未配置（TF-IDF）</span>';
             }
             populateMemorySessions(sessionData.sessions || []);
+            populateGroupAnalysisSessions([
+                ...(sessionData.sessions || []),
+                ...(analysisSessionData.sessions || [])
+            ]);
+            await loadGroupAnalysisReports();
             await loadMemories(1);
         }
 
@@ -3017,6 +3076,75 @@
             }
             if ([...sel.options].some(option => option.value === current)) {
                 sel.value = current;
+            }
+        }
+
+        function populateGroupAnalysisSessions(sessions) {
+            const sel = document.getElementById('group-analysis-session');
+            const current = sel.value;
+            sel.innerHTML = '<option value="">选择群聊...</option>';
+            for (const item of sessions) {
+                const session = typeof item === 'string' ? item : (item.session || '');
+                if (!session.startsWith('group_')) continue;
+                const opt = document.createElement('option');
+                opt.value = session;
+                opt.textContent = session.replace(/^group_/, '群 ');
+                sel.appendChild(opt);
+            }
+            if ([...sel.options].some(option => option.value === current)) {
+                sel.value = current;
+            }
+        }
+
+        async function loadGroupAnalysisReports(session = '') {
+            const list = document.getElementById('group-analysis-reports');
+            if (!list) return;
+            const params = new URLSearchParams({limit: '20'});
+            if (session) params.set('session', session);
+            try {
+                const data = await fetch(API + '/group-analysis/reports?' + params).then(r => r.json());
+                const reports = data.reports || [];
+                if (!reports.length) {
+                    list.innerHTML = '<div class="hint">暂无日报记录。选择群聊后可以从上面手动生成。</div>';
+                    return;
+                }
+                list.innerHTML = '<div class="hint" style="margin-bottom:8px;">最近日报</div>' + reports.map(report => `
+                    <details style="border:1px solid var(--border);border-radius:10px;padding:9px 12px;margin-top:7px;background:var(--surface-muted,#fafafa);">
+                        <summary style="cursor:pointer;font-size:13px;color:var(--text);">${escapeHtml(report.session || '')} · ${escapeHtml(report.report_date || '')} · ${report.message_count || 0} 条消息</summary>
+                        <pre style="white-space:pre-wrap;word-break:break-word;margin:10px 0 0;font:inherit;color:var(--text-secondary);">${escapeHtml(report.content || '')}</pre>
+                    </details>`).join('');
+            } catch (e) {
+                list.innerHTML = '<div class="hint">日报历史加载失败</div>';
+            }
+        }
+
+        async function runGroupAnalysis() {
+            const session = document.getElementById('group-analysis-session').value;
+            if (!session) {
+                showToast('请先选择群聊', 'error');
+                return;
+            }
+            const btn = document.querySelector('#group-analysis-session').parentElement.querySelector('button');
+            const old = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<svg class="icon-sm"><use href="#i-zap"/></svg>整理中...';
+            try {
+                const data = await fetch(API + '/group-analysis/run', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({session})
+                }).then(r => r.json());
+                if (data.success) {
+                    showToast(`已开始整理 ${session.replace(/^group_/, '群 ')} 今天的日报`, 'success');
+                    setTimeout(() => loadGroupAnalysisReports(), 1800);
+                } else {
+                    showToast('启动失败：' + (data.error || '未知错误'), 'error');
+                }
+            } catch (e) {
+                showToast('启动失败：' + e, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = old;
             }
         }
 
@@ -3508,6 +3636,13 @@
                         rerank_model: document.getElementById('rerank-model').value.trim(),
                         input_type: document.getElementById('embed-input-type').value,
                         batch_size: parseInt(document.getElementById('embed-batch-size').value),
+                    },
+                    group_analysis: {
+                        enabled: document.getElementById('group-analysis-enabled').checked,
+                        auto_enabled: document.getElementById('group-analysis-auto').checked,
+                        auto_times: listValue('group-analysis-times'),
+                        min_messages: parseInt(document.getElementById('group-analysis-min').value),
+                        retention_days: parseInt(document.getElementById('group-analysis-retention').value)
                     }
                 }
             };

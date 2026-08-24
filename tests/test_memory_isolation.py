@@ -192,6 +192,67 @@ class MemoryIsolationTests(unittest.TestCase):
             self.storage.get_profile_materials("bot", "group_profile_a"), []
         )
 
+    def test_group_analysis_storage_is_isolated_and_report_is_idempotent(self):
+        base = datetime.now()
+        self.storage.store_group_analysis_message(Memory(
+            content="今天开黑吗",
+            memory_type="group_analysis",
+            source_session="group_daily",
+            created_at=base,
+            metadata={
+                "message_id": "daily-1",
+                "sender_id": "u1",
+                "sender_name": "甲",
+            },
+        ))
+        self.storage.store_group_analysis_message(Memory(
+            content="我晚上有空",
+            memory_type="group_analysis",
+            source_session="group_daily",
+            created_at=base + timedelta(seconds=1),
+            metadata={
+                "message_id": "daily-2",
+                "sender_id": "u2",
+                "sender_name": "乙",
+            },
+        ))
+
+        messages = self.storage.get_group_analysis_messages("group_daily")
+        self.assertEqual([m.content for m in messages], ["今天开黑吗", "我晚上有空"])
+        self.assertEqual(
+            self.storage.get_group_analysis_sessions()[0]["message_count"], 2
+        )
+        self.assertEqual(
+            self.storage.retrieve_session_recent("group_daily", limit=10), []
+        )
+        self.assertNotIn(
+            "group_daily", {row["session"] for row in self.storage.list_sessions()}
+        )
+
+        report = Memory(
+            content="第一版日报",
+            memory_type="group_report",
+            source_session="group_daily",
+            metadata={"report_date": "2026-08-24", "days": 1},
+        )
+        self.storage.store_group_analysis_report(report)
+        updated = Memory(
+            content="更新版日报",
+            memory_type="group_report",
+            source_session="group_daily",
+            metadata={"report_date": "2026-08-24", "days": 1},
+        )
+        self.storage.store_group_analysis_report(updated)
+        self.assertEqual(
+            len(self.storage.get_group_analysis_reports("group_daily")), 1
+        )
+        self.assertEqual(
+            self.storage.get_group_analysis_report(
+                "group_daily", "2026-08-24"
+            ).content,
+            "更新版日报",
+        )
+
     def test_profile_context_returns_neighbors_and_reply_target(self):
         base = datetime.now()
         reply_target = Memory(

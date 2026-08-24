@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -26,6 +26,7 @@ from core.adapter.base import Message
 from modules.llm.openai_provider import create_provider, LLMProvider
 from modules.memory.storage import MemoryStorage, AsyncMemoryStorage, Memory
 from modules.memory.context import ContextManager
+from modules.group_analysis import GroupDailyAnalysis
 
 from modules.personality.personality import Personality
 from modules.personality.emotional_state import EmotionalManager
@@ -123,6 +124,11 @@ class GroupChatBot:
         self._digest_config: dict = {}
         self._last_digest_at: dict[str, float] = {}  # session -> 上次纪要覆盖到的消息时间戳
         self._digest_tasks: dict[str, asyncio.Task] = {}  # 进行中的纪要任务
+        # 群聊日报：独立保存完整群消息，避免长期记忆筛选导致日报只看到少数消息。
+        self._group_analysis_config: dict = {}
+        self._group_analysis_tasks: dict[str, asyncio.Task] = {}
+        self._group_analysis_write_tasks: set[asyncio.Task] = set()
+        self._last_group_analysis_cleanup: float = 0.0
 
         # 媒体轨迹：记录最近消息(时间/sender/是否纯图片/图片url)，用于判断"连图"。
         self._media_trail: dict[str, deque] = {}
@@ -323,6 +329,37 @@ class GroupChatBot:
         }
         logger.info(f"✓ 群聊纪要: enabled={self._digest_config['enabled']}, "
                     f"每{self._digest_config['interval_messages']}条消息总结一次")
+
+        # 群聊日报：默认不自动发送，避免升级后突然增加 LLM 调用和群消息；
+        # Dashboard 手动触发不受 auto_enabled 影响。
+        analysis_cfg = memory_config.get("group_analysis", {}) or {}
+        auto_times = analysis_cfg.get("auto_times", analysis_cfg.get("auto_time", "23:50"))
+        if isinstance(auto_times, str):
+            auto_times = [auto_times]
+        if not isinstance(auto_times, list):
+            auto_times = ["23:50"]
+        self._group_analysis_config = {
+            "enabled": bool(analysis_cfg.get("enabled", True)),
+            "auto_enabled": bool(analysis_cfg.get("auto_enabled", False)),
+            "auto_times": [str(value).strip() for value in auto_times if str(value).strip()][:8]
+            or ["23:50"],
+            "min_messages": max(3, min(5000, int(analysis_cfg.get("min_messages", 10)))),
+            "max_messages": max(20, min(5000, int(analysis_cfg.get("max_messages", 500)))),
+            "max_prompt_chars": max(4000, min(60000, int(analysis_cfg.get("max_prompt_chars", 24000)))),
+            "max_topics": max(1, min(10, int(analysis_cfg.get("max_topics", 5)))),
+            "max_quotes": max(1, min(8, int(analysis_cfg.get("max_quotes", 3)))),
+            "max_titles": max(1, min(8, int(analysis_cfg.get("max_titles", 5)))),
+            "max_tokens": max(400, min(3000, int(analysis_cfg.get("max_tokens", 1800)))),
+            "max_report_chars": max(1200, min(10000, int(analysis_cfg.get("max_report_chars", 6000)))),
+            "retention_days": max(3, min(365, int(analysis_cfg.get("retention_days", 30)))),
+            "send_report": bool(analysis_cfg.get("send_report", True)),
+        }
+        logger.info(
+            "✓ 群聊日报: enabled=%s, auto=%s, 时间=%s",
+            self._group_analysis_config["enabled"],
+            self._group_analysis_config["auto_enabled"],
+            ",".join(self._group_analysis_config["auto_times"]),
+        )
 
         # 用户画像配置：从情景记忆提炼每个群友的稳定个人特征（semantic 记忆）
         profile_cfg = memory_config.get("profile", {}) or {}
@@ -723,6 +760,9 @@ class GroupChatBot:
 
             # 群聊纪要：距上次总结的新消息达到固定条数 → 后台压缩成纪要存长期记忆
             self._maybe_schedule_digest(session_id)
+
+            # 群日报单独保存完整群消息，不参与普通长期记忆筛选和召回。
+            self._store_group_analysis_message(message, session_id)
 
             # 记录媒体轨迹，供"连图整体识别"判断连续纯图片
             self._record_media_trail(message)
@@ -1253,6 +1293,7 @@ class GroupChatBot:
 
                     # bot 的回复也写入长期记忆，让会话历史两侧完整
                     self._store_bot_memory(session_id, sent_reply)
+                    self._store_group_analysis_bot_message(session_id, sent_reply)
 
             if not sent_segments:
                 logger.error("Failed to send reply")
@@ -1281,6 +1322,7 @@ class GroupChatBot:
                     logger.info(f"[疲劳] {closing_msg}")
                     # 疲劳收尾消息同样入历史
                     self._store_bot_memory(session_id, closing_msg)
+                    self._store_group_analysis_bot_message(session_id, closing_msg)
 
         except asyncio.CancelledError:
             # 被更新的"对我说"消息取代，静默退出
@@ -1599,6 +1641,318 @@ class GroupChatBot:
             # 恢复失败不能阻塞当前消息；下次新建窗口时仍可再尝试。
             window.restored_from_storage = False
             logger.debug("恢复近期记忆失败: %s", exc)
+
+    def _store_group_analysis_message(self, message: Message, session_id: str) -> None:
+        """保存完整群聊流水，供日报使用，不进入普通记忆链路。"""
+        config = getattr(self, "_group_analysis_config", {}) or {}
+        if not config.get("enabled", True) or message.message_type != "group":
+            return
+        content = (message.content or message.outer_text or "").strip()
+        if message.rich_type:
+            content = f"{content} [{message.rich_type}]".strip()
+        if not content:
+            return
+        message_id = str(message.message_id or "").strip()
+        if not message_id:
+            message_id = f"{message.sender_id}-{time.time_ns()}"
+        memory = Memory(
+            content=content[:2000],
+            memory_type="group_analysis",
+            importance=0.05,
+            source_session=session_id,
+            metadata={
+                "message_id": message_id,
+                "sender_id": message.sender_id,
+                "sender_name": message.sender_name,
+                "is_bot": False,
+                "reply_to_id": message.reply_to_id,
+                "reply_to_qq": message.reply_to_qq,
+            },
+        )
+
+        async def _save():
+            try:
+                await self.memory_storage.store_group_analysis_message(memory)
+            except Exception as exc:
+                logger.debug("群日报消息保存失败: %s", exc)
+
+        task = self._track_memory_task(_save())
+        self._group_analysis_write_tasks.add(task)
+        task.add_done_callback(self._group_analysis_write_tasks.discard)
+
+    def _store_group_analysis_bot_message(self, session_id: str, content: str) -> None:
+        """保存 Bot 群消息到日报流水，但不把 Bot 计入群友统计。"""
+        config = getattr(self, "_group_analysis_config", {}) or {}
+        if not config.get("enabled", True) or not str(session_id).startswith("group_"):
+            return
+        content = (content or "").strip()
+        if not content:
+            return
+        self_id = str(self.config.get("qq", {}).get("self_id", ""))
+        memory = Memory(
+            content=content[:2000],
+            memory_type="group_analysis",
+            importance=0.05,
+            source_session=session_id,
+            metadata={
+                "message_id": f"bot-{time.time_ns()}",
+                "sender_id": self_id,
+                "sender_name": self.personality.name,
+                "is_bot": True,
+            },
+        )
+
+        async def _save():
+            try:
+                await self.memory_storage.store_group_analysis_message(memory)
+            except Exception as exc:
+                logger.debug("Bot 群日报消息保存失败: %s", exc)
+
+        task = self._track_memory_task(_save())
+        self._group_analysis_write_tasks.add(task)
+        task.add_done_callback(self._group_analysis_write_tasks.discard)
+
+    async def _wait_group_analysis_writes(self) -> None:
+        """日报读取前等待已进入队列的群消息写入，避免漏掉最近几条。"""
+        tasks = [task for task in self._group_analysis_write_tasks if not task.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def trigger_group_analysis(self, session_id: str, days: int = 1) -> dict:
+        """供 Dashboard 调用的手动日报入口；群内消息不再触发日报。"""
+        session_id = str(session_id or "").strip()
+        if not session_id.startswith("group_"):
+            return {"success": False, "error": "只能分析群聊会话"}
+        config = getattr(self, "_group_analysis_config", {}) or {}
+        if not config.get("enabled", True):
+            return {"success": False, "error": "群聊日报功能目前没有开启"}
+        current = self._group_analysis_tasks.get(session_id)
+        if current and not current.done():
+            return {"success": False, "error": "这个群的日报还在整理中"}
+        # 日报固定分析自然日，不再允许按滚动 N 天回看。
+        days = 1
+        trigger = Message(
+            message_id="",
+            message_type="group",
+            sender_id="",
+            sender_name="",
+            group_id=session_id.removeprefix("group_"),
+        )
+        started = await self._start_group_analysis(
+            trigger, days, automatic=False, send_ack=False
+        )
+        if not started:
+            return {"success": False, "error": "日报任务未能启动"}
+        return {"success": True, "session": session_id, "days": days}
+
+    async def _start_group_analysis(
+        self,
+        message: Message,
+        days: int,
+        automatic: bool = False,
+        send_ack: bool = True,
+    ) -> bool:
+        """启动单群日报任务；同一群同时只允许一个分析任务。"""
+        session_id = message.session_id
+        config = getattr(self, "_group_analysis_config", {}) or {}
+        if not config.get("enabled", True):
+            if not automatic and send_ack and self.qq_adapter:
+                await self.qq_adapter.send_message(session_id, "群聊日报功能目前没有开启")
+            return False
+        current = self._group_analysis_tasks.get(session_id)
+        if current and not current.done():
+            if not automatic and send_ack and self.qq_adapter:
+                await self.qq_adapter.send_message(session_id, "这群的日报还在整理中，稍等一下")
+            return False
+        if not automatic and send_ack and self.qq_adapter:
+            await self.qq_adapter.send_message(
+                session_id, "收到，正在整理今天的群聊，等我一会儿～"
+            )
+
+        task = asyncio.create_task(
+            self._run_group_analysis(session_id, days, automatic=automatic)
+        )
+        self._group_analysis_tasks[session_id] = task
+
+        def _cleanup(done_task, session=session_id):
+            if self._group_analysis_tasks.get(session) is done_task:
+                self._group_analysis_tasks.pop(session, None)
+
+        task.add_done_callback(_cleanup)
+        return True
+
+    async def _run_group_analysis(
+        self, session_id: str, days: int, automatic: bool = False
+    ) -> None:
+        """读取完整群聊流水、生成日报并保存/发送。"""
+        config = getattr(self, "_group_analysis_config", {}) or {}
+        try:
+            await self._wait_group_analysis_writes()
+            now = datetime.now()
+            since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            messages = await self.memory_storage.get_group_analysis_messages(
+                session_id,
+                since=since,
+                until=now + timedelta(seconds=1),
+                limit=config.get("max_messages", 500),
+            )
+            usable_count = len(GroupDailyAnalysis.human_messages(messages))
+            min_messages = config.get("min_messages", 10)
+            if usable_count < min_messages:
+                if not automatic and self.qq_adapter:
+                    await self.qq_adapter.send_message(
+                        session_id,
+                        f"今天只有 {usable_count} 条可分析的群友发言，至少需要 {min_messages} 条。",
+                    )
+                logger.info(
+                    "[群日报] %s 素材不足：%d/%d",
+                    session_id,
+                    usable_count,
+                    min_messages,
+                )
+                return
+
+            provider = self.get_active_provider()
+            report = await GroupDailyAnalysis.analyze(
+                messages,
+                provider=provider,
+                max_chars=config.get("max_prompt_chars", 24000),
+                max_topics=config.get("max_topics", 5),
+                max_quotes=config.get("max_quotes", 3),
+                max_titles=config.get("max_titles", 5),
+                max_tokens=config.get("max_tokens", 1800),
+                bot_name=getattr(getattr(self, "personality", None), "name", "爱丽丝"),
+                bot_persona=(
+                    self.personality.build_persona_prompt()
+                    if getattr(self, "personality", None)
+                    else ""
+                ),
+            )
+            report_text = GroupDailyAnalysis.render_report(
+                report,
+                report_label="今日",
+                max_chars=config.get("max_report_chars", 6000),
+            )
+            report_date = now.strftime("%Y-%m-%d")
+            report_memory = Memory(
+                content=report_text,
+                memory_type="group_report",
+                importance=0.7,
+                source_session=session_id,
+                tags=["群日报"],
+                metadata={
+                    "kind": "group_daily_analysis",
+                    "report_date": report_date,
+                    "days": 1,
+                    "message_count": report["statistics"].get("message_count", 0),
+                    "participant_count": report["statistics"].get("participant_count", 0),
+                    "analysis_error": report.get("analysis_error", ""),
+                },
+            )
+            await self.memory_storage.store_group_analysis_report(report_memory)
+            should_send = (not automatic) or config.get("send_report", True)
+            send_mode = "none"
+            if should_send and self.qq_adapter:
+                image_bytes = GroupDailyAnalysis.render_report_image(
+                    report, report_label="今日"
+                )
+                send_image = getattr(self.qq_adapter, "send_image", None)
+                sent_as_image = False
+                if image_bytes and callable(send_image):
+                    try:
+                        sent_as_image = bool(await send_image(session_id, image_bytes))
+                    except Exception as image_exc:
+                        logger.warning("[群日报] 图片发送失败，回退文本：%s", image_exc)
+                if sent_as_image:
+                    send_mode = "image"
+                elif await self.qq_adapter.send_message(session_id, report_text):
+                    send_mode = "text_fallback"
+            logger.info(
+                "[群日报] %s 完成：%d 条消息、%d 人、发送=%s、格式=%s",
+                session_id,
+                report["statistics"].get("message_count", 0),
+                report["statistics"].get("participant_count", 0),
+                should_send,
+                send_mode,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[群日报] %s 生成失败: %s", session_id, exc, exc_info=True)
+            if not automatic and self.qq_adapter:
+                await self.qq_adapter.send_message(session_id, "群日报生成失败了，具体错误已记到日志里")
+
+    @staticmethod
+    def _analysis_time_matches(now: datetime, value: str) -> bool:
+        try:
+            hour, minute = (int(part) for part in str(value).strip().split(":", 1))
+            target = hour * 60 + minute
+            current = now.hour * 60 + now.minute
+            return 0 <= current - target <= 6 and 0 <= hour <= 23 and 0 <= minute <= 59
+        except (TypeError, ValueError):
+            return False
+
+    async def _maybe_group_analysis(self) -> None:
+        """在配置时间窗口内为有素材的群自动生成日报。"""
+        config = getattr(self, "_group_analysis_config", {}) or {}
+        if not config.get("enabled", True) or not config.get("auto_enabled", False):
+            return
+        now = datetime.now()
+        if not any(
+            self._analysis_time_matches(now, value)
+            for value in config.get("auto_times", ["23:50"])
+        ):
+            return
+        since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        try:
+            sessions = await self.memory_storage.get_group_analysis_sessions(since=since)
+        except Exception as exc:
+            logger.debug("[群日报] 获取自动分析群失败: %s", exc)
+            return
+        report_date = now.strftime("%Y-%m-%d")
+        for item in sessions:
+            session_id = str(item.get("session") or "")
+            if not session_id.startswith("group_"):
+                continue
+            if int(item.get("message_count") or 0) < config.get("min_messages", 10):
+                continue
+            current = self._group_analysis_tasks.get(session_id)
+            if current and not current.done():
+                continue
+            try:
+                existing = await self.memory_storage.get_group_analysis_report(
+                    session_id, report_date
+                )
+            except Exception:
+                existing = None
+            if existing:
+                continue
+            # 自动任务没有触发消息对象，构造一个最小的会话载体即可复用启动逻辑。
+            trigger = Message(
+                message_id="",
+                message_type="group",
+                sender_id="",
+                sender_name="",
+                group_id=session_id.removeprefix("group_"),
+            )
+            await self._start_group_analysis(trigger, 1, automatic=True)
+
+    async def _maybe_cleanup_group_analysis(self) -> None:
+        """定期清理日报原始流水，控制 SQLite 体积。"""
+        config = getattr(self, "_group_analysis_config", {}) or {}
+        if not config.get("enabled", True):
+            return
+        now_ts = time.time()
+        if self._last_group_analysis_cleanup and now_ts - self._last_group_analysis_cleanup < 6 * 3600:
+            return
+        self._last_group_analysis_cleanup = now_ts
+        try:
+            cutoff = datetime.now() - timedelta(days=config.get("retention_days", 30))
+            deleted = await self.memory_storage.delete_group_analysis_before(cutoff)
+            if deleted:
+                logger.info("[群日报] 清理过期分析数据 %d 条", deleted)
+        except Exception as exc:
+            logger.debug("[群日报] 清理过期数据失败: %s", exc)
 
     def _store_long_term_memory(self, message: Message, session_id: str) -> None:
         """把有记忆价值的消息写入 SQLite 情景记忆（异步后台执行）
@@ -3142,6 +3496,8 @@ class GroupChatBot:
             await self._maybe_distill_profiles()
             await self._maybe_extract_slang()
             await self._maybe_cleanup_slang()
+            await self._maybe_group_analysis()
+            await self._maybe_cleanup_group_analysis()
             logger.debug("Cleaned up expired states")
 
     async def _maybe_decay_memories(self) -> None:
@@ -3243,6 +3599,7 @@ class GroupChatBot:
             list(self._reply_tasks.values())
             + list(self._rich_media_tasks)
             + list(self._digest_tasks.values())
+            + list(self._group_analysis_tasks.values())
         )
         await finish_tasks(list(self._tasks) + background_tasks)
 
@@ -3253,6 +3610,7 @@ class GroupChatBot:
         self._reply_tasks.clear()
         self._rich_media_tasks.clear()
         self._digest_tasks.clear()
+        self._group_analysis_tasks.clear()
         self._memory_tasks.clear()
 
         # 停止事件总线
@@ -3459,6 +3817,21 @@ class GroupChatBot:
                     "interval_messages": 20,
                     "min_messages": 10,
                     "max_tokens": 200
+                },
+                "group_analysis": {
+                    "enabled": True,
+                    "auto_enabled": False,
+                    "auto_times": ["23:50"],
+                    "min_messages": 10,
+                    "max_messages": 500,
+                    "max_prompt_chars": 24000,
+                    "max_topics": 5,
+                    "max_quotes": 3,
+                    "max_titles": 5,
+                    "max_tokens": 1800,
+                    "max_report_chars": 6000,
+                    "retention_days": 30,
+                    "send_report": True
                 },
                 "slang": {
                     "enabled": True,

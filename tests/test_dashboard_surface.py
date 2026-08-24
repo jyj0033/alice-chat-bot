@@ -22,6 +22,7 @@ class DashboardSurfaceTests(unittest.TestCase):
     def setUpClass(cls):
         path = Path(__file__).resolve().parents[1] / "templates" / "dashboard.html"
         cls.html = path.read_text(encoding="utf-8")
+        cls.dashboard_source = (path.parent.parent / "dashboard.py").read_text(encoding="utf-8")
         cls.parser = _IdCollector()
         cls.parser.feed(cls.html)
 
@@ -55,6 +56,13 @@ class DashboardSurfaceTests(unittest.TestCase):
             "personality-age",
             "personality-taboo",
             "embed-base-url",
+            "group-analysis-enabled",
+            "group-analysis-auto",
+            "group-analysis-times",
+            "group-analysis-min",
+            "group-analysis-retention",
+            "group-analysis-session",
+            "group-analysis-reports",
             "style-common-words",
             "style-max-reply",
             "typing-min-length",
@@ -89,6 +97,13 @@ class DashboardSurfaceTests(unittest.TestCase):
         self.assertIn("/profiles?", self.html)
         self.assertIn("scheduleLoadProfiles", self.html)
         self.assertIn("共 ${profileState.total} 个", self.html)
+
+    def test_group_analysis_controls_and_report_api_are_exposed(self):
+        self.assertIn("/api/group-analysis/reports", self.dashboard_source)
+        self.assertIn("/api/group-analysis/sessions", self.dashboard_source)
+        self.assertIn("/api/group-analysis/run", self.dashboard_source)
+        self.assertIn("runGroupAnalysis", self.html)
+        self.assertNotIn("/群分析 [天数]", self.html)
 
     def test_session_messages_are_html_escaped(self):
         self.assertIn("escapeHtml(m.sender)", self.html)

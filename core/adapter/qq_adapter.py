@@ -3,6 +3,7 @@ QQ 适配器 - 使用 NapCat/OneBot v11 协议
 作为 WebSocket 服务端接收 NapCat 的连接
 """
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -368,6 +369,40 @@ class QQAdapter(PlatformAdapter):
             return True
         except Exception as e:
             logger.error(f"Failed to send: {e}")
+            return False
+
+    async def send_image(self, session_id: str, image_bytes: bytes) -> bool:
+        """发送内嵌 PNG，使用 OneBot 的 base64 图片段，不依赖公网文件地址。"""
+        if not self._clients:
+            logger.error("No NapCat connected")
+            return False
+        if not image_bytes:
+            return False
+
+        try:
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+            message_array = [{
+                "type": "image",
+                "data": {"file": f"base64://{encoded}"},
+            }]
+            if session_id.startswith("group_"):
+                group_id = int(session_id.replace("group_", ""))
+                message_data = {
+                    "action": "send_group_msg",
+                    "params": {"group_id": group_id, "message": message_array},
+                }
+            else:
+                user_id = int(session_id.replace("private_", ""))
+                message_data = {
+                    "action": "send_private_msg",
+                    "params": {"user_id": user_id, "message": message_array},
+                }
+
+            await self._broadcast(json.dumps(message_data, ensure_ascii=False))
+            self.messages_sent += 1
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send image: {e}")
             return False
 
     async def send_group_message(self, group_id: str, content: str, reply_to_id: str | None = None) -> bool:

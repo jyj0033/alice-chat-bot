@@ -650,6 +650,65 @@ async def distill_profiles():
         return {"success": False, "error": str(e)}
 
 
+@app.get("/api/group-analysis/reports")
+async def get_group_analysis_reports(session: str = "", limit: int = 30):
+    """读取群聊日报历史；原始群消息不直接暴露给面板。"""
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"reports": [], "total": 0}
+    try:
+        rows = await bot_instance.memory_storage.get_group_analysis_reports(
+            session=(session or "").strip(),
+            limit=max(1, min(int(limit), 100)),
+        )
+        reports = []
+        for row in rows:
+            meta = row.metadata or {}
+            reports.append({
+                "id": row.id,
+                "session": row.source_session,
+                "content": row.content,
+                "report_date": meta.get("report_date", ""),
+                "days": meta.get("days", 1),
+                "message_count": meta.get("message_count", 0),
+                "participant_count": meta.get("participant_count", 0),
+                "analysis_error": meta.get("analysis_error", ""),
+                "created_at": row.created_at.isoformat(),
+            })
+        return {"reports": reports, "total": len(reports)}
+    except Exception as e:
+        logger.error(f"Failed to load group analysis reports: {e}")
+        return {"reports": [], "total": 0, "error": str(e)}
+
+
+@app.get("/api/group-analysis/sessions")
+async def get_group_analysis_sessions():
+    """读取有日报原始素材的群，和普通会话列表保持隔离。"""
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"sessions": []}
+    try:
+        rows = await bot_instance.memory_storage.get_group_analysis_sessions()
+        return {"sessions": rows}
+    except Exception as e:
+        logger.error(f"Failed to load group analysis sessions: {e}")
+        return {"sessions": [], "error": str(e)}
+
+
+@app.post("/api/group-analysis/run")
+async def run_group_analysis(request: Request):
+    """从管理面板手动启动指定群的日报；群内文本不会触发此任务。"""
+    if not bot_instance:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            data = {}
+        session = str(data.get("session") or "").strip()
+        return await bot_instance.trigger_group_analysis(session)
+    except Exception as e:
+        logger.error(f"Manual group analysis failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/api/slang")
 async def get_slang():
     """群聊黑话词表（Web 管理用，返回全部含停用项）"""

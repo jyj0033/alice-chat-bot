@@ -434,6 +434,232 @@ class MemoryStorage:
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
     @_db_locked
+    def store_group_analysis_message(self, memory: Memory) -> int:
+        """保存群分析专用消息，不参与普通长期记忆检索。"""
+        memory.memory_type = "group_analysis"
+        metadata = dict(memory.metadata or {})
+        message_id = str(metadata.get("message_id") or "").strip()
+        if message_id:
+            try:
+                row = self.conn.execute(
+                    """
+                    SELECT id FROM memories
+                    WHERE memory_type = 'group_analysis'
+                      AND source_session = ?
+                      AND json_valid(metadata)
+                      AND CAST(json_extract(metadata, '$.message_id') AS TEXT) = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (memory.source_session, message_id),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            if row:
+                memory.id = row["id"]
+                return int(row["id"])
+
+        cursor = self.conn.execute(
+            """
+            INSERT INTO memories (
+                content, memory_type, importance, tags, source_session,
+                metadata, created_at, last_accessed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory.content,
+                memory.memory_type,
+                min(1.0, max(0.0, float(memory.importance))),
+                json.dumps(memory.tags, ensure_ascii=False),
+                memory.source_session,
+                json.dumps(metadata, ensure_ascii=False),
+                memory.created_at.isoformat(sep=" "),
+                memory.last_accessed.isoformat(sep=" "),
+            ),
+        )
+        self.conn.commit()
+        memory.id = cursor.lastrowid
+        return int(cursor.lastrowid)
+
+    @_db_locked
+    def get_group_analysis_messages(
+        self,
+        session: str,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        limit: int = 500,
+    ) -> list[Memory]:
+        """按时间正序读取群分析消息，供日报生成使用。"""
+        session = str(session or "").strip()
+        if not session:
+            return []
+        limit = max(1, min(int(limit), 5000))
+        clauses = ["memory_type = 'group_analysis'", "source_session = ?"]
+        params: list = [session]
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since.isoformat(sep=" "))
+        if until is not None:
+            clauses.append("created_at < ?")
+            params.append(until.isoformat(sep=" "))
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM memories
+            WHERE {' AND '.join(clauses)}
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [self._row_to_memory(row) for row in rows]
+
+    @_db_locked
+    def get_group_analysis_sessions(
+        self, since: Optional[datetime] = None
+    ) -> list[dict]:
+        """列出指定时间后有群分析消息的群，会话按最近活跃排序。"""
+        clauses = [
+            "memory_type = 'group_analysis'",
+            "source_session LIKE 'group_%'",
+        ]
+        params: list = []
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since.isoformat(sep=" "))
+        rows = self.conn.execute(
+            f"""
+            SELECT source_session AS session,
+                   COUNT(*) AS message_count,
+                   MAX(created_at) AS last_active
+            FROM memories
+            WHERE {' AND '.join(clauses)}
+            GROUP BY source_session
+            ORDER BY last_active DESC
+            """,
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_db_locked
+    def store_group_analysis_report(self, memory: Memory) -> int:
+        """按会话和报告日期覆盖保存日报，避免定时任务重复刷屏。"""
+        memory.memory_type = "group_report"
+        metadata = dict(memory.metadata or {})
+        report_date = str(metadata.get("report_date") or "").strip()
+        existing = None
+        if report_date:
+            try:
+                existing = self.conn.execute(
+                    """
+                    SELECT id FROM memories
+                    WHERE memory_type = 'group_report'
+                      AND source_session = ?
+                      AND json_valid(metadata)
+                      AND CAST(json_extract(metadata, '$.report_date') AS TEXT) = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (memory.source_session, report_date),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                existing = None
+
+        values = (
+            memory.content,
+            memory.importance,
+            json.dumps(memory.tags, ensure_ascii=False),
+            json.dumps(metadata, ensure_ascii=False),
+            memory.created_at.isoformat(sep=" "),
+            memory.last_accessed.isoformat(sep=" "),
+        )
+        if existing:
+            self.conn.execute(
+                """
+                UPDATE memories
+                SET content = ?, importance = ?, tags = ?, metadata = ?,
+                    created_at = ?, last_accessed = ?
+                WHERE id = ?
+                """,
+                (*values, existing["id"]),
+            )
+            self.conn.commit()
+            memory.id = existing["id"]
+            return int(existing["id"])
+
+        cursor = self.conn.execute(
+            """
+            INSERT INTO memories (
+                content, memory_type, importance, tags, source_session,
+                metadata, created_at, last_accessed
+            ) VALUES (?, 'group_report', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory.content,
+                memory.importance,
+                json.dumps(memory.tags, ensure_ascii=False),
+                memory.source_session,
+                json.dumps(metadata, ensure_ascii=False),
+                memory.created_at.isoformat(sep=" "),
+                memory.last_accessed.isoformat(sep=" "),
+            ),
+        )
+        self.conn.commit()
+        memory.id = cursor.lastrowid
+        return int(cursor.lastrowid)
+
+    @_db_locked
+    def get_group_analysis_report(
+        self, session: str, report_date: str
+    ) -> Optional[Memory]:
+        """读取某群某天的日报。"""
+        row = self.conn.execute(
+            """
+            SELECT * FROM memories
+            WHERE memory_type = 'group_report'
+              AND source_session = ?
+              AND json_valid(metadata)
+              AND CAST(json_extract(metadata, '$.report_date') AS TEXT) = ?
+            ORDER BY created_at DESC, id DESC LIMIT 1
+            """,
+            (str(session or ""), str(report_date or "")),
+        ).fetchone()
+        return self._row_to_memory(row) if row else None
+
+    @_db_locked
+    def get_group_analysis_reports(
+        self, session: str = "", limit: int = 30
+    ) -> list[Memory]:
+        """读取日报历史，最新的排在前面。"""
+        limit = max(1, min(int(limit), 100))
+        clauses = ["memory_type = 'group_report'"]
+        params: list = []
+        if session:
+            clauses.append("source_session = ?")
+            params.append(str(session))
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM memories
+            WHERE {' AND '.join(clauses)}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [self._row_to_memory(row) for row in rows]
+
+    @_db_locked
+    def delete_group_analysis_before(self, before: datetime) -> int:
+        """清理过期的分析原始消息和日报。"""
+        cursor = self.conn.execute(
+            """
+            DELETE FROM memories
+            WHERE memory_type IN ('group_analysis', 'group_report')
+              AND created_at < ?
+            """,
+            (before.isoformat(sep=" "),),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount or 0)
+
+    @_db_locked
     def get_profile_scopes(
         self, limit: Optional[int] = None, share_across_sessions: bool = False
     ) -> list[tuple[str, str]]:
@@ -957,6 +1183,7 @@ class MemoryStorage:
                    MAX(created_at) AS last_active
             FROM memories
             WHERE source_session != ''
+              AND memory_type NOT IN ('group_analysis', 'group_report')
             GROUP BY source_session
             ORDER BY last_active DESC
             LIMIT ?
@@ -1445,6 +1672,8 @@ class MemoryStorage:
     def _is_retrievable_memory(memory: Memory) -> bool:
         """管理用上下文素材保留在数据库，但不直接喂给回复模型。"""
         meta = memory.metadata or {}
+        if memory.memory_type in {"group_analysis", "group_report"}:
+            return False
         if meta.get("profile_context_only"):
             return False
         return not (
@@ -1562,6 +1791,64 @@ class AsyncMemoryStorage:
     async def get_recent(self, memory_type: str, limit: int = 50) -> list[Memory]:
         """异步获取最近记忆"""
         return await asyncio.to_thread(self._storage.get_recent, memory_type, limit)
+
+    async def store_group_analysis_message(self, memory: Memory) -> int:
+        """异步保存群分析专用消息，不生成嵌入向量。"""
+        return await asyncio.to_thread(
+            self._storage.store_group_analysis_message, memory
+        )
+
+    async def get_group_analysis_messages(
+        self,
+        session: str,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        limit: int = 500,
+    ) -> list[Memory]:
+        """异步读取群分析消息。"""
+        return await asyncio.to_thread(
+            self._storage.get_group_analysis_messages,
+            session,
+            since,
+            until,
+            limit,
+        )
+
+    async def get_group_analysis_sessions(
+        self, since: Optional[datetime] = None
+    ) -> list[dict]:
+        """异步列出有群分析消息的群。"""
+        return await asyncio.to_thread(
+            self._storage.get_group_analysis_sessions, since
+        )
+
+    async def store_group_analysis_report(self, memory: Memory) -> int:
+        """异步保存日报。"""
+        return await asyncio.to_thread(
+            self._storage.store_group_analysis_report, memory
+        )
+
+    async def get_group_analysis_report(
+        self, session: str, report_date: str
+    ) -> Optional[Memory]:
+        """异步读取某群某日的日报。"""
+        return await asyncio.to_thread(
+            self._storage.get_group_analysis_report, session, report_date
+        )
+
+    async def get_group_analysis_reports(
+        self, session: str = "", limit: int = 30
+    ) -> list[Memory]:
+        """异步读取日报历史。"""
+        return await asyncio.to_thread(
+            self._storage.get_group_analysis_reports, session, limit
+        )
+
+    async def delete_group_analysis_before(self, before: datetime) -> int:
+        """异步清理过期群分析数据。"""
+        return await asyncio.to_thread(
+            self._storage.delete_group_analysis_before, before
+        )
 
     async def get_profile_scopes(
         self, limit: Optional[int] = None, share_across_sessions: bool = False
