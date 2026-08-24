@@ -1867,6 +1867,20 @@ class GroupChatBot:
         session_id = str(session_id or "").strip()
         if not session_id.startswith("group_"):
             return {"success": False, "error": "只能分析群聊会话"}
+        # 校验这个群真实存在（有记忆或活跃窗口），避免对不存在的 group 误触发
+        # 后向该群发送“素材不足”等群内消息。
+        if (
+            not self.context_manager
+            or session_id not in self.context_manager._windows
+        ):
+            try:
+                exists = await self.memory_storage.get_session_messages(
+                    session_id, limit=1
+                )
+            except Exception:
+                exists = []
+            if not exists:
+                return {"success": False, "error": "该群没有可分析的会话记录"}
         config = getattr(self, "_group_analysis_config", {}) or {}
         if not config.get("enabled", True):
             return {"success": False, "error": "群聊日报功能目前没有开启"}

@@ -366,26 +366,36 @@ async def get_sessions():
     seen = set()
     sessions = []
 
+    def normalize(sid: str) -> str:
+        # 同一群可能以 group_id 或完整 session 名出现在不同来源，统一成
+        # 基础群号再比较，避免同一群被同时列为“活跃”和“历史”两项。
+        return sid[len("group_"):] if sid.startswith("group_") else sid
+
+    def add(sid: str, active: bool, **extra) -> None:
+        key = normalize(sid)
+        if not sid or key in seen:
+            return
+        seen.add(key)
+        item = {"session": sid, "active": active}
+        item.update(extra)
+        sessions.append(item)
+
     # 1. 当前活跃窗口（内存），优先展示
     if bot_instance.context_manager:
         for sid in bot_instance.context_manager._windows.keys():
-            seen.add(sid)
-            sessions.append({"session": sid, "active": True})
+            add(sid, True)
 
     # 2. 历史会话（SQLite 记忆），重启后仍可恢复
     try:
         if bot_instance.memory_storage:
             for row in await bot_instance.memory_storage.list_sessions(limit=50):
                 sid = row.get("session") or ""
-                if not sid or sid in seen:
-                    continue
-                seen.add(sid)
-                sessions.append({
-                    "session": sid,
-                    "active": False,
-                    "message_count": row.get("message_count", 0),
-                    "last_active": (row.get("last_active") or ""),
-                })
+                add(
+                    sid,
+                    False,
+                    message_count=row.get("message_count", 0),
+                    last_active=(row.get("last_active") or ""),
+                )
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
 
