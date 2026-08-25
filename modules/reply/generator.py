@@ -320,6 +320,38 @@ class ReplyGenerator:
             self.replies_filtered += 1
             return None
 
+        # 群聊短插话最容易出现“只抓住最后一个数字/名词就评价”的表面回复，
+        # 例如把“放狠话→立刻暴毙，享年4级”说成“4级也太惨了”。发现这种
+        # 低信息反应时只追加一次纠偏调用；仍然看不懂就潜水，不把莫名其妙的
+        # 半句发进群里。定向回复不走这条兜底，避免影响正常的直接问答。
+        if self._is_surface_reaction(
+            result,
+            context_prompt=context_prompt,
+            current_message=current_message,
+            direction=direction,
+            action_plan=action_plan,
+        ):
+            logger.info("[事件理解] 检测到只围绕单一数字/名词的表面反应，要求重看上下文")
+            retry_reply = await self._retry_event_reaction(request)
+            if not retry_reply or self._is_silent(retry_reply):
+                logger.info("[事件理解] 重答仍不可用，本轮保持沉默")
+                return None
+            retry_passed, retry_result = self.response_filter.filter(retry_reply)
+            if not retry_passed:
+                logger.info("[事件理解] 重答被过滤: %s", retry_result)
+                self.replies_filtered += 1
+                return None
+            if self._is_surface_reaction(
+                retry_result,
+                context_prompt=context_prompt,
+                current_message=current_message,
+                direction=direction,
+                action_plan=action_plan,
+            ):
+                logger.info("[事件理解] 重答仍是表面反应，本轮保持沉默")
+                return None
+            result = retry_result
+
         self.replies_generated += 1
 
         # 7. 应用说话风格
@@ -760,9 +792,16 @@ class ReplyGenerator:
             "silent": "不要回复，只输出 <silent>",
         }
         behavior = guides.get(action, guides["reply"])
+        event_guide = ""
+        if action in {"react", "reply", "interrupt"}:
+            event_guide = (
+                "短插话先看最近2到4条消息，先判断这几条合起来发生了什么、谁在接谁的话、"
+                "笑点或反转在哪里，再落到最后一句；不要只抓最新消息里的一个数字、等级、名字"
+                "或表情做表面评价。上下文不足以确认事件时宁可输出 <silent>。"
+            )
         return (
             f"本轮行为计划：{behavior}。语气：{tone}。"
-            f"最终回复不得超过{max_chars}个字符。"
+            f"最终回复不得超过{max_chars}个字符。{event_guide}"
         )
 
     @staticmethod
@@ -971,6 +1010,87 @@ class ReplyGenerator:
             self._mark_frustrated(session_id)
             return True
         return False
+
+    # 事件理解兜底：短插话如果只复述一个数字/等级，再接一个通用情绪词，
+    # 往往说明模型没有把前后铺垫和结果合起来看。
+    _SURFACE_NUMBER_RE = re.compile(
+        r"\d+(?:\.\d+)?\s*(?:级|岁|次|个|人|块|分|血|杀|局|年|天|米|分钟|秒|点)?"
+    )
+    _SURFACE_EVENT_MARKERS = (
+        "遗言", "享年", "猝", "翻车", "打脸", "立flag", "立 flag", "被打",
+        "被秒", "暴毙", "倒了", "没了", "寄了", "嘲笑", "反转", "打不过",
+    )
+    _SURFACE_REACTION_WORDS = (
+        "这下", "也太", "太", "好", "真", "确实", "有点", "就", "是",
+        "惨", "离谱", "可怜", "抽象", "好笑", "笑死", "笑麻", "笑了",
+        "绷不住", "没了", "寄", "了", "啊", "呀", "吧",
+    )
+    _SURFACE_DIRECTIVE_RE = re.compile(
+        r"\[\[\s*(?:表情|表情包|meme)\s*(?::|：)[^\]]*\]\]"
+        r"|&&\s*meme\s*(?::|：)[^&]+&&",
+        flags=re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_surface_reaction(
+        cls,
+        reply: str,
+        *,
+        context_prompt: str,
+        current_message: str,
+        direction: str,
+        action_plan: Dict[str, Any] = None,
+    ) -> bool:
+        """识别“单一数字/名词 + 万能评价”的低信息群聊短回复。"""
+        if direction != "group" or not reply or not action_plan:
+            return False
+        if action_plan.get("action") not in {"react", "reply", "interrupt"}:
+            return False
+
+        body = cls._SURFACE_DIRECTIVE_RE.sub("", str(reply or ""))
+        body = re.sub(r"[\s，。！？!?、~…,.：:；;（）()【】\[\]]+", "", body)
+        if not body or len(body) > 22:
+            return False
+
+        context = f"{context_prompt or ''}\n{current_message or ''}"
+        context_compact = re.sub(r"\s+", "", context)
+        if not any(marker in context_compact for marker in cls._SURFACE_EVENT_MARKERS):
+            return False
+
+        # 只在回复确实沿用了上下文里的数字/等级时命中，避免误伤“太离谱了”
+        # 这种没有具体复读对象的普通感叹。
+        matched_unit = None
+        for match in cls._SURFACE_NUMBER_RE.finditer(context_compact):
+            unit = re.sub(r"\s+", "", match.group(0))
+            if unit and unit in body:
+                matched_unit = unit
+                break
+        if not matched_unit:
+            return False
+
+        remainder = body.replace(matched_unit, "", 1)
+        for word in sorted(cls._SURFACE_REACTION_WORDS, key=len, reverse=True):
+            remainder = remainder.replace(word, "")
+        return not remainder
+
+    async def _retry_event_reaction(self, request: ChatRequest) -> str:
+        """要求模型重新按完整事件组织一次短插话，最多额外调用一次。"""
+        retry_request = copy.deepcopy(request)
+        # 追加 user turn 而不是把 system 插到原始 user 后面，兼容严格要求 system
+        # 消息必须位于开头的 OpenAI 兼容端点。
+        retry_request.add_user(
+            "上一版草稿只抓住了一个数字、等级或名字，像脱离上下文的表面反应。"
+            "请重新看最近2到4条群聊消息，先判断完整事件：谁先说了什么、后面发生了什么、"
+            "是否有反转/打脸/接梗，再用一条自然口语点评这个事件的笑点或反差。"
+            "不要把原消息里的数字、等级、人名当成主要内容复述，不要编造看不出的细节；"
+            "如果仍无法确认前后关系，只输出 <silent>。"
+        )
+        try:
+            response = await self.llm.chat(retry_request)
+            return self._clean_thinking_process((response.content or "").strip())
+        except Exception as exc:
+            logger.warning("[事件理解] 重答失败: %s", exc)
+            return ""
 
     # 复读检测：剥掉笑声/语气词/标点后剩下的"实质内容"如果整段出现在最近
     # 某条群友消息里，就是把别人的话原样说了一遍。

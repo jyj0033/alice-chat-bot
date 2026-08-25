@@ -2,7 +2,9 @@
 
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+import asyncio
 import unittest
+from unittest.mock import patch
 
 from modules.memory.context import ContextManager, ContextMessage
 from modules.reply.generator import ReplyGenerator
@@ -275,6 +277,98 @@ class ConversationFloorTests(unittest.TestCase):
         cut = generator._limit_action_length("确实有点太离谱了", 6)
         self.assertLessEqual(len(cut), 6)
         self.assertEqual(cut, "确实有点太")
+
+    def test_short_reaction_prompt_prioritizes_complete_event(self):
+        generator = ReplyGenerator(llm_provider=None)
+        request = generator._build_request(
+            context_prompt="[刚刚] 牢森：我一个吕布还能打不过夏侯惇了？\n"
+            "[刚刚] 森：猝，享年4级",
+            current_message="森：猝，享年4级",
+            direction="group",
+            action_plan={"action": "reply", "tone": "自然", "max_chars": 18},
+        )
+
+        self.assertTrue(
+            any("最近2到4条消息" in message.content for message in request.messages)
+        )
+        self.assertTrue(
+            any("不要只抓最新消息" in message.content for message in request.messages)
+        )
+
+    def test_surface_reaction_guard_catches_number_only_comment(self):
+        plan = {"action": "reply", "max_chars": 18}
+        context = (
+            "[刚刚] 牢森：我一个吕布还能打不过夏侯惇了？\n"
+            "[刚刚] 森：猝，享年4级"
+        )
+
+        self.assertTrue(
+            ReplyGenerator._is_surface_reaction(
+                "4级也太惨了",
+                context_prompt=context,
+                current_message="森：猝，享年4级",
+                direction="group",
+                action_plan=plan,
+            )
+        )
+        self.assertFalse(
+            ReplyGenerator._is_surface_reaction(
+                "放完狠话马上就没了，这反差也太快",
+                context_prompt=context,
+                current_message="森：猝，享年4级",
+                direction="group",
+                action_plan=plan,
+            )
+        )
+
+    def test_settle_window_has_a_bounded_idle_and_total_wait(self):
+        manager = ConversationFloorManager(
+            settle_window_seconds=0.7,
+            settle_max_seconds=2.4,
+        )
+
+        self.assertEqual(manager.settle_window_seconds, 0.7)
+        self.assertEqual(manager.settle_max_seconds, 2.4)
+
+    def test_group_settle_resets_for_new_message_but_directed_does_not_wait(self):
+        from main import GroupChatBot
+
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.context_manager = ContextManager()
+        bot.conversation_floor_manager = ConversationFloorManager(
+            settle_window_seconds=0.2,
+            settle_max_seconds=0.4,
+        )
+        target = self.message("u1", "放狠话", 0, message_id="m1")
+        newer = self.message("u2", "然后翻车", 1, message_id="m2")
+        bot.context_manager.get_window("group_g1").add(target)
+        calls = 0
+
+        async def fake_sleep(_seconds):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                bot.context_manager.get_window("group_g1").add(newer)
+
+        async def exercise():
+            with patch("main.asyncio.sleep", new=fake_sleep):
+                await bot._wait_for_group_settle(
+                    "group_g1", SimpleNamespace(directed=False)
+                )
+
+        asyncio.run(exercise())
+        self.assertEqual(calls, 2)
+
+        calls = 0
+
+        async def exercise_directed():
+            with patch("main.asyncio.sleep", new=fake_sleep):
+                await bot._wait_for_group_settle(
+                    "group_g1", SimpleNamespace(directed=True)
+                )
+
+        asyncio.run(exercise_directed())
+        self.assertEqual(calls, 0)
 
     def test_reply_plan_refreshes_to_latest_undirected_message(self):
         """思考期间群聊前进但未过期时，计划应跟随最新消息而不是旧目标。"""

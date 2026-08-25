@@ -92,11 +92,20 @@ class ConversationFloorManager:
         burst_window_seconds: float = 12.0,
         burst_message_threshold: int = 4,
         topic_shift_threshold: float = 0.12,
+        settle_window_seconds: float = 0.7,
+        settle_max_seconds: float = 2.4,
     ):
         self.active_window_seconds = active_window_seconds
         self.burst_window_seconds = burst_window_seconds
         self.burst_message_threshold = burst_message_threshold
         self.topic_shift_threshold = topic_shift_threshold
+        # 普通插话在生成前需要一个很短的收尾窗口：窗口内有新消息就继续等，
+        # 但设置上限，避免 bot 因为热闹的群聊永久等不到“最后一条”。
+        self.settle_window_seconds = max(0.2, float(settle_window_seconds))
+        self.settle_max_seconds = max(
+            self.settle_window_seconds,
+            float(settle_max_seconds),
+        )
 
     def analyze(
         self,

@@ -542,6 +542,8 @@ class GroupChatBot:
             burst_window_seconds=floor_config.get("burst_window_seconds", 12),
             burst_message_threshold=floor_config.get("burst_message_threshold", 4),
             topic_shift_threshold=floor_config.get("topic_shift_threshold", 0.12),
+            settle_window_seconds=floor_config.get("settle_window_seconds", 0.7),
+            settle_max_seconds=floor_config.get("settle_max_seconds", 2.4),
         )
 
         # 发言决策器
@@ -677,7 +679,7 @@ class GroupChatBot:
 
         拆成两条路径，避免"思考期间看不到新消息"的失真：
         - 快速路径（立即执行）：状态更新 + 消息写入上下文 + 发言决策，不阻塞接收循环
-        - 慢路径（后台任务）：思考延迟 + LLM 生成 + 发送，期间新消息仍会进入上下文
+        - 慢路径（后台任务）：思考延迟 + 群聊收尾窗口 + LLM 生成 + 发送，期间新消息仍会进入上下文
         """
         session_id = message.session_id
         group_config = (
@@ -1179,6 +1181,59 @@ class GroupChatBot:
         )
         return refreshed, False
 
+    def _latest_user_context_marker(self, session_id: str):
+        """返回会话里最新群友消息的稳定标记，用于检测收尾窗口是否被打断。"""
+        recent = self.context_manager.get_window(session_id).get_recent(30)
+        for item in reversed(recent):
+            if item.is_bot:
+                continue
+            timestamp = getattr(item, "timestamp", None)
+            if hasattr(timestamp, "isoformat"):
+                timestamp = timestamp.isoformat()
+            return (
+                str(item.message_id or ""),
+                str(timestamp or ""),
+                str(item.sender_id or ""),
+                str(item.content or ""),
+            )
+        return None
+
+    async def _wait_for_group_settle(self, session_id: str, action_plan) -> None:
+        """等待普通群聊短暂安静，再把最新上下文交给 LLM。
+
+        这是插话和定向回复的边界：明确 @/引用 bot 的消息不走这里；普通群聊
+        只等待一个很短的 idle 窗口。新消息会重置 idle 计时，但总等待有上限，
+        所以热闹群聊最终仍会进入一次最新上下文的判断。
+        """
+        if not action_plan or action_plan.directed or not self.conversation_floor_manager:
+            return
+
+        floor = self.conversation_floor_manager
+        idle_seconds = max(0.2, float(getattr(floor, "settle_window_seconds", 0.7)))
+        max_seconds = max(
+            idle_seconds,
+            float(getattr(floor, "settle_max_seconds", 2.4)),
+        )
+        marker = self._latest_user_context_marker(session_id)
+        if marker is None:
+            return
+
+        started = time.monotonic()
+        while True:
+            remaining = max_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                logger.debug("[发言收尾] 达到 %.1fs 上限，使用当前群聊上下文", max_seconds)
+                return
+
+            await asyncio.sleep(min(idle_seconds, remaining))
+            latest = self._latest_user_context_marker(session_id)
+            if latest == marker:
+                logger.debug("[发言收尾] 群聊已安静 %.1fs，开始分析", idle_seconds)
+                return
+
+            marker = latest
+            logger.debug("[发言收尾] 检测到新群消息，继续等待 %.1fs", idle_seconds)
+
     async def _compose_and_send(self, message: Message, decision: dict) -> None:
         """慢路径：思考延迟 → 用最新上下文生成回复 → 发送"""
         session_id = message.session_id
@@ -1212,6 +1267,10 @@ class GroupChatBot:
                     * (action_plan.wait_multiplier if action_plan else 1.0)
                 )
             )
+
+            # 定向回复按原有节奏及时处理；普通插话再补一个很短的 debounce，
+            # 避免 LLM 只看到“享年4级”就抢先点评，错过后面紧接着的“猝/翻车”语境。
+            await self._wait_for_group_settle(session_id, action_plan)
 
             # 思考期间群聊可能已经向前发展；普通插话过期时放弃，仍适合时
             # 把行为计划切换到最新群友消息，避免旧计划套新上下文。
@@ -3980,7 +4039,9 @@ class GroupChatBot:
                 "active_window_seconds": 45,
                 "burst_window_seconds": 12,
                 "burst_message_threshold": 4,
-                "topic_shift_threshold": 0.12
+                "topic_shift_threshold": 0.12,
+                "settle_window_seconds": 0.7,
+                "settle_max_seconds": 2.4
             },
             "rich_media": {
                 "enabled": True,
