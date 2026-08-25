@@ -35,9 +35,8 @@ logger = logging.getLogger(__name__)
 SUPPORTED_FORMATS = {
     "PNG": ".png",
     "JPEG": ".jpg",
-    "GIF": ".gif",
-    "WEBP": ".webp",
 }
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 DEFAULT_CATEGORY = "待整理"
 DEFAULT_CATEGORIES = {
     "待整理": "刚收到、还没有决定放到哪里的图片",
@@ -316,10 +315,32 @@ class MemeManager:
         except Exception as exc:
             raise ValueError("图片内容无法验证") from exc
         if image_format not in SUPPORTED_FORMATS:
-            raise ValueError("只支持 PNG、JPEG、GIF 和 WebP 图片")
+            raise ValueError("表情包只支持 PNG 和 JPEG 图片")
         if width * height > 40_000_000:
             raise ValueError("图片像素过大")
         return image_format, SUPPORTED_FORMATS[image_format], (width, height)
+
+    @staticmethod
+    def to_png_bytes(content: bytes) -> bytes:
+        """把发送用素材统一编码为 PNG；旧清单中的 GIF/WebP 取首帧。"""
+        if not content:
+            raise ValueError("图片内容为空")
+        if content.startswith(PNG_SIGNATURE):
+            return content
+        if Image is None:
+            raise ValueError("当前环境无法把图片转换为 PNG")
+        try:
+            with Image.open(BytesIO(content)) as image:
+                image.seek(0)
+                frame = image.convert("RGBA")
+                try:
+                    output = BytesIO()
+                    frame.save(output, format="PNG", optimize=True)
+                    return output.getvalue()
+                finally:
+                    frame.close()
+        except Exception as exc:
+            raise ValueError("图片无法转换为 PNG") from exc
 
     def _image_path(self, item: dict[str, Any]) -> Path:
         category = _safe_category(item.get("category"))
@@ -708,7 +729,6 @@ class MemeManager:
         return bool(
             self.config.get("collect_plain_images", False)
             or self._has_meme_signal(message, segment)
-            or str(getattr(segment, "file", "") or "").lower().endswith((".gif", ".webp"))
         )
 
     def _image_passes_guard(self, content: bytes, segment: Any) -> bool:

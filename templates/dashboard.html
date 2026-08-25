@@ -2225,12 +2225,12 @@
                         <div class="card-title"><span class="card-ico"><svg class="icon-sm"><use href="#i-upload"/></svg></span>添加素材</div>
                     </div>
                     <div class="meme-upload">
-                        <input type="file" id="meme-upload-file" accept="image/png,image/jpeg,image/gif,image/webp">
+                        <input type="file" id="meme-upload-file" accept="image/png,image/jpeg">
                         <select id="meme-upload-category"></select>
                         <input type="text" id="meme-upload-meaning" maxlength="240" placeholder="大致含义 / 适用场景，例如：表面答应，实际不情愿" style="flex:1;min-width:260px;">
                         <button class="btn btn-primary" onclick="uploadMeme()"><svg class="icon-sm"><use href="#i-upload"/></svg>上传</button>
                     </div>
-                    <div class="hint" style="margin-top:10px;">支持 PNG、JPEG、GIF、WebP；相同图片会自动去重。</div>
+                    <div class="hint" style="margin-top:10px;">只支持 PNG、JPEG；相同图片会自动去重。</div>
                     <div style="display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap;">
                         <input type="text" id="meme-new-category" placeholder="新分类名称" style="max-width:220px;">
                         <button class="btn btn-secondary btn-sm" onclick="createMemeCategory()"><svg class="icon-sm"><use href="#i-plus"/></svg>新建分类</button>

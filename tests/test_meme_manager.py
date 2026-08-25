@@ -21,6 +21,18 @@ def _png_bytes(color=(124, 108, 255)):
     return buffer.getvalue()
 
 
+def _jpeg_bytes(color=(124, 108, 255)):
+    buffer = BytesIO()
+    Image.new("RGB", (240, 160), color).save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def _gif_bytes():
+    buffer = BytesIO()
+    Image.new("P", (240, 160), 3).save(buffer, format="GIF")
+    return buffer.getvalue()
+
+
 class MemeManagerTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = TemporaryDirectory()
@@ -89,6 +101,73 @@ class MemeManagerTests(unittest.TestCase):
         self.assertTrue(self.manager.delete(item["id"]))
         self.assertIsNone(self.manager.get(item["id"]))
         self.assertFalse(self.manager.delete(item["id"]))
+
+    def test_new_entries_only_accept_png_or_jpeg_and_send_as_png(self):
+        with self.assertRaises(ValueError):
+            self.manager.add_bytes(_gif_bytes(), category="吐槽")
+
+        for content in (_png_bytes(), _jpeg_bytes(), _gif_bytes()):
+            converted = self.manager.to_png_bytes(content)
+            with Image.open(BytesIO(converted)) as image:
+                self.assertEqual(image.format, "PNG")
+
+    def test_auto_collect_skips_gif_content(self):
+        gif = _gif_bytes()
+        data_url = "data:image/gif;base64," + base64.b64encode(gif).decode("ascii")
+
+        class Enricher:
+            async def _download_image_data_url(self, segment):
+                return data_url
+
+        manager = MemeManager(
+            {
+                "storage_path": self.temp_dir.name,
+                "auto_collect_enabled": True,
+                "collect_cooldown_seconds": 0,
+            },
+            base_dir=Path.cwd(),
+        )
+        message = Message(
+            message_id="gif-1",
+            message_type="group",
+            sender_id="u-gif",
+            sender_name="小明",
+            group_id="123",
+            content="哈哈这个梗图",
+            outer_text="哈哈这个梗图",
+            segments=[MessageSegment(type="image", file="reaction.gif")],
+        )
+        adapter = SimpleNamespace(self_id="bot", rich_media_enricher=Enricher())
+
+        import asyncio
+
+        self.assertEqual(asyncio.run(manager.collect_message(message, adapter)), [])
+        self.assertEqual(manager.stats()["total"], 0)
+
+    def test_send_meme_passes_png_bytes_to_adapter(self):
+        item = self.manager.add_bytes(_jpeg_bytes(), category="吐槽")
+        sent: list[bytes] = []
+
+        class Adapter:
+            async def send_image(self, session_id, image_bytes, reply_to_id=None):
+                sent.append(image_bytes)
+                return True
+
+        from main import GroupChatBot
+
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.meme_manager = self.manager
+        bot.qq_adapter = Adapter()
+
+        import asyncio
+
+        result = asyncio.run(
+            bot.send_meme("group_123", meme_id=item["id"])
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(len(sent), 1)
+        with Image.open(BytesIO(sent[0])) as image:
+            self.assertEqual(image.format, "PNG")
 
     def test_auto_collect_reuses_enricher_and_respects_scope(self):
         content = _png_bytes((20, 180, 130))

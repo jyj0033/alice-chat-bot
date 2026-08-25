@@ -898,6 +898,13 @@ class GroupChatBot:
             return {"success": False, "error": "表情文件不存在"}
         _, image_bytes = payload
         try:
+            # 历史清单可能还留有 GIF/WebP；发送前统一转成 PNG，避免 NapCat
+            # 对动图格式的兼容差异，也保证新旧表情包走同一种发送格式。
+            image_bytes = await asyncio.to_thread(manager.to_png_bytes, image_bytes)
+        except Exception as exc:
+            logger.warning("[表情库] 图片转 PNG 失败: %s", exc)
+            return {"success": False, "error": "表情图片无法转换为 PNG", "item": item}
+        try:
             success = await self.qq_adapter.send_image(
                 session_id,
                 image_bytes,
