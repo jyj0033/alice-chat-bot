@@ -474,6 +474,11 @@ class MemeManager:
     # ------------------------------------------------------------------
     # 选择与回复标记
     # ------------------------------------------------------------------
+    def strip_directives(self, text: str) -> str:
+        """剥掉所有表情选择标记的残留（供发送前兜底清理）。"""
+        raw = str(text or "")
+        return DIRECTIVE_RE.sub("", raw).strip()
+
     def extract_directive(self, text: str) -> tuple[str, str | None]:
         """提取 LLM 的表情选择标记，并从最终文字中删除标记。"""
         raw = str(text or "")
@@ -481,8 +486,12 @@ class MemeManager:
         if not match:
             return raw.strip(), None
         selection = (match.group(1) or match.group(2) or "").strip()
+        # 兼容 LLM 可能输出的 `编号:abc123:分类` / `1549acd5d9:歪嘴` 等变体：
+        # 先尝试精确选图（6~64 位十六进制），带不带 `编号/id/素材` 前缀、以及
+        # 后面是否再跟一个分类名都接受；无法精确匹配时再退化为分类/随机。
         id_match = re.fullmatch(
-            r"(?:编号|id|素材)\s*(?::|：|=)?\s*([0-9a-f]{6,64})",
+            r"(?:(?:编号|id|素材)\s*(?::|：|=)?\s*)?([0-9a-f]{6,64})"
+            r"(?:\s*(?::|：)\s*[^:：]{1,30})?",
             selection,
             flags=re.IGNORECASE,
         )

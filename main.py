@@ -1291,6 +1291,15 @@ class GroupChatBot:
                 if isinstance(meme_category, str) and meme_category.startswith("@id:"):
                     meme_id = meme_category[4:]
                     meme_category = ""
+                # 兜底：解析失败残留的标记（如 LLM 输出了格式外的变体）不能原样发进
+                # 群里，剥成普通文字后再继续，避免“[[表情:xxx:yyy”直接出现在聊天里。
+                residue = self.meme_manager.strip_directives(reply)
+                if residue != reply:
+                    logger.warning(
+                        "[表情库] 残留标记未解析成功，已剥离: %s",
+                        reply if len(reply) <= 80 else reply[:80] + "…",
+                    )
+                    reply = residue
 
             # 复读兜底：把群友的原话原样说一遍不如不说。表情包识别摘要会引用
             # 前文原话，短反应档下 LLM 容易直接抓那句引文当自己的发言。
