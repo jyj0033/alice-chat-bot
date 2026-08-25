@@ -1,6 +1,7 @@
 """富媒体解析、NapCat 回执和拟人策略的离线测试。"""
 
 import asyncio
+import base64
 import json
 import unittest
 
@@ -213,6 +214,98 @@ class RichMessageFloorTests(unittest.TestCase):
 
 
 class NapCatApiResponseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_image_waits_for_napcat_ack(self):
+        from core.adapter.qq_adapter import QQAdapter
+
+        sent = []
+        sent_event = asyncio.Event()
+
+        class Client:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+                sent_event.set()
+
+        adapter = QQAdapter({"self_id": "42"})
+        adapter._clients.add(Client())
+        task = asyncio.create_task(
+            adapter.send_image("group_123", b"not-a-real-png")
+        )
+        await asyncio.wait_for(sent_event.wait(), timeout=1.0)
+
+        request = sent[0]
+        self.assertEqual(request["action"], "send_group_msg")
+        self.assertEqual(request["params"]["group_id"], 123)
+        self.assertTrue(request["params"]["message"][0]["data"]["file"].startswith("base64://"))
+        self.assertIn("echo", request)
+        self.assertFalse(task.done())
+
+        await adapter._handle_message(json.dumps({
+            "status": "ok",
+            "retcode": 0,
+            "data": {"message_id": 987},
+            "echo": request["echo"],
+        }))
+
+        self.assertTrue(await task)
+        self.assertEqual(adapter.messages_sent, 1)
+
+    async def test_send_image_reports_napcat_failure(self):
+        from core.adapter.qq_adapter import QQAdapter
+
+        sent = []
+        sent_event = asyncio.Event()
+
+        class Client:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+                sent_event.set()
+
+        adapter = QQAdapter({"self_id": "42"})
+        adapter._clients.add(Client())
+        task = asyncio.create_task(adapter.send_image("group_123", b"image"))
+        await asyncio.wait_for(sent_event.wait(), timeout=1.0)
+        request = sent[0]
+        await adapter._handle_message(json.dumps({
+            "status": "failed",
+            "retcode": 1200,
+            "message": "图片发送失败",
+            "echo": request["echo"],
+        }))
+
+        self.assertFalse(await task)
+        self.assertEqual(adapter.messages_sent, 0)
+
+    async def test_rejected_gif_retries_as_first_frame_png(self):
+        from io import BytesIO
+
+        from PIL import Image
+
+        from core.adapter.qq_adapter import QQAdapter
+
+        gif_output = BytesIO()
+        Image.new("P", (2, 2), 3).save(gif_output, format="GIF")
+        gif_bytes = gif_output.getvalue()
+
+        adapter = QQAdapter({"self_id": "42"})
+        adapter._clients.add(object())
+        calls = []
+
+        async def fake_call_api(action, params):
+            calls.append((action, params))
+            if len(calls) == 1:
+                raise RuntimeError("NapCat 不支持该 GIF")
+            return {"message_id": 988}
+
+        adapter.call_api = fake_call_api
+
+        self.assertTrue(await adapter.send_image("group_123", gif_bytes))
+        self.assertEqual(len(calls), 2)
+        first_file = calls[0][1]["message"][0]["data"]["file"]
+        second_file = calls[1][1]["message"][0]["data"]["file"]
+        self.assertTrue(base64.b64decode(first_file.removeprefix("base64://")).startswith(b"GIF"))
+        self.assertTrue(base64.b64decode(second_file.removeprefix("base64://")).startswith(b"\x89PNG"))
+        self.assertEqual(adapter.messages_sent, 1)
+
     async def test_call_api_matches_echo_and_returns_data(self):
         # 延迟导入，复用项目测试环境对可选 websockets 依赖的处理。
         try:

@@ -432,7 +432,9 @@ class QQAdapter(PlatformAdapter):
                     "params": {"user_id": user_id, "message": message_array},
                 }
 
-            await self._broadcast(json.dumps(message_data))
+            # 必须等待 NapCat 的 echo/retcode 回执；仅把指令写进 WebSocket
+            # 不能证明 QQ 真的接受并发出了消息。
+            await self.call_api(message_data["action"], message_data["params"])
             self.messages_sent += 1
             return True
         except Exception as e:
@@ -461,25 +463,76 @@ class QQAdapter(PlatformAdapter):
                 "type": "image",
                 "data": {"file": f"base64://{encoded}"},
             })
-            if session_id.startswith("group_"):
-                group_id = int(session_id.replace("group_", ""))
-                message_data = {
-                    "action": "send_group_msg",
-                    "params": {"group_id": group_id, "message": message_array},
-                }
-            else:
-                user_id = int(session_id.replace("private_", ""))
-                message_data = {
-                    "action": "send_private_msg",
-                    "params": {"user_id": user_id, "message": message_array},
-                }
+            action, params = self._build_send_message_request(
+                session_id, message_array
+            )
 
-            await self._broadcast(json.dumps(message_data, ensure_ascii=False))
+            # 先尝试保留原始 GIF（动画表情仍可正常发送）；只有 NapCat 明确
+            # 拒绝后，才转首帧 PNG 重试，兼容部分实现对 GIF 编码的限制。
+            try:
+                await self.call_api(action, params)
+            except RuntimeError as exc:
+                png_bytes = self._gif_first_frame_png(image_bytes)
+                if not png_bytes:
+                    raise
+                logger.warning(
+                    "NapCat 拒绝 GIF 图片，转首帧 PNG 重试: %s",
+                    exc,
+                )
+                encoded_png = base64.b64encode(png_bytes).decode("ascii")
+                png_message_array = []
+                if reply_to_id:
+                    png_message_array.append({"type": "reply", "data": {"id": reply_to_id}})
+                png_message_array.append({
+                    "type": "image",
+                    "data": {"file": f"base64://{encoded_png}"},
+                })
+                action, params = self._build_send_message_request(
+                    session_id, png_message_array
+                )
+                await self.call_api(action, params)
             self.messages_sent += 1
             return True
         except Exception as e:
             logger.error(f"Failed to send image: {e}")
             return False
+
+    @staticmethod
+    def _build_send_message_request(
+        session_id: str, message_array: list[dict]
+    ) -> tuple[str, dict]:
+        """把会话标识转换成 OneBot 发送 API 和参数。"""
+        if session_id.startswith("group_"):
+            group_id = int(session_id.replace("group_", ""))
+            return "send_group_msg", {
+                "group_id": group_id,
+                "message": message_array,
+            }
+        user_id = int(session_id.replace("private_", ""))
+        return "send_private_msg", {
+            "user_id": user_id,
+            "message": message_array,
+        }
+
+    @staticmethod
+    def _gif_first_frame_png(image_bytes: bytes) -> bytes | None:
+        """把 GIF 的首帧转成 PNG；非 GIF 或转换失败时返回 None。"""
+        if image_bytes[:6] not in (b"GIF87a", b"GIF89a"):
+            return None
+        try:
+            from io import BytesIO
+
+            from PIL import Image
+
+            with Image.open(BytesIO(image_bytes)) as image:
+                image.seek(0)
+                frame = image.convert("RGBA")
+                output = BytesIO()
+                frame.save(output, format="PNG", optimize=True)
+                return output.getvalue()
+        except Exception as exc:
+            logger.debug("GIF 转 PNG 失败: %s", exc)
+            return None
 
     async def send_group_message(self, group_id: str, content: str, reply_to_id: str | None = None) -> bool:
         return await self.send_message(f"group_{group_id}", content, reply_to_id=reply_to_id)
