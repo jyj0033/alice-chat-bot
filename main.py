@@ -360,6 +360,10 @@ class GroupChatBot:
             "max_report_chars": max(1200, min(10000, int(analysis_cfg.get("max_report_chars", 6000)))),
             "retention_days": max(3, min(365, int(analysis_cfg.get("retention_days", 30)))),
             "send_report": bool(analysis_cfg.get("send_report", True)),
+            "avatars_enabled": bool(analysis_cfg.get("avatars_enabled", True)),
+            "avatar_cache_days": max(1, min(365, int(analysis_cfg.get("avatar_cache_days", 7)))),
+            "avatar_max_count": max(1, min(30, int(analysis_cfg.get("avatar_max_count", 12)))),
+            "avatar_timeout": max(1.0, min(20.0, float(analysis_cfg.get("avatar_timeout", 6)))),
         }
         logger.info(
             "✓ 群聊日报: enabled=%s, auto=%s, 时间=%s",
@@ -2024,6 +2028,24 @@ class GroupChatBot:
             should_send = (not automatic) or config.get("send_report", True)
             send_mode = "none"
             if should_send and self.qq_adapter:
+                avatar_fetcher = getattr(self.qq_adapter, "fetch_user_avatar", None)
+                if config.get("avatars_enabled", True) and callable(avatar_fetcher):
+                    async def _fetch_avatar(sender_id: str):
+                        return await avatar_fetcher(
+                            sender_id,
+                            timeout=config.get("avatar_timeout", 6),
+                        )
+
+                    report["avatars"] = await GroupDailyAnalysis.fetch_avatars(
+                        report,
+                        _fetch_avatar,
+                        Path(__file__).resolve().parent
+                        / "data"
+                        / "group_analysis"
+                        / "avatars",
+                        max_count=config.get("avatar_max_count", 12),
+                        cache_days=config.get("avatar_cache_days", 7),
+                    )
                 image_bytes = GroupDailyAnalysis.render_report_image(
                     report, report_label="今日"
                 )
@@ -3885,6 +3907,11 @@ class GroupChatBot:
                 "auto_send_enabled": False,
                 "collect_private": False,
                 "collect_scope": [],
+                "collect_plain_images": False,
+                "skip_screenshots": True,
+                "min_collect_dimension": 64,
+                "max_collect_dimension": 2400,
+                "max_collect_pixels": 6000000,
                 "default_category": "待整理",
                 "max_image_bytes": 8388608,
                 "max_images_per_message": 2,
@@ -4024,7 +4051,11 @@ class GroupChatBot:
                     "max_tokens": 1800,
                     "max_report_chars": 6000,
                     "retention_days": 30,
-                    "send_report": True
+                    "send_report": True,
+                    "avatars_enabled": True,
+                    "avatar_cache_days": 7,
+                    "avatar_max_count": 12,
+                    "avatar_timeout": 6
                 },
                 "slang": {
                     "enabled": True,

@@ -56,6 +56,24 @@ DIRECTIVE_RE = re.compile(
     r"&&\s*meme\s*(?::|：)\s*([^&]*?)\s*&&)",
     re.IGNORECASE,
 )
+SCREENSHOT_HINTS = (
+    "截图", "截屏", "屏幕截图", "screen shot", "screenshot", "screen_capture",
+    "手机界面", "聊天记录", "聊天界面", "设置页面", "应用界面", "网页截图",
+    "订单", "二维码", "条形码", "收款码", "付款码", "验证码", "通知栏",
+)
+MEME_SIGNAL_HINTS = (
+    "表情包", "梗图", "meme", "动图", "gif", "哈哈", "笑死", "笑不活", "笑哭",
+    "破防", "无语", "离谱", "可爱", "太真实", "蚌埠住", "救命", "绝了",
+    "吐槽", "阴阳", "发个图", "这图", "这个图", "这张图",
+)
+CATEGORY_HINTS = {
+    "开心": ("哈哈", "笑死", "笑不活", "笑哭", "开心", "高兴", "庆祝", "得意", "好耶"),
+    "无语": ("无语", "沉默", "无奈", "服了", "不想说", "叹气", "心累", "失望"),
+    "吐槽": ("吐槽", "嘲讽", "阴阳", "嫌弃", "反讽", "白眼", "讽刺", "看热闹"),
+    "鼓励": ("加油", "支持", "鼓励", "安慰", "抱抱", "辛苦", "没事", "打气"),
+    "卖萌": ("卖萌", "可爱", "萌", "撒娇", "害羞", "软乎乎", "眼巴巴"),
+    "震惊": ("震惊", "惊讶", "不敢相信", "目瞪口呆", "难以置信", "懵", "震撼"),
+}
 
 
 def _now_iso() -> str:
@@ -123,6 +141,12 @@ class MemeManager:
             "auto_send_enabled": bool(raw.get("auto_send_enabled", False)),
             "collect_private": bool(raw.get("collect_private", False)),
             "collect_scope": _parse_list(raw.get("collect_scope", [])),
+            # 普通图片默认只收集有明显表情/梗图信号的，市场表情不受此限制。
+            "collect_plain_images": bool(raw.get("collect_plain_images", False)),
+            "skip_screenshots": bool(raw.get("skip_screenshots", True)),
+            "min_collect_dimension": _bounded_int(raw.get("min_collect_dimension"), 64, 0, 2000),
+            "max_collect_dimension": _bounded_int(raw.get("max_collect_dimension"), 2400, 256, 10000),
+            "max_collect_pixels": _bounded_int(raw.get("max_collect_pixels"), 6_000_000, 0, 40_000_000),
             "default_category": _safe_category(raw.get("default_category", DEFAULT_CATEGORY)),
             "max_image_bytes": _bounded_int(raw.get("max_image_bytes"), 8 * 1024 * 1024, 128 * 1024, 20 * 1024 * 1024),
             "max_images_per_message": _bounded_int(raw.get("max_images_per_message"), 2, 1, 5),
@@ -332,6 +356,20 @@ class MemeManager:
                 if meaning_text and not _item_meaning(existing):
                     existing["meaning"] = meaning_text
                     existing["description"] = meaning_text
+                # 之前在待整理里的素材，后来有了明确情绪时补做一次归类；
+                # 已经人工归好的分类不被后续重复图片覆盖。
+                old_category = _safe_category(existing.get("category"))
+                default_category = self.config.get("default_category", DEFAULT_CATEGORY)
+                if category != default_category and old_category == default_category and category != old_category:
+                    old_path = self._image_path(existing)
+                    new_path = (self.root / category / old_path.name).resolve()
+                    new_path.parent.mkdir(parents=True, exist_ok=True)
+                    if old_path.is_file():
+                        shutil.move(str(old_path), str(new_path))
+                    else:
+                        new_path.write_bytes(content)
+                    existing["category"] = category
+                    self._catalog["categories"].setdefault(category, {"description": ""})
                 self._save_catalog()
                 return {**_public_item(existing), "duplicate": True}
 
@@ -618,6 +656,82 @@ class MemeManager:
         text = text.rstrip("] ")
         return text[:240]
 
+    @staticmethod
+    def _segment_hint_text(message: Any, segment: Any) -> str:
+        data = getattr(segment, "data", {}) or {}
+        values = [
+            getattr(message, "outer_text", ""),
+            getattr(segment, "summary", ""),
+            getattr(segment, "file", ""),
+            getattr(segment, "file_id", ""),
+            getattr(segment, "unique_id", ""),
+        ]
+        if isinstance(data, dict):
+            values.extend(data.get(key, "") for key in ("file", "filename", "name", "sub_type"))
+        return " ".join(str(value or "") for value in values).strip().lower()
+
+    def _looks_like_screenshot(self, message: Any, segment: Any) -> bool:
+        if not self.config.get("skip_screenshots", True):
+            return False
+        hint_text = self._segment_hint_text(message, segment)
+        return any(hint in hint_text for hint in SCREENSHOT_HINTS)
+
+    @staticmethod
+    def _has_meme_signal(message: Any, segment: Any) -> bool:
+        hint_text = MemeManager._segment_hint_text(message, segment)
+        return any(hint in hint_text for hint in MEME_SIGNAL_HINTS)
+
+    @staticmethod
+    def _infer_category(*texts: str) -> str:
+        """从识别摘要和发送者文字中做保守归类，冲突时回到待整理。"""
+        text = " ".join(str(value or "") for value in texts).lower()
+        if not text:
+            return DEFAULT_CATEGORY
+        scores = {
+            category: sum(1 for hint in hints if hint in text)
+            for category, hints in CATEGORY_HINTS.items()
+        }
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if not ranked or ranked[0][1] == 0:
+            return DEFAULT_CATEGORY
+        if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+            return DEFAULT_CATEGORY
+        return ranked[0][0]
+
+    def _segment_is_collectable(self, message: Any, segment: Any) -> bool:
+        """下载前做轻量筛选，避免普通截图和无语义图片进入图库。"""
+        # 市场表情已经是 QQ 的表情素材，直接允许；仍会经过大小和像素护栏。
+        if getattr(segment, "type", "") == "mface":
+            return not self._looks_like_screenshot(message, segment)
+        if self._looks_like_screenshot(message, segment):
+            return False
+        return bool(
+            self.config.get("collect_plain_images", False)
+            or self._has_meme_signal(message, segment)
+            or str(getattr(segment, "file", "") or "").lower().endswith((".gif", ".webp"))
+        )
+
+    def _image_passes_guard(self, content: bytes, segment: Any) -> bool:
+        try:
+            _, _, (width, height) = self._validate_image(
+                content,
+                str(getattr(segment, "file", "") or ""),
+            )
+        except ValueError:
+            return False
+        if not width or not height:
+            return True
+        min_dimension = int(self.config.get("min_collect_dimension", 0) or 0)
+        max_dimension = int(self.config.get("max_collect_dimension", 0) or 0)
+        max_pixels = int(self.config.get("max_collect_pixels", 0) or 0)
+        if min_dimension and min(width, height) < min_dimension:
+            return False
+        if max_dimension and max(width, height) > max_dimension:
+            return False
+        if max_pixels and width * height > max_pixels:
+            return False
+        return True
+
     async def collect_message(self, message: Any, adapter: Any) -> list[dict[str, Any]]:
         """后台收集一条消息里的直接图片，不阻塞回复主链路。"""
         if not message or not self._can_collect(message.session_id, message.message_type):
@@ -628,6 +742,7 @@ class MemeManager:
         segments = [
             segment for segment in (getattr(message, "segments", []) or [])
             if getattr(segment, "type", "") in {"image", "mface"}
+            and self._segment_is_collectable(message, segment)
         ][: int(self.config.get("max_images_per_message", 2))]
         if not segments:
             return []
@@ -637,13 +752,22 @@ class MemeManager:
         for segment in segments:
             try:
                 content = await self._download_segment_bytes(adapter, segment)
-                if not content:
+                if not content or not self._image_passes_guard(content, segment):
                     continue
+                meaning = self._meaning_from_content(getattr(segment, "summary", ""))
+                outer_text = str(getattr(message, "outer_text", "") or "").strip()[:240]
+                if not meaning:
+                    meaning = outer_text
+                category = self._infer_category(meaning, outer_text)
                 item = await asyncio.to_thread(
                     self.add_bytes,
                     content,
-                    category=self.config.get("default_category", DEFAULT_CATEGORY),
-                    meaning=self._meaning_from_content(getattr(message, "content", "")),
+                    category=(
+                        category
+                        if category != DEFAULT_CATEGORY
+                        else self.config.get("default_category", DEFAULT_CATEGORY)
+                    ),
+                    meaning=meaning,
                     tags=["自动收集", "表情包" if segment.type == "mface" else "图片"],
                     source={
                         "session_id": message.session_id,

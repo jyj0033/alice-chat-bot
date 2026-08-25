@@ -1,7 +1,12 @@
 import json
+import io
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
+
+from PIL import Image
 
 from modules.group_analysis import GroupDailyAnalysis
 from modules.memory.storage import Memory
@@ -86,6 +91,26 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
                 {"content": "这波配队太抽象了", "sender_id": "u1", "reason": "吐槽有画面"},
                 {"content": "模型编的不存在原话", "sender_id": "u2", "reason": "不应保留"},
             ],
+            "unhinged_quotes": [
+                {
+                    "content": "这波配队太抽象了",
+                    "sender_id": "u1",
+                    "score": 91,
+                    "reason": "好家伙，原来还能这么说",
+                },
+                {
+                    "content": "我可以，八点半上线",
+                    "sender_id": "u2",
+                    "score": 60,
+                    "reason": "这句至少是真的",
+                },
+                {
+                    "content": "模型编的逆天原话",
+                    "sender_id": "u2",
+                    "score": 99,
+                    "reason": "不应保留",
+                },
+            ],
             "profiles": [{
                 "sender_id": "u1",
                 "title": "抽象配队师",
@@ -116,6 +141,9 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["topics"][0]["sender_ids"], ["u1", "u2"])
         self.assertEqual(len(report["quotes"]), 1)
         self.assertEqual(report["quotes"][0]["content"], "这波配队太抽象了")
+        self.assertEqual(len(report["unhinged_quotes"]), 2)
+        self.assertEqual(report["unhinged_quotes"][0]["score"], 91)
+        self.assertEqual(report["unhinged_quotes"][1]["score"], 60)
         self.assertEqual(report["titles"][0]["sender_id"], "u1")
         self.assertEqual(report["title"], "今晚的群聊小剧场")
         self.assertEqual(report["subtitle"], "大家从开黑聊到了配队")
@@ -125,7 +153,16 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("第一人称", provider.request.messages[-1].content)
         self.assertIn('"quality_review"', provider.request.messages[-1].content)
         self.assertIn('"profiles"', provider.request.messages[-1].content)
+        self.assertIn('"unhinged_quotes"', provider.request.messages[-1].content)
+        self.assertIn("逆天语录", provider.request.messages[-1].content)
+        self.assertIn("短反应", provider.request.messages[-1].content)
+        self.assertIn("多用互联网黑话", provider.request.messages[-1].content)
+        self.assertIn("话题又拐回来了", provider.request.messages[-1].content)
         self.assertIn("我说话很短", provider.request.messages[-1].content)
+        rendered = GroupDailyAnalysis.render_report(report)
+        self.assertNotIn("我当时想说", rendered)
+        self.assertIn("吐槽有画面", rendered)
+        self.assertIn("逆天现场", rendered)
 
     async def test_provider_failure_keeps_local_statistics(self):
         report = await GroupDailyAnalysis.analyze(self.messages, provider=None)
@@ -141,6 +178,47 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
         image = GroupDailyAnalysis.render_report_image(report)
         self.assertIsNotNone(image)
         self.assertTrue(image.startswith(b"\x89PNG\r\n\x1a\n"))
+
+    async def test_report_fetches_and_uses_cached_avatars(self):
+        report = await GroupDailyAnalysis.analyze(self.messages, provider=None)
+        avatar_image = Image.new("RGB", (64, 64), (244, 128, 168))
+        avatar_buffer = io.BytesIO()
+        avatar_image.save(avatar_buffer, format="PNG")
+        payload = avatar_buffer.getvalue()
+        calls = []
+
+        async def fetcher(sender_id):
+            calls.append(sender_id)
+            return payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            avatars = await GroupDailyAnalysis.fetch_avatars(
+                report,
+                fetcher,
+                temp_dir,
+                max_count=2,
+                cache_days=7,
+            )
+            self.assertEqual(set(avatars), {"u1", "u2"})
+            self.assertEqual(set(calls), {"u1", "u2"})
+            self.assertTrue(all(Path(path).is_file() for path in avatars.values()))
+
+            calls.clear()
+            cached = await GroupDailyAnalysis.fetch_avatars(
+                report,
+                fetcher,
+                temp_dir,
+                max_count=2,
+                cache_days=7,
+            )
+            self.assertEqual(cached, avatars)
+            self.assertEqual(calls, [])
+
+            report["avatars"] = avatars
+            with_avatar = GroupDailyAnalysis.render_report_image(report)
+            report.pop("avatars")
+            without_avatar = GroupDailyAnalysis.render_report_image(report)
+            self.assertNotEqual(with_avatar, without_avatar)
 
     def test_rich_report_image_is_a_png(self):
         report = {
@@ -179,6 +257,20 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
                 "content": "先别决定，先复盘一下",
                 "reason": "把一个普通安排拐成了复盘会议。",
             }],
+            "unhinged_quotes": [
+                {
+                    "sender_id": "u3",
+                    "content": "这也能接上，真的太抽象了",
+                    "score": 97,
+                    "reason": "这句的走向我是真没猜到",
+                },
+                {
+                    "sender_id": "u1",
+                    "content": "我宣布今天的计划先不计划",
+                    "score": 88,
+                    "reason": "好家伙，计划自己先消失了",
+                },
+            ],
             "quality_review": {
                 "title": "没有散场的闲聊",
                 "subtitle": "今晚",

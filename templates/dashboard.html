@@ -2165,7 +2165,26 @@
                             <div class="toggle-row" style="padding-top:6px;max-width:120px;">
                                 <label class="toggle"><input type="checkbox" id="meme-auto-collect"><span class="toggle-slider"></span></label>
                             </div>
-                            <div class="hint">默认只收集群聊，图片会先放进待整理</div>
+                            <div class="hint">能判断情绪时自动归类，判断不出才放进待整理</div>
+                        </div>
+                        <div class="form-group">
+                            <label>收集普通图片</label>
+                            <div class="toggle-row" style="padding-top:6px;max-width:120px;">
+                                <label class="toggle"><input type="checkbox" id="meme-collect-plain"><span class="toggle-slider"></span></label>
+                            </div>
+                            <div class="hint">谨慎开启；关闭可拦截大量无语义截图</div>
+                        </div>
+                        <div class="form-group">
+                            <label>跳过截图和码图</label>
+                            <div class="toggle-row" style="padding-top:6px;max-width:120px;">
+                                <label class="toggle"><input type="checkbox" id="meme-skip-screenshots"><span class="toggle-slider"></span></label>
+                            </div>
+                            <div class="hint">依据文件名、识别摘要和消息文字判断</div>
+                        </div>
+                        <div class="form-group">
+                            <label>收集图片最长边上限</label>
+                            <input type="number" id="meme-max-dimension" min="256" max="10000" value="2400">
+                            <div class="hint">过长的手机长截图会被跳过</div>
                         </div>
                         <div class="form-group">
                             <label>允许 Alice 自动发送</label>
@@ -3433,6 +3452,9 @@
                 const meme = config.meme_manager || {};
                 document.getElementById('meme-enabled').checked = meme.enabled !== false;
                 document.getElementById('meme-auto-collect').checked = meme.auto_collect_enabled === true;
+                document.getElementById('meme-collect-plain').checked = meme.collect_plain_images === true;
+                document.getElementById('meme-skip-screenshots').checked = meme.skip_screenshots !== false;
+                document.getElementById('meme-max-dimension').value = meme.max_collect_dimension ?? 2400;
                 document.getElementById('meme-auto-send').checked = meme.auto_send_enabled === true;
                 document.getElementById('meme-collect-scope').value = (meme.collect_scope || []).join(', ');
                 document.getElementById('meme-daily-limit').value = meme.daily_collect_limit ?? 80;
@@ -3510,6 +3532,9 @@
                 meme_manager: {
                     enabled: document.getElementById('meme-enabled').checked,
                     auto_collect_enabled: document.getElementById('meme-auto-collect').checked,
+                    collect_plain_images: document.getElementById('meme-collect-plain').checked,
+                    skip_screenshots: document.getElementById('meme-skip-screenshots').checked,
+                    max_collect_dimension: parseInt(document.getElementById('meme-max-dimension').value) || 2400,
                     auto_send_enabled: document.getElementById('meme-auto-send').checked,
                     default_category: document.getElementById('meme-default-category').value || '待整理',
                     collect_scope: listValue('meme-collect-scope'),

@@ -8,6 +8,9 @@ import contextlib
 import json
 import logging
 import uuid
+from urllib.parse import quote
+
+import aiohttp
 import websockets
 from typing import Any, Callable, Awaitable, Optional, Set
 
@@ -190,6 +193,71 @@ class QQAdapter(PlatformAdapter):
             return await asyncio.wait_for(future, timeout=max(0.1, float(timeout)))
         finally:
             self._pending_api.pop(echo, None)
+
+    async def fetch_user_avatar(
+        self,
+        user_id: str,
+        *,
+        timeout: float = 6.0,
+    ) -> bytes | None:
+        """获取 QQ 用户头像；日报只把结果用于本地图片渲染，不写入聊天内容。"""
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return None
+
+        encoded_id = quote(user_id, safe="")
+        configured_template = str(
+            self.config.get("avatar_url_template", "") or ""
+        ).strip()
+        if configured_template:
+            try:
+                urls = [
+                    configured_template.format(
+                        user_id=encoded_id,
+                        uid=encoded_id,
+                        size=640,
+                    )
+                ]
+            except (KeyError, ValueError):
+                urls = []
+        else:
+            # QQ 头像公共缩略图接口不需要额外权限；第二个地址作为备用。
+            urls = [
+                f"https://q1.qlogo.cn/g?b=qq&nk={encoded_id}&s=640",
+                f"https://q2.qlogo.cn/headimg_dl?dst_uin={encoded_id}&spec=640",
+            ]
+
+        if not urls:
+            return None
+        request_timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout)))
+        headers = {"User-Agent": "AliceChatBot/1.0"}
+        try:
+            async with aiohttp.ClientSession(
+                timeout=request_timeout, headers=headers
+            ) as session:
+                for url in urls:
+                    try:
+                        async with session.get(url) as response:
+                            if response.status != 200:
+                                continue
+                            content = await response.read()
+                            content_type = str(
+                                response.headers.get("Content-Type", "")
+                            ).lower()
+                            if (
+                                content
+                                and len(content) <= 4 * 1024 * 1024
+                                and (
+                                    content_type.startswith("image/")
+                                    or content.startswith((b"\x89PNG", b"\xff\xd8", b"GIF8"))
+                                )
+                            ):
+                                return content
+                    except (aiohttp.ClientError, asyncio.TimeoutError):
+                        continue
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+        return None
 
     async def enrich_message(
         self,

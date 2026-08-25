@@ -17,7 +17,7 @@ from modules.reply.generator import ReplyGenerator
 
 def _png_bytes(color=(124, 108, 255)):
     buffer = BytesIO()
-    Image.new("RGB", (24, 16), color).save(buffer, format="PNG")
+    Image.new("RGB", (240, 160), color).save(buffer, format="PNG")
     return buffer.getvalue()
 
 
@@ -41,6 +41,10 @@ class MemeManagerTests(unittest.TestCase):
         self.assertTrue(duplicate["duplicate"])
         self.assertEqual(self.manager.stats()["total"], 1)
         self.assertEqual(self.manager.get(first["id"])["category"], "吐槽")
+
+        pending = self.manager.add_bytes(_png_bytes((10, 20, 30)), category="待整理")
+        self.manager.add_bytes(_png_bytes((10, 20, 30)), category="开心", meaning="开心的反应")
+        self.assertEqual(self.manager.get(pending["id"])["category"], "开心")
 
         updated = self.manager.update(first["id"], category="开心", tags=["反应"])
         self.assertEqual(updated["category"], "开心")
@@ -110,6 +114,7 @@ class MemeManagerTests(unittest.TestCase):
             sender_name="小明",
             group_id="123",
             content="这张可以",
+            outer_text="哈哈这张好好笑",
             segments=[MessageSegment(type="image")],
         )
         adapter = SimpleNamespace(self_id="bot", rich_media_enricher=Enricher())
@@ -118,11 +123,61 @@ class MemeManagerTests(unittest.TestCase):
 
         result = asyncio.run(manager.collect_message(message, adapter))
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["category"], "待整理")
+        self.assertEqual(result[0]["category"], "开心")
         self.assertEqual(result[0]["source_session"], "group_123")
 
         message.group_id = "999"
         self.assertEqual(asyncio.run(manager.collect_message(message, adapter)), [])
+
+    def test_plain_images_require_signal_and_screenshots_are_skipped(self):
+        content = _png_bytes((220, 220, 220))
+        data_url = "data:image/png;base64," + base64.b64encode(content).decode("ascii")
+        calls = 0
+
+        class Enricher:
+            async def _download_image_data_url(self, segment):
+                nonlocal calls
+                calls += 1
+                return data_url
+
+        manager = MemeManager(
+            {
+                "storage_path": self.temp_dir.name,
+                "auto_collect_enabled": True,
+                "collect_cooldown_seconds": 0,
+            },
+            base_dir=Path.cwd(),
+        )
+        message = Message(
+            message_id="m2",
+            message_type="group",
+            sender_id="u2",
+            sender_name="小红",
+            group_id="123",
+            content="看一下",
+            outer_text="看一下",
+            segments=[MessageSegment(type="image", summary="[图片]")],
+        )
+        adapter = SimpleNamespace(self_id="bot", rich_media_enricher=Enricher())
+
+        import asyncio
+
+        self.assertEqual(asyncio.run(manager.collect_message(message, adapter)), [])
+        self.assertEqual(calls, 0)
+
+        message.segments[0].summary = "[图片，内容：一张聊天截图]"
+        self.assertEqual(asyncio.run(manager.collect_message(message, adapter)), [])
+        self.assertEqual(calls, 0)
+
+        message.segments[0].summary = "[图片，内容：一个人在翻白眼的梗图]"
+        result = asyncio.run(manager.collect_message(message, adapter))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(calls, 1)
+        self.assertEqual(result[0]["category"], "吐槽")
+
+    def test_auto_category_falls_back_when_meaning_is_unclear(self):
+        self.assertEqual(MemeManager._infer_category("一张普通风景图"), "待整理")
+        self.assertEqual(MemeManager._infer_category("哈哈但又有点无语"), "待整理")
 
     def test_private_collection_is_off_by_default(self):
         manager = MemeManager(

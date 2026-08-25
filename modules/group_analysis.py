@@ -7,18 +7,172 @@
 
 from __future__ import annotations
 
+import asyncio
 import difflib
+import hashlib
 import io
 import json
 import logging
 import os
 import re
+import time
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 
 logger = logging.getLogger(__name__)
+
+
+class _ScaledDraw:
+    """在高分辨率画布上使用逻辑坐标绘图，最后缩小以获得抗锯齿效果。"""
+
+    def __init__(self, draw, factor: int = 1):
+        self._draw = draw
+        self.factor = max(1, int(factor))
+
+    def _coords(self, value):
+        if isinstance(value, (tuple, list)):
+            if all(isinstance(item, (int, float)) for item in value):
+                scaled = tuple(round(float(item) * self.factor) for item in value)
+                return list(scaled) if isinstance(value, list) else scaled
+            values = [self._coords(item) for item in value]
+            return values if isinstance(value, list) else tuple(values)
+        return value
+
+    def _kwargs(self, kwargs: dict) -> dict:
+        scaled = dict(kwargs)
+        for key in ("width", "stroke_width", "spacing"):
+            if key in scaled and isinstance(scaled[key], (int, float)):
+                scaled[key] = max(1, round(scaled[key] * self.factor))
+        return scaled
+
+    def line(self, xy, *args, **kwargs):
+        return self._draw.line(self._coords(xy), *args, **self._kwargs(kwargs))
+
+    def polygon(self, xy, *args, **kwargs):
+        return self._draw.polygon(self._coords(xy), *args, **self._kwargs(kwargs))
+
+    def rectangle(self, xy, *args, **kwargs):
+        return self._draw.rectangle(self._coords(xy), *args, **self._kwargs(kwargs))
+
+    def ellipse(self, xy, *args, **kwargs):
+        return self._draw.ellipse(self._coords(xy), *args, **self._kwargs(kwargs))
+
+    def rounded_rectangle(self, xy, radius=0, *args, **kwargs):
+        return self._draw.rounded_rectangle(
+            self._coords(xy),
+            radius=max(0, round(radius * self.factor)),
+            *args,
+            **self._kwargs(kwargs),
+        )
+
+    def arc(self, xy, start, end, *args, **kwargs):
+        return self._draw.arc(
+            self._coords(xy), start, end, *args, **self._kwargs(kwargs)
+        )
+
+    def text(self, xy, text, *args, **kwargs):
+        return self._draw.text(
+            self._coords(xy), text, *args, **self._kwargs(kwargs)
+        )
+
+    def textlength(self, text, *args, **kwargs):
+        return self._draw.textlength(text, *args, **self._kwargs(kwargs)) / self.factor
+
+    def textbbox(self, xy, text, *args, **kwargs):
+        box = self._draw.textbbox(
+            self._coords(xy), text, *args, **self._kwargs(kwargs)
+        )
+        return tuple(round(value / self.factor) for value in box)
+
+    def __getattr__(self, name):
+        return getattr(self._draw, name)
+
+
+def _draw_report_avatar(
+    canvas,
+    draw,
+    avatar_paths: dict,
+    avatar_cache: dict,
+    sender_id: str,
+    name: str,
+    x: int,
+    y: int,
+    radius: int,
+    fallback_fill: str,
+    outline: str,
+    font,
+    text_fill: str,
+    scale: int = 1,
+) -> None:
+    """绘制真实头像；文件不可用时稳定回退到首字占位头像。"""
+    try:
+        from PIL import Image, ImageDraw
+
+        avatar_path = avatar_paths.get(str(sender_id or "").strip())
+        if avatar_path:
+            cache_key = str(avatar_path)
+            if cache_key not in avatar_cache:
+                try:
+                    with Image.open(cache_key) as opened:
+                        avatar_cache[cache_key] = opened.convert("RGB")
+                except Exception:
+                    avatar_cache[cache_key] = None
+            source = avatar_cache.get(cache_key)
+            if source is not None:
+                render_scale = max(1, int(scale))
+                diameter = max(2, int(radius) * 2 * render_scale)
+                thumb = source.copy()
+                resampling = getattr(Image, "Resampling", None)
+                filter_mode = (
+                    getattr(resampling, "LANCZOS", Image.LANCZOS)
+                    if resampling
+                    else Image.LANCZOS
+                )
+                thumb.thumbnail((diameter, diameter), filter_mode)
+                tile = Image.new("RGB", (diameter, diameter), fallback_fill)
+                tile.paste(
+                    thumb,
+                    ((diameter - thumb.width) // 2, (diameter - thumb.height) // 2),
+                )
+                mask = Image.new("L", (diameter, diameter), 0)
+                ImageDraw.Draw(mask).ellipse(
+                    (0, 0, diameter - 1, diameter - 1), fill=255
+                )
+                canvas.paste(
+                    tile,
+                    (
+                        (x - radius) * render_scale,
+                        (y - radius) * render_scale,
+                    ),
+                    mask,
+                )
+                draw.ellipse(
+                    (x - radius, y - radius, x + radius, y + radius),
+                    outline=outline,
+                    width=max(2, radius // 12),
+                )
+                return
+    except Exception:
+        # 头像只是装饰素材，任何格式或 Pillow 异常都不应影响日报生成。
+        pass
+
+    draw.ellipse(
+        (x - radius, y - radius, x + radius, y + radius),
+        fill=fallback_fill,
+        outline=outline,
+        width=max(2, radius // 12),
+    )
+    mark = str(name or "?").strip()[:1] or "?"
+    box = draw.textbbox((0, 0), mark, font=font)
+    draw.text(
+        (x - (box[2] - box[0]) / 2, y - (box[3] - box[1]) / 2 - 2),
+        mark,
+        font=font,
+        fill=text_fill,
+    )
 
 
 class GroupDailyAnalysis:
@@ -225,7 +379,15 @@ class GroupDailyAnalysis:
                 {
                     "content": "必须来自原文的完整或近似原话",
                     "sender_id": "用户ID",
-                    "reason": "这句话为什么有画面或代表性，60到100字",
+                    "reason": "我看到这里时的短点评，15到50字，像聊天，不像分析",
+                }
+            ],
+            "unhinged_quotes": [
+                {
+                    "content": "必须来自原文的完整或近似原话",
+                    "sender_id": "用户ID",
+                    "score": 92,
+                    "reason": "我对这句的口语化点评，15到50字，不写成报告",
                 }
             ],
             "quality_review": {
@@ -252,9 +414,17 @@ class GroupDailyAnalysis:
             "原文中标记为“我”的行才是 Bot 自己说过的话。\n"
             "标题可以有一点文学感或群聊梗，但必须能从当天消息得到依据；副标题要像给朋友看的手写批注。\n"
             f"topics 最多{max_topics}条，profiles 最多{max_titles}人，quotes 最多{max_quotes}句；"
+            "unhinged_quotes 固定最多5句，按 score 从高到低排列；"
             "profiles 只能从参与者里挑有明显行为特征的人，MBTI 只是轻量玩笑标签，不要当成心理诊断。"
             "quality_review 如果素材不足可以返回空对象，但有素材时要给出3到5个具体维度和锐评。\n"
-            "quotes.content 必须来自原文或只是删减标点；sender_id、sender_ids 只能使用原文中的用户ID。"
+            "金句区要像我在群里看到后顺手记下来的东西：content 必须来自原文或只是删减标点，不能改写成鸡汤。"
+            "reason 只写我当时的短反应和点评，15到50字，允许吐槽、偏心、接梗或补半句原因；不要解释‘这句话体现了什么’。"
+            "可以参考‘好，话题又拐回来了’‘这句一出来我就知道今晚还早’‘这也能接上，服了’这种口气，但不能凭空补事实、关系或背景。"
+            "避免使用‘具有代表性’‘可以看出’‘反映了’‘体现了’‘这说明’等报告腔，也不要把 reason 写成总结段落。"
+            "点评风格：语言要接地气，多用互联网黑话；吐槽要精准、避重就轻，优先调侃具体场面，不上纲上线，不做人身攻击。"
+            "unhinged_quotes 是独立的‘逆天语录’区：只挑今天最离谱、最反差、最让人接不上话的真实原话，"
+            "不要因为单纯脏话、刷屏、普通问候或一般吐槽就入选；score 用0到100表示逆天程度，宁缺毋滥。"
+            "sender_id、sender_ids 只能使用原文中的用户ID。"
             "输出必须是纯 JSON 对象，不要 Markdown 代码块，不要在 JSON 外解释。\n\n"
             f"【输出结构示例】\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
             f"【我的人格背景】{persona_block or f'我是{bot_name}，说话简短，但会记住群里有趣的细节。'}\n"
@@ -281,6 +451,123 @@ class GroupDailyAnalysis:
     def _short_text(cls, value: Any, limit: int) -> str:
         text = cls._SPACE_RE.sub(" ", str(value or "")).strip()
         return text[:limit]
+
+    @classmethod
+    def _avatar_sender_ids(cls, report: dict, max_count: int = 12) -> list[str]:
+        """按日报实际展示顺序收集需要头像的群友 QQ 号。"""
+        stats = report.get("statistics", {}) or {}
+        seen: set[str] = set()
+        result: list[str] = []
+
+        def add(value: Any) -> None:
+            sender_id = str(value or "").strip()
+            if not sender_id or sender_id in seen or len(result) >= max_count:
+                return
+            seen.add(sender_id)
+            result.append(sender_id)
+
+        for item in stats.get("top_users", []) or []:
+            if isinstance(item, dict):
+                add(item.get("sender_id"))
+        for section in (
+            report.get("profiles"),
+            report.get("titles"),
+            report.get("quotes"),
+            report.get("unhinged_quotes"),
+        ):
+            for item in section or []:
+                if isinstance(item, dict):
+                    add(item.get("sender_id"))
+        for item in report.get("topics", []) or []:
+            if isinstance(item, dict):
+                for sender_id in item.get("sender_ids", []) or []:
+                    add(sender_id)
+        return result
+
+    @staticmethod
+    def _avatar_cache_path(cache_dir: Path, sender_id: str) -> Path:
+        digest = hashlib.sha256(str(sender_id).encode("utf-8")).hexdigest()[:24]
+        return cache_dir / f"{digest}.img"
+
+    @staticmethod
+    def _valid_avatar_bytes(content: bytes) -> bool:
+        if not content or len(content) > 4 * 1024 * 1024:
+            return False
+        try:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(content)) as image:
+                image.verify()
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    async def fetch_avatars(
+        cls,
+        report: dict,
+        fetcher: Any,
+        cache_dir: str | Path,
+        *,
+        max_count: int = 12,
+        cache_days: int = 7,
+    ) -> dict[str, str]:
+        """获取并缓存日报需要的 QQ 头像，失败时保留旧缓存或返回空映射。"""
+        sender_ids = cls._avatar_sender_ids(report, max(1, int(max_count)))
+        if not sender_ids:
+            return {}
+
+        root = Path(cache_dir)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.debug("群日报头像缓存目录创建失败: %s", exc)
+            return {}
+
+        max_age = max(1, int(cache_days)) * 86400
+        now = time.time()
+        avatars: dict[str, str] = {}
+        stale: dict[str, Path] = {}
+        pending: list[tuple[str, Path]] = []
+        for sender_id in sender_ids:
+            target = cls._avatar_cache_path(root, sender_id)
+            try:
+                if target.is_file() and target.stat().st_size > 0:
+                    if now - target.stat().st_mtime <= max_age:
+                        avatars[sender_id] = str(target)
+                    else:
+                        stale[sender_id] = target
+                else:
+                    pending.append((sender_id, target))
+            except OSError:
+                pending.append((sender_id, target))
+
+        if not callable(fetcher):
+            avatars.update({sender_id: str(path) for sender_id, path in stale.items()})
+            return avatars
+
+        pending.extend(stale.items())
+
+        async def fetch_one(sender_id: str, target: Path):
+            try:
+                content = await fetcher(sender_id)
+                if isinstance(content, (bytes, bytearray)) and cls._valid_avatar_bytes(content):
+                    await asyncio.to_thread(target.write_bytes, bytes(content))
+                    return sender_id, str(target)
+            except Exception as exc:
+                logger.debug("获取群友头像失败 %s: %s", sender_id, exc)
+            if target.is_file() and target.stat().st_size > 0:
+                return sender_id, str(target)
+            return sender_id, ""
+
+        results = await asyncio.gather(
+            *(fetch_one(sender_id, target) for sender_id, target in pending),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, tuple) and len(result) == 2 and result[1]:
+                avatars[result[0]] = result[1]
+        return avatars
 
     @classmethod
     def _sender_id_from_item(cls, item: dict) -> str:
@@ -318,20 +605,30 @@ class GroupDailyAnalysis:
                     output.append(
                         {"name": name, "detail": detail, "sender_ids": sender_ids}
                     )
-            elif kind == "quote":
+            elif kind in {"quote", "unhinged_quote"}:
                 content = cls._short_text(item.get("content"), 220)
-                reason = cls._short_text(item.get("reason"), 110)
+                reason = cls._short_text(item.get("reason"), 80)
                 if not content or sender_id not in known_ids:
                     continue
                 matched = cls._match_quote(content, sender_id, source_messages)
                 if matched:
-                    output.append(
-                        {
-                            "content": matched,
-                            "sender_id": sender_id,
-                            "reason": reason or "这句话很有代表性",
-                        }
-                    )
+                    quote = {
+                        "content": matched,
+                        "sender_id": sender_id,
+                        "reason": reason or "这句我得记一下",
+                    }
+                    if kind == "unhinged_quote":
+                        try:
+                            score = float(
+                                item.get("score")
+                                or item.get("unhinged_score")
+                                or item.get("rank_score")
+                                or 0
+                            )
+                        except (TypeError, ValueError):
+                            score = 0
+                        quote["score"] = max(0, min(100, int(round(score))))
+                    output.append(quote)
             else:
                 title = cls._short_text(item.get("title"), 24)
                 reason = cls._short_text(item.get("reason"), 140)
@@ -348,9 +645,11 @@ class GroupDailyAnalysis:
                             "reason": reason,
                         }
                     )
-            if len(output) >= max_count:
+            if len(output) >= max_count and kind != "unhinged_quote":
                 break
-        return output
+        if kind == "unhinged_quote":
+            output.sort(key=lambda item: item.get("score", 0), reverse=True)
+        return output[:max_count]
 
     @classmethod
     def _normalise_quality_review(cls, raw: Any) -> dict[str, Any]:
@@ -416,6 +715,63 @@ class GroupDailyAnalysis:
         return fallback
 
     @classmethod
+    def _fallback_unhinged_quotes(cls, messages: list, max_count: int = 5) -> list[dict]:
+        """LLM 不可用时，只从带明显离谱信号的原话里挑选逆天语录。"""
+        signals = (
+            ("逆天", 32),
+            ("离谱", 28),
+            ("抽象", 24),
+            ("绷不住", 24),
+            ("不是吧", 20),
+            ("怎么会", 20),
+            ("居然", 18),
+            ("竟然", 18),
+            ("救命", 18),
+            ("什么鬼", 18),
+            ("合理吗", 22),
+            ("我服了", 22),
+            ("？？", 16),
+            ("??", 16),
+        )
+        reactions = (
+            "这句的走向我是真没猜到，后面居然还能接上",
+            "好家伙，原来还能这么说，群里又多了一种解法",
+            "这句放在今天很难不被记住，实在太会拐了",
+            "我看到这里停了一下，主要是没想到还能这样",
+            "话题拐成这样也算本事，起点已经找不回来了",
+        )
+        candidates = []
+        seen: set[str] = set()
+        for order, message in enumerate(cls.human_messages(messages)):
+            content = cls._content(message)
+            if len(content) < 6 or content in seen:
+                continue
+            seen.add(content)
+            score = sum(weight for signal, weight in signals if signal in content)
+            if 10 <= len(content) <= 120:
+                score += 6
+            if any(mark in content for mark in ("？", "?", "！", "!", "……", "...")):
+                score += 8
+            metadata = cls._metadata(message)
+            if metadata.get("reply_to_id") or metadata.get("reply_to_qq"):
+                score += 6
+            if score < 18:
+                continue
+            sender_id, _ = cls._sender(message)
+            candidates.append((score, len(content), -order, content, sender_id))
+
+        candidates.sort(reverse=True)
+        return [
+            {
+                "content": content[:220],
+                "sender_id": sender_id,
+                "score": min(99, int(score)),
+                "reason": reactions[index % len(reactions)],
+            }
+            for index, (score, _, _, content, sender_id) in enumerate(candidates[:max_count])
+        ]
+
+    @classmethod
     def _match_quote(cls, candidate: str, sender_id: str, messages: list) -> str:
         candidate_norm = cls._SPACE_RE.sub("", candidate)
         candidates = [
@@ -465,6 +821,7 @@ class GroupDailyAnalysis:
             "summary": "",
             "topics": [],
             "quotes": [],
+            "unhinged_quotes": [],
             "titles": [],
             "profiles": [],
             "quality_review": {},
@@ -483,6 +840,9 @@ class GroupDailyAnalysis:
             report["summary"] = "我先按自己看到的消息做了个统计，暂时没提炼出更具体的总结。"
             report["titles"] = cls._fallback_titles(statistics, max_titles)
             report["profiles"] = report["titles"]
+            report["unhinged_quotes"] = cls._fallback_unhinged_quotes(
+                human_messages, 5
+            )
             return report
 
         from modules.llm.base import ChatRequest
@@ -513,6 +873,9 @@ class GroupDailyAnalysis:
             report["summary"] = "我先按自己看到的消息做了个统计，暂时没提炼出更具体的总结。"
             report["titles"] = cls._fallback_titles(statistics, max_titles)
             report["profiles"] = report["titles"]
+            report["unhinged_quotes"] = cls._fallback_unhinged_quotes(
+                human_messages, 5
+            )
             return report
 
         known_ids = {cls._sender(message)[0] for message in human_messages}
@@ -525,6 +888,9 @@ class GroupDailyAnalysis:
         )
         report["quotes"] = cls._normalise_items(
             parsed.get("quotes"), known_ids, max_quotes, "quote", human_messages
+        )
+        report["unhinged_quotes"] = cls._normalise_items(
+            parsed.get("unhinged_quotes"), known_ids, 5, "unhinged_quote", human_messages
         )
         report["titles"] = cls._normalise_items(
             parsed.get("profiles") or parsed.get("titles"),
@@ -546,6 +912,10 @@ class GroupDailyAnalysis:
         if not report["titles"]:
             report["titles"] = cls._fallback_titles(statistics, max_titles)
             report["profiles"] = report["titles"]
+        if not report["unhinged_quotes"]:
+            report["unhinged_quotes"] = cls._fallback_unhinged_quotes(
+                human_messages, 5
+            )
         return report
 
     @classmethod
@@ -609,14 +979,30 @@ class GroupDailyAnalysis:
 
         quotes = report.get("quotes", []) or []
         if quotes:
-            lines.append("\n我挑出的几句：")
+            lines.append("\n我忍不住记下的几句：")
             for quote in quotes:
                 sender = ui_text(
                     cls._name_for_id(quote.get("sender_id", ""), top_users, sender_names),
                     24,
                 )
                 lines.append(
-                    f"「{ui_text(quote.get('content'), 220)}」——{sender}（{ui_text(quote.get('reason'), 110)}）"
+                    f"「{ui_text(quote.get('content'), 220)}」——{sender}"
+                    f"\n  {ui_text(quote.get('reason'), 80)}"
+                )
+
+        unhinged_quotes = report.get("unhinged_quotes", []) or []
+        if unhinged_quotes:
+            lines.append("\n我挑出来的五句逆天现场：")
+            for index, quote in enumerate(unhinged_quotes[:5], 1):
+                sender = ui_text(
+                    cls._name_for_id(quote.get("sender_id", ""), top_users, sender_names),
+                    24,
+                )
+                score = quote.get("score")
+                score_text = f"｜逆天度 {int(score)}" if isinstance(score, (int, float)) and score else ""
+                lines.append(
+                    f"{index}.「{ui_text(quote.get('content'), 220)}」——{sender}{score_text}"
+                    f"\n  {ui_text(quote.get('reason'), 80)}"
                 )
 
         quality = report.get("quality_review", {}) or {}
@@ -678,6 +1064,8 @@ class GroupDailyAnalysis:
             configured = os.environ.get("ALICE_REPORT_FONT", "").strip()
             candidates = [
                 configured,
+                "C:/Windows/Fonts/Dengb.ttf" if bold else "C:/Windows/Fonts/Deng.ttf",
+                "C:/Windows/Fonts/STKAITI.TTF" if bold else "C:/Windows/Fonts/STSONG.TTF",
                 "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
                 "C:/Windows/Fonts/simhei.ttf" if bold else "C:/Windows/Fonts/simsun.ttc",
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "",
@@ -697,41 +1085,53 @@ class GroupDailyAnalysis:
             logger.warning("未找到中文字体，群聊日报将回退为文本")
             return None
 
+        render_scale = 2
+
         def load_font(size: int, bold: bool = False):
             path = bold_path if bold else regular_path
             try:
-                return ImageFont.truetype(path, size=size) if path else ImageFont.load_default()
+                return (
+                    ImageFont.truetype(path, size=max(1, int(size * render_scale)))
+                    if path
+                    else ImageFont.load_default()
+                )
             except OSError:
                 return ImageFont.load_default()
 
         try:
             width = max(960, int(width))
-            canvas_height = 10000
-            margin = 64
+            canvas_height = 12000
+            margin = 76
             content_width = width - margin * 2
 
             # 这里故意避开深色编辑部、数据看板和学术报告的语气，改成轻盈的
             # 糖果色手帐：卡片有软阴影，背景像一张铺着云朵和气泡的纸。
-            bg = "#fbf8ff"
-            bg_2 = "#fffdfd"
-            surface = "#fffefe"
-            surface_alt = "#f6f0ff"
-            ink = "#5b4c68"
-            white = "#5b4c68"
-            muted = "#978aa6"
-            dark_muted = "#8b7b9c"
-            line = "#eee5f4"
-            acid = "#8abf68"
-            cyan = "#6ebbd0"
-            coral = "#ed8fa2"
-            violet = "#a88cda"
-            peach = "#efb579"
-            butter = "#f4d883"
-            shadow = "#e8ddf2"
+            bg = "#f4f2ec"
+            bg_2 = "#fffdfa"
+            surface = "#fffefb"
+            surface_alt = "#f8f1e8"
+            ink = "#53494a"
+            white = "#53494a"
+            muted = "#887b79"
+            dark_muted = "#776968"
+            line = "#e5dbd3"
+            acid = "#7fc8bb"
+            cyan = "#8bcfe5"
+            coral = "#ed806d"
+            violet = "#b6a0d9"
+            peach = "#f2b46f"
+            butter = "#f7d77f"
+            shadow = "#dbe5e5"
             palette = [coral, cyan, violet, acid, peach]
+            avatar_paths = report.get("avatars", {}) or {}
+            avatar_cache: dict[str, Any] = {}
 
-            image = Image.new("RGB", (width, canvas_height), bg)
-            draw = ImageDraw.Draw(image)
+            image = Image.new(
+                "RGB",
+                (width * render_scale, canvas_height * render_scale),
+                bg,
+            )
+            draw = _ScaledDraw(ImageDraw.Draw(image), render_scale)
 
             def hex_rgb(value: str) -> tuple[int, int, int]:
                 value = value.lstrip("#")
@@ -746,35 +1146,57 @@ class GroupDailyAnalysis:
                     for index in range(3)
                 )
 
-            # 顶部做一段很轻的粉紫渐变，整张图用气泡和云朵取代硬朗网格。
+            # 先铺一层参考图里的米白纸张和细点底纹；正文随后全部收进纸面。
             for gradient_y in range(520):
                 draw.line(
                     (0, gradient_y, width, gradient_y),
-                    fill=blend("#eee7ff", "#fff0f6", gradient_y / 520),
+                    fill=blend("#eef5f3", "#fff1e8", gradient_y / 520),
                 )
-            for grid_x in range(30, width, 60):
-                for grid_y in range(30, canvas_height, 60):
+            for row, grid_y in enumerate(range(30, canvas_height, 60)):
+                offset = 18 if row % 2 else 0
+                for column, grid_x in enumerate(range(30 + offset, width, 60)):
+                    if (row + column) % 5 == 0:
+                        continue
+                    radius = 2 if (row + column) % 4 == 0 else 1
                     draw.ellipse(
-                        (grid_x - 1, grid_y - 1, grid_x + 1, grid_y + 1),
-                        fill="#f1eaf8",
+                        (grid_x - radius, grid_y - radius, grid_x + radius, grid_y + radius),
+                        fill="#e8e3dc" if radius == 2 else "#eee8e2",
                     )
-            # 大面积低对比气泡只负责制造梦幻的纵深，不压住任何正文。
-            draw.ellipse((-180, -130, 310, 360), fill="#f0e8ff")
-            draw.ellipse((width - 360, -120, width + 140, 330), fill="#ffeaf1")
-            draw.ellipse((width - 500, 530, width + 170, 1190), fill="#eaf8ff")
-            draw.ellipse((-210, 1120, 260, 1690), fill="#effbe9")
-            draw.ellipse((width - 260, 2260, width + 120, 2640), fill="#fff3d9")
+            paper_left, paper_top = 28, 24
+            paper_right = width - 28
+            draw.rounded_rectangle(
+                (paper_left + 10, paper_top + 12, paper_right + 10, canvas_height - 12),
+                radius=28,
+                fill="#d8e2e2",
+            )
+            draw.rounded_rectangle(
+                (paper_left, paper_top, paper_right, canvas_height - 24),
+                radius=28,
+                fill="#fffefa",
+                outline="#d2c9c0",
+                width=3,
+            )
+            draw.line(
+                (paper_right - 10, paper_top + 22, paper_right - 10, canvas_height - 46),
+                fill="#efb1a6",
+                width=3,
+            )
+            draw.line(
+                (paper_right - 4, paper_top + 22, paper_right - 4, canvas_height - 46),
+                fill="#9bd7df",
+                width=2,
+            )
 
-            hero_font = load_font(58, True)
+            hero_font = load_font(54, True)
             hero_small = load_font(16, True)
-            section_font = load_font(28, True)
-            item_font = load_font(24, True)
-            body_font = load_font(22)
-            body_bold = load_font(22, True)
-            quote_font = load_font(28, True)
-            small_font = load_font(17)
-            small_bold = load_font(17, True)
-            stat_font = load_font(44, True)
+            section_font = load_font(26, True)
+            item_font = load_font(22, True)
+            body_font = load_font(20)
+            body_bold = load_font(20, True)
+            quote_font = load_font(25, True)
+            small_font = load_font(16)
+            small_bold = load_font(16, True)
+            stat_font = load_font(42, True)
 
             def display_text(value: Any, limit: int | None = None) -> str:
                 """界面文本去掉表情符号；原始消息仍只在分析链路中保留。"""
@@ -925,28 +1347,30 @@ class GroupDailyAnalysis:
                 accent: str | None = None,
                 shadow_color: str | None = None,
             ) -> None:
+                radius = 28
                 if shadow_color:
+                    soft_shadow = blend(shadow_color, bg_2, 0.42)
                     draw.rounded_rectangle(
-                        (x + 9, y + 10, x + panel_width + 9, y + panel_height + 10),
-                        radius=32,
-                        fill=shadow_color,
+                        (x + 7, y + 8, x + panel_width + 7, y + panel_height + 8),
+                        radius=radius,
+                        fill=soft_shadow,
                     )
                 draw.rounded_rectangle(
                     (x, y, x + panel_width, y + panel_height),
-                    radius=32,
+                    radius=radius,
                     fill=fill,
                     outline=border,
-                    width=2,
+                    width=1,
                 )
                 if accent:
                     draw.rounded_rectangle(
-                        (x + 2, y + 16, x + 8, y + panel_height - 16),
+                        (x + 26, y + 2, x + 116, y + 7),
                         radius=3,
-                        fill=accent,
+                        fill=blend(accent, bg_2, 0.12),
                     )
                     draw.ellipse(
-                        (x + panel_width - 19, y + 14, x + panel_width - 9, y + 24),
-                        fill=accent,
+                        (x + panel_width - 22, y + 18, x + panel_width - 12, y + 28),
+                        fill=blend(accent, bg_2, 0.08),
                     )
 
             def section_label(
@@ -1003,20 +1427,29 @@ class GroupDailyAnalysis:
                     cls._name_for_id(sender_id, top_users, sender_names), 12
                 ) or display_text(sender_id, 12) or "匿名"
 
-            def avatar(x: int, y: int, name: str, radius: int, color: str) -> None:
-                draw.ellipse(
-                    (x - radius, y - radius, x + radius, y + radius),
-                    fill=color,
-                    outline=ink,
-                    width=2,
-                )
-                mark = display_text(name, 2) or "?"
-                box = draw.textbbox((0, 0), mark[0], font=small_bold)
-                draw.text(
-                    (x - (box[2] - box[0]) / 2, y - (box[3] - box[1]) / 2 - 2),
-                    mark[0],
-                    font=small_bold,
-                    fill=ink,
+            def avatar(
+                x: int,
+                y: int,
+                name: str,
+                radius: int,
+                color: str,
+                sender_id: str = "",
+            ) -> None:
+                _draw_report_avatar(
+                    image,
+                    draw,
+                    avatar_paths,
+                    avatar_cache,
+                    sender_id,
+                    name,
+                    x,
+                    y,
+                    radius,
+                    color,
+                    ink,
+                    small_bold,
+                    ink,
+                    render_scale,
                 )
 
             stats = report.get("statistics", {}) or {}
@@ -1086,38 +1519,68 @@ class GroupDailyAnalysis:
             )
             y = hero_y + hero_height + 54
 
-            # 今天的小数字和聊天波纹
-            section_label("", "今天的小数字", margin, y, "activity")
+            # 今天的小数字：参考图的 2×2 统计格 + 一块醒目的高峰卡。
+            section_label("", "今天留下的数字", margin, y, "activity")
             y += 56
-            signal_height = 150
-            panel(margin, y, content_width, signal_height, bg_2, border=line, accent=cyan, shadow_color=shadow)
+            signal_height = 222
+            left_width = int(content_width * 0.61)
+            gap = 18
+            highlight_width = content_width - left_width - gap
+            panel(margin, y, left_width, signal_height, bg_2, border=line, accent=cyan, shadow_color=shadow)
             metrics = [
-                ("消息", stats.get("message_count", 0), "message-square", acid),
-                ("参与", stats.get("participant_count", 0), "users", cyan),
-                ("文字", stats.get("total_characters", 0), "type", coral),
-                ("回复", stats.get("reply_count", 0), "reply", violet),
+                ("消息总数", stats.get("message_count", 0), "message-square", acid, "条"),
+                ("参与人数", stats.get("participant_count", 0), "users", cyan, "人"),
+                ("文字数量", stats.get("total_characters", 0), "type", coral, "字"),
+                ("回复次数", stats.get("reply_count", 0), "reply", violet, "次"),
             ]
-            metric_width = content_width // len(metrics)
-            metric_fills = ["#fff1f5", "#eefaff", "#f4efff", "#fff8df"]
-            for index, (label, value, icon_name, color) in enumerate(metrics):
-                cell_x = margin + index * metric_width
+            tile_gap = 12
+            tile_width = (left_width - 48 - tile_gap) // 2
+            tile_height = 84
+            for index, (label, value, icon_name, color, unit) in enumerate(metrics):
+                cell_x = margin + 20 + (index % 2) * (tile_width + tile_gap)
+                cell_y = y + 20 + (index // 2) * (tile_height + tile_gap)
                 draw.rounded_rectangle(
-                    (cell_x + 14, y + 16, cell_x + metric_width - 14, y + signal_height - 16),
-                    radius=22,
-                    fill=metric_fills[index % len(metric_fills)],
+                    (cell_x, cell_y, cell_x + tile_width, cell_y + tile_height),
+                    radius=16,
+                    fill=["#fff4ef", "#eef9fb", "#f6f1ff", "#fff9df"][index],
                     outline=line,
                     width=1,
                 )
-                draw_lucide(icon_name, cell_x + 30, y + 29, 24, color, stroke=1.7)
-                value_text = trim_line(display_text(value, 12), stat_font, metric_width - 104)
-                draw.text((cell_x + 68, y + 25), value_text, font=stat_font, fill=ink)
-                label_width = int(draw.textlength(label, font=small_bold)) + 18
-                draw.rounded_rectangle(
-                    (cell_x + 68, y + 96, cell_x + 68 + label_width, y + 122),
-                    radius=13,
-                    fill=bg_2,
-                )
-                draw.text((cell_x + 77, y + 101), label, font=small_bold, fill=dark_muted)
+                draw_lucide(icon_name, cell_x + 18, cell_y + 18, 22, color, stroke=1.7)
+                value_text = trim_line(display_text(value, 12), stat_font, tile_width - 112)
+                draw.text((cell_x + 54, cell_y + 12), value_text, font=stat_font, fill=ink)
+                draw.text((cell_x + 56, cell_y + 57), f"{label} · {unit}", font=small_bold, fill=dark_muted)
+
+            highlight_x = margin + left_width + gap
+            panel(
+                highlight_x,
+                y,
+                highlight_width,
+                signal_height,
+                "#fff5bd",
+                border="#e7c976",
+                accent=peach,
+                shadow_color="#eadfc4",
+            )
+            draw_lucide("clock", highlight_x + 26, y + 28, 25, peach, stroke=1.8)
+            draw.text((highlight_x + 66, y + 31), "最热闹的时段", font=small_bold, fill=dark_muted)
+            peak_hour = stats.get("peak_hour")
+            if peak_hour is not None:
+                peak_text = f"{int(peak_hour):02d}:00-{(int(peak_hour) + 1) % 24:02d}:00"
+                peak_hint = "我注意到大家在这里聊得最密"
+            else:
+                peak_text = "今天还没有高峰"
+                peak_hint = "等下一阵热闹留下来"
+            peak_lines = wrap_text(peak_text, section_font, highlight_width - 48, max_lines=2)
+            draw_block(peak_lines, highlight_x + 26, y + 82, section_font, ink, leading=2)
+            draw_block(
+                wrap_text(peak_hint, small_font, highlight_width - 48, max_lines=3),
+                highlight_x + 28,
+                y + 150,
+                small_font,
+                dark_muted,
+                leading=3,
+            )
             y += signal_height + 30
 
             activity = stats.get("hourly_activity", {}) or {}
@@ -1178,7 +1641,8 @@ class GroupDailyAnalysis:
             summary = display_text(report.get("summary"), 260) or "我暂时没有提炼出更具体的故事。"
             atmosphere = display_text(report.get("atmosphere"), 110)
             left_width = int(content_width * 0.63)
-            right_width = content_width - left_width - 24
+            # 左右两栏各留出 24px 内边距，避免“今天的空气”内卡片贴到外框边缘。
+            right_width = content_width - left_width - 48
             summary_lines = wrap_text(summary, body_font, left_width - 68, max_lines=6)
             atmosphere_lines = wrap_text(atmosphere, small_font, right_width - 56, max_lines=5)
             field_height = max(
@@ -1199,7 +1663,12 @@ class GroupDailyAnalysis:
             draw.text((inset_x + 66, inset_y + 31), "今天的空气", font=hero_small, fill=acid)
             draw_block(atmosphere_lines or ["今天的聊天留下了自己的节奏。"], inset_x + 26, inset_y + 90, small_font, white, leading=6)
             draw.rounded_rectangle((inset_x + 26, inset_y + inset_h - 52, inset_x + right_width - 26, inset_y + inset_h - 50), radius=1, fill=line)
-            draw.text((inset_x + 26, inset_y + inset_h - 38), "爱丽丝的观察", font=hero_small, fill=dark_muted)
+            draw.text(
+                (inset_x + 26, inset_y + inset_h - 38),
+                f"{bot_name}的观察",
+                font=hero_small,
+                fill=dark_muted,
+            )
             y += field_height + 48
 
             # 04 / Topics
@@ -1225,15 +1694,32 @@ class GroupDailyAnalysis:
                     topic_rows.append((name, participant_lines, detail_lines, row_height))
                 topics_height = 86 + sum(row[3] for row in topic_rows) + 20
                 panel(margin, y, content_width, topics_height, surface, border=line, accent=coral, shadow_color=shadow)
-                draw.text((margin + 32, y + 26), "话题像小星球一样转来转去", font=hero_small, fill=coral)
+                draw.text((margin + 32, y + 26), "今日话题  ·  Topics", font=hero_small, fill=coral)
+                for ruled_y in range(y + 78, y + topics_height - 12, 42):
+                    draw.line(
+                        (margin + 26, ruled_y, width - margin - 26, ruled_y),
+                        fill="#e8f0ee",
+                        width=1,
+                    )
                 current_y = y + 76
                 for index, (name, participant_lines, detail_lines, row_height) in enumerate(topic_rows, 1):
                     if index > 1:
                         draw.rounded_rectangle((margin + 32, current_y, width - margin - 32, current_y + 2), radius=1, fill=line)
                     row_y = current_y + 22
                     accent = palette[(index - 1) % len(palette)]
-                    draw.ellipse((margin + 36, row_y + 8, margin + 76, row_y + 48), fill=blend(accent, bg_2, 0.76), outline=line, width=1)
-                    draw_lucide("spark", margin + 45, row_y + 17, 22, accent, stroke=1.5)
+                    draw.rounded_rectangle(
+                        (margin + 36, row_y + 10, margin + 70, row_y + 44),
+                        radius=8,
+                        fill=blend(accent, bg_2, 0.76),
+                        outline=line,
+                        width=1,
+                    )
+                    draw.line(
+                        [(margin + 44, row_y + 27), (margin + 51, row_y + 34), (margin + 63, row_y + 19)],
+                        fill=accent,
+                        width=3,
+                        joint="curve",
+                    )
                     text_x = margin + 104
                     draw.text((text_x, row_y + 2), name, font=item_font, fill=ink)
                     participant_y = row_y + 42
@@ -1246,7 +1732,7 @@ class GroupDailyAnalysis:
             # 05 / People
             profiles = report.get("profiles") or report.get("titles") or []
             if profiles:
-                section_label("", "群友小像", margin, y, "users")
+                section_label("", "群友画像  ·  Portraits", margin, y, "users")
                 y += 56
                 # 内卡片统一收进外框 32px，避免第二列在长内容或阴影下贴边溢出。
                 profile_width = (content_width - 64 - 24) // 2
@@ -1258,95 +1744,278 @@ class GroupDailyAnalysis:
                     mbti = display_text(item.get("mbti"), 20)
                     reason_lines = wrap_text(display_text(item.get("reason"), 170), small_font, profile_width - 48, max_lines=5)
                     profile_height = max(214, 142 + block_height(reason_lines, small_font, 5))
-                    profile_data.append((name, profile_title, mbti, reason_lines, profile_height))
+                    profile_data.append(
+                        (sender_id, name, profile_title, mbti, reason_lines, profile_height)
+                    )
                 people_height = 80
                 for index in range(0, len(profile_data), 2):
-                    people_height += max(row[4] for row in profile_data[index:index + 2]) + 18
+                    people_height += max(row[5] for row in profile_data[index:index + 2]) + 18
                 people_height += 22
                 panel(margin, y, content_width, people_height, surface_alt, border=line, accent=violet, shadow_color=shadow)
                 draw.text((margin + 32, y + 26), "我悄悄注意到的大家", font=hero_small, fill=violet)
                 current_y = y + 78
                 for index in range(0, len(profile_data), 2):
                     row_items = profile_data[index:index + 2]
-                    row_height = max(row[4] for row in row_items)
-                    for column, (name, profile_title, mbti, reason_lines, _) in enumerate(row_items):
+                    row_height = max(row[5] for row in row_items)
+                    for column, (sender_id, name, profile_title, mbti, reason_lines, _) in enumerate(row_items):
                         card_x = margin + 32 + column * (profile_width + 24)
+                        card_y = current_y
                         colors = [acid, cyan, coral, violet]
                         accent = colors[(index // 2 + column) % len(colors)]
                         draw.rounded_rectangle(
-                            (card_x, current_y, card_x + profile_width, current_y + row_height),
+                            (card_x, card_y, card_x + profile_width, card_y + row_height),
                             radius=20,
                             fill=surface,
                             outline=line,
                             width=1,
                         )
-                        avatar(card_x + 46, current_y + 50, name, 27, accent)
-                        draw.text((card_x + 86, current_y + 22), name, font=item_font, fill=ink)
-                        next_x = tag(card_x + 86, current_y + 60, profile_title, accent, max_chars=14)
+                        draw.rounded_rectangle(
+                            (card_x + 18, card_y + 12, card_x + profile_width - 18, card_y + 18),
+                            radius=3,
+                            fill=accent,
+                        )
+                        avatar(card_x + 46, card_y + 50, name, 27, accent, sender_id)
+                        draw.text((card_x + 86, card_y + 22), name, font=item_font, fill=ink)
+                        next_x = tag(card_x + 86, card_y + 60, profile_title, accent, max_chars=14)
                         if mbti:
                             remaining = card_x + profile_width - 24 - next_x
                             if remaining >= 80:
-                                tag(next_x, current_y + 60, mbti, surface_alt, ink, max_chars=10)
-                        draw.rounded_rectangle((card_x + 24, current_y + 108, card_x + profile_width - 24, current_y + 110), radius=1, fill=line)
-                        draw_block(reason_lines or ["我只根据今天看到的行为留下这个观察。"], card_x + 24, current_y + 130, small_font, muted, leading=5)
+                                tag(next_x, card_y + 60, mbti, surface_alt, ink, max_chars=10)
+                        draw.rounded_rectangle((card_x + 24, card_y + 108, card_x + profile_width - 24, card_y + 110), radius=1, fill=line)
+                        draw_block(reason_lines or ["我只根据今天看到的行为留下这个观察。"], card_x + 24, card_y + 130, small_font, muted, leading=5)
                     current_y += row_height + 18
                 y += people_height + 48
 
             # 06 / Quotes
             quotes = report.get("quotes", []) or []
             if quotes:
-                section_label("", "偷偷记下的几句话", margin, y, "quote")
+                section_label("", "群聊金句  ·  Quotes", margin, y, "quote")
                 y += 56
-                quote_width = (content_width - 64 - 24) // 2
+                quote_bubble_width = content_width - 190
                 quote_data = []
                 for item in quotes[:6]:
-                    name = display_name(str(item.get("sender_id") or ""))
-                    content_lines = wrap_text(display_text(item.get("content"), 220), quote_font, quote_width - 76, max_lines=3)
-                    reason_lines = wrap_text(display_text(item.get("reason"), 130), small_font, quote_width - 48, max_lines=3)
-                    quote_height = max(
-                        220,
-                        78
-                        + block_height(content_lines, quote_font, 7)
-                        + 28
-                        + 32
-                        + block_height(reason_lines, small_font, 5)
-                        + 24,
+                    sender_id = str(item.get("sender_id") or "")
+                    name = display_name(sender_id)
+                    content_lines = wrap_text(
+                        display_text(item.get("content"), 220),
+                        quote_font,
+                        quote_bubble_width - 82,
+                        max_lines=3,
                     )
-                    quote_data.append((name, content_lines, reason_lines, quote_height))
-                quotes_height = 80
-                for index in range(0, len(quote_data), 2):
-                    quotes_height += max(row[3] for row in quote_data[index:index + 2]) + 18
-                quotes_height += 22
-                panel(margin, y, content_width, quotes_height, surface, border=line, accent=cyan, shadow_color=shadow)
-                draw.text((margin + 32, y + 26), "有画面的原话", font=hero_small, fill=cyan)
+                    reason_lines = wrap_text(
+                        display_text(item.get("reason"), 130),
+                        small_font,
+                        quote_bubble_width - 116,
+                        max_lines=2,
+                    )
+                    quote_height = max(
+                        132,
+                        72
+                        + block_height(content_lines, quote_font, 7)
+                        + 30
+                        + block_height(reason_lines, small_font, 5)
+                        + 18,
+                    )
+                    quote_data.append((sender_id, name, content_lines, reason_lines, quote_height))
+                quotes_height = 82 + sum(item[4] + 22 for item in quote_data) + 18
+                panel(
+                    margin,
+                    y,
+                    content_width,
+                    quotes_height,
+                    surface,
+                    border=line,
+                    accent=cyan,
+                    shadow_color=shadow,
+                )
+                draw.text((margin + 32, y + 26), "这几句我记住了，像聊天一样留下来", font=hero_small, fill=cyan)
                 current_y = y + 78
-                for index in range(0, len(quote_data), 2):
-                    row_items = quote_data[index:index + 2]
-                    row_height = max(row[3] for row in row_items)
-                    for column, (name, content_lines, reason_lines, _) in enumerate(row_items):
-                        card_x = margin + 32 + column * (quote_width + 24)
-                        draw.rounded_rectangle(
-                            (card_x, current_y, card_x + quote_width, current_y + row_height),
-                            radius=20,
-                            fill=surface_alt,
-                            outline=line,
-                            width=1,
-                        )
-                        draw_lucide("quote", card_x + 24, current_y + 24, 28, coral, stroke=1.6)
-                        draw.text((card_x + 68, current_y + 30), name, font=small_bold, fill=muted)
-                        draw_block(content_lines or [""], card_x + 24, current_y + 78, quote_font, ink, leading=7)
-                        reason_y = current_y + 78 + block_height(content_lines, quote_font, 7) + 28
-                        draw.rounded_rectangle((card_x + 24, reason_y - 16, card_x + quote_width - 24, reason_y - 14), radius=1, fill=line)
-                        draw.text((card_x + 24, reason_y), "我的小评语", font=hero_small, fill=acid)
-                        draw_block(reason_lines, card_x + 24, reason_y + 31, small_font, muted, leading=5)
-                    current_y += row_height + 18
+                for index, (sender_id, name, content_lines, reason_lines, row_height) in enumerate(quote_data):
+                    right_aligned = index % 2 == 1
+                    avatar_x = width - margin - 40 if right_aligned else margin + 40
+                    avatar_radius = 27
+                    avatar_gap = 14
+                    bubble_width = quote_bubble_width
+                    bubble_x = (
+                        margin + 90
+                        if not right_aligned
+                        else avatar_x - avatar_radius - avatar_gap - bubble_width
+                    )
+                    bubble_y = current_y + 28
+                    bubble_fill = "#fff2f5" if not right_aligned else "#fff7d8"
+                    avatar(avatar_x, current_y + 48, name, avatar_radius, coral if not right_aligned else peach, sender_id)
+                    name_x = bubble_x + 18 if not right_aligned else bubble_x + bubble_width - 18 - int(draw.textlength(name, font=small_bold))
+                    draw.text((name_x, current_y + 3), name, font=small_bold, fill=dark_muted)
+                    draw.rounded_rectangle(
+                        (bubble_x, bubble_y, bubble_x + bubble_width, bubble_y + row_height - 12),
+                        radius=22,
+                        fill=bubble_fill,
+                        outline=line,
+                        width=1,
+                    )
+                    tail = (
+                        [(bubble_x, bubble_y + 24), (bubble_x - 16, bubble_y + 38), (bubble_x, bubble_y + 52)]
+                        if not right_aligned
+                        else [(bubble_x + bubble_width, bubble_y + 24), (bubble_x + bubble_width + 8, bubble_y + 38), (bubble_x + bubble_width, bubble_y + 52)]
+                    )
+                    draw.polygon(tail, fill=bubble_fill, outline=line)
+                    draw_lucide("quote", bubble_x + 18, bubble_y + 16, 22, coral if not right_aligned else peach, stroke=1.5)
+                    draw_block(content_lines or [""], bubble_x + 54, bubble_y + 16, quote_font, ink, leading=5)
+                    reason_y = bubble_y + 22 + block_height(content_lines, quote_font, 7)
+                    draw.rounded_rectangle(
+                        (bubble_x + 22, reason_y - 8, bubble_x + bubble_width - 22, reason_y - 6),
+                        radius=1,
+                        fill="#eadfd5",
+                    )
+                    draw_block(reason_lines, bubble_x + 22, reason_y + 5, small_font, muted, leading=3)
+                    current_y += row_height + 22
                 y += quotes_height + 48
 
-            # 07 / Quality review
+            # 07 / Unhinged quotes
+            unhinged_quotes = report.get("unhinged_quotes", []) or []
+            if unhinged_quotes:
+                section_label(
+                    "",
+                    "逆天语录  ·  Wild Quotes",
+                    margin,
+                    y,
+                    "spark",
+                    fill=ink,
+                    icon_color=coral,
+                )
+                y += 56
+                wild_width = (content_width - 64 - 24) // 2
+                wild_data = []
+                for item in unhinged_quotes[:5]:
+                    if not isinstance(item, dict):
+                        continue
+                    rank = len(wild_data) + 1
+                    sender_id = str(item.get("sender_id") or "")
+                    name = display_name(sender_id)
+                    content_lines = wrap_text(
+                        display_text(item.get("content"), 220),
+                        quote_font,
+                        wild_width - 48,
+                        max_lines=3,
+                    )
+                    reason_lines = wrap_text(
+                        display_text(item.get("reason"), 90),
+                        small_font,
+                        wild_width - 48,
+                        max_lines=2,
+                    ) or ["这句我得记一下"]
+                    try:
+                        score = max(0, min(100, int(round(float(item.get("score", 0) or 0)))))
+                    except (TypeError, ValueError):
+                        score = 0
+                    content_height = block_height(content_lines or [""], quote_font, 4)
+                    reason_height = block_height(reason_lines, small_font, 4)
+                    card_height = max(244, 96 + content_height + 12 + 24 + reason_height + 20)
+                    wild_data.append(
+                        (
+                            rank,
+                            sender_id,
+                            name,
+                            content_lines,
+                            reason_lines,
+                            score,
+                            card_height,
+                        )
+                    )
+                if wild_data:
+                    wild_height = 86 + sum(
+                        max(item[6] for item in wild_data[index:index + 2]) + 18
+                        for index in range(0, len(wild_data), 2)
+                    ) + 20
+                    panel(
+                        margin,
+                        y,
+                        content_width,
+                        wild_height,
+                        "#fff7ec",
+                        border="#ecd8c3",
+                        accent=coral,
+                        shadow_color=shadow,
+                    )
+                    draw.text(
+                        (margin + 32, y + 24),
+                        "今天最离谱的几句，宁缺毋滥",
+                        font=hero_small,
+                        fill=coral,
+                    )
+                    current_y = y + 78
+                    for index in range(0, len(wild_data), 2):
+                        row_items = wild_data[index:index + 2]
+                        row_height = max(item[6] for item in row_items)
+                        for column, item in enumerate(row_items):
+                            rank, sender_id, name, content_lines, reason_lines, score, _ = item
+                            card_x = margin + 32 + column * (wild_width + 24)
+                            card_y = current_y
+                            accent = [coral, peach, violet, acid][(rank - 1) % 4]
+                            draw.rounded_rectangle(
+                                (card_x + 6, card_y + 8, card_x + wild_width + 6, card_y + row_height + 8),
+                                radius=20,
+                                fill="#eadfd6",
+                            )
+                            draw.rounded_rectangle(
+                                (card_x, card_y, card_x + wild_width, card_y + row_height),
+                                radius=20,
+                                fill=surface,
+                                outline="#ead8cb",
+                                width=1,
+                            )
+                            draw.rounded_rectangle(
+                                (card_x + 20, card_y + 20, card_x + 62, card_y + 52),
+                                radius=14,
+                                fill=blend(accent, bg_2, 0.78),
+                                outline=line,
+                                width=1,
+                            )
+                            rank_text = f"{rank:02d}"
+                            rank_width = int(draw.textlength(rank_text, font=hero_small))
+                            draw.text(
+                                (card_x + 41 - rank_width / 2, card_y + 26),
+                                rank_text,
+                                font=hero_small,
+                                fill=accent,
+                            )
+                            avatar(card_x + 92, card_y + 46, name, 22, accent, sender_id)
+                            score_label = f"逆天度 {score}" if score else "逆天现场"
+                            score_width = int(draw.textlength(score_label, font=hero_small)) + 18
+                            score_x = card_x + wild_width - 20 - score_width
+                            draw.rounded_rectangle(
+                                (score_x, card_y + 22, score_x + score_width, card_y + 50),
+                                radius=14,
+                                fill="#fff0e4",
+                                outline="#f0cbb7",
+                                width=1,
+                            )
+                            draw.text((score_x + 9, card_y + 27), score_label, font=hero_small, fill=coral)
+                            name_x = card_x + 120
+                            name_width = max(46, score_x - name_x - 10)
+                            draw.text(
+                                (name_x, card_y + 26),
+                                trim_line(name, small_bold, name_width),
+                                font=small_bold,
+                                fill=ink,
+                            )
+                            content_y = card_y + 88
+                            draw_block(content_lines or [""], card_x + 24, content_y, quote_font, ink, leading=4)
+                            reason_y = content_y + block_height(content_lines or [""], quote_font, 4) + 12
+                            draw.rounded_rectangle(
+                                (card_x + 24, reason_y - 6, card_x + wild_width - 24, reason_y - 4),
+                                radius=1,
+                                fill="#eadfd5",
+                            )
+                            draw_block(reason_lines, card_x + 24, reason_y + 6, small_font, muted, leading=4)
+                        current_y += row_height + 18
+                    y += wild_height + 48
+
+            # 08 / Quality review
             quality = report.get("quality_review", {}) or {}
             dimensions = quality.get("dimensions", []) if isinstance(quality, dict) else []
             if isinstance(quality, dict) and dimensions:
-                section_label("", "今天的群聊心情", margin, y, "bar-chart")
+                section_label("", "群聊质量复盘  ·  Review", margin, y, "bar-chart")
                 y += 56
                 quality_title = display_text(quality.get("title"), 38) or "今天的群聊主题"
                 quality_subtitle = display_text(quality.get("subtitle"), 62) or report_label
@@ -1364,11 +2033,23 @@ class GroupDailyAnalysis:
                         percentage = 0.0
                     lines = wrap_text(comment, small_font, dim_width - 42, max_lines=4)
                     dim_data.append((name, percentage, lines))
-                dimensions_height = 0
-                for index in range(0, len(dim_data), 2):
-                    dimensions_height += max(154, *(112 + block_height(row[2], small_font, 5) for row in dim_data[index:index + 2])) + 18
                 summary_lines = wrap_text(quality_summary, body_font, content_width - 112, max_lines=4)
-                quality_height = 190 + dimensions_height + (48 + block_height(summary_lines, body_font, 7) if summary_lines else 0)
+                row_heights = [
+                    max(
+                        154,
+                        *(112 + block_height(row[2], small_font, 5) for row in dim_data[index:index + 2]),
+                    )
+                    for index in range(0, len(dim_data), 2)
+                ]
+                dimensions_height = sum(row_height + 18 for row_height in row_heights)
+                dimensions_bottom = y + 136 + max(0, dimensions_height - 18)
+                summary_height = block_height(summary_lines, body_font, 7) if summary_lines else 0
+                summary_y = dimensions_bottom + 34 if summary_lines else dimensions_bottom
+                quality_bottom = max(
+                    y + 190 + dimensions_height,
+                    summary_y + summary_height + 28,
+                )
+                quality_height = quality_bottom - y
                 panel(margin, y, content_width, quality_height, bg_2, border=line, accent=acid, shadow_color=shadow)
                 draw.text((margin + 32, y + 28), quality_title, font=section_font, fill=ink)
                 subtitle_y = y + 30
@@ -1379,22 +2060,51 @@ class GroupDailyAnalysis:
                 bar_x = margin + 32
                 bar_y = y + 92
                 bar_width = content_width - 64
-                draw.rounded_rectangle((bar_x, bar_y, bar_x + bar_width, bar_y + 24), radius=12, fill=surface_alt, outline=line, width=1)
-                total = sum(row[1] for row in dim_data) or 1
-                current_x = bar_x + 2
+                draw.rounded_rectangle(
+                    (bar_x, bar_y, bar_x + bar_width, bar_y + 24),
+                    radius=12,
+                    fill=surface_alt,
+                )
+                inner_left = bar_x + 2
+                inner_right = bar_x + bar_width - 2
+                inner_top = bar_y + 2
+                inner_bottom = bar_y + 22
+                total = sum(max(0.0, float(row[1] or 0)) for row in dim_data) or 1
+                current_x = inner_left
+                running = 0.0
                 for index, (_, percentage, _) in enumerate(dim_data):
-                    segment = max(1, round((percentage / total) * (bar_width - 4)))
-                    draw.rounded_rectangle(
-                        (current_x, bar_y + 2, min(bar_x + bar_width - 2, current_x + segment), bar_y + 22),
-                        radius=9,
-                        fill=palette[index % len(palette)],
+                    running += max(0.0, float(percentage or 0))
+                    segment_end = (
+                        inner_right
+                        if index == len(dim_data) - 1
+                        else inner_left + round((running / total) * (inner_right - inner_left))
                     )
-                    current_x += segment
-                draw.text((bar_x, bar_y + 42), "今天的聊天温度", font=hero_small, fill=muted)
+                    if segment_end > current_x:
+                        # 中间段使用直角矩形，颜色连续，不会因两端圆角留下白缝。
+                        draw.rectangle(
+                            (current_x, inner_top, segment_end, inner_bottom),
+                            fill=palette[index % len(palette)],
+                        )
+                    current_x = segment_end
+                cap_radius = 10
+                draw.ellipse(
+                    (inner_left, inner_top, inner_left + cap_radius * 2, inner_bottom),
+                    fill=palette[0],
+                )
+                draw.ellipse(
+                    (inner_right - cap_radius * 2, inner_top, inner_right, inner_bottom),
+                    fill=palette[(len(dim_data) - 1) % len(palette)],
+                )
+                draw.rounded_rectangle(
+                    (bar_x, bar_y, bar_x + bar_width, bar_y + 24),
+                    radius=12,
+                    outline=line,
+                    width=1,
+                )
                 current_y = y + 136
-                for index in range(0, len(dim_data), 2):
+                for row_index, index in enumerate(range(0, len(dim_data), 2)):
                     row_items = dim_data[index:index + 2]
-                    row_height = max(154, *(112 + block_height(row[2], small_font, 5) for row in row_items))
+                    row_height = row_heights[row_index]
                     for column, (name, percentage, lines) in enumerate(row_items):
                         card_x = margin + 32 + column * (dim_width + 24)
                         accent = palette[(index + column) % len(palette)]
@@ -1406,13 +2116,12 @@ class GroupDailyAnalysis:
                         draw_block(lines or ["今天没有足够素材形成更多判断。"], card_x + 18, current_y + 78, small_font, muted, leading=5)
                     current_y += row_height + 18
                 if summary_lines:
-                    summary_y = y + quality_height - 34 - block_height(summary_lines, body_font, 7)
                     draw_lucide("user-round", margin + 34, summary_y + 4, 28, acid, stroke=1.5)
                     draw_block(summary_lines, margin + 82, summary_y, body_font, ink, leading=7)
                 y += quality_height + 48
 
             # 页脚留一点手帐式的收束，不再使用装饰性表情符号。
-            footer_height = 128
+            footer_height = 176
             footer_y = y + 4
             panel(margin, footer_y, content_width, footer_height, bg_2, border=line, accent=acid, shadow_color=shadow)
             footer_label = trim_line(
@@ -1421,12 +2130,67 @@ class GroupDailyAnalysis:
                 content_width - 150,
             )
             draw.text((margin + 32, footer_y + 28), footer_label, font=section_font, fill=ink)
-            draw.text((margin + 34, footer_y + 78), "我把今天看到的热闹，轻轻收进这一页。", font=hero_small, fill=muted)
+            draw.text((margin + 34, footer_y + 76), "我把今天看到的热闹，轻轻收进这一页。", font=hero_small, fill=muted)
+            footer_items = [
+                ("记录范围", report_label, "clock", "#fff3d7"),
+                ("素材来源", "群聊消息", "message-square", "#e8f6f4"),
+                ("整理方式", f"{bot_name}的观察", "scan", "#f4edff"),
+            ]
+            footer_gap = 12
+            footer_tile_width = (content_width - 64 - footer_gap * 2) // 3
+            for index, (label, value, icon_name, fill) in enumerate(footer_items):
+                tile_x = margin + 32 + index * (footer_tile_width + footer_gap)
+                tile_y = footer_y + 112
+                draw.rounded_rectangle(
+                    (tile_x, tile_y, tile_x + footer_tile_width, tile_y + 48),
+                    radius=14,
+                    fill=fill,
+                    outline=line,
+                    width=1,
+                )
+                draw_lucide(icon_name, tile_x + 12, tile_y + 12, 22, acid, stroke=1.5)
+                draw.text((tile_x + 44, tile_y + 8), label, font=small_font, fill=muted)
+                draw.text((tile_x + 44, tile_y + 25), trim_line(value, small_bold, footer_tile_width - 58), font=small_bold, fill=ink)
             draw_lucide("arrow-up-right", width - margin - 78, footer_y + 35, 34, acid, stroke=1.6)
 
             final_height = min(canvas_height, max(footer_y + footer_height + margin, 520))
+            # 裁切高度确定后再补纸张底边和两条彩色装订线，避免压到正文。
+            draw.rounded_rectangle(
+                (paper_left, paper_top, paper_right, final_height - 24),
+                radius=28,
+                outline="#d2c9c0",
+                width=3,
+            )
+            draw.line(
+                (paper_right - 10, paper_top + 22, paper_right - 10, final_height - 46),
+                fill="#efb1a6",
+                width=3,
+            )
+            draw.line(
+                (paper_right - 4, paper_top + 22, paper_right - 4, final_height - 46),
+                fill="#9bd7df",
+                width=2,
+            )
             output = io.BytesIO()
-            image.crop((0, 0, width, final_height)).save(output, format="PNG", optimize=True)
+            cropped = image.crop(
+                (
+                    0,
+                    0,
+                    width * render_scale,
+                    final_height * render_scale,
+                )
+            )
+            resampling = getattr(Image, "Resampling", None)
+            resize_filter = (
+                getattr(resampling, "LANCZOS", Image.LANCZOS)
+                if resampling
+                else Image.LANCZOS
+            )
+            cropped.resize((width, final_height), resize_filter).save(
+                output,
+                format="PNG",
+                optimize=True,
+            )
             return output.getvalue()
         except Exception as exc:
             logger.warning("梦幻版群聊日报图片生成失败，将回退：%s", exc)
@@ -1454,6 +2218,8 @@ class GroupDailyAnalysis:
             configured = os.environ.get("ALICE_REPORT_FONT", "").strip()
             candidates = [
                 configured,
+                "C:/Windows/Fonts/Dengb.ttf" if bold else "C:/Windows/Fonts/Deng.ttf",
+                "C:/Windows/Fonts/STKAITI.TTF" if bold else "C:/Windows/Fonts/STSONG.TTF",
                 "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
                 "C:/Windows/Fonts/simhei.ttf" if bold else "C:/Windows/Fonts/simsun.ttc",
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "",
@@ -1619,7 +2385,7 @@ class GroupDailyAnalysis:
                         radius=9,
                         fill=accent,
                     )
-                    marker = "“" if title == "我挑出的几句" else str(index).zfill(2)
+                    marker = "“" if title in {"我挑出的几句", "我忍不住记下的几句"} else str(index).zfill(2)
                     marker_box = draw.textbbox((0, 0), marker, font=small_font)
                     marker_width = marker_box[2] - marker_box[0]
                     draw.text(
@@ -1808,7 +2574,7 @@ class GroupDailyAnalysis:
                     margin + column_width + column_gap,
                     right_y,
                     column_width,
-                    "我挑出的几句",
+                    "我忍不住记下的几句",
                     quote_rows,
                     pink,
                     fill="#fff8f7",
@@ -1889,6 +2655,8 @@ class GroupDailyAnalysis:
             configured = os.environ.get("ALICE_REPORT_FONT", "").strip()
             candidates = [
                 configured,
+                "C:/Windows/Fonts/Dengb.ttf" if bold else "C:/Windows/Fonts/Deng.ttf",
+                "C:/Windows/Fonts/STKAITI.TTF" if bold else "C:/Windows/Fonts/STSONG.TTF",
                 "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
                 "C:/Windows/Fonts/simhei.ttf" if bold else "C:/Windows/Fonts/simsun.ttc",
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "",
@@ -1954,6 +2722,8 @@ class GroupDailyAnalysis:
             top_users = stats.get("top_users", []) or []
             sender_names = stats.get("sender_names", {}) or {}
             palette = [orange, blue, pink, green, yellow, purple]
+            avatar_paths = report.get("avatars", {}) or {}
+            avatar_cache: dict[str, Any] = {}
 
             def step(font, extra: int = 8) -> int:
                 box = draw.textbbox((0, 0), "国Ag", font=font)
@@ -2016,23 +2786,31 @@ class GroupDailyAnalysis:
                     width=outline_width,
                 )
 
-            def avatar(x: int, y: int, name: str, radius: int = 30, accent: str | None = None) -> None:
+            def avatar(
+                x: int,
+                y: int,
+                name: str,
+                radius: int = 30,
+                accent: str | None = None,
+                sender_id: str = "",
+            ) -> None:
                 name = str(name or "?").strip() or "?"
                 seed = sum(ord(char) for char in name)
                 fill = accent or palette[seed % len(palette)]
-                draw.ellipse(
-                    (x - radius, y - radius, x + radius, y + radius),
-                    fill=fill,
-                    outline=ink,
-                    width=3,
-                )
-                mark = name[0]
-                mark_box = draw.textbbox((0, 0), mark, font=small_bold_font)
-                draw.text(
-                    (x - (mark_box[2] - mark_box[0]) / 2, y - (mark_box[3] - mark_box[1]) / 2 - 2),
-                    mark,
-                    font=small_bold_font,
-                    fill=ink,
+                _draw_report_avatar(
+                    image,
+                    draw,
+                    avatar_paths,
+                    avatar_cache,
+                    sender_id,
+                    name,
+                    x,
+                    y,
+                    radius,
+                    fill,
+                    ink,
+                    small_bold_font,
+                    ink,
                 )
 
             def pill(x: int, y: int, text: str, fill: str, text_fill: str = ink) -> int:
@@ -2290,7 +3068,7 @@ class GroupDailyAnalysis:
                         card_x = margin + col * (profile_width + 24)
                         fill = ["#fff9e6", "#f4f0ff", "#eef8f4", "#fff1ef"][index // 2 % 4]
                         card(card_x, row_y, profile_width, row_height, fill=fill, shadow_color=None, radius=16, outline_width=2)
-                        avatar(card_x + 43, row_y + 46, name, radius=27)
+                        avatar(card_x + 43, row_y + 46, name, radius=27, sender_id=sender_id)
                         draw.text((card_x + 82, row_y + 22), name, font=item_title_font, fill=ink)
                         next_x = card_x + 82
                         next_x = pill(next_x, row_y + 58, profile_title, yellow)
@@ -2318,12 +3096,12 @@ class GroupDailyAnalysis:
                     reason_lines = wrap(cls._short_text(item.get("reason"), 110), small_font, bubble_width - 56)
                     bubble_height = 42 + lines_height(content_lines, quote_font, 2) + 20
                     bubble_height += 28 + lines_height(reason_lines, small_font, 1) + 20
-                    quote_data.append((name, content_lines, reason_lines, bubble_height))
-                quote_height = quote_header + sum(max(112, item[3]) + 30 for item in quote_data) + 10
+                    quote_data.append((sender_id, name, content_lines, reason_lines, bubble_height))
+                quote_height = quote_header + sum(max(112, item[4]) + 30 for item in quote_data) + 10
                 card(margin, y, content_width, quote_height, fill="#fffdf8", shadow_color=pink)
                 heading(margin + 24, y + 20, "群聊金句", pink)
                 current_y = y + quote_header
-                for index, (name, content_lines, reason_lines, bubble_height) in enumerate(quote_data):
+                for index, (sender_id, name, content_lines, reason_lines, bubble_height) in enumerate(quote_data):
                     row_height = max(112, bubble_height)
                     right_aligned = index % 2 == 1
                     if right_aligned:
@@ -2333,7 +3111,7 @@ class GroupDailyAnalysis:
                         avatar_x = margin + 38
                         bubble_x = margin + 88
                     avatar_y = current_y + 42
-                    avatar(avatar_x, avatar_y, name, radius=28)
+                    avatar(avatar_x, avatar_y, name, radius=28, sender_id=sender_id)
                     name_x = bubble_x + 20 if not right_aligned else bubble_x + bubble_width - 20 - int(draw.textlength(name, font=small_bold_font))
                     draw.text((name_x, current_y + 4), name, font=small_bold_font, fill=ink)
                     bubble_y = current_y + 34
@@ -2354,8 +3132,7 @@ class GroupDailyAnalysis:
                     quote_y = bubble_y + 22
                     quote_y = draw_lines(content_lines, bubble_x + 28, quote_y, quote_font, ink, gap=2)
                     quote_y += 8
-                    draw.text((bubble_x + 28, quote_y), "我的锐评：", font=small_bold_font, fill=orange)
-                    draw_lines(reason_lines, bubble_x + 126, quote_y, small_font, muted, gap=1)
+                    draw_lines(reason_lines, bubble_x + 28, quote_y, small_font, muted, gap=1)
                     current_y += row_height + 30
                 y += quote_height + 32
 
