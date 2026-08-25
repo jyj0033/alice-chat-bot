@@ -120,7 +120,7 @@ class DashboardSurfaceTests(unittest.TestCase):
         self.assertIn("uploadMeme", self.html)
         self.assertIn("sendMeme", self.html)
         self.assertIn("updateMemeMeaning", self.html)
-        self.assertIn("大致含义 / 适用场景", self.html)
+        self.assertIn("图片客观描述", self.html)
         self.assertIn("MEME_PAGE_SIZE = 48", self.html)
 
     def test_group_analysis_controls_and_report_api_are_exposed(self):

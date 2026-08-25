@@ -2227,10 +2227,10 @@
                     <div class="meme-upload">
                         <input type="file" id="meme-upload-file" accept="image/png,image/jpeg">
                         <select id="meme-upload-category"></select>
-                        <input type="text" id="meme-upload-meaning" maxlength="240" placeholder="大致含义 / 适用场景，例如：表面答应，实际不情愿" style="flex:1;min-width:260px;">
+                        <input type="text" id="meme-upload-meaning" maxlength="240" placeholder="客观描述，例如：眯眼橘猫，配字“拽”" style="flex:1;min-width:260px;">
                         <button class="btn btn-primary" onclick="uploadMeme()"><svg class="icon-sm"><use href="#i-upload"/></svg>上传</button>
                     </div>
-                    <div class="hint" style="margin-top:10px;">只支持 PNG、JPEG；相同图片会自动去重。</div>
+                    <div class="hint" style="margin-top:10px;">只填写图片本身能观察到的内容，不要写当时群聊的具体事件；只支持 PNG、JPEG。</div>
                     <div style="display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap;">
                         <input type="text" id="meme-new-category" placeholder="新分类名称" style="max-width:220px;">
                         <button class="btn btn-secondary btn-sm" onclick="createMemeCategory()"><svg class="icon-sm"><use href="#i-plus"/></svg>新建分类</button>
@@ -2379,9 +2379,9 @@
                                 <option value="all">全部图片</option>
                                 <option value="mention_only">仅点名 / 回复 Bot 时</option>
                             </select>
-                            <div class="hint">全部图片时 Bot 才能看懂表情包与连图的意图</div>
+                            <div class="hint">全部图片时 Bot 才能结合对话理解图片所在语境</div>
                         </div>
-                        <div class="form-group"><label>结合前文对话</label><div class="toggle-row" style="padding-top: 6px; max-width: 120px;"><label class="toggle"><input type="checkbox" id="image-to-text-context"><span class="toggle-slider"></span></label></div><div class="hint">喂前文帮助判断梗图 / 表情包意图</div></div>
+                        <div class="form-group"><label>结合前文对话</label><div class="toggle-row" style="padding-top: 6px; max-width: 120px;"><label class="toggle"><input type="checkbox" id="image-to-text-context"><span class="toggle-slider"></span></label></div><div class="hint">喂前文帮助确认图片边界，但识别结果仍只保留画面事实</div></div>
                         <div class="form-group"><label>前文窗口（条）</label><input type="number" id="image-context-window" min="0" max="30"></div>
                         <div class="form-group"><label>识别超时（秒）</label><input type="number" id="image-to-text-timeout" min="5" max="300"></div>
                         <div class="form-group"><label>描述缓存（秒）</label><input type="number" id="image-cache-ttl" min="60" max="86400"><div class="hint">同一张图重复出现时的缓存时长</div></div>
@@ -3635,8 +3635,8 @@
                     <div class="meme-preview"><img src="${imageUrl}" alt="${escapeAttr(item.description || '表情包')}" loading="lazy"></div>
                     <div class="meme-info">
                         <span class="meme-category">${category}</span>
-                        <div class="meme-desc-label">大致含义 / 适用场景</div>
-                        <input class="meme-meaning-input" type="text" maxlength="240" value="${escapeAttr(meaning)}" placeholder="还没有填写" onchange="updateMemeMeaning('${id}', this.value)">
+                        <div class="meme-desc-label">图片客观描述</div>
+                        <input class="meme-meaning-input" type="text" maxlength="240" value="${escapeAttr(meaning)}" placeholder="例如：眯眼橘猫，配字“拽”" onchange="updateMemeMeaning('${id}', this.value)">
                         <div class="meme-meta"><span>${escapeHtml(dimensions)}</span><span>使用 ${Number(item.use_count || 0)}</span></div>
                         <select aria-label="修改分类" style="width:100%;margin-top:9px;" onchange="updateMeme('${id}', this.value)">${options}</select>
                         <div class="meme-actions">

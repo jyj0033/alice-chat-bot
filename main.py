@@ -4072,7 +4072,7 @@ class GroupChatBot:
                     "ocr_action": "ocr_image",
                     "ocr_timeout": 5.0,
                     "to_text_scope": "all",
-                    "to_text_prompt": "用一两句话（50字以内）描述图片内容，如果是表情包/梗图，重点说明它想表达的情绪和意图（如调侃、无语、赞同、嘲讽、自嘲），并结合前文对话判断含义。",
+                    "to_text_prompt": "用一两句话（50字以内）客观描述图片中能直接看到的内容：主体、动作或表情、画面文字、明显颜色和构图；不要推测人物关系、前因后果、情绪意图或适用场景。",
                     "to_text_context": True,
                     "context_window": 6,
                     "to_text_timeout": 60,

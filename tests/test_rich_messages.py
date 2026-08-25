@@ -109,6 +109,18 @@ class RichMessageParsingTests(unittest.TestCase):
 
 
 class RichMediaEnricherTests(unittest.IsolatedAsyncioTestCase):
+    def test_image_prompt_requires_objective_visual_description(self):
+        enricher = RichMediaEnricher({}, lambda *_: None)
+        prompt = enricher._build_image_prompt(
+            MessageSegment(type="mface"),
+            "小明说：这个不铲还偷偷练？",
+        )
+
+        self.assertIn("客观描述", prompt)
+        self.assertIn("只描述画面、人物表情和图片文字", prompt)
+        self.assertIn("不要把前文人物、事件、评价或原话写进图片描述", prompt)
+        self.assertNotIn("结合前文判断这张图在说什么、在回应谁", prompt)
+
     async def test_forward_expands_with_bounded_readable_excerpts(self):
         calls = []
 

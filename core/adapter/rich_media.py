@@ -84,8 +84,8 @@ class RichMediaEnricher:
         self.image_to_text_prompt = str(
             image.get(
                 "to_text_prompt",
-                "用一两句话（50字以内）描述图片内容，如果是表情包/梗图，重点说明它想表达的"
-                "情绪和意图（如调侃、无语、赞同、嘲讽、自嘲），并结合前文对话判断含义。",
+                "用一两句话（50字以内）客观描述图片中能直接看到的内容：主体、动作或表情、"
+                "画面文字、明显颜色和构图；不要推测人物关系、前因后果、情绪意图或适用场景。",
             )
         )
         self.image_to_text_timeout = max(1.0, float(image.get("to_text_timeout", 60)))
@@ -389,7 +389,7 @@ class RichMediaEnricher:
         conversation_context: str = "",
         group_image_urls: list[dict] | None = None,
     ) -> bool:
-        """用视觉模型把图片转成文字描述（含意图解读），写入 segment.summary。
+        """用视觉模型把图片转成客观文字描述，写入 segment.summary。
 
         group_image_urls：同一人此前连续发的图片（[{url, file}, ...]）。非空时把
         整组一起喂给视觉模型判断整体含义，此时不读/不写缓存（组含义随上下文变化）。
@@ -417,6 +417,11 @@ class RichMediaEnricher:
             # 敏感图：直接落占位文案，让 LLM 知道"爱丽丝看了不想看"，而不是空占位。
             segment.summary = f"{prefix}{SENSITIVE_IMAGE_NOTE}]"
             return True
+        metadata = getattr(segment, "data", None)
+        if isinstance(metadata, dict):
+            # 表情库使用这一份不带群聊语境的描述；segment.summary 仍保留给
+            # 普通回复链路使用，避免把“图片是什么”和“当时在回应谁”混成一个字段。
+            metadata["objective_summary"] = desc[:240]
         segment.summary = f"{prefix}{desc[:100]}]"
         return True
 
@@ -533,20 +538,23 @@ class RichMediaEnricher:
         conversation_context: str,
         group_image_urls: list[dict] | None = None,
     ) -> str:
-        """构造意图导向的视觉 prompt。"""
-        parts = [self.image_to_text_prompt]
+        """构造只输出画面事实的视觉 prompt。"""
+        parts = [
+            self.image_to_text_prompt,
+            "输出规则：只写图片中直接可观察的事实，不要结合群聊推断谁在说谁、"
+            "不要解释梗的前因后果，不要写“适合用来……”或替群友评价这张图。",
+        ]
         if segment.type == "mface":
-            parts.append("这是群友发的表情包/梗图，重点分析它想表达的情绪和意图。")
+            parts.append("这是群友发的表情包/梗图，仍然只描述画面、人物表情和图片文字。")
         if group_image_urls and self.image_group_enabled:
             parts.append(
                 f"这些图是同一人连续发的（共{len(group_image_urls) + 1}张），"
-                "请判断这组图合起来想表达什么、在回应什么，以及当前这张在组里的作用。"
+                "请分别概括每张图能直接看到的内容，不要推断这组图在回应谁或想表达什么。"
             )
         if conversation_context and self.image_to_text_context:
             parts.append(
-                f"前文对话：\n{conversation_context}\n结合前文判断这张图在说什么、在回应谁。"
-                "描述里不要照抄前文原话（不要加引号复述群友说过的句子），"
-                "用你自己的话概括它在回应什么，否则后续会被当成发言原样复读。"
+                f"前文对话仅用于确认图片边界：\n{conversation_context}\n"
+                "不要把前文人物、事件、评价或原话写进图片描述；不要加引号复述群友说过的句子。"
             )
         return "\n".join(parts)
 

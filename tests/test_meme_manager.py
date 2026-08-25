@@ -258,6 +258,28 @@ class MemeManagerTests(unittest.TestCase):
         self.assertEqual(MemeManager._infer_category("一张普通风景图"), "待整理")
         self.assertEqual(MemeManager._infer_category("哈哈但又有点无语"), "待整理")
 
+    def test_meme_meaning_keeps_visual_facts_and_drops_chat_context(self):
+        summary = (
+            "[表情包，内容：一只眯眼橘猫配字\"拽\"，群友在吐槽对方偷偷练了，"
+            "表达一种\"你可拉倒吧别装了\"的调侃和无语感。]"
+        )
+        self.assertEqual(
+            MemeManager._meaning_from_content(summary),
+            "一只眯眼橘猫配字\"拽\"",
+        )
+
+        segment = MessageSegment(
+            type="mface",
+            summary="[表情包，内容：结合前文判断是在嘲讽某人]",
+            data={"objective_summary": "一只眯眼橘猫，眯眼，配字\"拽\""},
+        )
+        self.assertEqual(
+            MemeManager._meaning_from_content(
+                segment.data["objective_summary"]
+            ),
+            "一只眯眼橘猫，眯眼，配字\"拽\"",
+        )
+
     def test_private_collection_is_off_by_default(self):
         manager = MemeManager(
             {"storage_path": self.temp_dir.name, "auto_collect_enabled": True},
