@@ -875,6 +875,10 @@ class GroupChatBot:
         if not session_id.startswith(("group_", "private_")):
             return {"success": False, "error": "会话格式不正确"}
 
+        # 发送前同步磁盘最新清单：自动收集的新素材可能未进运行内存，
+        # 避免「列表能看到、发送却说不存在」。
+        await asyncio.to_thread(manager.reload)
+
         if meme_id:
             item = await asyncio.to_thread(manager.resolve, meme_id)
             if not item:

@@ -746,6 +746,8 @@ async def get_memes(
     if not manager:
         return {"memes": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
     try:
+        # 先同步磁盘最新清单，避免自动收集的新素材在运行内存里不可见。
+        await asyncio.to_thread(manager.reload)
         items, total = await asyncio.to_thread(
             manager.list_memes,
             category=category,
@@ -843,6 +845,23 @@ async def create_meme_category(request: Request):
         return {"success": False, "error": str(exc)}
 
 
+@app.post("/api/memes/send")
+async def send_meme(request: Request):
+    if not bot_instance:
+        return {"success": False, "error": "Bot 未初始化"}
+    try:
+        data = await request.json()
+        data = data if isinstance(data, dict) else {}
+        return await bot_instance.send_meme(
+            str(data.get("session") or ""),
+            meme_id=str(data.get("meme_id") or ""),
+            category=str(data.get("category") or ""),
+        )
+    except Exception as exc:
+        logger.error("Manual meme send failed: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+
 @app.post("/api/memes/{meme_id}")
 async def update_meme(meme_id: str, request: Request):
     manager = _get_meme_manager()
@@ -874,23 +893,6 @@ async def delete_meme(meme_id: str):
         deleted = await asyncio.to_thread(manager.delete, meme_id)
         return {"success": deleted, "error": "表情不存在" if not deleted else ""}
     except Exception as exc:
-        return {"success": False, "error": str(exc)}
-
-
-@app.post("/api/memes/send")
-async def send_meme(request: Request):
-    if not bot_instance:
-        return {"success": False, "error": "Bot 未初始化"}
-    try:
-        data = await request.json()
-        data = data if isinstance(data, dict) else {}
-        return await bot_instance.send_meme(
-            str(data.get("session") or ""),
-            meme_id=str(data.get("meme_id") or ""),
-            category=str(data.get("category") or ""),
-        )
-    except Exception as exc:
-        logger.error("Manual meme send failed: %s", exc)
         return {"success": False, "error": str(exc)}
 
 

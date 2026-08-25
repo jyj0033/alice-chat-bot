@@ -167,6 +167,37 @@ class MemeManager:
             # 配置路径改变时不切换当前对象的清单，避免 Web 保存配置造成数据漂移。
             if fresh.root != self.root:
                 logger.warning("表情库 storage_path 修改后将在重启时生效: %s", fresh.root)
+            else:
+                # 配置更新时顺带同步磁盘最新清单：自动收集/其他入口可能已经
+                # 往 catalog.json 写入了新素材，运行时还停留在启动时的快照，
+                # 会导致「列表能看到，但 resolve/发送说不存在」。
+                self._reload_catalog_locked()
+
+    def _reload_catalog_locked(self) -> None:
+        """在持锁状态下把磁盘 catalog.json 的最新清单合并进运行时。
+
+        只增量和原地更新已有条目，不删除本地新增/还在内存里的内容：
+        并发写（自动收集）与这里的读走同一个临时文件原子替换，读到的是
+        完整的最新快照，直接整体覆盖最安全。
+        """
+        try:
+            if not self.catalog_path.is_file():
+                return
+            fresh = self._load_catalog()
+            loaded = fresh["memes"]
+            for key, value in loaded.items():
+                if isinstance(value, dict):
+                    self._catalog["memes"][key] = value
+            for name, desc in fresh["categories"].items():
+                if isinstance(name, str) and isinstance(desc, dict):
+                    self._catalog["categories"].setdefault(name, desc)
+        except Exception as exc:
+            logger.warning("重载表情包清单失败，保留现有清单: %s", exc)
+
+    def reload(self) -> None:
+        """供外部入口（列表读取、发送前）同步磁盘最新清单。"""
+        with self._lock:
+            self._reload_catalog_locked()
 
     def _load_catalog(self) -> dict[str, Any]:
         default = {
