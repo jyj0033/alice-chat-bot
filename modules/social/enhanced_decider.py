@@ -325,11 +325,11 @@ class EnhancedSpeakingDecider:
                 modifiers["独聊更积极"] = 0.18 if n_speakers <= 1 else 0.10
             elif floor.two_person_thread:
                 # 两人连续对聊：不盲目插话。话题与人格高度相关且非消息爆发时，
-                # 允许偶尔自然融入讨论；否则旁观。低概率由插话成本惩罚保证。
+                # 允许自然融入；否则只保留极低概率的短附和机会。
                 if context.topic_relevance >= 0.7 and not floor.fast_burst:
                     modifiers["自然融入对聊"] = 0.12
                 else:
-                    modifiers["两人对聊旁观"] = -0.18
+                    modifiers["两人对聊谨慎"] = -0.18
             elif group_activity > 0.8:
                 modifiers["群聊节奏"] = -0.12
             elif group_activity < 0.2:

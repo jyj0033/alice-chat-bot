@@ -544,6 +544,9 @@ class GroupChatBot:
             topic_shift_threshold=floor_config.get("topic_shift_threshold", 0.12),
             settle_window_seconds=floor_config.get("settle_window_seconds", 0.7),
             settle_max_seconds=floor_config.get("settle_max_seconds", 2.4),
+            other_target_context_seconds=floor_config.get(
+                "other_target_context_seconds", 900
+            ),
         )
 
         # 发言决策器
@@ -4048,7 +4051,8 @@ class GroupChatBot:
                 "burst_message_threshold": 4,
                 "topic_shift_threshold": 0.12,
                 "settle_window_seconds": 0.7,
-                "settle_max_seconds": 2.4
+                "settle_max_seconds": 2.4,
+                "other_target_context_seconds": 900
             },
             "rich_media": {
                 "enabled": True,

@@ -62,7 +62,7 @@ class ConversationFloorTests(unittest.TestCase):
         self.assertEqual(plan.action, ActionType.ANSWER)
         self.assertTrue(plan.directed)
 
-    def test_two_people_in_fast_dialogue_produce_silent_plan(self):
+    def test_two_people_in_fast_dialogue_allow_short_agreement(self):
         messages = [
             self.message("u1", "今晚吃啥", 0, message_id="m1"),
             self.message("u2", "火锅吧", 1, message_id="m2"),
@@ -74,7 +74,23 @@ class ConversationFloorTests(unittest.TestCase):
 
         self.assertTrue(floor.two_person_thread)
         self.assertTrue(floor.fast_burst)
-        self.assertEqual(plan.action, ActionType.SILENT)
+        self.assertEqual(plan.action, ActionType.REACT)
+        self.assertLessEqual(plan.max_chars, 10)
+        self.assertIn("附和", plan.reason)
+
+    def test_three_people_in_fast_chat_keep_short_interjection_candidate(self):
+        messages = [
+            self.message("u1", "今晚吃啥", 0, message_id="m1"),
+            self.message("u2", "火锅吧", 1, message_id="m2"),
+            self.message("u3", "我支持", 2, message_id="m3"),
+            self.message("u1", "那就这么定", 3, message_id="m4"),
+        ]
+
+        floor, plan = self.manager.analyze(messages[-1], messages, bot_id="bot")
+
+        self.assertEqual(len(floor.active_speakers), 3)
+        self.assertEqual(plan.action, ActionType.REPLY)
+        self.assertFalse(plan.directed)
 
     def test_message_replying_to_another_user_produces_silent_plan(self):
         first = self.message("u1", "这个怎么弄", 0, message_id="m1")
@@ -91,6 +107,63 @@ class ConversationFloorTests(unittest.TestCase):
 
         self.assertEqual(floor.interruption_cost, 0.95)
         self.assertEqual(plan.action, ActionType.SILENT)
+
+    def test_question_after_same_sender_message_waits_for_complete_turn(self):
+        """同一用户拆成两条补充时，不因第二条问号抢答。"""
+        first = self.message(
+            "u2", "你确定你用的是ds，而不是其他模型", 0, message_id="m1"
+        )
+        current = self.message(
+            "u2", "比如Gemini3f?", 6, message_id="m2"
+        )
+
+        floor, plan = self.manager.analyze(
+            current,
+            [first, current],
+            bot_id="bot",
+            is_question=True,
+        )
+
+        self.assertTrue(floor.same_sender_continuation)
+        self.assertEqual(plan.action, ActionType.SILENT)
+        self.assertIn("连续补充", plan.reason)
+
+    def test_second_person_question_to_previous_group_member_is_silent(self):
+        """无 @ 的“你确定”更像是在问上一位群友时，Bot 旁观。"""
+        previous = self.message("u1", "我的鲸鱼娘说干好了", -10, message_id="m0")
+        current = self.message(
+            "u2", "你确定你用的是ds，而不是其他模型", 0, message_id="m1"
+        )
+
+        floor, plan = self.manager.analyze(
+            current,
+            [previous, current],
+            bot_id="bot",
+            is_question=False,
+        )
+
+        self.assertEqual(floor.likely_target_user, "u1")
+        self.assertEqual(plan.action, ActionType.SILENT)
+        self.assertIn("上一位群友", plan.reason)
+
+    def test_explicit_bot_direction_overrides_contextual_other_target(self):
+        """明确指向 Bot 时，上一位群友推断不能挡住回复。"""
+        previous = self.message("u1", "我的鲸鱼娘说干好了", -10, message_id="m0")
+        current = self.message(
+            "u2", "你确定你用的是ds，而不是其他模型", 0,
+            message_id="m1", directed=True,
+        )
+
+        _, plan = self.manager.analyze(
+            current,
+            [previous, current],
+            bot_id="bot",
+            directed_to_bot=True,
+            is_question=False,
+        )
+
+        self.assertEqual(plan.action, ActionType.REPLY)
+        self.assertTrue(plan.directed)
 
     def test_short_expressive_message_prefers_react(self):
         current = self.message("u1", "笑死哈哈哈", 0, message_id="m1")
