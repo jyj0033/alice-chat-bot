@@ -356,10 +356,11 @@ class GroupChatBot:
             "max_topics": max(1, min(10, int(analysis_cfg.get("max_topics", 5)))),
             "max_quotes": max(1, min(8, int(analysis_cfg.get("max_quotes", 3)))),
             "max_titles": max(1, min(8, int(analysis_cfg.get("max_titles", 5)))),
-            "max_tokens": max(400, min(3000, int(analysis_cfg.get("max_tokens", 1800)))),
+            "max_tokens": max(400, min(6000, int(analysis_cfg.get("max_tokens", 2400)))),
             "max_report_chars": max(1200, min(10000, int(analysis_cfg.get("max_report_chars", 6000)))),
             "retention_days": max(3, min(365, int(analysis_cfg.get("retention_days", 30)))),
             "send_report": bool(analysis_cfg.get("send_report", True)),
+            "retries": max(1, min(8, int(analysis_cfg.get("retries", 2)))),
             "avatars_enabled": bool(analysis_cfg.get("avatars_enabled", True)),
             "avatar_cache_days": max(1, min(365, int(analysis_cfg.get("avatar_cache_days", 7)))),
             "avatar_max_count": max(1, min(30, int(analysis_cfg.get("avatar_max_count", 12)))),
@@ -1948,8 +1949,14 @@ class GroupChatBot:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def trigger_group_analysis(self, session_id: str, days: int = 1) -> dict:
-        """供 Dashboard 调用的手动日报入口；群内消息不再触发日报。"""
+    async def trigger_group_analysis(
+        self, session_id: str, days: int = 1, report_date: str = ""
+    ) -> dict:
+        """供 Dashboard 调用的手动日报入口；群内消息不再触发日报。
+
+        report_date 传 "YYYY-MM-DD" 时，按指定自然日重新分析并补发该日报告；
+        不传时固定分析今天。
+        """
         session_id = str(session_id or "").strip()
         if not session_id.startswith("group_"):
             return {"success": False, "error": "只能分析群聊会话"}
@@ -1975,6 +1982,7 @@ class GroupChatBot:
             return {"success": False, "error": "这个群的日报还在整理中"}
         # 日报固定分析自然日，不再允许按滚动 N 天回看。
         days = 1
+        report_date = str(report_date or "").strip()
         trigger = Message(
             message_id="",
             message_type="group",
@@ -1983,11 +1991,16 @@ class GroupChatBot:
             group_id=session_id.removeprefix("group_"),
         )
         started = await self._start_group_analysis(
-            trigger, days, automatic=False, send_ack=False
+            trigger, days, automatic=False, send_ack=False, report_date=report_date
         )
         if not started:
             return {"success": False, "error": "日报任务未能启动"}
-        return {"success": True, "session": session_id, "days": days}
+        return {
+            "success": True,
+            "session": session_id,
+            "days": days,
+            "report_date": report_date or "today",
+        }
 
     async def _start_group_analysis(
         self,
@@ -1995,6 +2008,7 @@ class GroupChatBot:
         days: int,
         automatic: bool = False,
         send_ack: bool = True,
+        report_date: str = "",
     ) -> bool:
         """启动单群日报任务；同一群同时只允许一个分析任务。"""
         session_id = message.session_id
@@ -2014,7 +2028,9 @@ class GroupChatBot:
             )
 
         task = asyncio.create_task(
-            self._run_group_analysis(session_id, days, automatic=automatic)
+            self._run_group_analysis(
+                session_id, days, automatic=automatic, report_date=report_date
+            )
         )
         self._group_analysis_tasks[session_id] = task
 
@@ -2026,18 +2042,34 @@ class GroupChatBot:
         return True
 
     async def _run_group_analysis(
-        self, session_id: str, days: int, automatic: bool = False
+        self,
+        session_id: str,
+        days: int,
+        automatic: bool = False,
+        report_date: str = "",
     ) -> None:
         """读取完整群聊流水、生成日报并保存/发送。"""
         config = getattr(self, "_group_analysis_config", {}) or {}
         try:
             await self._wait_group_analysis_writes()
             now = datetime.now()
-            since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            target_date = None
+            report_label = "今日"
+            try:
+                target_date = datetime.strptime(str(report_date or ""), "%Y-%m-%d")
+                report_label = f"{target_date.strftime('%m-%d')}"
+            except ValueError:
+                target_date = None
+            if target_date is not None:
+                since = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                until = since + timedelta(days=1)
+            else:
+                since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                until = now + timedelta(seconds=1)
             messages = await self.memory_storage.get_group_analysis_messages(
                 session_id,
                 since=since,
-                until=now + timedelta(seconds=1),
+                until=until,
                 limit=config.get("max_messages", 500),
             )
             usable_count = len(GroupDailyAnalysis.human_messages(messages))
@@ -2064,7 +2096,8 @@ class GroupChatBot:
                 max_topics=config.get("max_topics", 5),
                 max_quotes=config.get("max_quotes", 3),
                 max_titles=config.get("max_titles", 5),
-                max_tokens=config.get("max_tokens", 1800),
+                max_tokens=config.get("max_tokens", 2400),
+                retries=config.get("retries", 2),
                 bot_name=getattr(getattr(self, "personality", None), "name", "爱丽丝"),
                 bot_persona=(
                     self.personality.build_persona_prompt()
@@ -2074,10 +2107,13 @@ class GroupChatBot:
             )
             report_text = GroupDailyAnalysis.render_report(
                 report,
-                report_label="今日",
+                report_label=report_label,
                 max_chars=config.get("max_report_chars", 6000),
             )
-            report_date = now.strftime("%Y-%m-%d")
+            if target_date is not None:
+                report_date_str = report_date
+            else:
+                report_date_str = now.strftime("%Y-%m-%d")
             report_memory = Memory(
                 content=report_text,
                 memory_type="group_report",
@@ -2086,7 +2122,7 @@ class GroupChatBot:
                 tags=["群日报"],
                 metadata={
                     "kind": "group_daily_analysis",
-                    "report_date": report_date,
+                    "report_date": report_date_str,
                     "days": 1,
                     "message_count": report["statistics"].get("message_count", 0),
                     "participant_count": report["statistics"].get("participant_count", 0),

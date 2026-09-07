@@ -12,6 +12,7 @@ services:
       - "3001:3001"
     environment:
       - PYTHONUNBUFFERED=1
+      - TZ=Asia/Shanghai
     networks:
       - bot-network
 

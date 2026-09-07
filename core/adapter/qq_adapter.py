@@ -434,11 +434,23 @@ class QQAdapter(PlatformAdapter):
 
             # 必须等待 NapCat 的 echo/retcode 回执；仅把指令写进 WebSocket
             # 不能证明 QQ 真的接受并发出了消息。
-            await self.call_api(message_data["action"], message_data["params"])
-            self.messages_sent += 1
-            return True
+            try:
+                await self.call_api(message_data["action"], message_data["params"])
+                self.messages_sent += 1
+                return True
+            except (asyncio.TimeoutError, ConnectionError, RuntimeError) as first_exc:
+                # NapCat 反向 ws 重启时容易撞上 send 时刻：等重连再重试一次
+                logger.warning(
+                    "send_message 首调失败（%s），等 NapCat 重连后重试一次", first_exc
+                )
+                if not await self._wait_for_napcat(timeout=60.0):
+                    logger.error("NapCat 重连超时，放弃 send_message")
+                    return False
+                await self.call_api(message_data["action"], message_data["params"])
+                self.messages_sent += 1
+                return True
         except Exception as e:
-            logger.error(f"Failed to send: {e}")
+            logger.exception(f"Failed to send: {e!r}")
             return False
 
     async def send_image(
@@ -490,11 +502,29 @@ class QQAdapter(PlatformAdapter):
                 action, params = self._build_send_message_request(
                     session_id, png_message_array
                 )
+                try:
+                    await self.call_api(action, params)
+                except (asyncio.TimeoutError, ConnectionError, RuntimeError) as first_exc:
+                    logger.warning(
+                        "send_image 首调失败（%s），等 NapCat 重连后重试一次", first_exc
+                    )
+                    if not await self._wait_for_napcat(timeout=60.0):
+                        logger.error("NapCat 重连超时，放弃 send_image")
+                        return False
+                    await self.call_api(action, params)
+            except (asyncio.TimeoutError, ConnectionError) as first_exc:
+                # NapCat 反向 ws 重启时容易撞上 send 时刻：等重连再重试一次
+                logger.warning(
+                    "send_image 首调失败（%s），等 NapCat 重连后重试一次", first_exc
+                )
+                if not await self._wait_for_napcat(timeout=60.0):
+                    logger.error("NapCat 重连超时，放弃 send_image")
+                    return False
                 await self.call_api(action, params)
             self.messages_sent += 1
             return True
         except Exception as e:
-            logger.error(f"Failed to send image: {e}")
+            logger.exception(f"Failed to send image: {e!r}")
             return False
 
     @staticmethod
@@ -562,3 +592,19 @@ class QQAdapter(PlatformAdapter):
     @property
     def is_connected(self) -> bool:
         return self._connected and len(self._clients) > 0
+
+    async def _wait_for_napcat(self, timeout: float = 60.0, poll: float = 1.0) -> bool:
+        """等 NapCat 反向 ws 重连，最多等 timeout 秒。返回 True=已连。
+
+        NapCat 反向 ws 重连瞬间握手还没完成，立即 send 会再次触发断开。
+        看到 _clients 非空后多等 settle 秒，确认 ws 仍然存活再返回。
+        """
+        settle = 3.0
+        deadline = asyncio.get_event_loop().time() + max(0.0, timeout)
+        while asyncio.get_event_loop().time() < deadline:
+            if self.is_connected:
+                await asyncio.sleep(settle)
+                if self.is_connected:
+                    return True
+            await asyncio.sleep(poll)
+        return self.is_connected

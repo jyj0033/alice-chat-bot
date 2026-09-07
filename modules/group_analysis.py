@@ -436,16 +436,38 @@ class GroupDailyAnalysis:
 
     @classmethod
     def _parse_json(cls, text: str) -> dict:
+        # 1) 剥掉模型思考过程与 ```json 围栏
         text = cls._THINK_RE.sub("", text or "").strip()
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
-        start = text.find("{")
-        if start < 0:
-            return {}
-        try:
-            value, _ = json.JSONDecoder().raw_decode(text[start:])
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return {}
-        return value if isinstance(value, dict) else {}
+        # 2) 逐个 { 起点尝试解析。首个解析成功的候选未必是最外层（输出被截断时
+        #    raw_decode 可能恰好停在内层对象上），所以收集结果内关键 key 最全的。
+        #
+        #    docstring：模型超长输出被 max_tokens 截断时，最外层 JSON 不闭合，
+        #    但内层 topics[0] 等对象完整。此时宁取内层完整段，也不返回空。
+        # 3) 前导说明文字、尾部附言、逗号残留全部丢弃。
+        decoder = json.JSONDecoder()
+        start = 0
+        best: dict = {}
+        best_score = -1
+        schema_keys = {"title", "summary", "topics", "profiles", "quotes", "unhinged_quotes"}
+        while True:
+            start = text.find("{", start)
+            if start < 0:
+                return best
+            try:
+                value, end = decoder.raw_decode(text[start:])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                start += 1
+                continue
+            if isinstance(value, dict):
+                score = len(schema_keys & set(value.keys()))
+                if score > best_score:
+                    best_score = score
+                    best = value
+                if score >= 4:
+                    return value
+                start = start
+            start += 1
 
     @classmethod
     def _short_text(cls, value: Any, limit: int) -> str:
@@ -608,27 +630,46 @@ class GroupDailyAnalysis:
             elif kind in {"quote", "unhinged_quote"}:
                 content = cls._short_text(item.get("content"), 220)
                 reason = cls._short_text(item.get("reason"), 80)
-                if not content or sender_id not in known_ids:
+                if not content:
+                    logger.info(
+                        "[群日报] %s 丢弃:content 为空 item=%s",
+                        kind, item,
+                    )
                     continue
-                matched = cls._match_quote(content, sender_id, source_messages)
-                if matched:
-                    quote = {
-                        "content": matched,
-                        "sender_id": sender_id,
-                        "reason": reason or "这句我得记一下",
-                    }
-                    if kind == "unhinged_quote":
-                        try:
-                            score = float(
-                                item.get("score")
-                                or item.get("unhinged_score")
-                                or item.get("rank_score")
-                                or 0
-                            )
-                        except (TypeError, ValueError):
-                            score = 0
-                        quote["score"] = max(0, min(100, int(round(score))))
-                    output.append(quote)
+                if sender_id not in known_ids:
+                    logger.info(
+                        "[群日报] %s 丢弃:sender_id=%s 不在 known_ids(%d)",
+                        kind, sender_id, len(known_ids),
+                    )
+                    continue
+                matched, match_info = cls._match_quote(content, sender_id, source_messages)
+                if not matched:
+                    logger.info(
+                        "[群日报] %s 丢弃:match_quote 失败 sender=%s candidate=%r info=%s",
+                        kind, sender_id, content[:60], match_info,
+                    )
+                    continue
+                logger.info(
+                    "[群日报] %s 命中 sender=%s info=%s",
+                    kind, sender_id, match_info,
+                )
+                quote = {
+                    "content": matched,
+                    "sender_id": sender_id,
+                    "reason": reason or "这句我得记一下",
+                }
+                if kind == "unhinged_quote":
+                    try:
+                        score = float(
+                            item.get("score")
+                            or item.get("unhinged_score")
+                            or item.get("rank_score")
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        score = 0
+                    quote["score"] = max(0, min(100, int(round(score))))
+                output.append(quote)
             else:
                 title = cls._short_text(item.get("title"), 24)
                 reason = cls._short_text(item.get("reason"), 140)
@@ -685,94 +726,27 @@ class GroupDailyAnalysis:
         }
         return review if any(review.values()) else {}
 
-    @classmethod
-    def _fallback_titles(cls, statistics: dict[str, Any], max_count: int) -> list[dict]:
-        """LLM 不可用时，用可验证的统计特征生成轻量画像，避免图片只剩报表。"""
-        fallback = []
-        for item in (statistics.get("top_users") or [])[:max_count]:
-            sender_id = str(item.get("sender_id") or "")
-            name = str(item.get("name") or sender_id or "匿名")
-            message_count = int(item.get("message_count") or 0)
-            reply_count = int(item.get("reply_count") or 0)
-            emoji_count = int(item.get("emoji_count") or 0)
-            if reply_count >= 2:
-                title = "接话担当"
-                reason = f"我注意到{name}今天不只是发言，还接住了{reply_count}次话头，让几段聊天没有断掉。"
-            elif emoji_count >= 2:
-                title = "表情包供给者"
-                reason = f"我看到{name}今天用了{emoji_count}个表情，聊天里的情绪基本都能在这里找到回应。"
-            else:
-                title = "今日发言担当"
-                reason = f"我注意到{name}今天留下了{message_count}条消息，是我回看这段聊天时最常遇到的名字之一。"
-            fallback.append(
-                {
-                    "sender_id": sender_id,
-                    "title": title,
-                    "mbti": "今日观察",
-                    "reason": reason,
-                }
-            )
-        return fallback
-
-    @classmethod
-    def _fallback_unhinged_quotes(cls, messages: list, max_count: int = 5) -> list[dict]:
-        """LLM 不可用时，只从带明显离谱信号的原话里挑选逆天语录。"""
-        signals = (
-            ("逆天", 32),
-            ("离谱", 28),
-            ("抽象", 24),
-            ("绷不住", 24),
-            ("不是吧", 20),
-            ("怎么会", 20),
-            ("居然", 18),
-            ("竟然", 18),
-            ("救命", 18),
-            ("什么鬼", 18),
-            ("合理吗", 22),
-            ("我服了", 22),
-            ("？？", 16),
-            ("??", 16),
+    @staticmethod
+    def _shared_token_ratio(source_norm: str, candidate_norm: str) -> float:
+        """分词交集比例，弥补 SequenceMatcher 对长句整体相似度偏低的问题。"""
+        source_tokens = set(
+            token
+            for token in re.findall(r"[\w一-鿿]+", source_norm)
+            if len(token) >= 2
         )
-        reactions = (
-            "这句的走向我是真没猜到，后面居然还能接上",
-            "好家伙，原来还能这么说，群里又多了一种解法",
-            "这句放在今天很难不被记住，实在太会拐了",
-            "我看到这里停了一下，主要是没想到还能这样",
-            "话题拐成这样也算本事，起点已经找不回来了",
+        candidate_tokens = set(
+            token
+            for token in re.findall(r"[\w一-鿿]+", candidate_norm)
+            if len(token) >= 2
         )
-        candidates = []
-        seen: set[str] = set()
-        for order, message in enumerate(cls.human_messages(messages)):
-            content = cls._content(message)
-            if len(content) < 6 or content in seen:
-                continue
-            seen.add(content)
-            score = sum(weight for signal, weight in signals if signal in content)
-            if 10 <= len(content) <= 120:
-                score += 6
-            if any(mark in content for mark in ("？", "?", "！", "!", "……", "...")):
-                score += 8
-            metadata = cls._metadata(message)
-            if metadata.get("reply_to_id") or metadata.get("reply_to_qq"):
-                score += 6
-            if score < 18:
-                continue
-            sender_id, _ = cls._sender(message)
-            candidates.append((score, len(content), -order, content, sender_id))
-
-        candidates.sort(reverse=True)
-        return [
-            {
-                "content": content[:220],
-                "sender_id": sender_id,
-                "score": min(99, int(score)),
-                "reason": reactions[index % len(reactions)],
-            }
-            for index, (score, _, _, content, sender_id) in enumerate(candidates[:max_count])
-        ]
+        if not source_tokens or not candidate_tokens:
+            return 0.0
+        shared = source_tokens & candidate_tokens
+        denom = min(len(source_tokens), len(candidate_tokens))
+        return len(shared) / denom if denom > 0 else 0.0
 
     @classmethod
-    def _match_quote(cls, candidate: str, sender_id: str, messages: list) -> str:
+    def _match_quote(cls, candidate: str, sender_id: str, messages: list) -> tuple[str, dict]:
         candidate_norm = cls._SPACE_RE.sub("", candidate)
         candidates = [
             cls._content(message)
@@ -780,21 +754,38 @@ class GroupDailyAnalysis:
             if cls._sender(message)[0] == sender_id and cls._content(message)
         ]
         if not candidates:
-            return ""
+            return "", {"reason": "sender_no_messages"}
+        # 1) 完全包含
         for source in candidates:
             source_norm = cls._SPACE_RE.sub("", source)
-            if candidate_norm in source_norm or source_norm in candidate_norm:
-                return source[:220]
-        best = max(
-            candidates,
-            key=lambda source: difflib.SequenceMatcher(
-                None, candidate_norm, cls._SPACE_RE.sub("", source)
-            ).ratio(),
-        )
-        score = difflib.SequenceMatcher(
-            None, candidate_norm, cls._SPACE_RE.sub("", best)
-        ).ratio()
-        return best[:220] if score >= 0.45 else ""
+            if candidate_norm and (candidate_norm in source_norm or source_norm in candidate_norm):
+                return source[:220], {"by": "contain", "ratio": 1.0}
+        # 2) 评分找 best
+        scored = []
+        for source in candidates:
+            source_norm = cls._SPACE_RE.sub("", source)
+            ratio = difflib.SequenceMatcher(None, candidate_norm, source_norm).ratio()
+            tok = cls._shared_token_ratio(source_norm, candidate_norm)
+            scored.append((source, source_norm, ratio, tok))
+        scored.sort(key=lambda item: (item[2] + 0.3 * item[3]), reverse=True)
+        best, best_norm, ratio, tok = scored[0]
+        # 3) 子串片段命中:candidate_norm 任意连续 8+ 字符 slice 在 best_norm 里
+        if len(candidate_norm) >= 8:
+            window = 8
+            hit = False
+            for start in range(0, len(candidate_norm) - window + 1):
+                slice_text = candidate_norm[start:start + window]
+                if slice_text in best_norm:
+                    hit = True
+                    break
+            if hit:
+                return best[:220], {"by": "subseq", "ratio": round(ratio, 3), "tok": round(tok, 3)}
+        # 4) 阈值判定(放宽:0.30 ratio 或 0.35 token 任一命中即可)
+        if ratio >= 0.30:
+            return best[:220], {"by": "ratio", "ratio": round(ratio, 3), "tok": round(tok, 3)}
+        if tok >= 0.35:
+            return best[:220], {"by": "token", "ratio": round(ratio, 3), "tok": round(tok, 3)}
+        return "", {"by": "miss", "ratio": round(ratio, 3), "tok": round(tok, 3)}
 
     @classmethod
     async def analyze(
@@ -805,14 +796,20 @@ class GroupDailyAnalysis:
         max_topics: int = 5,
         max_quotes: int = 3,
         max_titles: int = 5,
-        max_tokens: int = 1800,
+        max_tokens: int = 2400,
+        retries: int = 2,
         bot_name: str = "爱丽丝",
         bot_persona: str = "",
     ) -> dict:
-        """生成结构化日报；LLM 失败时返回可发送的纯统计结果。"""
+        """生成结构化日报；LLM 重试后仍不可用才返回可发送的纯统计结果。"""
         source_messages = cls._source_messages(messages)
         human_messages = cls.human_messages(source_messages)
         statistics = cls.build_statistics(human_messages)
+        logger.info(
+            "[群日报] provider=%s model=%s",
+            type(provider).__name__ if provider else None,
+            getattr(provider, "model", "?"),
+        )
         report: dict[str, Any] = {
             "statistics": statistics,
             "bot_name": cls._short_text(bot_name or "我", 30) or "我",
@@ -838,47 +835,61 @@ class GroupDailyAnalysis:
             report["title"] = "我先把今天的脚印收好"
             report["subtitle"] = "等有空再慢慢补上故事"
             report["summary"] = "我先按自己看到的消息做了个统计，暂时没提炼出更具体的总结。"
-            report["titles"] = cls._fallback_titles(statistics, max_titles)
-            report["profiles"] = report["titles"]
-            report["unhinged_quotes"] = cls._fallback_unhinged_quotes(
-                human_messages, 5
-            )
             return report
 
         from modules.llm.base import ChatRequest
 
-        request = ChatRequest(temperature=0.45, max_tokens=max_tokens, top_p=0.92)
-        request.add_system(
-            "你只负责生成群聊日报 JSON，不要和群友对话或输出解释文字；报告必须保持 Bot 的第一人称视角。"
-        )
-        request.add_user(
-            cls.build_prompt(
-                source_messages,
-                statistics,
-                max_chars=max_chars,
-                max_topics=max_topics,
-                max_quotes=max_quotes,
-                max_titles=max_titles,
-                bot_name=bot_name,
-                bot_persona=bot_persona,
+        # LLM 只产生文本/JSON，没有真实点评的固定句式模板，所以失败就重试：
+        # 网络抖动/限流一般两次内能回来，超过上限直接降级为纯统计，避免无限重试。
+        last_error = ""
+        parsed: dict = {}
+        for attempt in range(1, max(1, int(retries)) + 1):
+            request = ChatRequest(temperature=0.45, max_tokens=max_tokens, top_p=0.92)
+            request.add_system(
+                "你只负责生成群聊日报 JSON，不要和群友对话或输出解释文字；报告必须保持 Bot 的第一人称视角。"
             )
-        )
-        try:
-            response = await provider.chat(request)
-            parsed = cls._parse_json(getattr(response, "content", "") or "")
-        except Exception as exc:
-            report["analysis_error"] = str(exc)
+            request.add_user(
+                cls.build_prompt(
+                    source_messages,
+                    statistics,
+                    max_chars=max_chars,
+                    max_topics=max_topics,
+                    max_quotes=max_quotes,
+                    max_titles=max_titles,
+                    bot_name=bot_name,
+                    bot_persona=bot_persona,
+                )
+            )
+            try:
+                response = await provider.chat(request)
+                parsed = cls._parse_json(getattr(response, "content", "") or "")
+                if parsed:
+                    break
+                last_error = "输出不是有效 JSON"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = str(exc) or exc.__class__.__name__
+            if attempt < max(1, int(retries)):
+                logger.warning("[群日报] LLM 调用失败，第%d次重试: %s", attempt, last_error)
+                await asyncio.sleep(1.5 * attempt)
+
+        if not parsed:
+            report["analysis_error"] = last_error or "LLM 调用失败"
             report["title"] = "我先把今天的脚印收好"
             report["subtitle"] = "AI 暂时没接上，我先替它看着"
             report["summary"] = "我先按自己看到的消息做了个统计，暂时没提炼出更具体的总结。"
-            report["titles"] = cls._fallback_titles(statistics, max_titles)
-            report["profiles"] = report["titles"]
-            report["unhinged_quotes"] = cls._fallback_unhinged_quotes(
-                human_messages, 5
-            )
             return report
 
         known_ids = {cls._sender(message)[0] for message in human_messages}
+        logger.info(
+            "[群日报] parsed keys=%s quotes=%s unhinged=%s profiles=%s topics=%s",
+            sorted(parsed.keys()),
+            type(parsed.get("quotes")).__name__,
+            type(parsed.get("unhinged_quotes")).__name__,
+            type(parsed.get("profiles") or parsed.get("titles")).__name__,
+            type(parsed.get("topics")).__name__,
+        )
         report["title"] = cls._short_text(parsed.get("title"), 32)
         report["subtitle"] = cls._short_text(parsed.get("subtitle"), 52)
         report["summary"] = cls._short_text(parsed.get("summary"), 220)
@@ -910,12 +921,8 @@ class GroupDailyAnalysis:
         if not report["subtitle"]:
             report["subtitle"] = report["atmosphere"] or "我把注意到的几处记了下来"
         if not report["titles"]:
-            report["titles"] = cls._fallback_titles(statistics, max_titles)
-            report["profiles"] = report["titles"]
-        if not report["unhinged_quotes"]:
-            report["unhinged_quotes"] = cls._fallback_unhinged_quotes(
-                human_messages, 5
-            )
+            report["titles"] = []
+            report["profiles"] = []
         return report
 
     @classmethod
@@ -1042,7 +1049,9 @@ class GroupDailyAnalysis:
         image = cls._render_report_image_rich(
             report, report_label=report_label, width=width
         )
-        return image or cls._render_report_image_legacy(
+        if image:
+            return image
+        return cls._render_report_image_legacy(
             report, report_label=report_label, width=width
         )
 

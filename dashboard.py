@@ -716,7 +716,10 @@ async def get_group_analysis_sessions():
 
 @app.post("/api/group-analysis/run")
 async def run_group_analysis(request: Request):
-    """从管理面板手动启动指定群的日报；群内文本不会触发此任务。"""
+    """从管理面板手动启动指定群的日报；群内文本不会触发此任务。
+
+    body 可选 `report_date`("YYYY-MM-DD")：重新分析并补发指定自然日的日报。
+    """
     if not bot_instance:
         return {"success": False, "error": "Bot not initialized"}
     try:
@@ -724,7 +727,8 @@ async def run_group_analysis(request: Request):
         if not isinstance(data, dict):
             data = {}
         session = str(data.get("session") or "").strip()
-        return await bot_instance.trigger_group_analysis(session)
+        report_date = str(data.get("report_date") or "").strip()
+        return await bot_instance.trigger_group_analysis(session, report_date=report_date)
     except Exception as e:
         logger.error(f"Manual group analysis failed: {e}")
         return {"success": False, "error": str(e)}
