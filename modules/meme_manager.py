@@ -564,10 +564,33 @@ class MemeManager:
     # ------------------------------------------------------------------
     # 选择与回复标记
     # ------------------------------------------------------------------
-    def strip_directives(self, text: str) -> str:
-        """剥掉所有表情选择标记的残留（供发送前兜底清理）。"""
+    def strip_directives(self, text: str) -> tuple[str, str]:
+        """剥掉所有表情选择标记的残留，并尝试回收"半截标记"里的分类。
+
+        返回 `(cleaned_text, recovered_category)`：
+        - `cleaned_text` 是剥完所有标记的纯文本，可直接发到群里。
+        - `recovered_category` 是从半截标记（LLM 写了 `[[表情:无语]` 漏了 `]]`）里
+          抢救回来的分类名，供外层当作 meme_category 去 `choose(...)` 找图。
+        既要清理格式正确的 `[[表情:xxx]]` / `&&meme:xxx&&`，也要兜住 LLM 偶尔
+        只写出开头却忘了闭合的情况，避免半截标记直接出现在群里、并且把丢掉的
+        "想发图"意图补回来。
+        """
         raw = str(text or "")
-        return DIRECTIVE_RE.sub("", raw).strip()
+        cleaned = DIRECTIVE_RE.sub("", raw)
+        recovered = ""
+        # 兜底：LLM 只写了开头（`[[表情`、`[[表情包`、`[[meme`）却漏了 `]]`，
+        # 把开头到行尾的整段当作一个候选分类剥出来；同时把残留的引号、空白清掉。
+        half_match = re.search(
+            r"\[\[\s*(?:表情|表情包|meme)\s*[:：]\s*([^\]\n]*)",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if half_match:
+            candidate = half_match.group(1).strip().strip('"\'').rstrip("，。,. ")
+            cleaned = (cleaned[: half_match.start()] + cleaned[half_match.end():]).strip()
+            if candidate and candidate not in {"随机", "随便", "任意"}:
+                recovered = candidate
+        return cleaned.strip(), recovered
 
     def extract_directive(self, text: str) -> tuple[str, str | None]:
         """提取 LLM 的表情选择标记，并从最终文字中删除标记。"""

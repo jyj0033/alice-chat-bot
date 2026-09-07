@@ -1312,6 +1312,11 @@ class GroupChatBot:
                 memories=memories
             )
 
+            # === 注入最近群日报摘要：让 bot 知道"昨天/今天群里聊过啥，群友标签是啥" ===
+            context_prompt = await self._augment_context_with_group_reports(
+                session_id, context_prompt
+            )
+
             # === 命中的群黑话：只注入本轮对话里真正出现的词条 ===
             glossary = []
             try:
@@ -1371,10 +1376,15 @@ class GroupChatBot:
                     meme_category = ""
                 # 兜底：解析失败残留的标记（如 LLM 输出了格式外的变体）不能原样发进
                 # 群里，剥成普通文字后再继续，避免“[[表情:xxx:yyy”直接出现在聊天里。
-                residue = self.meme_manager.strip_directives(reply)
+                # 同时把半截标记里的分类名抢救回来当作 meme_category，让"想发表情包"
+                # 的意图不会因为 LLM 漏写 `]]` 而彻底丢失。
+                residue, recovered_category = self.meme_manager.strip_directives(reply)
+                if recovered_category and not meme_id and not meme_category:
+                    meme_category = recovered_category
                 if residue != reply:
                     logger.warning(
-                        "[表情库] 残留标记未解析成功，已剥离: %s",
+                        "[表情库] 残留标记未解析成功，已剥离并回收分类 %s: %s",
+                        recovered_category or "<空>",
                         reply if len(reply) <= 80 else reply[:80] + "…",
                     )
                     reply = residue
@@ -1391,6 +1401,19 @@ class GroupChatBot:
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
                 return
+
+            # 兜底：极短回复（≤8 字）只是把对方最后一句的关键词原样重复，
+            # 没有补充任何新信息（典型："确实真实""就是真实""对"）。
+            # 这种复读群里会被直接当成废话，提前挡掉让 LLM 重答。
+            if reply and recent_texts:
+                last_msg = recent_texts[-1].strip()
+                if last_msg and self.reply_generator.is_short_echo(reply, last_msg):
+                    logger.info(
+                        f"[复读] 放弃短复读回（{reply!r} 复读自 {last_msg!r}）"
+                    )
+                    if direction == "to_bot":
+                        self.attention_manager.on_no_reply(group_id, message.sender_id)
+                    return
 
             # LLM 调用和模拟打字也会耗时，发送前再复核一次群聊局势。
             if action_plan:
@@ -3706,6 +3729,9 @@ class GroupChatBot:
             return []
 
         limit = limit or self.memory_search_top_k
+        # 略微提高单次召回数，让"近况纪要"和"群友画像"有更多被覆盖到的概率
+        if limit < 8:
+            limit = 8
 
         memories: list = []
         try:
@@ -3737,10 +3763,10 @@ class GroupChatBot:
             if excluded:
                 memories = [m for m in memories if m.id not in excluded]
 
-        # 最近纪要作为"近况"放最前，细节记忆在后（去重避免重复出现）
+        # 近况纪要：今天 + 昨天各 1 条，让 bot 跨日也记得群里聊过啥
         try:
             digests = await self.memory_storage.retrieve_session_recent(
-                session_id, limit=1, memory_type="session_summary"
+                session_id, limit=2, memory_type="session_summary"
             )
         except Exception as e:
             logger.debug(f"Digest retrieval skipped: {e}")
@@ -3748,6 +3774,37 @@ class GroupChatBot:
         if digests:
             digest_ids = {d.id for d in digests}
             memories = (digests + [m for m in memories if m.id not in digest_ids])[:limit]
+
+        # 群友画像补充：semantic_search 不一定召回到当前活跃的常驻群友，
+        # 这里再单独拉本会话最近的画像（最多 3 条），保证至少有"谁是谁"的锚点
+        try:
+            profile_existing_ids = {m.id for m in memories}
+            profiles = await self.memory_storage.retrieve_session_recent(
+                session_id, limit=12, memory_type="semantic"
+            )
+            profile_picks: list = []
+            seen_senders: set[str] = set()
+            for mem in profiles:
+                meta = mem.metadata or {}
+                tags = meta.get("tags") or []
+                if isinstance(tags, str):
+                    tags = [tags]
+                if "用户画像" not in tags:
+                    continue
+                sender_key = str(meta.get("sender_id") or "")
+                if sender_key and sender_key in seen_senders:
+                    continue
+                if mem.id in profile_existing_ids:
+                    continue
+                profile_picks.append(mem)
+                if sender_key:
+                    seen_senders.add(sender_key)
+                if len(profile_picks) >= 3:
+                    break
+            if profile_picks:
+                memories = profile_picks + memories
+        except Exception as e:
+            logger.debug(f"Profile retrieval skipped: {e}")
 
         # 只刷新真正命中的画像访问时间；不提升 importance，也不把无关召回当成强化。
         profile_ids = [
@@ -3761,6 +3818,50 @@ class GroupChatBot:
                 logger.debug(f"Profile access update skipped: {e}")
 
         return memories
+
+    async def _augment_context_with_group_reports(
+        self, session_id: str, context_prompt: str
+    ) -> str:
+        """把最近两天的群日报里的"话题"和"群友标签"段拼进 context_prompt。
+
+        bot 跨日不会自动记得群里聊过啥、人是谁，日报里已经有结构化结论，
+        直接复用，避免每次都"群友 X 是谁"猜错。
+        """
+        try:
+            reports = await self.memory_storage.get_group_analysis_reports(
+                session=session_id, limit=2
+            )
+        except Exception as exc:
+            logger.debug(f"Group report retrieval skipped: {exc}")
+            return context_prompt
+        if not reports:
+            return context_prompt
+
+        # 取报告里有用的两段：话题 + 群友标签（忽略金句/逆天等闲聊段子）
+        blocks: list[str] = ["\n[近期群日报摘要]（这些是昨天/前天群里聊过的主题和群友标签，"
+                              "用得上就顺手提一下，不要主动复述）："]
+        used = False
+        for report in reports:
+            meta = report.metadata or {}
+            report_date = meta.get("report_date") or "?"
+            content = report.content or ""
+            profiles_segment = _extract_section(content, "我给几位群友留了个小标签", "我注意到的话题")
+            topics_segment = _extract_section(content, "我注意到的话题", "我忍不住记下的几句")
+            if not topics_segment and not profiles_segment:
+                continue
+            blocks.append(f"--- {report_date} ---")
+            if topics_segment:
+                used = True
+                # 截短：每段最多 3 行，避免 prompt 过长
+                short_topics = "\n".join(topics_segment.splitlines()[:3])
+                blocks.append(f"话题：\n{short_topics}")
+            if profiles_segment:
+                used = True
+                short_profiles = "\n".join(profiles_segment.splitlines()[:5])
+                blocks.append(f"群友标签：\n{short_profiles}")
+        if not used:
+            return context_prompt
+        return context_prompt + "\n" + "\n".join(blocks)
 
     async def run(self) -> None:
         """运行 Bot"""
@@ -4228,6 +4329,19 @@ class GroupChatBot:
             },
             "groups": {}
         }
+
+
+def _extract_section(text: str, start_marker: str, end_marker: str) -> str:
+    """从群日报渲染文本里截两 marker 之间的段落。任一 marker 缺失返回空串。"""
+    if not text or not start_marker or not end_marker:
+        return ""
+    start = text.find(start_marker)
+    if start < 0:
+        return ""
+    end = text.find(end_marker, start + len(start_marker))
+    if end < 0:
+        return text[start:].strip()
+    return text[start:end].strip()
 
 
 async def main():

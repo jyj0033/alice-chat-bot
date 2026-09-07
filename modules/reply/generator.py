@@ -708,6 +708,20 @@ class ReplyGenerator:
         if style_guide:
             request.add_system(f"说话风格指导：{style_guide}")
 
+        # 高频口头禅：让 LLM 知道哪些是你的招牌词，分布更自然（不堆在一句话里）
+        try:
+            catchphrases = getattr(self.personality, "catchphrases", None) or []
+            if catchphrases:
+                phrase_list = "、".join(str(p) for p in catchphrases if str(p).strip())
+                if phrase_list:
+                    request.add_system(
+                        f"你的口头禅（用得自然像顺手，不是堆砌）：{phrase_list}。"
+                        "平均 2~3 句里偶尔冒一个，开场/转折/收尾最自然，"
+                        "不要每句都用，也不要刻意罗列。"
+                    )
+        except Exception:
+            pass
+
         # 添加情感状态指导
         if emotional_state:
             emotion_guide = self._get_emotion_guide(emotional_state)
@@ -1109,6 +1123,31 @@ class ReplyGenerator:
         """取回复里的实质内容（去掉首尾语气词、笑声和标点）。"""
         core = cls._PARROT_STRIP_HEAD.sub("", (text or "").strip())
         return cls._PARROT_STRIP_TAIL.sub("", core).strip()
+
+    @classmethod
+    def is_short_echo(cls, reply: str, last_user_text: str) -> bool:
+        """短复读兜底：bot 回复极短（≤8 字），且核心词被群友刚说的话包含/高度重叠。
+
+        例如回复「确实真实」对方问「为啥真实」→ 复读掉；
+        回复「对」对方说「行」→ 也算复读。
+        用在 `is_parroting` 之后，专门拦「短回复 + 反向复读」这种群里会被
+        当废话的偷懒回。
+        """
+        core = cls._parrot_core(reply)
+        if not core or len(core) > 8:
+            return False
+        target = cls._parrot_core(last_user_text or "")
+        if not target:
+            return False
+        # 任一方向包含 / 高 token 重叠都判复读
+        if core in target or target in core:
+            return True
+        core_tokens = {t for t in core if t.strip()}
+        target_tokens = {t for t in target if t.strip()}
+        if not core_tokens or not target_tokens:
+            return False
+        overlap = len(core_tokens & target_tokens)
+        return overlap / min(len(core_tokens), len(target_tokens)) >= 0.6
 
     @classmethod
     def is_parroting(cls, reply: str, recent_texts: list) -> bool:
