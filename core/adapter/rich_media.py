@@ -395,8 +395,9 @@ class RichMediaEnricher:
         整组一起喂给视觉模型判断整体含义，此时不读/不写缓存（组含义随上下文变化）。
         """
         image_ref = segment.unique_id or segment.url
-        if not image_ref:
-            return False
+        # 注意：哪怕 image_ref 为空也继续走，让 _call_vision 尝试用 segment.file
+        # 兜底。原来的早 return 会让 NapCat 只发 file 没 url/unique_id 的图片
+        # 完全没有识别机会，群里 bot 看到 "[图片]" 占位只能瞎回。
 
         is_group = bool(group_image_urls and self.image_group_enabled)
         if is_group:
@@ -442,9 +443,17 @@ class RichMediaEnricher:
         prompt 由「意图导向基础提示 + 消息类型提示 + 前文对话」组成。
         """
         if self.vision_provider is None:
+            logger.info("[图片] 无 vision_provider，跳过识别")
             return ""
 
         prompt = self._build_image_prompt(segment, conversation_context, group_image_urls)
+        url = segment.url
+        logger.info(
+            "[图片] 进入 vision 识别（type=%s, has_url=%s, has_file=%s, "
+            "has_unique_id=%s, group_imgs=%d）",
+            segment.type, bool(url), bool(segment.file),
+            bool(segment.unique_id), len(group_image_urls or []),
+        )
 
         # 组内前图（list[dict]：{url, file}），cap 限制一次最多带几张（含当前图）
         group_items: list[dict] = []
