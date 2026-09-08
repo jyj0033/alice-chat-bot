@@ -377,10 +377,22 @@ class ReplyGenerator:
 
     @staticmethod
     def _is_silent(reply: str) -> bool:
-        """判断 LLM 是否选择沉默（输出了沉默标记或空回复）"""
-        r = (reply or "").strip().lower().strip("[]()（）")
-        silent_markers = {"<silent>", "silent", "沉默", "不参与", "不说话"}
-        return r in silent_markers or not r
+        """判断 LLM 是否选择沉默（输出了沉默标记或空回复）。
+
+        兜住常见拼写误差：`<silen>` / `<sile>` / `<sil>` / `silent`（去尖括号）
+        都视为沉默标记，避免 LLM 偶尔手抖少打一个字母、把半个 token 直接
+        发到群里。
+        """
+        r = (reply or "").strip().lower().strip("[]()（）<>")
+        if not r:
+            return True
+        silent_markers = {"silent", "沉默", "不参与", "不说话"}
+        if r in silent_markers:
+            return True
+        # 残余的尖括号包裹（`<silen` / `<sile` / `<sil`）：去前缀后判定。
+        if r.startswith("sil") and len(r) <= 8:
+            return True
+        return False
 
     # === 联网搜索（LLM 判断是否需要搜索） ===
 
