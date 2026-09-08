@@ -737,6 +737,24 @@ class ReplyGenerator:
                 "简短地道歉一句、自嘲一下或直接转移话题，点到为止。"
             )
 
+        # 被强行拽进对话但对方只丢一个极短追问（"什么？""啥？""你？"）
+        # 这类情况 LLM 没有实质内容可答、上下文也没明确指代，常见产物是
+        # 输出自己名字 / 复读上一句。提前给一个"先问一句澄清"的指引，
+        # 比让 LLM 自由发挥靠谱得多。
+        if (
+            direction == "to_bot"
+            and current_message
+            and len(current_message.strip()) <= 4
+            and not current_message.strip().startswith(("[[", "[图片", "[表情"))
+        ):
+            request.add_system(
+                "对方只丢了一个极短的追问（例如「什么？」「啥？」「你？」），"
+                "并且现在看起来是被点名才回应的。如果你确实不知道对方在问啥、"
+                "或者刚才那段对话已经过去几轮、已经接不上了，"
+                "最自然的反应是简短地问一句澄清（\"你说啥？\"\"我刚说了啥\""
+                "\"你指的是 X 吗？\"），而不是硬猜或复读上一句。"
+            )
+
         # 添加会话上下文
         if session_context:
             context_info = self._format_session_context(session_context)

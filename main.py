@@ -991,6 +991,15 @@ class GroupChatBot:
             self.emotional_manager.trigger_event(session_id, "boring")
 
         # 发言权和行为计划。当前消息已在快速路径进入上下文，因此可直接分析消息拓扑。
+        # 解析失败的占位文本（segment 都识别不出）没有可用语义输入，调 LLM
+        # 只会产出复读上文 / 输出自己名字这种垃圾回复；按"沉默"对待，直接
+        # 跳过整个 bot 决策链，避免触发后续 stale-plan 链路。
+        if (message.content or "").strip() == "[无法识别的消息]":
+            logger.info(
+                f"[静默] 无法识别的消息，跳过 bot 决策: {message.content}"
+            )
+            return
+
         window = self.context_manager.get_window(session_id)
         recent_context_messages = window.get_recent(12)
         action_plan = None
@@ -1140,6 +1149,14 @@ class GroupChatBot:
             logger.info("[发送复核] 新消息已明确对 bot 说，放弃旧插话")
             return None, True
 
+        # 内容无法渲染（segment 都解析不出来）→ 没有可用语义输入，硬插话
+        # 只会让 LLM 复读上文或输出自己名字这种垃圾。直接放弃旧插话。
+        if latest.content.strip() == "[无法识别的消息]":
+            logger.info(
+                "[发送复核] 最新消息无法识别（%s），放弃旧插话", latest.content
+            )
+            return None, True
+
         try:
             topic_relevance = self.social_awareness.topic_analyzer.analyze_relevance(
                 latest.content
@@ -1156,7 +1173,11 @@ class GroupChatBot:
             "[链接", "[卡片", "[小程序", "[图片", "[表情包", "[动画表情",
             "[视频", "[合并转发",
         )
-        rich_message_only = latest.content.lstrip().startswith(rich_markers)
+        # 渲染失败（无法识别的消息段）的占位文本也算"无可用文字"，与
+        # 纯富媒体等同——LLM 没有可用的语义输入，硬调只会产出"复读上
+        # 一句"或"输出自己名字"这类垃圾回复。
+        unparseable_placeholder = latest.content.strip() == "[无法识别的消息]"
+        rich_message_only = latest.content.lstrip().startswith(rich_markers) or unparseable_placeholder
         rich_type = ""
         if latest.content.lstrip().startswith("[图片"):
             rich_type = "image"
@@ -1164,6 +1185,9 @@ class GroupChatBot:
             rich_type = "mface"
         elif latest.content.lstrip().startswith("[视频"):
             rich_type = "video"
+        elif unparseable_placeholder:
+            # 没有可用文字、也没有明确富类型，至少别让 plan 当成普通文本。
+            rich_type = "unknown"
 
         # 最新消息本身已经由快速路径写入上下文；这里仅重新计算发言权计划，
         # 不重新抽一次随机概率，避免同一条候选回复被随机数重复改变。
