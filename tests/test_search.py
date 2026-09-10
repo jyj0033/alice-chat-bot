@@ -163,12 +163,13 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         search_client.format_results = lambda r: "搜索到的资料：\n1. 某新闻"
 
         gen = self._make_generator(tool_llm, search_client)
-        reply = await gen.generate(
+        gen_result = await gen.generate(
             context_prompt="[刚刚] 小明：今天有什么新闻？",
             current_message="今天有什么新闻",
             direction="group",
             session_id="group_1",
         )
+        reply = gen_result["reply"] if isinstance(gen_result, dict) else gen_result
         self.assertIn("xxx", reply)
         search_client.search.assert_awaited_once()
         # 两次工具 LLM 调用：判断 + 带资料生成；资料已注入最后一条消息
@@ -188,11 +189,12 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         search_client.search = AsyncMock(return_value=[])
 
         gen = self._make_generator(tool_llm, search_client, main_llm)
-        reply = await gen.generate(
+        gen_result = await gen.generate(
             context_prompt="[刚刚] 小明：今天有什么新闻？",
             current_message="今天有什么新闻",
             direction="group",
         )
+        reply = gen_result["reply"] if isinstance(gen_result, dict) else gen_result
         self.assertIn("没搜到", reply)
         # 判断调用一次；搜索空 → 不再带资料生成，主 LLM 兜底
         self.assertEqual(tool_llm.chat.call_count, 1)
@@ -210,11 +212,12 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         search_client.search = AsyncMock(return_value=[])
 
         gen = self._make_generator(tool_llm, search_client, main_llm)
-        reply = await gen.generate(
+        gen_result = await gen.generate(
             context_prompt="[刚刚] 小明：晚饭吃啥",
             current_message="晚饭吃啥",
             direction="group",
         )
+        reply = gen_result["reply"] if isinstance(gen_result, dict) else gen_result
         # LLM 判定不需要搜索 → 走主 LLM，不触发搜索后端
         self.assertIsNotNone(reply)
         main_llm.chat.assert_awaited_once()
@@ -246,11 +249,12 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         search_client.format_results = lambda r: "搜索到的资料：\n1. 崩铁当前卡池"
 
         gen = self._make_generator(tool_llm, search_client, main_llm)
-        reply = await gen.generate(
+        gen_result = await gen.generate(
             context_prompt="[刚刚] 小明：崩铁现在up角色是谁？",
             current_message="崩铁现在up角色是谁",
             direction="group",
         )
+        reply = gen_result["reply"] if isinstance(gen_result, dict) else gen_result
         self.assertIn("流萤", reply)
         # 主 LLM 带同一份资料重答，且不带资料的无资料重答不应发生
         main_llm.chat.assert_awaited_once()
@@ -277,11 +281,12 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         search_client.format_results = lambda r: "搜索到的资料：\n1. 天气"
 
         gen = self._make_generator(tool_llm, search_client, main_llm)
-        reply = await gen.generate(
+        gen_result = await gen.generate(
             context_prompt="[刚刚] 小明：今天天气",
             current_message="今天天气",
             direction="group",
         )
+        reply = gen_result["reply"] if isinstance(gen_result, dict) else gen_result
         self.assertIn("晴天", reply)
         main_llm.chat.assert_awaited_once()
         last_content = main_llm.chat.await_args.args[0].messages[-1].content

@@ -717,6 +717,73 @@ class MemeManager:
             "不要连续几条只用表情包刷屏，也不要每条都硬塞。"
         )
 
+    # ------------------------------------------------------------------
+    # 工具调用：把 [[表情:xxx]] 这种字符串 marker 升级成结构化 tool_use，
+    # 从根上避免 LLM 输出 `[[表情:无语]` / `[表情包:开心` / `&&meme:xxx&&`
+    # 等半截 marker 漏到群里。正常路径走 tool_use，老调用兜底仍走
+    # extract_directive / strip_directives。
+    # ------------------------------------------------------------------
+    def tool_definition(self) -> dict:
+        """返回 OpenAI 风格的 function tool 定义（generator 会包装成 Anthropic 格式）。
+
+        返回值可以直接 `ChatRequest.add_tool` 注册。LLM 调用本工具即代表
+        「要发一张表情包」，arguments 携带选图信息。
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": "send_meme",
+                "description": (
+                    "从本地表情包库选一张图并发送到当前对话。"
+                    "当你认为一张表情包比纯文字更能表达情绪、吐槽或反应时调用本工具；"
+                    "plain text 与表情包可以共存——同一轮里既输出文字也调用本工具，"
+                    "或只调用本工具不发文字都可以。"
+                    "不要调用本工具来描述「想发图」——一旦调用就代表真的要让 bot 发图。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "description": (
+                                "表情包分类名（如「无语」「笑死」「离谱」）。"
+                                "留空表示按上下文情绪让系统自动选。"
+                            ),
+                        },
+                        "meme_id": {
+                            "type": "string",
+                            "description": (
+                                "表情包精确 id（来自系统给你的素材元数据里的编号）。"
+                                "如果你已经知道哪一张最贴，就直接传 id。"
+                            ),
+                        },
+                        "random": {
+                            "type": "boolean",
+                            "description": "是否随机抽一张；与 category/meme_id 互斥。",
+                            "default": False,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def resolve_tool_call(self, arguments: dict, session_id: str = "") -> tuple[str, str]:
+        """把 send_meme 的 arguments 解析成 `(category, meme_id)` 给 choose() 使用。
+
+        优先级：meme_id > category > random。任一为空就当对方没指定。
+        返回值可以直接喂给 `send_meme(category=, meme_id=)`。
+        """
+        if not isinstance(arguments, dict):
+            return "", ""
+        category = str(arguments.get("category") or "").strip()
+        meme_id = str(arguments.get("meme_id") or "").strip()
+        if arguments.get("random") and not category and not meme_id:
+            category = ""  # 留给 choose() 在全部库里随机抽
+        if category:
+            category = _safe_category(category, "")
+        return category, meme_id
+
     def choose(self, category: str = "", session_id: str = "") -> dict[str, Any] | None:
         items, _ = self.list_memes(category=category, page=1, page_size=100)
         if not items and category:

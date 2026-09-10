@@ -17,6 +17,18 @@ from modules.personality.emotional_state import EmotionalState
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_meme_label(value: Any) -> str:
+    """把 LLM 输出的 category/id 字段收敛成安全字符串：剥空白、剥引号、剥句末标点。"""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = text.strip("\"'`“”‘’")
+    return text.rstrip("，。,. ")
+
+
 # 常见 emoji 的 Unicode 范围（涵盖主流表情）
 EMOJI_RE = re.compile(
     r'[\U0001F000-\U0001FAFF☀-➿️‍⭐❤❣'
@@ -222,7 +234,7 @@ class ReplyGenerator:
         action_plan: Dict[str, Any] = None,
         session_id: str = "",
         glossary: list = None,
-    ) -> Optional[str]:
+    ) -> Optional[dict]:
         """
         生成回复
 
@@ -237,7 +249,11 @@ class ReplyGenerator:
             session_id: 会话ID（用于联网搜索限频）
 
         Returns:
-            str: 生成的回复；如果 LLM 选择沉默或回复被过滤则返回 None
+            dict | None：None 表示 LLM 选择沉默。
+            dict 形如 ``{"reply": str, "meme_category": str | None, "meme_id": str}``：
+            - ``reply`` 是要发给群友的纯文本（已剥离 tool_call / marker）
+            - ``meme_category`` / ``meme_id`` 来自 send_meme 工具调用，交给
+              外层 main.py 走独立发图通道；二者都为空时表示本轮没有选表情包。
         """
         # 1. 构建请求
         request = self._build_request(
@@ -262,6 +278,10 @@ class ReplyGenerator:
             direction=direction,
             action_plan=action_plan,
         )
+        # 工具调用：send_meme 是结构化输出，正常路径走原生 tool_use，
+        # 异常端点漏成 `<invoke>` 文本时再走 _extract_native_tool_calls 兜底。
+        meme_category = ""
+        meme_id = ""
         if need_search:
             try:
                 response = await self._generate_with_search(
@@ -271,11 +291,15 @@ class ReplyGenerator:
                 logger.error(f"Search generation failed, fallback to normal: {e}", exc_info=True)
                 response = None
             reply = response.content if (response is not None) else ""
+            if response is not None and self.meme_manager:
+                meme_category, meme_id = self._extract_send_meme_call(response)
         else:
             # 3. 常规调用 LLM
             try:
                 response = await self.llm.chat(request)
                 reply = response.content.strip()
+                if self.meme_manager:
+                    meme_category, meme_id = self._extract_send_meme_call(response)
             except Exception as e:
                 logger.error(f"LLM error: {e}", exc_info=True)
                 if direction != "to_bot":
@@ -293,6 +317,9 @@ class ReplyGenerator:
             try:
                 resp2 = await self.llm.chat(request)
                 reply2 = self._clean_thinking_process(resp2.content.strip())
+                # 重答时也要顺手把 send_meme 工具调用捞出来
+                if self.meme_manager and not (meme_category or meme_id):
+                    meme_category, meme_id = self._extract_send_meme_call(resp2)
             except Exception as e:
                 logger.error(f"LLM fallback error: {e}", exc_info=True)
                 reply2 = ""
@@ -373,7 +400,11 @@ class ReplyGenerator:
         # 9. 思考/打字延迟由 GroupChatBot._compose_and_send 统一处理。
         # 这里不再重复等待，避免一次回复串行等待两套延迟。
 
-        return reply
+        return {
+            "reply": reply,
+            "meme_category": meme_category or None,
+            "meme_id": meme_id or "",
+        }
 
     @staticmethod
     def _is_silent(reply: str) -> bool:
@@ -580,6 +611,36 @@ class ReplyGenerator:
         """判断文本里是否残留工具调用标记（MiniMax 泄漏的兜底信号）。"""
         return any(tag in content for tag in ("<tool_call>", "<invoke", "<]minimax", "<parameter"))
 
+    def _extract_send_meme_call(self, response) -> tuple[str, str]:
+        """从 ChatResponse 里挑出 send_meme 工具调用，返回 (category, meme_id)。
+
+        结构化 tool_use 走 OpenAI/Anthropic 原生协议；MiniMax 偶发把工具调用
+        漏成 `<invoke>` 文本时 `_extract_native_tool_calls` 兜底。
+        两个路径都解析不到就返回 `("", "")`。
+        """
+        try:
+            for tc in (getattr(response, "tool_calls", None) or []):
+                if (tc.get("name") or "").strip() == "send_meme":
+                    category, meme_id = self.meme_manager.resolve_tool_call(
+                        tc.get("arguments") or {}, session_id=""
+                    )
+                    return category, meme_id
+        except Exception:
+            logger.debug("[工具调用] 解析 send_meme tool_calls 失败", exc_info=True)
+        # 兜底：MiniMax 原生 <invoke> 泄漏
+        try:
+            content = (response.content or "") if response is not None else ""
+        except Exception:
+            content = ""
+        for tc in self._extract_native_tool_calls(content):
+            if (tc.get("name") or "").strip() == "send_meme":
+                args = tc.get("arguments") or {}
+                # 泄漏协议里 arguments 形态不一致：直接当作 category 字段
+                category = _safe_meme_label(args.get("category") or args.get("query") or "")
+                meme_id = _safe_meme_label(args.get("meme_id") or "")
+                return category, meme_id
+        return "", ""
+
     @staticmethod
     def _extract_native_tool_calls(content: str) -> list[dict]:
         """解析 MiniMax 原生工具调用泄漏在文本里的格式。
@@ -689,6 +750,14 @@ class ReplyGenerator:
         )
         if self.meme_manager and meme_guide:
             request.add_system(meme_guide)
+            # 注册 send_meme 工具调用：从根上避免 LLM 输出 `[[表情:xxx]]` /
+            # `[表情:无语]` / `&&meme:xxx&&` 等半截 marker 漏到群里。
+            # LLM 真的要发图就调工具，工具调用会被外层 main.py 当作"想发图"
+            # 单独走 send_meme 通道，不会再混进 reply 文本。
+            try:
+                request.tools.append(self.meme_manager.tool_definition())
+            except Exception as exc:
+                logger.debug("[工具调用] 注册 send_meme 失败，继续走 marker 兜底: %s", exc)
 
         # 参与规则 - 根据消息指向决定「该不该插嘴」
         request.add_system(self._build_participation_guide(direction))

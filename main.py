@@ -1366,7 +1366,7 @@ class GroupChatBot:
 
             # === 生成回复（direction 控制是否可沉默） ===
             try:
-                reply = await self.reply_generator.generate(
+                gen_result = await self.reply_generator.generate(
                     context_prompt=context_prompt,
                     current_message=generation_message,
                     emotional_state=emotional_state,
@@ -1383,35 +1383,65 @@ class GroupChatBot:
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
                 return
 
-            # LLM 选择沉默（群友互聊/自言自语时的正常行为）
-            if reply is None:
+            # generator 返回 dict / None；老调用兜底仍兼容字符串返回。
+            if gen_result is None:
+                reply = None
+                tool_meme_category = None
+                tool_meme_id = ""
+            elif isinstance(gen_result, dict):
+                reply = gen_result.get("reply")
+                tool_meme_category = gen_result.get("meme_category")
+                tool_meme_id = (gen_result.get("meme_id") or "").strip()
+            else:
+                # 兼容：旧版本直接返回 str
+                reply = gen_result
+                tool_meme_category = None
+                tool_meme_id = ""
+
+            # LLM 选择沉默（群友互聊/自言自语时的正常行为）。
+            # 但 generator 可能用 send_meme 工具调用单独发图、文本为空——这是合法
+            # 的「只发表情包」路径，让它继续走到 send_meme 通道，不要被吞掉。
+            if reply is None and not (tool_meme_category or tool_meme_id):
                 logger.info(f"[沉默] direction={direction}，不参与该条消息")
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
                 return
+            # reply 为 None 但有表情包要发 → 当成空字符串处理，下游分支会跳过
+            # 文字发送直接走 send_meme 通道。
+            if reply is None:
+                reply = ""
 
             # 表情包选择标记只在内部流转，不能进入群聊文本、记忆或日报。
             meme_category = None
-            meme_id = ""
+            meme_id = tool_meme_id  # 工具调用优先；下面兜底仍允许 marker 走老路
             if self.meme_manager:
-                reply, meme_category = self.meme_manager.extract_directive(reply)
-                if isinstance(meme_category, str) and meme_category.startswith("@id:"):
-                    meme_id = meme_category[4:]
-                    meme_category = ""
+                # 工具调用已经给出 meme_category / meme_id 时，LLM 偶发残留的
+                # [[表情:xxx]] marker 也要从 reply 里剥干净，避免重复发图/重复标签。
+                reply, marker_category = self.meme_manager.extract_directive(reply or "")
+                if isinstance(marker_category, str) and marker_category.startswith("@id:"):
+                    candidate_id = marker_category[4:]
+                    if not meme_id:
+                        meme_id = candidate_id
+                else:
+                    if not tool_meme_category and marker_category:
+                        tool_meme_category = marker_category
                 # 兜底：解析失败残留的标记（如 LLM 输出了格式外的变体）不能原样发进
-                # 群里，剥成普通文字后再继续，避免“[[表情:xxx:yyy”直接出现在聊天里。
-                # 同时把半截标记里的分类名抢救回来当作 meme_category，让"想发表情包"
+                # 群里，剥成普通文字后再继续，避免”[[表情:xxx:yyy”直接出现在聊天里。
+                # 同时把半截标记里的分类名抢救回来当作 meme_category，让”想发表情包”
                 # 的意图不会因为 LLM 漏写 `]]` 而彻底丢失。
                 residue, recovered_category = self.meme_manager.strip_directives(reply)
-                if recovered_category and not meme_id and not meme_category:
-                    meme_category = recovered_category
+                if recovered_category and not meme_id and not tool_meme_category:
+                    tool_meme_category = recovered_category
                 if residue != reply:
                     logger.warning(
                         "[表情库] 残留标记未解析成功，已剥离并回收分类 %s: %s",
                         recovered_category or "<空>",
-                        reply if len(reply) <= 80 else reply[:80] + "…",
+                        reply if len(reply) <= 80 else reply[:80] + "...",
                     )
                     reply = residue
+                # 工具调用优先：send_meme 已经告诉系统要发图，marker 路径只用来
+                # 兜老 LLM 输出；正常情况直接以 tool_use 为准。
+                meme_category = tool_meme_category
 
             # 复读兜底：把群友的原话原样说一遍不如不说。表情包识别摘要会引用
             # 前文原话，短反应档下 LLM 容易直接抓那句引文当自己的发言。
