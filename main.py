@@ -745,6 +745,11 @@ class GroupChatBot:
             or is_reply_to_bot
             or continuing
         )
+        logger.warning(
+            "[dir-trace] type=%s self_id=%s mentioned_me=%s reply_to_bot=%s continuing=%s directed=%s content=%r",
+            message.message_type, self.config.get("qq", {}).get("self_id", ""),
+            message.mentioned_me, is_reply_to_bot, continuing, directed_to_bot, message.content[:60],
+        )
         try:
             # 进程重启后，先恢复该会话最近仍在上下文有效期内的 episodic 消息，
             # 再追加当前消息；这样首条消息不会让 Bot 突然失去刚才的对话。
@@ -1388,20 +1393,26 @@ class GroupChatBot:
                 reply = None
                 tool_meme_category = None
                 tool_meme_id = ""
+                tool_meme_called = False
             elif isinstance(gen_result, dict):
                 reply = gen_result.get("reply")
                 tool_meme_category = gen_result.get("meme_category")
                 tool_meme_id = (gen_result.get("meme_id") or "").strip()
+                tool_meme_called = bool(gen_result.get("meme_called"))
             else:
                 # 兼容：旧版本直接返回 str
                 reply = gen_result
                 tool_meme_category = None
                 tool_meme_id = ""
+                tool_meme_called = False
 
             # LLM 选择沉默（群友互聊/自言自语时的正常行为）。
             # 但 generator 可能用 send_meme 工具调用单独发图、文本为空——这是合法
             # 的「只发表情包」路径，让它继续走到 send_meme 通道，不要被吞掉。
-            if reply is None and not (tool_meme_category or tool_meme_id):
+            # tool_meme_called 是 LLM 显式调工具的事实旗标（独立于 args 是否为空），
+            # 用它做兜底，避免空 category/空 id 的随机抽图路径被这里误判为沉默。
+            has_meme_intent = bool(tool_meme_called or tool_meme_category or tool_meme_id)
+            if reply is None and not has_meme_intent:
                 logger.info(f"[沉默] direction={direction}，不参与该条消息")
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
@@ -1551,7 +1562,9 @@ class GroupChatBot:
                         meme_id=meme_id,
                         category=meme_category,
                         reply_to_id=(quote_id if not segments else ""),
-                        automatic=True,
+                        # LLM 通过 send_meme 工具显式要求发图 ≠ 后台自动广播，
+                        # 不应受 auto_send_enabled 闸门影响（那个开关只挡"没被点名就乱发"）。
+                        automatic=False,
                     )
                     meme_sent = bool(meme_result.get("success"))
                     meme_item = meme_result.get("item")

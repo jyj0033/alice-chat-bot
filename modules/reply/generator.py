@@ -282,6 +282,7 @@ class ReplyGenerator:
         # 异常端点漏成 `<invoke>` 文本时再走 _extract_native_tool_calls 兜底。
         meme_category = ""
         meme_id = ""
+        meme_called = False
         if need_search:
             try:
                 response = await self._generate_with_search(
@@ -292,14 +293,14 @@ class ReplyGenerator:
                 response = None
             reply = response.content if (response is not None) else ""
             if response is not None and self.meme_manager:
-                meme_category, meme_id = self._extract_send_meme_call(response)
+                meme_category, meme_id, meme_called = self._extract_send_meme_call(response)
         else:
             # 3. 常规调用 LLM
             try:
                 response = await self.llm.chat(request)
                 reply = response.content.strip()
                 if self.meme_manager:
-                    meme_category, meme_id = self._extract_send_meme_call(response)
+                    meme_category, meme_id, meme_called = self._extract_send_meme_call(response)
             except Exception as e:
                 logger.error(f"LLM error: {e}", exc_info=True)
                 if direction != "to_bot":
@@ -315,17 +316,21 @@ class ReplyGenerator:
         #     注意：如果 LLM 调用了 send_meme 工具（content 为空 + tool_calls 非空），
         #     这是合法的「只发图」回复，不要走 fallback 重答——
         #     重答会把 tool_use 又生成一遍再被同样的逻辑吞掉，最后掉到 fallback 文本。
-        has_meme = bool(meme_category or meme_id)
+        #     meme_called 是工具实际被调用的旗标，独立于 arguments 是否解析出 category/id
+        #     （空 args 想随机抽时 category/id 都是空，但 called=True）。
+        has_meme = meme_called
         if (self._has_tool_markup(reply) or not reply) and not has_meme:
             logger.warning("搜索回复不可用(%s)，回退主 LLM 重答", (reply or "")[:40])
             try:
                 resp2 = await self.llm.chat(request)
                 reply2 = self._clean_thinking_process(resp2.content.strip())
                 # 重答时也要顺手把 send_meme 工具调用捞出来
-                if self.meme_manager and not (meme_category or meme_id):
-                    meme_category, meme_id = self._extract_send_meme_call(resp2)
+                if self.meme_manager and not meme_called:
+                    cat2, id2, called2 = self._extract_send_meme_call(resp2)
+                    if called2:
+                        meme_category, meme_id, meme_called = cat2, id2, called2
                 # 重答也走 tool_use 且没文字 → 别再兜底，否则会无限循环
-                if not reply2 and not (meme_category or meme_id):
+                if not reply2 and not meme_called:
                     if direction != "to_bot":
                         return None
                     reply = self._get_fallback_reply()
@@ -346,7 +351,9 @@ class ReplyGenerator:
         # 5. 参与决策：LLM 有权选择沉默（群友互聊/自言自语时）。
         # 明确对 bot 的消息不能被模型偶发输出的 <silent> 吞掉，异常时使用
         # 和网络/模型失败相同的短兜底回复；只有隐式延续和普通插话保留沉默权。
-        if self._is_silent(reply):
+        # 注意：LLM 调 send_meme 只发图 → reply 为空但不是沉默，是合法「只发图」，
+        # 不应被 silent 兜底覆盖成文字，否则用户看到的就不是干净发图了。
+        if self._is_silent(reply) and not has_meme:
             if direction != "to_bot":
                 logger.debug(f"LLM 选择沉默（direction={direction}）")
                 return None
@@ -354,7 +361,12 @@ class ReplyGenerator:
             reply = self._get_fallback_reply()
 
         # 6. 过滤回复
-        passed, result = self.response_filter.filter(reply)
+        # 注意：LLM 调 send_meme 只发图 → reply 必为空但合法，不能被「空回复」过滤器吞掉。
+        # main.py 也有同样的过滤逻辑，那里已用 meme_category is not None 守过；这里用 meme_called 守。
+        if not reply and meme_called:
+            passed, result = True, ""
+        else:
+            passed, result = self.response_filter.filter(reply)
         if not passed:
             logger.info(f"Reply filtered: {result}")
             self.replies_filtered += 1
@@ -415,8 +427,13 @@ class ReplyGenerator:
 
         return {
             "reply": reply,
-            "meme_category": meme_category or None,
-            "meme_id": meme_id or "",
+            # meme_called 表达"LLM 真的调了 send_meme"这个事实。
+            # meme_category 即使空（LLM 调了 send_meme({}) 想随机抽）也必须保留空串，
+            # 不能 fold 成 None——下游 main.py 用 `meme_category is not None` 判断
+            # 是否有图要发，会被这个细节吞掉整条响应。
+            "meme_category": meme_category,
+            "meme_id": meme_id,
+            "meme_called": meme_called,
         }
 
     @staticmethod
@@ -624,12 +641,16 @@ class ReplyGenerator:
         """判断文本里是否残留工具调用标记（MiniMax 泄漏的兜底信号）。"""
         return any(tag in content for tag in ("<tool_call>", "<invoke", "<]minimax", "<parameter"))
 
-    def _extract_send_meme_call(self, response) -> tuple[str, str]:
-        """从 ChatResponse 里挑出 send_meme 工具调用，返回 (category, meme_id)。
+    def _extract_send_meme_call(self, response) -> tuple[str, str, bool]:
+        """从 ChatResponse 里挑出 send_meme 工具调用，返回 (category, meme_id, called)。
 
         结构化 tool_use 走 OpenAI/Anthropic 原生协议；MiniMax 偶发把工具调用
         漏成 `<invoke>` 文本时 `_extract_native_tool_calls` 兜底。
-        两个路径都解析不到就返回 `("", "")`。
+
+        返回值第三位 `called` 表示「send_meme 工具真的被调了」。
+        当 LLM 调了 send_meme 但 arguments 是空 dict（想随机抽）时，
+        category/meme_id 都是空，但 called=True。generator 用这个旗标
+        跳过 fallback 兜底（content 空 + tool_use 不算"搜索失败"）。
         """
         try:
             for tc in (getattr(response, "tool_calls", None) or []):
@@ -637,7 +658,7 @@ class ReplyGenerator:
                     category, meme_id = self.meme_manager.resolve_tool_call(
                         tc.get("arguments") or {}, session_id=""
                     )
-                    return category, meme_id
+                    return category, meme_id, True
         except Exception:
             logger.debug("[工具调用] 解析 send_meme tool_calls 失败", exc_info=True)
         # 兜底：MiniMax 原生 <invoke> 泄漏
@@ -651,8 +672,8 @@ class ReplyGenerator:
                 # 泄漏协议里 arguments 形态不一致：直接当作 category 字段
                 category = _safe_meme_label(args.get("category") or args.get("query") or "")
                 meme_id = _safe_meme_label(args.get("meme_id") or "")
-                return category, meme_id
-        return "", ""
+                return category, meme_id, True
+        return "", "", False
 
     @staticmethod
     def _extract_native_tool_calls(content: str) -> list[dict]:

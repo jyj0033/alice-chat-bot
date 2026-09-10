@@ -759,18 +759,34 @@ class MemeManager:
             },
         }
 
+    def _send_meme_called(response) -> bool:
+        """判断 LLM 是否调用了 send_meme 工具（不管 arguments 是不是 {}）。
+
+        send_meme 被调用即代表「想发图」，即便 LLM 没填 category/meme_id，
+        generator 也要把这次响应视为合法（content 空、tool_calls 非空），
+        不要走 fallback 兜底。空 args 让 choose(category="") 在全库随机抽。
+        """
+        try:
+            for tc in (getattr(response, "tool_calls", None) or []):
+                if (tc.get("name") or "").strip() == "send_meme":
+                    return True
+        except Exception:
+            return False
+        return False
+
     def resolve_tool_call(self, arguments: dict, session_id: str = "") -> tuple[str, str]:
         """把 send_meme 的 arguments 解析成 `(category, meme_id)` 给 choose() 使用。
 
         优先级：meme_id > category > random。任一为空就当对方没指定。
         返回值可以直接喂给 `send_meme(category=, meme_id=)`。
+
+        arguments 为空 dict 也合法（LLM 想随机抽一张），返回 `("", "")`
+        让 choose() 在全部库里随机挑。
         """
         if not isinstance(arguments, dict):
             return "", ""
         category = str(arguments.get("category") or "").strip()
         meme_id = str(arguments.get("meme_id") or "").strip()
-        if arguments.get("random") and not category and not meme_id:
-            category = ""  # 留给 choose() 在全部库里随机抽
         if category:
             category = _safe_category(category, "")
         return category, meme_id
