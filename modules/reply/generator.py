@@ -312,7 +312,11 @@ class ReplyGenerator:
 
         # 4.5 搜索路径没产出可用回复（空/残留工具标记）→ 用主 LLM 干净重答一轮，
         #     保证 to_bot 一定有回应，group 则按 LLM 是否愿意参与决定。
-        if self._has_tool_markup(reply) or not reply:
+        #     注意：如果 LLM 调用了 send_meme 工具（content 为空 + tool_calls 非空），
+        #     这是合法的「只发图」回复，不要走 fallback 重答——
+        #     重答会把 tool_use 又生成一遍再被同样的逻辑吞掉，最后掉到 fallback 文本。
+        has_meme = bool(meme_category or meme_id)
+        if (self._has_tool_markup(reply) or not reply) and not has_meme:
             logger.warning("搜索回复不可用(%s)，回退主 LLM 重答", (reply or "")[:40])
             try:
                 resp2 = await self.llm.chat(request)
@@ -320,15 +324,24 @@ class ReplyGenerator:
                 # 重答时也要顺手把 send_meme 工具调用捞出来
                 if self.meme_manager and not (meme_category or meme_id):
                     meme_category, meme_id = self._extract_send_meme_call(resp2)
+                # 重答也走 tool_use 且没文字 → 别再兜底，否则会无限循环
+                if not reply2 and not (meme_category or meme_id):
+                    if direction != "to_bot":
+                        return None
+                    reply = self._get_fallback_reply()
+                elif reply2:
+                    reply = reply2
             except Exception as e:
                 logger.error(f"LLM fallback error: {e}", exc_info=True)
                 reply2 = ""
-            if self._has_tool_markup(reply2) or not reply2:
                 if direction != "to_bot":
                     return None
                 reply = self._get_fallback_reply()
-            else:
-                reply = reply2
+        elif has_meme and not reply:
+            # LLM 选择只发图不发文字：content 为空但 tool_calls 已经把
+            # meme_category/meme_id 抓到。让 reply 走一个空字符串，让下游
+            # filter/meme 通道正常处理。
+            reply = ""
 
         # 5. 参与决策：LLM 有权选择沉默（群友互聊/自言自语时）。
         # 明确对 bot 的消息不能被模型偶发输出的 <silent> 吞掉，异常时使用
