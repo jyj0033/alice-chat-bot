@@ -696,7 +696,10 @@ class ReplyGenerator:
 
         request = ChatRequest(
             temperature=temp,
-            max_tokens=200,
+            # 默认 200；注册了 send_meme tool 后至少需要 ~400-500 才能覆盖
+            # "正文回复 + tool_use JSON" 同时输出的场景（实测 MiniMax M3
+            # 在 200 时会把 token 耗在文本上、cut 时还没轮 tool_use）。
+            max_tokens=512,
             top_p=0.9,
         )
         # 显式带上 provider 的模型：ChatRequest 默认 "gpt-4o" 会对部分严格端点

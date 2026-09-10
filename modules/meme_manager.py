@@ -734,32 +734,23 @@ class MemeManager:
             "function": {
                 "name": "send_meme",
                 "description": (
-                    "从本地表情包库选一张图并发送到当前对话。"
-                    "当你认为一张表情包比纯文字更能表达情绪、吐槽或反应时调用本工具；"
-                    "plain text 与表情包可以共存——同一轮里既输出文字也调用本工具，"
-                    "或只调用本工具不发文字都可以。"
-                    "不要调用本工具来描述「想发图」——一旦调用就代表真的要让 bot 发图。"
+                    "选一张表情包发到当前对话。文字 + 表情可共存；"
+                    "觉得一张图比纯文字更贴切时调用。"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "category": {
                             "type": "string",
-                            "description": (
-                                "表情包分类名（如「无语」「笑死」「离谱」）。"
-                                "留空表示按上下文情绪让系统自动选。"
-                            ),
+                            "description": "表情分类名（如「无语」「离谱」）。可省略，让系统自动选。",
                         },
                         "meme_id": {
                             "type": "string",
-                            "description": (
-                                "表情包精确 id（来自系统给你的素材元数据里的编号）。"
-                                "如果你已经知道哪一张最贴，就直接传 id。"
-                            ),
+                            "description": "精确 id（从素材元数据）。知道哪张最贴时传。",
                         },
                         "random": {
                             "type": "boolean",
-                            "description": "是否随机抽一张；与 category/meme_id 互斥。",
+                            "description": "随机抽一张，与 category/meme_id 互斥。",
                             "default": False,
                         },
                     },
