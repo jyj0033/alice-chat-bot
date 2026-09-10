@@ -55,6 +55,15 @@ DIRECTIVE_RE = re.compile(
     r"&&\s*meme\s*(?::|：)\s*([^&]*?)\s*&&)",
     re.IGNORECASE,
 )
+# 兜底：LLM 经常把 "[[表情:xxx]]" 随手写成 "[表情:xxx]"（少打一个 [），
+# 也可能写到一半没闭合（"[表情包:开心"）。这两种情况都按指令尝试
+# 解析和剥离，避免半截 marker 直接发到群里。
+# 这里只匹配 marker 本体（不含末尾闭合 `]`，避免 `[无语]` 这种中文字符
+# 被误吞）。闭合由调用方按文本里实际有没有 `]` 决定要不要吃。
+SINGLE_BRACKET_RE = re.compile(
+    r"\[\s*(?:表情|表情包|meme)\s*(?::|：)\s*([^\]\n]*)",
+    re.IGNORECASE,
+)
 SCREENSHOT_HINTS = (
     "截图", "截屏", "屏幕截图", "screen shot", "screenshot", "screen_capture",
     "手机界面", "聊天记录", "聊天界面", "设置页面", "应用界面", "网页截图",
@@ -569,52 +578,116 @@ class MemeManager:
 
         返回 `(cleaned_text, recovered_category)`：
         - `cleaned_text` 是剥完所有标记的纯文本，可直接发到群里。
-        - `recovered_category` 是从半截标记（LLM 写了 `[[表情:无语]` 漏了 `]]`）里
-          抢救回来的分类名，供外层当作 meme_category 去 `choose(...)` 找图。
+        - `recovered_category` 是从半截标记（LLM 写了 `[[表情:无语]` 漏了 `]]`、
+          或者更常见的随手少打一个 `[` 写成 `[表情:无语]`）里抢救回来的分类名，
+          供外层当作 meme_category 去 `choose(...)` 找图。
         既要清理格式正确的 `[[表情:xxx]]` / `&&meme:xxx&&`，也要兜住 LLM 偶尔
         只写出开头却忘了闭合的情况，避免半截标记直接出现在群里、并且把丢掉的
         "想发图"意图补回来。
         """
         raw = str(text or "")
-        cleaned = DIRECTIVE_RE.sub("", raw)
-        recovered = ""
-        # 兜底：LLM 只写了开头（`[[表情`、`[[表情包`、`[[meme`）却漏了 `]]`，
-        # 把开头到行尾的整段当作一个候选分类剥出来；同时把残留的引号、空白清掉。
-        half_match = re.search(
-            r"\[\[\s*(?:表情|表情包|meme)\s*[:：]\s*([^\]\n]*)",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        if half_match:
-            candidate = half_match.group(1).strip().strip('"\'').rstrip("，。,. ")
-            cleaned = (cleaned[: half_match.start()] + cleaned[half_match.end():]).strip()
-            if candidate and candidate not in {"随机", "随便", "任意"}:
-                recovered = candidate
+        # 完整形式先剥一轮（这一轮会把 `[[表情:xxx]]` 整段清掉，recovered 为空）
+        cleaned, recovered = self._scrub_directives(raw, allow_half_open=True)
         return cleaned.strip(), recovered
 
     def extract_directive(self, text: str) -> tuple[str, str | None]:
-        """提取 LLM 的表情选择标记，并从最终文字中删除标记。"""
+        """提取 LLM 的表情选择标记，并从最终文字中删除标记。
+
+        优先匹配完整形式 `[[表情:xxx]]`；匹配不到再退到单方括号 `[表情:xxx]`
+        / 半截 `[表情:xxx`（LLM 经常少打一个 `[` 或漏闭合）。后两者只能给出
+        候选分类名，不能精确选图。
+        """
         raw = str(text or "")
         match = DIRECTIVE_RE.search(raw)
-        if not match:
-            return raw.strip(), None
-        selection = (match.group(1) or match.group(2) or "").strip()
-        # 兼容 LLM 可能输出的 `编号:abc123:分类` / `1549acd5d9:歪嘴` 等变体：
-        # 先尝试精确选图（6~64 位十六进制），带不带 `编号/id/素材` 前缀、以及
-        # 后面是否再跟一个分类名都接受；无法精确匹配时再退化为分类/随机。
-        id_match = re.fullmatch(
-            r"(?:(?:编号|id|素材)\s*(?::|：|=)?\s*)?([0-9a-f]{6,64})"
-            r"(?:\s*(?::|：)\s*[^:：]{1,30})?",
-            selection,
+        if match:
+            selection = (match.group(1) or match.group(2) or "").strip()
+            id_match = re.fullmatch(
+                r"(?:(?:编号|id|素材)\s*(?::|：|=)?\s*)?([0-9a-f]{6,64})"
+                r"(?:\s*(?::|：)\s*[^:：]{1,30})?",
+                selection,
+                flags=re.IGNORECASE,
+            )
+            if id_match:
+                category = f"@id:{id_match.group(1).lower()}"
+            else:
+                category = "" if selection in {"随机", "随便", "任意", ""} else _safe_category(selection, "")
+            cleaned = (raw[:match.start()] + raw[match.end():]).strip()
+            cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+            return cleaned, category
+        # 兜底单方括号 / 半截：拿到分类名就走，让上层 try 选图
+        sb = SINGLE_BRACKET_RE.search(raw)
+        if sb:
+            candidate = sb.group(1).strip().strip('"\'').rstrip("，。,. ")
+            end = sb.end()
+            if end < len(raw) and raw[end] == "]":
+                end += 1
+            cleaned = (raw[:sb.start()] + raw[end:]).strip()
+            cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+            if candidate and candidate not in {"随机", "随便", "任意"}:
+                return cleaned, _safe_category(candidate, "") or None
+            return cleaned, None
+        return raw.strip(), None
+
+    @staticmethod
+    def _scrub_directives(text: str, *, allow_half_open: bool) -> tuple[str, str]:
+        """内部：剥离 marker，回收分类名。供 strip_directives 复用。
+
+        三种形式都尝试剥离并回收分类名：
+        - `[[表情:xxx]]` 完整双方括号
+        - `[[表情:xxx` 双方括号漏闭合
+        - `[表情:xxx]` / `[表情:xxx` 单方括号（含 / 不含闭合）
+        """
+        recovered = ""
+        spans: list[tuple[int, int, str]] = []
+        # 完整形式
+        for m in DIRECTIVE_RE.finditer(text):
+            sel = (m.group(1) or m.group(2) or "").strip()
+            spans.append((m.start(), m.end(), sel))
+        # 双方括号但漏闭合 `[[表情:xxx`
+        for m in re.finditer(
+            r"\[\[\s*(?:表情|表情包|meme)\s*[:：]\s*([^\]\n]*)",
+            text,
             flags=re.IGNORECASE,
-        )
-        if id_match:
-            category = f"@id:{id_match.group(1).lower()}"
-        else:
-            category = "" if selection in {"随机", "随便", "任意", ""} else _safe_category(selection, "")
-        cleaned = (raw[:match.start()] + raw[match.end():]).strip()
-        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-        return cleaned, category
+        ):
+            spans.append((m.start(), m.end(), m.group(1).strip()))
+        # 单方括号 `[表情:xxx`
+        for m in SINGLE_BRACKET_RE.finditer(text):
+            spans.append((m.start(), m.end(), m.group(1).strip()))
+
+        # 去重：起点相同的 span 保留先匹配的（优先级：完整 > 半截双方 > 单方括号）
+        spans.sort(key=lambda s: (s[0], -s[1]))
+        seen_starts: set[int] = set()
+        unique: list[tuple[int, int, str]] = []
+        for start, end, sel in spans:
+            if start in seen_starts:
+                continue
+            seen_starts.add(start)
+            unique.append((start, end, sel))
+
+        # 单方括号 / 半截双方括号的 span 末尾如果是 `]`，把闭合也吃掉，
+        # 避免 `[表情:无语]` 处理后残留 `]`、`[[表情:无语]` 残留 `]`。
+        adjusted: list[tuple[int, int, str]] = []
+        for start, end, sel in unique:
+            # 完整形式 DIRECTIVE_RE 已经吃了闭合；其他两类没收
+            if (end, sel) and end < len(text) and text[end] == "]":
+                # 但要确认这个 `]` 不是 marker 内容的一部分——`]` 紧跟
+                # span 末尾就是闭合，几乎没歧义；保险起见只对单方括号 / 半截
+                # 双方括号两类吃。
+                # 通过 sel 反推是哪一类：完整形式 end 已经在 `]]` 之后；
+                # 这里只对 end 紧跟单个 `]` 的情况吃。
+                adjusted.append((start, end + 1, sel))
+            else:
+                adjusted.append((start, end, sel))
+
+        # 从后往前剥
+        adjusted.sort(key=lambda s: -s[0])
+        cleaned = text
+        for start, end, sel in adjusted:
+            cand = sel.strip().strip('"\'').rstrip("，。,. ")
+            if cand and cand not in {"随机", "随便", "任意"} and not recovered:
+                recovered = cand
+            cleaned = cleaned[:start] + cleaned[end:]
+        return cleaned, recovered
 
     def build_prompt_guide(self) -> str:
         if not self.auto_send_enabled:
