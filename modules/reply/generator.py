@@ -730,16 +730,23 @@ class ReplyGenerator:
 
         # 回复长度硬约束 - 群聊回复必须简短才像真人
         meme_guide = ""
-        meme_capability = "发送能力限制：你只能发送纯文字消息，不能发送图片、表情包、语音、视频或文件；"
+        # 注意：meme_capability 不再被 auto_send_enabled 短路——
+        # 即便用户关掉了 auto_send（不想让 bot 频繁发图），只要 meme_manager 存在，
+        # 就把 send_meme 工具的能力告诉 LLM。auto_send 只控制"频次/触发门槛"，
+        # 不应该抹掉 LLM 主动选择发图的权利。
+        # 旧逻辑的 bug：auto_send=False → meme_guide="" → system prompt 写"你只能发纯文字"，
+        # LLM 信 system prompt 不信 tools，结果 tool 定义发了 LLM 也不调。
+        meme_capability = ""
         if self.meme_manager:
             try:
                 meme_guide = self.meme_manager.build_prompt_guide()
             except Exception:
                 meme_guide = ""
-            if meme_guide:
-                meme_capability = (
-                    "发送能力：普通情况下发送纯文字；如果真的适合，可以按下面的表情包规则选择一张图片。"
-                )
+            meme_capability = (
+                "发送能力：普通情况下发送纯文字；如果真的适合，可以调用 send_meme 工具"
+                "（category 选分类、meme_id 精确选图、random 随便来一张）让系统替你发一张表情包。"
+                "可以只发图不发文字，也可以文字+图并存；调用即代表真的要让 bot 发图，不要用文字描述「想发图」。"
+            )
         request.add_system(
             f"回复长度要求：优先用一条短句，确需说明时再用两句，通常不超过{max_reply_length}个中文字符。"
             "如果本轮行为计划给了更短上限，以行为计划为准。"
@@ -749,7 +756,6 @@ class ReplyGenerator:
             "不要把「哈哈」「哈哈哈」「笑死」当成万能语气词——真觉得好笑才笑，"
             "大部分回复不需要带笑声，也不要习惯性用「...」结尾。\n"
             f"{meme_capability}"
-            "所以不要声称已经发送了自己没有选择的素材；没有表情包能力时，想回应图片/表情包就用文字描述感受。"
         )
         if self.meme_manager and meme_guide:
             request.add_system(meme_guide)
