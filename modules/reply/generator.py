@@ -750,10 +750,14 @@ class ReplyGenerator:
         )
         if self.meme_manager and meme_guide:
             request.add_system(meme_guide)
-            # 注册 send_meme 工具调用：从根上避免 LLM 输出 `[[表情:xxx]]` /
-            # `[表情:无语]` / `&&meme:xxx&&` 等半截 marker 漏到群里。
-            # LLM 真的要发图就调工具，工具调用会被外层 main.py 当作"想发图"
-            # 单独走 send_meme 通道，不会再混进 reply 文本。
+        # 注册 send_meme 工具调用：从根上避免 LLM 输出 `[[表情:xxx]]` /
+        # `[表情:无语]` / `&&meme:xxx&&` 等半截 marker 漏到群里。
+        # LLM 真的要发图就调工具，工具调用会被外层 main.py 当作"想发图"
+        # 单独走 send_meme 通道，不会再混进 reply 文本。
+        # 注意：不依赖 meme_guide 是否非空——auto_send_enabled=False 时
+        # build_prompt_guide() 会返回 ""，但 send_meme tool 该注册还得注册，
+        # 否则 LLM 没有任何可用工具，marker 兜底也得依赖 LLM 输出 marker 字符串。
+        if self.meme_manager:
             try:
                 request.tools.append(self.meme_manager.tool_definition())
             except Exception as exc:

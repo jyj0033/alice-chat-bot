@@ -69,6 +69,11 @@ class ClaudeProvider(LLMProvider):
                     }
                     for tool in request.tools
                 ]
+                logger.info(
+                    "[tool_use] Claude request 携带 %d 个工具: %s",
+                    len(body["tools"]),
+                    [t["name"] for t in body["tools"]],
+                )
 
             # 发送请求
             async with aiohttp.ClientSession() as session:
@@ -97,6 +102,14 @@ class ClaudeProvider(LLMProvider):
                         "name": block.get("name", ""),
                         "arguments": block.get("input", {}) or {},
                     })
+
+            logger.info(
+                "[tool_use] Claude response: stop_reason=%s, content_len=%d, tool_calls=%d (%s)",
+                result.get("stop_reason", "stop"),
+                len(content),
+                len(tool_calls),
+                [tc.get("name") for tc in tool_calls],
+            )
 
             usage = result.get("usage", {})
             return ChatResponse(
