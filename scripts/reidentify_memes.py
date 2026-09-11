@@ -103,7 +103,7 @@ async def _vision(provider: Any, data_url: str) -> str:
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < 3:
-                logger.warning("  视觉调用失败(第%d次): %s，重试…", attempt, exc)
+                logger.warning("  视觉调用失败（第%d次）：%s，正在重试…", attempt, exc)
                 await asyncio.sleep(2.0 * attempt)
     raise last_exc  # type: ignore[misc]
 
@@ -206,18 +206,18 @@ def main() -> None:
             if not path.exists():
                 logger.warning("[%d/%d] %s 文件缺失 %s", idx, len(raw_items), meme_id[:12], path)
                 continue
-            logger.info("[%d/%d] 识别中 %s (%s)", idx, len(raw_items), meme_id[:12], item.get("category"))
+            logger.info("[%d/%d] 正在识别 %s（分类：%s）", idx, len(raw_items), meme_id[:12], item.get("category"))
             try:
                 text = await _vision(provider, _data_url(path))
             except Exception as exc:  # noqa: BLE001
                 errors += 1
-                logger.error("[%d/%d] %s 识别失败: %s", idx, len(raw_items), meme_id[:12], exc)
+                logger.error("[%d/%d] %s 识别失败：%s", idx, len(raw_items), meme_id[:12], exc)
                 if not args.fail:
                     raise
                 continue
             obj = _parse_json(text)
             if not obj:
-                logger.error("[%d/%d] %s 输出无法解析: %r", idx, len(raw_items), meme_id[:12], text[:160])
+                logger.error("[%d/%d] %s 输出无法解析：%r", idx, len(raw_items), meme_id[:12], text[:160])
                 continue
             is_meme = bool(obj.get("is_meme", True))
             desc = str(obj.get("description", "")).strip().replace("\n", " ")[:240]
@@ -235,11 +235,11 @@ def main() -> None:
             })
             flag = "非表情包-待删" if not is_meme else ("已变更" if changed else "不变")
             logger.info(
-                "  %s | 旧[%s] %s -> 新[%s] %s",
+                "  %s｜旧分类[%s] %s → 新分类[%s] %s",
                 flag, results[-1]["old_category"], results[-1]["old_meaning"][:20],
                 cat, desc[:40],
             )
-        logger.info("完成，失败/未解析 %d", errors)
+        logger.info("处理完成，失败或无法解析：%d 项", errors)
 
     asyncio.run(run())
 

@@ -35,7 +35,7 @@ class DoubaoSearch(BaseSearchBackend):
             logger.warning("aiohttp 未安装，搜索不可用")
             return []
         if not self.api_key:
-            logger.warning("豆包搜索未配置 api_key")
+            logger.warning("豆包搜索未配置 API 密钥")
             return []
 
         headers = {
@@ -65,19 +65,19 @@ class DoubaoSearch(BaseSearchBackend):
                 ) as resp:
                     text = await resp.text()
                     if resp.status != 200:
-                        logger.error(f"豆包搜索失败: HTTP {resp.status} - {text[:200]}")
+                        logger.error(f"豆包搜索失败：HTTP 状态码 {resp.status}，响应内容：{text[:200]}")
                         return []
                     payload = await resp.json()
             return self._parse(payload)
         except Exception as exc:
-            logger.error(f"豆包搜索异常: {exc}")
+            logger.error(f"豆包搜索异常：{exc}")
             return []
 
     @staticmethod
     def _parse(payload: dict) -> list[SearchResult]:
         meta = payload.get("ResponseMetadata") or {}
         if meta.get("Error"):
-            logger.error("豆包搜索返回错误: %s", meta["Error"])
+            logger.error("豆包搜索返回错误：%s", meta["Error"])
             return []
         result = payload.get("Result") or {}
         results = []

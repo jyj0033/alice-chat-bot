@@ -85,7 +85,7 @@ class EmbeddingRerankService:
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    logger.error(f"Embedding API error {resp.status}: {body[:300]}")
+                    logger.error(f"向量接口出错（HTTP {resp.status}）：{body[:300]}")
                     return None
                 data = await resp.json()
 
@@ -96,7 +96,7 @@ class EmbeddingRerankService:
                 self._embed_dim = len(vecs[0])
             return vecs
         except Exception as e:
-            logger.error(f"Embedding failed: {e}")
+            logger.error(f"生成向量失败：{e}")
             return None
 
     async def embed_many(self, texts: list[str]) -> Optional[list[list[float]]]:
@@ -139,7 +139,7 @@ class EmbeddingRerankService:
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    logger.error(f"Rerank API error {resp.status}: {body[:300]}")
+                    logger.error(f"重排接口出错（HTTP {resp.status}）：{body[:300]}")
                     return None
                 data = await resp.json()
 
@@ -153,5 +153,5 @@ class EmbeddingRerankService:
                 return [r["index"] for r in results]
             return [r.get("index", i) for i, r in enumerate(results)]
         except Exception as e:
-            logger.error(f"Rerank failed: {e}")
+            logger.error(f"重排失败：{e}")
             return None

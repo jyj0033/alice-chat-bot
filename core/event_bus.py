@@ -58,24 +58,24 @@ class EventBus:
             self._subscribers[event_type] = []
         if handler not in self._subscribers[event_type]:
             self._subscribers[event_type].append(handler)
-            logger.debug(f"Subscribed handler to {event_type.value}")
+            logger.debug(f"已订阅事件处理器：{event_type.value}")
 
     def unsubscribe(self, event_type: EventType, handler: EventHandler) -> None:
         """取消订阅"""
         if event_type in self._subscribers:
             if handler in self._subscribers[event_type]:
                 self._subscribers[event_type].remove(handler)
-                logger.debug(f"Unsubscribed handler from {event_type.value}")
+                logger.debug(f"已取消订阅事件处理器：{event_type.value}")
 
     async def publish(self, event: Event) -> None:
         """发布事件到队列"""
         await self._queue.put(event)
-        logger.debug(f"Published event: {event.type.value}")
+        logger.debug(f"已发布事件：{event.type.value}")
 
     async def start(self) -> None:
         """启动事件循环"""
         self._running = True
-        logger.info("EventBus started")
+        logger.info("事件总线已启动")
 
         while self._running:
             try:
@@ -91,21 +91,23 @@ class EventBus:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"EventBus error: {e}", exc_info=True)
+                logger.error(f"事件总线运行出错：{e}", exc_info=True)
 
-        logger.info("EventBus stopped")
+        logger.info("事件总线已停止")
 
     async def _safe_handle(self, handler: EventHandler, event: Event) -> None:
         """安全执行处理器"""
         try:
             await handler(event)
         except Exception as e:
-            logger.error(f"Event handler error for {event.type.value}: {e}", exc_info=True)
+            logger.error(
+                f"事件 {event.type.value} 的处理器出错：{e}", exc_info=True
+            )
 
     def stop(self) -> None:
         """停止事件循环"""
         self._running = False
-        logger.info("EventBus stopping...")
+        logger.info("事件总线正在停止...")
 
     @property
     def queue_size(self) -> int:

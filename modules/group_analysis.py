@@ -543,7 +543,7 @@ class GroupDailyAnalysis:
         try:
             root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            logger.debug("群日报头像缓存目录创建失败: %s", exc)
+            logger.debug("群日报头像缓存目录创建失败：%s", exc)
             return {}
 
         max_age = max(1, int(cache_days)) * 86400
@@ -577,7 +577,7 @@ class GroupDailyAnalysis:
                     await asyncio.to_thread(target.write_bytes, bytes(content))
                     return sender_id, str(target)
             except Exception as exc:
-                logger.debug("获取群友头像失败 %s: %s", sender_id, exc)
+                logger.debug("获取群友头像失败：%s，原因：%s", sender_id, exc)
             if target.is_file() and target.stat().st_size > 0:
                 return sender_id, str(target)
             return sender_id, ""
@@ -632,25 +632,25 @@ class GroupDailyAnalysis:
                 reason = cls._short_text(item.get("reason"), 80)
                 if not content:
                     logger.info(
-                        "[群日报] %s 丢弃:content 为空 item=%s",
+                        "[群日报] %s 丢弃：内容为空，条目=%s",
                         kind, item,
                     )
                     continue
                 if sender_id not in known_ids:
                     logger.info(
-                        "[群日报] %s 丢弃:sender_id=%s 不在 known_ids(%d)",
+                        "[群日报] %s 丢弃：发送者编号=%s 不在已知列表（%d）",
                         kind, sender_id, len(known_ids),
                     )
                     continue
                 matched, match_info = cls._match_quote(content, sender_id, source_messages)
                 if not matched:
                     logger.info(
-                        "[群日报] %s 丢弃:match_quote 失败 sender=%s candidate=%r info=%s",
+                        "[群日报] %s 丢弃：原句匹配失败，发送者=%s，候选=%r，详情=%s",
                         kind, sender_id, content[:60], match_info,
                     )
                     continue
                 logger.info(
-                    "[群日报] %s 命中 sender=%s info=%s",
+                    "[群日报] %s 命中：发送者=%s，详情=%s",
                     kind, sender_id, match_info,
                 )
                 quote = {
@@ -806,7 +806,7 @@ class GroupDailyAnalysis:
         human_messages = cls.human_messages(source_messages)
         statistics = cls.build_statistics(human_messages)
         logger.info(
-            "[群日报] provider=%s model=%s",
+            "[群日报] 使用提供商=%s，模型=%s",
             type(provider).__name__ if provider else None,
             getattr(provider, "model", "?"),
         )
@@ -871,7 +871,7 @@ class GroupDailyAnalysis:
             except Exception as exc:
                 last_error = str(exc) or exc.__class__.__name__
             if attempt < max(1, int(retries)):
-                logger.warning("[群日报] LLM 调用失败，第%d次重试: %s", attempt, last_error)
+                logger.warning("[群日报] 语言模型调用失败，第%d次重试：%s", attempt, last_error)
                 await asyncio.sleep(1.5 * attempt)
 
         if not parsed:
@@ -883,7 +883,7 @@ class GroupDailyAnalysis:
 
         known_ids = {cls._sender(message)[0] for message in human_messages}
         logger.info(
-            "[群日报] parsed keys=%s quotes=%s unhinged=%s profiles=%s topics=%s",
+            "[群日报] 解析结果：字段=%s，普通摘录=%s，趣闻摘录=%s，画像=%s，话题=%s",
             sorted(parsed.keys()),
             type(parsed.get("quotes")).__name__,
             type(parsed.get("unhinged_quotes")).__name__,

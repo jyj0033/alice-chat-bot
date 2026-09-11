@@ -109,7 +109,7 @@ class FatigueManager:
         # 检查是否需要重置
         if current_time - state.last_activity_time > self.reset_threshold:
             state.reset()
-            logger.debug(f"Session {session_id} fatigue reset due to inactivity")
+            logger.debug(f"会话 {session_id} 因长时间无消息，疲劳状态已重置")
             return
 
         # 更新活动时间
@@ -227,7 +227,7 @@ class FatigueManager:
         duration = min(self.cooldown_max_duration, max(10, duration))  # 最少10秒
 
         self._cooldowns[session_id] = time.time() + duration
-        logger.debug(f"Session {session_id} entered cooldown for {duration:.0f}s")
+        logger.debug(f"会话 {session_id} 进入 {duration:.0f} 秒冷却")
 
     def get_cooldown_remaining(self, session_id: str) -> float:
         """获取冷却剩余时间"""

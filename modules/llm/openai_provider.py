@@ -61,7 +61,7 @@ class OpenAIProvider(LLMProvider):
             default_headers=headers if headers else None,
         )
 
-        logger.info(f"Initialized OpenAI provider: {base_url}, model: {self.model}")
+        logger.info(f"OpenAI 提供商已初始化：地址={base_url}，模型={self.model}")
 
     @property
     def provider_name(self) -> str:
@@ -138,13 +138,13 @@ class OpenAIProvider(LLMProvider):
             )
 
         except openai.RateLimitError as e:
-            logger.warning(f"Rate limit hit: {e}")
+            logger.warning(f"触发接口频率限制：{e}")
             raise
         except openai.APIError as e:
-            logger.error(f"API error: {e}")
+            logger.error(f"API 接口出错：{e}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error in chat: {e}", exc_info=True)
+            logger.error(f"聊天请求发生未预期错误：{e}", exc_info=True)
             raise
 
     async def stream_chat(self, request: ChatRequest) -> AsyncIterator[str]:
@@ -169,7 +169,7 @@ class OpenAIProvider(LLMProvider):
                     yield chunk.choices[0].delta.content
 
         except Exception as e:
-            logger.error(f"Stream error: {e}", exc_info=True)
+            logger.error(f"流式聊天请求出错：{e}", exc_info=True)
             raise
 
     async def close(self) -> None:

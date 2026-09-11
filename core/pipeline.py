@@ -83,16 +83,16 @@ class Pipeline:
         执行 Pipeline
         返回是否成功完成
         """
-        logger.debug(f"Pipeline starting with {len(self.stages)} stages")
+        logger.debug(f"开始执行消息处理流水线，共 {len(self.stages)} 个阶段")
 
         for i, stage in enumerate(self.stages):
             try:
-                logger.debug(f"Executing stage: {stage.name}")
+                logger.debug(f"正在执行流水线阶段：{stage.name}")
                 result = await stage.process(context)
 
                 # 处理不同返回类型
                 if result is False:
-                    logger.debug(f"Pipeline aborted at stage: {stage.name}")
+                    logger.debug(f"流水线在阶段 {stage.name} 被中止")
                     return False
 
                 # 更新上下文
@@ -100,11 +100,11 @@ class Pipeline:
                     context = result
 
             except Exception as e:
-                logger.error(f"Stage {stage.name} error: {e}", exc_info=True)
+                logger.error(f"流水线阶段 {stage.name} 出错：{e}", exc_info=True)
                 context.error = str(e)
                 return False
 
-        logger.debug("Pipeline completed successfully")
+        logger.debug("消息处理流水线执行完成")
         return True
 
 
@@ -129,7 +129,9 @@ class ParseStage(PipelineStage):
         if message.strip().startswith("//") or "[CQ:reply" in message:
             context.reply_to_me = True
 
-        logger.debug(f"Parsed message: mentioned={context.mentioned_me}, reply={context.reply_to_me}")
+        logger.debug(
+            f"消息解析完成：提及机器人={context.mentioned_me}，回复机器人={context.reply_to_me}"
+        )
         return context
 
 

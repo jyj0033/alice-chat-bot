@@ -71,7 +71,7 @@ class SearchClient:
                 try:
                     self._backends[name] = backend_cls(cfg.pop("api_key"), **cfg)
                 except Exception as exc:
-                    logger.error(f"搜索后端 {name} 初始化失败: {exc}")
+                    logger.error(f"搜索后端 {name} 初始化失败：{exc}")
 
         self.primary = primary if primary in self._backends else (next(iter(self._backends), ""))
         self._last_search: dict[str, float] = {}  # session_id -> 上次搜索时间
@@ -143,7 +143,7 @@ class SearchClient:
             try:
                 results = await backend.search(query, **kwargs)
             except Exception as exc:
-                logger.error(f"搜索后端 {name} 异常: {exc}")
+                logger.error(f"搜索后端 {name} 异常：{exc}")
                 results = []
             if results:
                 # 时效性查询：降权"未来上线/前瞻"类结果。搜索引擎按热度排序，
@@ -153,12 +153,12 @@ class SearchClient:
                 if session_id:
                     self._record(session_id)
                 logger.info(
-                    f"[搜索] 后端={name}, 时效={'是' if time_sensitive else '否'}, "
-                    f"query={query[:40]}, 结果={len(results)}"
+                    f"[搜索] 后端={name}，时效性={'是' if time_sensitive else '否'}，"
+                    f"查询={query[:40]}，结果数={len(results)}"
                 )
                 return results[: self.result_limit]
 
-        logger.warning(f"[搜索] 所有后端均无结果: query={query[:40]}")
+        logger.warning(f"[搜索] 所有后端均无结果：查询={query[:40]}")
         return []
 
     @staticmethod

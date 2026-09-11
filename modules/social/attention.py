@@ -154,12 +154,16 @@ class AttentionManager:
         if mentioned_bot:
             # 被@ - 大幅提升
             user_attention.boost(self.boost_step)
-            logger.debug(f"User {user_id} mentioned bot, attention boosted to {user_attention.attention:.2f}")
+            logger.debug(
+                f"用户 {user_id} 提及 Bot，注意力提升至 {user_attention.attention:.2f}"
+            )
 
         elif is_reply_to_bot:
             # 回复Bot - 中等提升
             user_attention.boost(self.boost_step * 0.7)
-            logger.debug(f"User {user_id} replied to bot, attention boosted to {user_attention.attention:.2f}")
+            logger.debug(
+                f"用户 {user_id} 回复 Bot，注意力提升至 {user_attention.attention:.2f}"
+            )
 
         # 触发溢出效果
         if self.enable_spillover and user_attention.attention > self.spillover_min_trigger:
@@ -190,7 +194,9 @@ class AttentionManager:
             # 如果注意力已经很低，再降
             if attention.attention < self.decrease_threshold:
                 attention.attention = max(0.0, attention.attention - self.decrease_step)
-                logger.debug(f"User {user_id} attention decreased to {attention.attention:.2f}")
+                logger.debug(
+                    f"用户 {user_id} 的注意力降至 {attention.attention:.2f}"
+                )
 
     def get_effective_attention(self, group_id: str, user_id: str = None) -> float:
         """

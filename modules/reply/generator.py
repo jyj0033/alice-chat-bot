@@ -149,7 +149,7 @@ class ResponseFilter:
         # 检查敏感词
         for word in self.sensitive_words:
             if word in text:
-                logger.warning(f"Reply contains sensitive word: {word}")
+                logger.warning(f"回复包含敏感词：{word}")
                 return False, f"包含敏感词: {word}"
 
         return True, text
@@ -295,7 +295,7 @@ class ReplyGenerator:
                     request, session_id, current_message
                 )
             except Exception as e:
-                logger.error(f"Search generation failed, fallback to normal: {e}", exc_info=True)
+                logger.error(f"搜索回复生成失败，回退普通回复：{e}", exc_info=True)
                 response = None
             reply = response.content if (response is not None) else ""
             if response is not None and self.meme_manager:
@@ -308,7 +308,7 @@ class ReplyGenerator:
                 if self.meme_manager:
                     meme_category, meme_id, meme_called = self._extract_send_meme_call(response)
             except Exception as e:
-                logger.error(f"LLM error: {e}", exc_info=True)
+                logger.error(f"语言模型调用失败：{e}", exc_info=True)
                 if direction != "to_bot":
                     # 群友互聊/推断的延续对话场景 LLM 挂了 → 安静潜水，比说错话好
                     return None
@@ -326,7 +326,7 @@ class ReplyGenerator:
         #     （空 args 想随机抽时 category/id 都是空，但 called=True）。
         has_meme = meme_called
         if (self._has_tool_markup(reply) or not reply) and not has_meme:
-            logger.warning("搜索回复不可用(%s)，回退主 LLM 重答", (reply or "")[:40])
+            logger.warning("搜索回复不可用（%s），回退主语言模型重新生成", (reply or "")[:40])
             try:
                 resp2 = await self.llm.chat(request)
                 reply2 = self._clean_thinking_process(resp2.content.strip())
@@ -343,7 +343,7 @@ class ReplyGenerator:
                 elif reply2:
                     reply = reply2
             except Exception as e:
-                logger.error(f"LLM fallback error: {e}", exc_info=True)
+                logger.error(f"语言模型回退调用失败：{e}", exc_info=True)
                 reply2 = ""
                 if direction != "to_bot":
                     return None
@@ -361,9 +361,9 @@ class ReplyGenerator:
         # 不应被 silent 兜底覆盖成文字，否则用户看到的就不是干净发图了。
         if self._is_silent(reply) and not has_meme:
             if direction != "to_bot":
-                logger.debug(f"LLM 选择沉默（direction={direction}）")
+                logger.debug(f"语言模型选择沉默（回复方向={direction}）")
                 return None
-            logger.warning("明确对 bot 的消息被 LLM 判为沉默，使用兜底回复")
+            logger.warning("明确对机器人的消息被语言模型判为沉默，使用兜底回复")
             reply = self._get_fallback_reply()
 
         # 6. 过滤回复
@@ -374,8 +374,8 @@ class ReplyGenerator:
         else:
             passed, result = self.response_filter.filter(reply)
         if not passed:
-            logger.warning(f"[meme-exit] filter rejected: {result}")
-            logger.info(f"Reply filtered: {result}")
+            logger.warning(f"[表情处理] 回复过滤器拒绝：{result}")
+            logger.info(f"回复已被过滤：{result}")
             self.replies_filtered += 1
             return None
 
@@ -397,7 +397,7 @@ class ReplyGenerator:
                 return None
             retry_passed, retry_result = self.response_filter.filter(retry_reply)
             if not retry_passed:
-                logger.info("[事件理解] 重答被过滤: %s", retry_result)
+                logger.info("[事件理解] 重答被过滤：%s", retry_result)
                 self.replies_filtered += 1
                 return None
             if self._is_surface_reaction(
@@ -433,7 +433,7 @@ class ReplyGenerator:
         # 这里不再重复等待，避免一次回复串行等待两套延迟。
 
         logger.warning(
-            "[meme-exit] reply=%r, cat=%r, id=%r, called=%s",
+            "[表情处理] 回复=%r，分类=%r，编号=%r，是否调用=%s",
             reply, meme_category, meme_id, meme_called,
         )
         return {
@@ -526,7 +526,7 @@ class ReplyGenerator:
             logger.info(f"[搜索判断] 「{text[:40]}」 → {'需要搜索' if verdict else '不搜索'}")
             return verdict
         except Exception as e:
-            logger.error(f"搜索判断失败，按不需搜索处理: {e}", exc_info=True)
+            logger.error(f"搜索判断失败，按不需搜索处理：{e}", exc_info=True)
             return False
 
     @staticmethod
@@ -631,7 +631,7 @@ class ReplyGenerator:
         if not reply or self._has_tool_markup(reply):
             reason = f"finish={getattr(resp, 'finish_reason', '?')!r}" if resp else "无响应"
             logger.warning(
-                "搜索工具 LLM 回复不可用(%r，%s)，改用主 LLM 带资料重答",
+                "搜索工具语言模型回复不可用（%r，%s），改用主语言模型带资料重答",
                 reply[:40],
                 reason,
             )
@@ -639,11 +639,11 @@ class ReplyGenerator:
                 resp = await self.llm.chat(clean)
                 reply = self._clean_thinking_process(str(resp.content or "")) if resp else ""
             except Exception as exc:
-                logger.error(f"主 LLM 带资料重答失败: {exc}", exc_info=True)
+                logger.error(f"主语言模型带资料重答失败：{exc}", exc_info=True)
                 resp = None
                 reply = ""
             if not reply or self._has_tool_markup(reply):
-                logger.warning("主 LLM 带资料重答仍不可用，丢弃搜索结果")
+                logger.warning("主语言模型带资料重答仍不可用，丢弃搜索结果")
                 resp = None
         return resp
 
@@ -671,7 +671,7 @@ class ReplyGenerator:
                     )
                     return category, meme_id, True
         except Exception:
-            logger.debug("[工具调用] 解析 send_meme tool_calls 失败", exc_info=True)
+            logger.debug("[工具调用] 解析表情发送工具调用失败", exc_info=True)
         # 兜底：MiniMax 原生 <invoke> 泄漏
         try:
             content = (response.content or "") if response is not None else ""
@@ -818,7 +818,7 @@ class ReplyGenerator:
             try:
                 request.tools.append(self.meme_manager.tool_definition())
             except Exception as exc:
-                logger.debug("[工具调用] 注册 send_meme 失败，继续走 marker 兜底: %s", exc)
+                logger.debug("[工具调用] 注册表情发送工具失败，继续使用标记兜底：%s", exc)
 
         # 参与规则 - 根据消息指向决定「该不该插嘴」
         request.add_system(self._build_participation_guide(direction))
@@ -1245,7 +1245,7 @@ class ReplyGenerator:
             current = self._strip_rich_descriptions(current_message)
             hits = [m for m in self._FRUSTRATION_MARKERS if m in current]
             if hits:
-                logger.debug("[降级] 当前消息命中不满信号: %s", hits)
+                logger.debug("[降级] 当前消息命中不满信号：%s", hits)
                 self._mark_frustrated(session_id)
                 return True
 
@@ -1269,9 +1269,9 @@ class ReplyGenerator:
             tail_hits.extend(m for m in self._FRUSTRATION_MARKERS if m in clean)
         if tail_hits:
             if self._frustration_in_cooldown(session_id):
-                logger.debug("[降级] 尾巴命中但冷却中，不再重复道歉: %s", tail_hits)
+                logger.debug("[降级] 尾巴命中但冷却中，不再重复道歉：%s", tail_hits)
                 return False
-            logger.debug("[降级] 上下文尾巴命中不满信号: %s", tail_hits)
+            logger.debug("[降级] 上下文尾巴命中不满信号：%s", tail_hits)
             self._mark_frustrated(session_id)
             return True
         return False
@@ -1354,7 +1354,7 @@ class ReplyGenerator:
             response = await self.llm.chat(retry_request)
             return self._clean_thinking_process((response.content or "").strip())
         except Exception as exc:
-            logger.warning("[事件理解] 重答失败: %s", exc)
+            logger.warning("[事件理解] 重答失败：%s", exc)
             return ""
 
     # 复读检测：剥掉笑声/语气词/标点后剩下的"实质内容"如果整段出现在最近

@@ -267,7 +267,7 @@ async def get_status():
             try:
                 recognition_history = enricher.recognition_history(20)
             except Exception as e:
-                logger.warning("recognition_history failed: %s", e)
+                logger.warning("获取识别历史失败：%s", e)
     emotion = {
         "energy": 0.7,
         "engagement": 0.5,
@@ -387,7 +387,7 @@ async def get_sessions():
                     last_active=(row.get("last_active") or ""),
                 )
     except Exception as e:
-        logger.error(f"Failed to list sessions: {e}")
+        logger.error(f"列出会话失败：{e}")
 
     return {"sessions": sessions}
 
@@ -550,7 +550,7 @@ async def get_memories(
             decay_presets=decay_presets,
         )
     except Exception as e:
-        logger.error(f"Failed to load memories: {e}")
+        logger.error(f"加载记忆失败：{e}")
         return empty
 
     from datetime import datetime
@@ -644,7 +644,7 @@ async def get_profiles(page: int = 1, page_size: int = 30, q: str = ""):
             "has_more": page < total_pages,
         }
     except Exception as e:
-        logger.error(f"Failed to load profiles: {e}")
+        logger.error(f"加载用户画像失败：{e}")
         return empty
 
 
@@ -657,7 +657,7 @@ async def distill_profiles():
         result = await bot_instance._distill_user_profiles(force=True)
         return {"success": True, **result}
     except Exception as e:
-        logger.error(f"Manual profile distill failed: {e}")
+        logger.error(f"手动提炼用户画像失败：{e}")
         return {"success": False, "error": str(e)}
 
 
@@ -687,7 +687,7 @@ async def get_group_analysis_reports(session: str = "", limit: int = 30):
             })
         return {"reports": reports, "total": len(reports)}
     except Exception as e:
-        logger.error(f"Failed to load group analysis reports: {e}")
+        logger.error(f"加载群聊日报失败：{e}")
         return {"reports": [], "total": 0, "error": str(e)}
 
 
@@ -700,7 +700,7 @@ async def get_group_analysis_sessions():
         rows = await bot_instance.memory_storage.get_group_analysis_sessions()
         return {"sessions": rows}
     except Exception as e:
-        logger.error(f"Failed to load group analysis sessions: {e}")
+        logger.error(f"加载群聊日报会话失败：{e}")
         return {"sessions": [], "error": str(e)}
 
 
@@ -720,7 +720,7 @@ async def run_group_analysis(request: Request):
         report_date = str(data.get("report_date") or "").strip()
         return await bot_instance.trigger_group_analysis(session, report_date=report_date)
     except Exception as e:
-        logger.error(f"Manual group analysis failed: {e}")
+        logger.error(f"手动生成群聊日报失败：{e}")
         return {"success": False, "error": str(e)}
 
 
@@ -763,7 +763,7 @@ async def get_memes(
             "has_more": page < total_pages,
         }
     except Exception as exc:
-        logger.error("Failed to load memes: %s", exc)
+        logger.error("加载表情失败：%s", exc)
         return {"memes": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0, "error": str(exc)}
 
 
@@ -778,7 +778,7 @@ async def get_meme_categories():
             "stats": await asyncio.to_thread(manager.stats),
         }
     except Exception as exc:
-        logger.error("Failed to load meme categories: %s", exc)
+        logger.error("加载表情分类失败：%s", exc)
         return {"categories": [], "stats": {}, "error": str(exc)}
 
 
@@ -852,7 +852,7 @@ async def send_meme(request: Request):
             category=str(data.get("category") or ""),
         )
     except Exception as exc:
-        logger.error("Manual meme send failed: %s", exc)
+        logger.error("手动发送表情失败：%s", exc)
         return {"success": False, "error": str(exc)}
 
 
@@ -904,7 +904,7 @@ async def get_slang():
             "cleanup": slang_config.get("cleanup", {}) or {},
         }
     except Exception as e:
-        logger.error(f"Failed to load slang: {e}")
+        logger.error(f"加载黑话失败：{e}")
         return {"slang": [], "total": 0, "cleanup": {}}
 
 
@@ -928,7 +928,7 @@ async def create_slang(request: Request):
         )
         return {"success": bool(slang_id), "id": slang_id}
     except Exception as e:
-        logger.error(f"Create slang failed: {e}")
+        logger.error(f"创建黑话失败：{e}")
         return {"success": False, "error": str(e)}
 
 
@@ -948,7 +948,7 @@ async def edit_slang(slang_id: int, request: Request):
         )
         return {"success": ok}
     except Exception as e:
-        logger.error(f"Update slang failed: {e}")
+        logger.error(f"更新黑话失败：{e}")
         return {"success": False, "error": str(e)}
 
 
@@ -974,7 +974,7 @@ async def extract_slang_now():
         result = await bot_instance.extract_slang_all(hours=hours)
         return {"success": True, **result}
     except Exception as e:
-        logger.error(f"Manual slang extract failed: {e}")
+        logger.error(f"手动提取黑话失败：{e}")
         return {"success": False, "error": str(e)}
 
 
@@ -990,7 +990,7 @@ async def cleanup_slang_now():
         )
         return {"success": not result["error"], **result}
     except Exception as e:
-        logger.error(f"Manual slang cleanup failed: {e}")
+        logger.error(f"手动清理黑话失败：{e}")
         return {"success": False, "error": str(e)}
 
 
@@ -1188,7 +1188,7 @@ async def test_provider(name: str):
     except Exception as e:
         import traceback
         error_msg = f"{type(e).__name__}: {str(e)}"
-        logger.error(f"Provider test failed: {error_msg}\n{traceback.format_exc()}")
+        logger.error(f"测试模型提供商失败：{error_msg}\n{traceback.format_exc()}")
         return {"success": False, "error": error_msg}
 
 
@@ -1234,7 +1234,7 @@ async def test_vision(request: Request):
     except Exception as e:
         import traceback
         error_msg = f"{type(e).__name__}: {str(e)}"
-        logger.error(f"Vision test failed: {error_msg}\n{traceback.format_exc()}")
+        logger.error(f"测试视觉模型失败：{error_msg}\n{traceback.format_exc()}")
         return {"success": False, "error": error_msg}
 
 
@@ -1281,5 +1281,5 @@ async def restart():
 
 def run_dashboard(bot, host: str = "0.0.0.0", port: int = 30080):
     set_bot(bot)
-    logger.info(f"Starting dashboard on {host}:{port}")
+    logger.info(f"正在启动 Web 管理面板：{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="info")

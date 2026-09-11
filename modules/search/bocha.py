@@ -34,7 +34,7 @@ class BochaSearch(BaseSearchBackend):
             logger.warning("aiohttp 未安装，搜索不可用")
             return []
         if not self.api_key:
-            logger.warning("博查搜索未配置 api_key")
+            logger.warning("博查搜索未配置 API 密钥")
             return []
 
         headers = {
@@ -60,12 +60,12 @@ class BochaSearch(BaseSearchBackend):
                 ) as resp:
                     text = await resp.text()
                     if resp.status != 200:
-                        logger.error(f"博查搜索失败: HTTP {resp.status} - {text[:200]}")
+                        logger.error(f"博查搜索失败：HTTP 状态码 {resp.status}，响应内容：{text[:200]}")
                         return []
                     payload = await resp.json()
             return self._parse(payload)
         except Exception as exc:
-            logger.error(f"博查搜索异常: {exc}")
+            logger.error(f"博查搜索异常：{exc}")
             return []
 
     @staticmethod

@@ -165,48 +165,48 @@ class GroupChatBot:
 
     async def initialize(self) -> None:
         """初始化 Bot"""
-        logger.info("Initializing Alice (爱丽丝)...")
+        logger.info("正在初始化 Alice（爱丽丝）……")
         self._start_time = time.time()
 
         # 1. 加载配置
         self._load_config()
-        logger.info("✓ Config loaded")
+        logger.info("✓ 配置已加载")
 
         # 2. 初始化事件总线
         self.event_bus = EventBus()
         self._tasks.append(asyncio.create_task(self.event_bus.start()))
-        logger.info("✓ EventBus initialized")
+        logger.info("✓ 事件总线已初始化")
 
         # 3. 初始化 LLM
         self._init_llm()
-        logger.info("✓ LLM provider initialized")
+        logger.info("✓ 语言模型提供商已初始化")
 
         # 4. 初始化记忆系统
         self._init_memory()
-        logger.info("✓ Memory system initialized")
+        logger.info("✓ 记忆系统已初始化")
 
         # 4.5 初始化本地表情库；素材不进入普通记忆和 LLM 召回。
         self._init_meme_manager()
-        logger.info("✓ Meme library initialized")
+        logger.info("✓ 表情库已初始化")
 
         # 5. 初始化人格系统
         self._init_personality()
-        logger.info("✓ Personality system initialized")
+        logger.info("✓ 人格系统已初始化")
 
         # 6. 初始化社交感知
         self._init_social()
-        logger.info("✓ Social awareness initialized")
+        logger.info("✓ 社交感知系统已初始化")
 
         # 7. 初始化回复生成
         self._init_reply_generator()
-        logger.info("✓ Reply generator initialized")
+        logger.info("✓ 回复生成器已初始化")
 
         # 8. 初始化 QQ 适配器
         self._init_qq_adapter()
-        logger.info("✓ QQ adapter initialized")
+        logger.info("✓ QQ 适配器已初始化")
 
         elapsed = time.time() - self._start_time
-        logger.info(f"GroupChatBot initialized successfully in {elapsed:.2f}s!")
+        logger.info(f"爱丽丝初始化完成，耗时 {elapsed:.2f} 秒")
 
     def _load_config(self) -> None:
         """加载配置，如果没有则创建默认配置"""
@@ -217,11 +217,11 @@ class GroupChatBot:
 
         if not config_file.exists():
             # 创建默认配置文件
-            logger.info("No config file found, creating default configuration...")
+            logger.info("未找到配置文件，正在创建默认配置...")
             default_config = self._get_default_config()
             save_config_file(default_config, config_file)
             self.config = default_config
-            logger.info(f"✓ Default config created at {config_file}")
+            logger.info(f"✓ 默认配置已创建：{config_file}")
         else:
             self.config = load_config_file(config_file)
 
@@ -229,7 +229,9 @@ class GroupChatBot:
         personality_config = self.config.get("personality", {})
         self.personality = Personality.from_dict(personality_config)
 
-        logger.info(f"Bot name: {self.personality.name}, nickname: {self.personality.nickname}")
+        logger.info(
+            f"机器人名称：{self.personality.name}，昵称：{self.personality.nickname}"
+        )
 
     def _init_llm(self) -> None:
         """初始化 LLM providers - 支持 llm 和 providers 两个配置结构"""
@@ -267,9 +269,12 @@ class GroupChatBot:
                         }
                     )
                     self.llm_providers[name] = provider
-                    logger.info(f"✓ LLM provider '{name}': {provider_config.get('base_url')}, model: {provider_config.get('model')}")
+                    logger.info(
+                        f"✓ 语言模型提供商「{name}」：地址={provider_config.get('base_url')}，"
+                        f"模型={provider_config.get('model')}"
+                    )
                 except Exception as e:
-                    logger.error(f"✗ Failed to init provider '{name}': {e}")
+                    logger.error(f"✗ 初始化语言模型提供商「{name}」失败：{e}")
 
         # 设置激活的 provider（优先级：primary > claude > siliconflow > 其他）
         priority_order = ["primary", "minimax", "siliconflow", "nvidia", "ark"]
@@ -283,7 +288,7 @@ class GroupChatBot:
             self.active_provider_id = next(iter(self.llm_providers))
 
         if not self.llm_providers:
-            logger.error("No LLM providers available!")
+            logger.error("没有可用的语言模型提供商！")
 
     def get_active_provider(self) -> Optional[LLMProvider]:
         """获取当前激活的 provider"""
@@ -307,7 +312,7 @@ class GroupChatBot:
         )
 
         logger.info(
-            "✓ 长期记忆: enabled=%s, 跨会话共享=%s",
+            "✓ 长期记忆：启用=%s，跨会话共享=%s",
             self.long_term_memory_enabled,
             self.memory_share_across_sessions,
         )
@@ -318,9 +323,12 @@ class GroupChatBot:
         embed_service = EmbeddingRerankService(embed_config)
         self.memory_storage._storage.set_embedding_service(embed_service)
         if embed_service.enabled:
-            logger.info(f"✓ 嵌入服务已启用: {embed_service.embed_model} + rerank {embed_service.rerank_model}")
+            logger.info(
+                f"✓ 嵌入服务已启用：向量模型={embed_service.embed_model}，"
+                f"重排模型={embed_service.rerank_model}"
+            )
         else:
-            logger.info("嵌入服务未配置（无 api_key），记忆检索使用 TF-IDF 回退")
+            logger.info("嵌入服务未配置（无 API 密钥），记忆检索使用 TF-IDF 回退")
 
         self.context_manager = ContextManager(
             max_messages=memory_config.get("context_window_size", 30),
@@ -347,8 +355,10 @@ class GroupChatBot:
             "min_messages": digest_cfg.get("min_messages", 10),
             "max_tokens": digest_cfg.get("max_tokens", 200),
         }
-        logger.info(f"✓ 群聊纪要: enabled={self._digest_config['enabled']}, "
-                    f"每{self._digest_config['interval_messages']}条消息总结一次")
+        logger.info(
+            f"✓ 群聊纪要：启用={self._digest_config['enabled']}，"
+            f"每{self._digest_config['interval_messages']}条消息总结一次"
+        )
 
         # 群聊日报：默认不自动发送，避免升级后突然增加 LLM 调用和群消息；
         # Dashboard 手动触发不受 auto_enabled 影响。
@@ -380,7 +390,7 @@ class GroupChatBot:
             "avatar_timeout": max(1.0, min(20.0, float(analysis_cfg.get("avatar_timeout", 6)))),
         }
         logger.info(
-            "✓ 群聊日报: enabled=%s, auto=%s, 时间=%s",
+            "✓ 群聊日报：启用=%s，自动生成=%s，时间=%s",
             self._group_analysis_config["enabled"],
             self._group_analysis_config["auto_enabled"],
             ",".join(self._group_analysis_config["auto_times"]),
@@ -413,8 +423,10 @@ class GroupChatBot:
             ),
         }
         self._last_profile_distill: float = 0.0
-        logger.info(f"✓ 用户画像: enabled={self._profile_config['enabled']}, "
-                    f"每{self._profile_config['interval_minutes']}分钟提炼一次（自述+日常发言）")
+        logger.info(
+            f"✓ 用户画像：启用={self._profile_config['enabled']}，"
+            f"每{self._profile_config['interval_minutes']}分钟提炼一次（自述+日常发言）"
+        )
 
         # 群聊黑话：定时从聊天记录提取群内特有的梗/称呼，回复时按需注入
         slang_cfg = memory_config.get("slang", {}) or {}
@@ -432,10 +444,12 @@ class GroupChatBot:
             },
         }
         self._last_slang_extract: float = 0.0
-        logger.info(f"✓ 群聊黑话: enabled={self._slang_config['enabled']}, "
-                    f"每{self._slang_config['interval_hours']}小时提取一次；"
-                    f"自动清理={self._slang_config['cleanup']['enabled']}，"
-                    f"每{self._slang_config['cleanup']['interval_hours']}小时检查一次")
+        logger.info(
+            f"✓ 群聊黑话：启用={self._slang_config['enabled']}，"
+            f"每{self._slang_config['interval_hours']}小时提取一次；"
+            f"自动清理={self._slang_config['cleanup']['enabled']}，"
+            f"每{self._slang_config['cleanup']['interval_hours']}小时检查一次"
+        )
 
     def _init_meme_manager(self) -> None:
         """初始化本地表情包素材库。"""
@@ -444,7 +458,7 @@ class GroupChatBot:
             base_dir=Path(__file__).resolve().parent,
         )
         logger.info(
-            "✓ 表情库: enabled=%s, auto_collect=%s, auto_send=%s, total=%d",
+            "✓ 表情库：启用=%s，自动收集=%s，自动发送=%s，总数=%d",
             self.meme_manager.enabled,
             self.meme_manager.auto_collect_enabled,
             self.meme_manager.auto_send_enabled,
@@ -604,7 +618,7 @@ class GroupChatBot:
             context_messages=judge_config.get("context_messages", 16),
         )
         logger.info(
-            "✓ 群聊目标判断: enabled=%s, provider=%s, timeout=%.1fs",
+            "✓ 群聊目标判断：启用=%s，提供商=%s，超时=%.1f秒",
             self.conversation_judge.enabled,
             judge_provider_id or "active",
             self.conversation_judge.timeout,
@@ -664,15 +678,15 @@ class GroupChatBot:
                     "model": model or "MiniMax-M3",
                     "timeout": float(llm_cfg.get("timeout", 60)),
                 })
-                logger.info(f"✓ 联网搜索 LLM: {tool_llm.model}")
+                logger.info(f"✓ 联网搜索语言模型：{tool_llm.model}")
             except Exception as e:
-                logger.error(f"✗ 联网搜索 LLM 初始化失败: {e}")
+                logger.error(f"✗ 初始化联网搜索语言模型失败：{e}")
                 tool_llm = None
 
         if search_client.available:
             logger.info(
-                f"✓ 联网搜索已启用: primary={search_client.primary}, "
-                f"后端={list(search_client._backends.keys())}"
+                f"✓ 联网搜索已启用：主后端={search_client.primary}，"
+                f"备用后端={list(search_client._backends.keys())}"
             )
         return search_client, tool_llm
 
@@ -707,11 +721,12 @@ class GroupChatBot:
                 },
             )
             logger.info(
-                f"✓ Vision provider: {vision_config.get('base_url')}, model: {vision_config.get('model')}"
+                f"✓ 视觉模型提供商：地址={vision_config.get('base_url')}，"
+                f"模型={vision_config.get('model')}"
             )
             return provider
         except Exception as e:
-            logger.error(f"✗ Failed to init vision provider: {e}")
+            logger.error(f"✗ 初始化视觉模型提供商失败：{e}")
             return None
 
     def _get_rich_media_config(self) -> dict:
@@ -815,7 +830,7 @@ class GroupChatBot:
             or message.mentioned_me
             or is_reply_to_bot
         )
-        logger.info(f"[{message.group_id or '私聊'}] {message.sender_name}: {message.content[:50]}...")
+        logger.info(f"[{message.group_id or '私聊'}] {message.sender_name}：{message.content[:50]}……")
 
         # 创建事件
         event = Event(
@@ -907,7 +922,7 @@ class GroupChatBot:
             # 记录媒体轨迹，供"连图整体识别"判断连续纯图片
             self._record_media_trail(message)
         except Exception as e:
-            logger.error(f"Fast path error: {e}", exc_info=True)
+            logger.error(f"快速消息处理路径出错：{e}", exc_info=True)
         finally:
             # 只锁到快速入库结束；动态判断和回复生成必须在锁外，后续消息
             # 才能继续进入上下文，供收尾窗口观察。
@@ -1048,7 +1063,7 @@ class GroupChatBot:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.debug("表情自动收集任务失败: %s", exc)
+            logger.debug("表情自动收集任务失败：%s", exc)
 
     async def send_meme(
         self,
@@ -1090,7 +1105,7 @@ class GroupChatBot:
             # 对动图格式的兼容差异，也保证新旧表情包走同一种发送格式。
             image_bytes = await asyncio.to_thread(manager.to_png_bytes, image_bytes)
         except Exception as exc:
-            logger.warning("[表情库] 图片转 PNG 失败: %s", exc)
+            logger.warning("[表情库] 图片转 PNG 失败：%s", exc)
             return {"success": False, "error": "表情图片无法转换为 PNG", "item": item}
         try:
             send_with_id = getattr(self.qq_adapter, "send_image_with_id", None)
@@ -1110,12 +1125,12 @@ class GroupChatBot:
                     getattr(self.qq_adapter, "last_sent_message_id", "") or ""
                 )
         except Exception as exc:
-            logger.warning("[表情库] 发送失败: %s", exc)
+            logger.warning("[表情库] 发送失败：%s", exc)
             return {"success": False, "error": str(exc)}
         if not success:
             return {"success": False, "error": "QQ 适配器发送失败", "item": item}
         await asyncio.to_thread(manager.record_use, item.get("id", ""))
-        logger.info("[表情库] 发送成功: %s -> %s", item.get("category", ""), session_id)
+        logger.info("[表情库] 发送成功：分类=%s，会话=%s", item.get("category", ""), session_id)
         return {
             "success": True,
             "item": item,
@@ -1172,7 +1187,7 @@ class GroupChatBot:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("[目标判断] 准备判断失败，回退旧决策: %s", exc)
+            logger.warning("[目标判断] 准备判断失败，回退旧决策：%s", exc)
             return ConversationJudgeResult.unavailable(str(exc))
 
     def _decide_reply(
@@ -1210,7 +1225,7 @@ class GroupChatBot:
             # 动态判断是最终的目标依据；程序提取的 @/回复信息仍会放入模型上下文。
             if not judge_should_reply:
                 logger.info(
-                    "[目标判断] 本轮不参与：target=%s intent=%s reason=%s",
+                    "[目标判断] 本轮不参与：目标=%s，意图=%s，理由=%s",
                     judge_target,
                     judge_intent,
                     judge.get("reason", ""),
@@ -1272,7 +1287,7 @@ class GroupChatBot:
         # 跳过整个 bot 决策链，避免触发后续 stale-plan 链路。
         if (message.content or "").strip() == "[无法识别的消息]":
             logger.info(
-                f"[静默] 无法识别的消息，跳过 bot 决策: {message.content}"
+                f"[静默] 无法识别的消息，跳过机器人决策：{message.content}"
             )
             return
 
@@ -1398,7 +1413,9 @@ class GroupChatBot:
                 message.message_id or message.sender_id,
             )
             return None
-        logger.debug(f"[指向] {direction} (触发: {trigger_reasons}, 延续对话={continuing})")
+        logger.debug(
+            f"[指向] {direction}（触发：{trigger_reasons}，延续对话={continuing}）"
+        )
 
         return {
             "direction": direction,
@@ -1464,7 +1481,7 @@ class GroupChatBot:
             )
         ):
             # 新的定向消息应该由 _handle_message 创建的新任务负责，旧插话不抢答。
-            logger.info("[发送复核] 新消息已明确对 bot 说，放弃旧插话")
+            logger.info("[发送复核] 新消息已明确对机器人说，放弃旧插话")
             return None, True
 
         # 内容无法渲染（segment 都解析不出来）→ 没有可用语义输入，硬插话
@@ -1810,7 +1827,7 @@ class GroupChatBot:
                         return
                     if latest_judgement.target == "bot":
                         # 新定向消息会由 _handle_message 的任务替换机制负责。
-                        logger.info("[发送复核] 最新消息已动态判断为对 Bot 说，放弃旧插话")
+                        logger.info("[发送复核] 最新消息已动态判断为对机器人说，放弃旧插话")
                         return
                     conversation_judgement = latest_judgement.to_dict()
                     effective_context_item = latest_item
@@ -1922,7 +1939,7 @@ class GroupChatBot:
                             len(glossary), "、".join(g["term"] for g in glossary),
                         )
             except Exception as exc:
-                logger.debug("黑话匹配失败: %s", exc)
+                logger.debug("黑话匹配失败：%s", exc)
 
             # === 生成回复（direction 控制是否可沉默） ===
             try:
@@ -1948,7 +1965,7 @@ class GroupChatBot:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(f"Error generating reply: {e}", exc_info=True)
+                logger.error(f"生成回复时出错：{e}", exc_info=True)
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
                 return
@@ -1978,7 +1995,7 @@ class GroupChatBot:
             # 用它做兜底，避免空 category/空 id 的随机抽图路径被这里误判为沉默。
             has_meme_intent = bool(tool_meme_called or tool_meme_category or tool_meme_id)
             if reply is None and not has_meme_intent:
-                logger.info(f"[沉默] direction={direction}，不参与该条消息")
+                logger.info(f"[沉默] 回复方向={direction}，不参与该条消息")
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
                 return
@@ -2155,7 +2172,7 @@ class GroupChatBot:
                 else self.response_filter.filter(reply)
             )
             if not passed:
-                logger.info(f"回复被过滤: {result}")
+                logger.info(f"回复被过滤：{result}")
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
                 return
@@ -2235,7 +2252,9 @@ class GroupChatBot:
                         sent_segments.append(seg)
                         if not first_sent_message_id:
                             first_sent_message_id = str(outbound_message_id or "")
-                        logger.info(f"[回复段{i+1}/{len(segments)}] {self.personality.name}: {seg[:50]}")
+                        logger.info(
+                            f"[回复段{i+1}/{len(segments)}] {self.personality.name}：{seg[:50]}"
+                        )
                         # 段间延迟，模拟真人打字停顿
                         if i < len(segments) - 1:
                             await asyncio.sleep(random.uniform(0.6, 2.0))
@@ -2264,7 +2283,7 @@ class GroupChatBot:
                             meme_result.get("message_id") or ""
                         )
                     if not meme_sent:
-                        logger.info("[表情库] 本轮没有可发送的表情: %s", meme_result.get("error", "未知原因"))
+                        logger.info("[表情库] 本轮没有可发送的表情：%s", meme_result.get("error", "未知原因"))
             finally:
                 # 任务可能在段间被新的"对我说"消息取消；已经发到群里的内容
                 # 必须记录状态和上下文（全部是同步操作，取消中也能安全执行），
@@ -2274,7 +2293,7 @@ class GroupChatBot:
                     if meme_sent:
                         meme_label = (meme_item or {}).get("category", "表情")
                         sent_reply = f"{sent_reply} [发送表情包：{meme_label}]".strip()
-                    logger.info(f"[回复] {self.personality.name}: {sent_reply[:50]}...")
+                        logger.info(f"[回复] {self.personality.name}：{sent_reply[:50]}……")
 
                     # Bot回复后状态更新（真实概率：高概率的@/回复不触发冷却，对话可延续）
                     self.speaking_decider.on_bot_reply(
@@ -2307,7 +2326,7 @@ class GroupChatBot:
                     self._store_group_analysis_bot_message(session_id, sent_reply)
 
             if not sent_segments and not meme_sent:
-                logger.error("Failed to send reply")
+                logger.error("回复发送失败")
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
                 return
@@ -2338,10 +2357,10 @@ class GroupChatBot:
 
         except asyncio.CancelledError:
             # 被更新的"对我说"消息取代，静默退出
-            logger.debug(f"Reply task cancelled: {session_id}")
+            logger.debug(f"回复任务已取消：{session_id}")
             raise
         except Exception as e:
-            logger.error(f"Compose/send error: {e}", exc_info=True)
+            logger.error(f"组织或发送回复时出错：{e}", exc_info=True)
         finally:
             # 释放会话锁：只有自己仍是当前登记的任务才移除，避免误删被更新的任务
             if self._reply_tasks.get(session_id) is asyncio.current_task():
@@ -2397,7 +2416,7 @@ class GroupChatBot:
                 "message_id": message.message_id,
             })
         except Exception as e:
-            logger.debug("Record media trail failed: %s", e)
+            logger.debug("记录媒体轨迹失败：%s", e)
 
     def _collect_group_image_urls(self, message: Message) -> list[dict]:
         """取当前图片消息之前、同一人连续发的纯图片（URL+file，相邻间隔≤60s）。
@@ -2433,7 +2452,7 @@ class GroupChatBot:
             now = entry["ts"]  # 向前推移，判断下一条与前一条的间隔
         collected.reverse()  # 时间正序
         if collected:
-            logger.debug("[连图] 当前图前收集 %d 张组图: %s", len(collected), [c["url"] for c in collected])
+            logger.debug("[连图] 当前图前收集 %d 张组图：%s", len(collected), [c["url"] for c in collected])
         return collected
 
     def _build_image_conversation_context(self, message: Message) -> str:
@@ -2540,7 +2559,7 @@ class GroupChatBot:
 
             return "\n".join(lines)
         except Exception as e:
-            logger.debug("Build image conversation context failed: %s", e)
+            logger.debug("构建图片对话上下文失败：%s", e)
             return ""
 
     def _is_reply_to_bot(self, message: Message) -> bool:
@@ -2673,7 +2692,7 @@ class GroupChatBot:
         except Exception as exc:
             # 恢复失败不能阻塞当前消息；下次新建窗口时仍可再尝试。
             window.restored_from_storage = False
-            logger.debug("恢复近期记忆失败: %s", exc)
+            logger.debug("恢复近期记忆失败：%s", exc)
 
     def _store_group_analysis_message(self, message: Message, session_id: str) -> None:
         """保存完整群聊流水，供日报使用，不进入普通记忆链路。"""
@@ -2707,7 +2726,7 @@ class GroupChatBot:
             try:
                 await self.memory_storage.store_group_analysis_message(memory)
             except Exception as exc:
-                logger.debug("群日报消息保存失败: %s", exc)
+                logger.debug("群日报消息保存失败：%s", exc)
 
         task = self._track_memory_task(_save())
         self._group_analysis_write_tasks.add(task)
@@ -2739,7 +2758,7 @@ class GroupChatBot:
             try:
                 await self.memory_storage.store_group_analysis_message(memory)
             except Exception as exc:
-                logger.debug("Bot 群日报消息保存失败: %s", exc)
+                logger.debug("机器人群日报消息保存失败：%s", exc)
 
         task = self._track_memory_task(_save())
         self._group_analysis_write_tasks.add(task)
@@ -2978,7 +2997,7 @@ class GroupChatBot:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("[群日报] %s 生成失败: %s", session_id, exc, exc_info=True)
+            logger.error("[群日报] %s 生成失败：%s", session_id, exc, exc_info=True)
             if not automatic and self.qq_adapter:
                 await self.qq_adapter.send_message(session_id, "群日报生成失败了，具体错误已记到日志里")
 
@@ -3007,7 +3026,7 @@ class GroupChatBot:
         try:
             sessions = await self.memory_storage.get_group_analysis_sessions(since=since)
         except Exception as exc:
-            logger.debug("[群日报] 获取自动分析群失败: %s", exc)
+            logger.debug("[群日报] 获取自动分析群失败：%s", exc)
             return
         report_date = now.strftime("%Y-%m-%d")
         for item in sessions:
@@ -3052,7 +3071,7 @@ class GroupChatBot:
             if deleted:
                 logger.info("[群日报] 清理过期分析数据 %d 条", deleted)
         except Exception as exc:
-            logger.debug("[群日报] 清理过期数据失败: %s", exc)
+            logger.debug("[群日报] 清理过期数据失败：%s", exc)
 
     def _store_long_term_memory(self, message: Message, session_id: str) -> None:
         """把有记忆价值的消息写入 SQLite 情景记忆（异步后台执行）
@@ -3141,14 +3160,14 @@ class GroupChatBot:
                     boost = max(0.05, memory.importance - dup.importance)
                     await self.memory_storage.bump_memories([dup.id], importance_boost=boost)
                     logger.debug(
-                        "记忆去重: 更新已有 #%d (imp %.2f→+%.2f) 而非新增",
+                        "记忆去重：更新已有 #%d（重要性 %.2f→+%.2f），而非新增",
                         dup.id, dup.importance, boost,
                     )
                     return
                 await self.memory_storage.store(memory)
-                logger.debug(f"Saved long-term memory: importance={memory.importance:.2f}")
+                logger.debug(f"长期记忆已保存：重要性={memory.importance:.2f}")
             except Exception as e:
-                logger.error(f"Failed to save memory: {e}")
+                logger.error(f"保存长期记忆失败：{e}")
 
         # 不阻塞消息处理主流程
         self._track_memory_task(_save())
@@ -3208,7 +3227,7 @@ class GroupChatBot:
                         return
                 await self.memory_storage.store(memory)
             except Exception as e:
-                logger.error(f"Failed to save bot memory: {e}")
+                logger.error(f"保存机器人记忆失败：{e}")
 
         # 不阻塞消息处理主流程
         self._track_memory_task(_save())
@@ -3286,12 +3305,12 @@ class GroupChatBot:
                 metadata={"kind": "session_summary"},
             )
             await self.memory_storage.store(memory)
-            logger.info(f"[纪要] {session_id}: {summary[:60]}...")
+            logger.info(f"[纪要] {session_id}：{summary[:60]}...")
 
             # 纪要覆盖到的最后一条消息时间；之后新到的消息下次再总结
             self._last_digest_at[session_id] = max(m.timestamp.timestamp() for m in messages)
         except Exception as e:
-            logger.error(f"Digest generation failed: {e}", exc_info=True)
+            logger.error(f"生成群聊纪要失败：{e}", exc_info=True)
         finally:
             self._digest_tasks.pop(session_id, None)
 
@@ -3470,7 +3489,7 @@ class GroupChatBot:
                     target.id, before=before, after=after, since=since
                 )
             except Exception as exc:
-                logger.debug("[画像] 读取对话上下文失败 #%s: %s", target.id, exc)
+                logger.debug("[画像] 读取对话上下文失败（编号%s）：%s", target.id, exc)
                 continue
             if len(rows) <= 1:
                 continue
@@ -3652,7 +3671,7 @@ class GroupChatBot:
         try:
             resp = await provider.chat(req)
         except Exception as exc:
-            logger.warning("[MBTI] %s 分析失败: %s", name, exc)
+            logger.warning("[MBTI] %s 分析失败：%s", name, exc)
             return None
         parsed = self._parse_mbti_response(resp.content if resp else "")
         if not parsed:
@@ -3660,7 +3679,7 @@ class GroupChatBot:
             return None
         parsed["analyzed_at"] = datetime.now().isoformat()
         logger.info(
-            "[MBTI] %s: %s（%s）",
+            "[MBTI] %s：类型=%s（%s）",
             name, parsed["type"],
             "、".join(f"{d['axis']}{d['letter']}{d['confidence']}" for d in parsed["dimensions"]),
         )
@@ -3770,7 +3789,7 @@ class GroupChatBot:
                     )
                 except Exception as exc:
                     # 记录失败不能反过来阻断其它用户画像；内存标记仍然有效。
-                    logger.debug("[画像] 保存提炼尝试记录失败: %s", exc)
+                    logger.debug("[画像] 保存提炼尝试记录失败：%s", exc)
 
             by_scope: dict[tuple, dict] = {}
             for sid, source_scope in scopes:
@@ -3787,7 +3806,7 @@ class GroupChatBot:
                         after=suppressions.get(scope_key),
                     )
                 except Exception as exc:
-                    logger.warning("[画像] %s 素材读取失败，跳过本范围: %s", sid, exc)
+                    logger.warning("[画像] %s 素材读取失败，跳过本范围：%s", sid, exc)
                     result["failed"] += 1
                     if not result["error"]:
                         result["error"] = str(exc)
@@ -3953,7 +3972,7 @@ class GroupChatBot:
                 try:
                     resp = await provider.chat(req)
                 except Exception as exc:
-                    logger.warning("[画像] %s 提炼失败，继续处理其他用户: %s", latest_name, exc)
+                    logger.warning("[画像] %s 提炼失败，继续处理其他用户：%s", latest_name, exc)
                     result["failed"] += 1
                     await remember_profile_attempt(scope_key, material_sig)
                     if not result["error"]:
@@ -3961,7 +3980,7 @@ class GroupChatBot:
                     continue
                 summary = (getattr(resp, "content", "") or "").strip().strip('"\'“”')
                 if not summary:
-                    logger.info("[画像] 跳过 %s：LLM 返回空", latest_name)
+                    logger.info("[画像] 跳过 %s：语言模型返回空", latest_name)
                     await remember_profile_attempt(scope_key, material_sig)
                     result["skipped"] += 1
                     continue
@@ -3988,7 +4007,7 @@ class GroupChatBot:
                 )
                 warnings = self._profile_quality_warnings(summary)
                 if warnings:
-                    logger.info("[画像] %s 质量提示: %s", latest_name, "；".join(warnings))
+                    logger.info("[画像] %s 质量提示：%s", latest_name, "；".join(warnings))
                 # MBTI：与画像共用素材，只在画像确实更新且素材足够时才分析。
                 # 失败或素材不足时沿用上一次的结果，不影响画像写入。
                 mbti = existing_meta.get("mbti")
@@ -4019,7 +4038,7 @@ class GroupChatBot:
                 try:
                     latest_suppressions = await self.memory_storage.get_profile_suppressions()
                 except Exception as exc:
-                    logger.warning("[画像] %s 保存前无法确认删除抑制，跳过本轮: %s", latest_name, exc)
+                    logger.warning("[画像] %s 保存前无法确认删除抑制，跳过本轮：%s", latest_name, exc)
                     result["failed"] += 1
                     if not result["error"]:
                         result["error"] = str(exc)
@@ -4067,15 +4086,15 @@ class GroupChatBot:
                     await self.memory_storage.clear_profile_suppression(sid, profile_scope)
                     await self.memory_storage.clear_profile_attempt(sid, profile_scope)
                 except Exception as exc:
-                    logger.warning("[画像] %s 保存失败，继续处理其他用户: %s", latest_name, exc)
+                    logger.warning("[画像] %s 保存失败，继续处理其他用户：%s", latest_name, exc)
                     result["failed"] += 1
                     if not result["error"]:
                         result["error"] = str(exc)
                     continue
                 result["distilled"] += 1
-                logger.info(f"[画像] {latest_name}: {summary[:50]}...")
+                logger.info(f"[画像] {latest_name}：{summary[:50]}...")
         except Exception as e:
-            logger.error(f"User profile distillation failed: {e}", exc_info=True)
+            logger.error(f"提炼用户画像失败：{e}", exc_info=True)
             result["error"] = str(e)
         finally:
             guard.release()
@@ -4297,7 +4316,7 @@ class GroupChatBot:
             rows = await self.memory_storage.list_slang()
         except Exception as exc:
             result["error"] = str(exc)
-            logger.error("列出黑话供自动清理失败: %s", exc, exc_info=True)
+            logger.error("列出黑话供自动清理失败：%s", exc, exc_info=True)
             return result
 
         auto_rows = [
@@ -4344,7 +4363,7 @@ class GroupChatBot:
             all_lines.reverse()
         except Exception as exc:
             result["error"] = str(exc)
-            logger.error("读取黑话清理素材失败: %s", exc, exc_info=True)
+            logger.error("读取黑话清理素材失败：%s", exc, exc_info=True)
             return result
 
         max_entries = max(1, int(cleanup_cfg.get("max_entries", 40)))
@@ -4364,7 +4383,7 @@ class GroupChatBot:
                     )
                 except Exception as exc:
                     logger.error(
-                        "黑话自动审核失败（%s）: %s", session_id, exc, exc_info=True
+                        "黑话自动审核失败（%s）：%s", session_id, exc, exc_info=True
                     )
                     if not result["error"]:
                         result["error"] = str(exc)
@@ -4451,7 +4470,7 @@ class GroupChatBot:
                     "、".join(i["term"] for i in items[:8]),
                 )
         except Exception as exc:
-            logger.error("黑话提取失败: %s", exc, exc_info=True)
+            logger.error("黑话提取失败：%s", exc, exc_info=True)
             result["error"] = str(exc)
         return result
 
@@ -4468,7 +4487,7 @@ class GroupChatBot:
                 if m.source_session and m.created_at > since
             }
         except Exception as exc:
-            logger.debug("列出活跃会话失败: %s", exc)
+            logger.debug("列出活跃会话失败：%s", exc)
         for session_id in sorted(sessions):
             if not str(session_id).startswith("group_"):
                 continue  # 黑话是群内共识，私聊没有这个概念
@@ -4511,7 +4530,7 @@ class GroupChatBot:
                 hours=int(cleanup_cfg.get("lookback_hours", 168))
             )
         except Exception as exc:
-            logger.error("[黑话清理] 定时任务失败: %s", exc, exc_info=True)
+            logger.error("[黑话清理] 定时任务失败：%s", exc, exc_info=True)
             return
         if result["deleted"] or result["checked"]:
             logger.info(
@@ -4553,7 +4572,7 @@ class GroupChatBot:
                 decay_presets=self.memory_decay_presets,
             )
         except Exception as e:
-            logger.error(f"Semantic search failed: {e}")
+            logger.error(f"语义检索失败：{e}")
 
         if not memories:
             # 兜底只取该会话最近的消息，不按重要性拿一条无关的旧画像/旧事实。
@@ -4562,7 +4581,7 @@ class GroupChatBot:
                     session_id, limit=limit, memory_type="episodic"
                 )
             except Exception as e:
-                logger.error(f"Failed to retrieve memories: {e}")
+                logger.error(f"读取相关记忆失败：{e}")
                 memories = []
 
         # 排除当前消息自己（若已落库且被召回）：通过 metadata.message_id 匹配
@@ -4578,7 +4597,7 @@ class GroupChatBot:
                 session_id, limit=2, memory_type="session_summary"
             )
         except Exception as e:
-            logger.debug(f"Digest retrieval skipped: {e}")
+            logger.debug(f"读取群聊纪要失败，跳过：{e}")
             digests = []
         if digests:
             digest_ids = {d.id for d in digests}
@@ -4613,7 +4632,7 @@ class GroupChatBot:
             if profile_picks:
                 memories = profile_picks + memories
         except Exception as e:
-            logger.debug(f"Profile retrieval skipped: {e}")
+            logger.debug(f"读取用户画像失败，跳过：{e}")
 
         # 只刷新真正命中的画像访问时间；不提升 importance，也不把无关召回当成强化。
         profile_ids = [
@@ -4624,7 +4643,7 @@ class GroupChatBot:
             try:
                 await self.memory_storage.update_access_many(profile_ids)
             except Exception as e:
-                logger.debug(f"Profile access update skipped: {e}")
+                logger.debug(f"更新用户画像访问记录失败，跳过：{e}")
 
         return memories
 
@@ -4641,7 +4660,7 @@ class GroupChatBot:
                 session=session_id, limit=2
             )
         except Exception as exc:
-            logger.debug(f"Group report retrieval skipped: {exc}")
+            logger.debug(f"读取群日报失败，跳过：{exc}")
             return context_prompt
         if not reports:
             return context_prompt
@@ -4678,7 +4697,7 @@ class GroupChatBot:
 
         self._running = True
         logger.info("=" * 50)
-        logger.info(f"GroupChatBot is running as {self.personality.name}!")
+        logger.info(f"爱丽丝已开始运行，当前名称：{self.personality.name}")
         logger.info("=" * 50)
 
         # 清理任务必须在连接前启动：connect() 成功后会一直阻塞服务 WebSocket，
@@ -4689,8 +4708,8 @@ class GroupChatBot:
         try:
             await self.qq_adapter.connect()
         except Exception as e:
-            logger.warning(f"QQ连接失败 (可继续运行用于测试): {e}")
-            logger.warning("提示: 请确保 NapCat QQ机器人 已启动")
+            logger.warning(f"QQ 连接失败（可继续运行用于测试）：{e}")
+            logger.warning("提示：请确保 NapCat QQ 机器人已启动")
             # 不停止 - 让bot以测试模式运行
 
         # 保持运行
@@ -4713,7 +4732,7 @@ class GroupChatBot:
             await self._maybe_cleanup_slang()
             await self._maybe_group_analysis()
             await self._maybe_cleanup_group_analysis()
-            logger.debug("Cleaned up expired states")
+            logger.debug("已清理过期状态")
 
     async def _maybe_decay_memories(self) -> None:
         """定期对长期记忆应用时间衰减（每6小时一次，避免频繁写库）"""
@@ -4735,13 +4754,13 @@ class GroupChatBot:
                 presets=self.memory_decay_presets,
             )
             if result["deleted"]:
-                logger.info(f"[记忆衰减] {result}")
+                logger.info(f"[记忆衰减] 检查结果：{result}")
         except Exception as e:
-            logger.error(f"Memory decay failed: {e}")
+            logger.error(f"记忆衰减失败：{e}")
 
     async def stop(self) -> None:
         """停止 Bot"""
-        logger.info("Stopping GroupChatBot...")
+        logger.info("正在停止爱丽丝...")
         self._running = False
 
         current_loop = asyncio.get_running_loop()
@@ -4858,7 +4877,7 @@ class GroupChatBot:
             pass
 
         elapsed = time.time() - self._start_time
-        logger.info(f"GroupChatBot stopped after {elapsed:.0f}s")
+        logger.info(f"爱丽丝已停止，运行时长 {elapsed:.0f} 秒")
 
     def _get_default_config(self) -> dict:
         """获取默认配置 - 全部通过Web页面配置"""
@@ -5204,7 +5223,9 @@ async def main():
 
         dashboard_thread = threading.Thread(target=start_dashboard, daemon=True)
         dashboard_thread.start()
-        logger.info(f"Dashboard running at http://{args.dashboard_host}:{args.dashboard_port}")
+        logger.info(
+            f"管理面板已启动：http://{args.dashboard_host}:{args.dashboard_port}"
+        )
 
         # 在线程中连接 QQ 适配器
         async def connect_qq():
@@ -5216,13 +5237,13 @@ async def main():
             try:
                 await bot.qq_adapter.connect()
             except Exception as e:
-                logger.warning(f"QQ连接失败: {e}")
+                logger.warning(f"QQ 连接失败：{e}")
                 # 连接失败也保持本线程的清理循环运行（测试模式）
                 await asyncio.gather(cleanup_task, return_exceptions=True)
 
         qq_thread = threading.Thread(target=lambda: asyncio.run(connect_qq()), daemon=True)
         qq_thread.start()
-        logger.info("QQ adapter starting in background...")
+        logger.info("QQ 适配器正在后台启动...")
 
         # 保持运行直到被中断
         try:

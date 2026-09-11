@@ -77,7 +77,7 @@ class QQAdapter(PlatformAdapter):
         self._running = True
         self._connected = False
 
-        logger.info(f"Starting WebSocket server at {self.ws_host}:{self.ws_port}...")
+        logger.info(f"正在启动 WebSocket 服务：{self.ws_host}:{self.ws_port}……")
 
         try:
             self._server = await websockets.serve(
@@ -88,28 +88,28 @@ class QQAdapter(PlatformAdapter):
                 ping_timeout=10,
             )
             self._connected = True
-            logger.info(f"WebSocket server started successfully! Waiting for NapCat connection...")
+            logger.info("WebSocket 服务已启动，正在等待 NapCat 连接...")
 
             # 保持运行
             async with self._server:
                 await asyncio.Future()
 
         except Exception as e:
-            logger.error(f"Server error: {e}")
+            logger.error(f"WebSocket 服务出错：{e}")
             self._connected = False
 
     async def _handle_client(self, websocket) -> None:
         """处理 NapCat 客户端连接"""
-        logger.info(f"NapCat connected from {websocket.remote_address}")
+        logger.info(f"NapCat 已连接，来源：{websocket.remote_address}")
         self._clients.add(websocket)
 
         try:
             async for message in websocket:
                 await self._handle_message(message)
         except websockets.exceptions.ConnectionClosed:
-            logger.info("NapCat disconnected")
+            logger.info("NapCat 已断开连接")
         except Exception as e:
-            logger.error(f"Client error: {e}")
+            logger.error(f"客户端连接出错：{e}")
         finally:
             self._clients.discard(websocket)
 
@@ -138,9 +138,9 @@ class QQAdapter(PlatformAdapter):
                 message_type = data.get("message_type", "private")
                 message = self._parse_message(data)
                 if message.message_id and not self._remember_message_id(message.message_id):
-                    logger.debug("Skip duplicated message: %s", message.message_id)
+                    logger.debug("跳过重复消息：%s", message.message_id)
                     return
-                logger.info(f"[{'群聊' if message_type == 'group' else '私聊'}] {message.sender_name}: {message.content[:50]}...")
+                logger.info(f"[{'群聊' if message_type == 'group' else '私聊'}] {message.sender_name}：{message.content[:50]}……")
                 task = asyncio.create_task(self._dispatch_message(message))
                 self._message_tasks.add(task)
                 task.add_done_callback(self._message_tasks.discard)
@@ -149,12 +149,12 @@ class QQAdapter(PlatformAdapter):
             elif post_type == "meta_event":
                 meta_type = data.get("meta_event_type", "")
                 if meta_type == "lifecycle":
-                    logger.info("NapCat connected!")
+                    logger.info("NapCat 已连接！")
                 elif meta_type == "heartbeat":
-                    logger.debug("Heartbeat received")
+                    logger.debug("已收到心跳")
 
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
+            logger.error(f"处理消息时出错：{e}")
 
     async def _dispatch_message(self, message: Message) -> None:
         """独立处理消息，让接收循环能继续接收 API 回执和后续群消息。"""
@@ -164,7 +164,7 @@ class QQAdapter(PlatformAdapter):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("Message callback failed: %s", exc, exc_info=True)
+            logger.error("消息回调执行失败：%s", exc, exc_info=True)
 
     def _remember_message_id(self, message_id: str) -> bool:
         """记录入站消息 ID；返回 False 表示近期已经处理过。"""
@@ -299,7 +299,7 @@ class QQAdapter(PlatformAdapter):
 
     async def _handle_api_call(self, action: str, params: dict, echo: str = None) -> None:
         """处理 API 调用"""
-        logger.debug(f"API call: {action}")
+        logger.debug(f"调用 API：{action}")
 
         response = {"status": "ok", "retcode": 0, "data": {}}
         if echo:
@@ -322,14 +322,14 @@ class QQAdapter(PlatformAdapter):
             group_id = params.get("group_id")
             message = params.get("message", "")
             response["data"] = {"message_id": self._gen_message_id()}
-            logger.info(f"Sending to group {group_id}: {message[:50]}...")
+            logger.info(f"正在向群 {group_id} 发送消息：{message[:50]}……")
         elif action == "send_private_msg":
             user_id = params.get("user_id")
             message = params.get("message", "")
             response["data"] = {"message_id": self._gen_message_id()}
-            logger.info(f"Sending to user {user_id}: {message[:50]}...")
+            logger.info(f"正在向用户 {user_id} 发送消息：{message[:50]}……")
         else:
-            logger.debug(f"API call: {action}")
+            logger.debug(f"调用 API：{action}")
 
         # 发送到所有客户端
         await self._broadcast(json.dumps(response))
@@ -448,7 +448,7 @@ class QQAdapter(PlatformAdapter):
     ) -> tuple[bool, str]:
         """发送消息并返回平台实际生成的消息 ID。"""
         if not self._clients:
-            logger.error("No NapCat connected")
+            logger.error("NapCat 未连接")
             return False, ""
 
         try:
@@ -480,10 +480,10 @@ class QQAdapter(PlatformAdapter):
             except (asyncio.TimeoutError, ConnectionError, RuntimeError) as first_exc:
                 # NapCat 反向 ws 重启时容易撞上 send 时刻：等重连再重试一次
                 logger.warning(
-                    "send_message 首调失败（%s），等 NapCat 重连后重试一次", first_exc
+                    "发送消息接口首次调用失败（%s），等 NapCat 重连后重试一次", first_exc
                 )
                 if not await self._wait_for_napcat(timeout=60.0):
-                    logger.error("NapCat 重连超时，放弃 send_message")
+                    logger.error("NapCat 重连超时，放弃发送消息")
                     return False, ""
                 response = await self.call_api(
                     message_data["action"], message_data["params"]
@@ -492,7 +492,7 @@ class QQAdapter(PlatformAdapter):
             self.messages_sent += 1
             return True, message_id
         except Exception as e:
-            logger.exception(f"Failed to send: {e!r}")
+            logger.exception(f"发送消息失败：{e!r}")
             return False, ""
 
     async def send_message(
@@ -515,7 +515,7 @@ class QQAdapter(PlatformAdapter):
     ) -> tuple[bool, str]:
         """发送内嵌图片并返回平台实际生成的消息 ID。"""
         if not self._clients:
-            logger.error("No NapCat connected")
+            logger.error("NapCat 未连接")
             return False, ""
         if not image_bytes:
             return False, ""
@@ -542,7 +542,7 @@ class QQAdapter(PlatformAdapter):
                 if not png_bytes:
                     raise
                 logger.warning(
-                    "NapCat 拒绝 GIF 图片，转首帧 PNG 重试: %s",
+                    "NapCat 拒绝 GIF 图片，转首帧 PNG 重试：%s",
                     exc,
                 )
                 encoded_png = base64.b64encode(png_bytes).decode("ascii")
@@ -560,26 +560,26 @@ class QQAdapter(PlatformAdapter):
                     response = await self.call_api(action, params)
                 except (asyncio.TimeoutError, ConnectionError, RuntimeError) as first_exc:
                     logger.warning(
-                        "send_image 首调失败（%s），等 NapCat 重连后重试一次", first_exc
+                        "发送图片接口首次调用失败（%s），等 NapCat 重连后重试一次", first_exc
                     )
                     if not await self._wait_for_napcat(timeout=60.0):
-                        logger.error("NapCat 重连超时，放弃 send_image")
+                        logger.error("NapCat 重连超时，放弃发送图片")
                         return False, ""
                     response = await self.call_api(action, params)
             except (asyncio.TimeoutError, ConnectionError) as first_exc:
                 # NapCat 反向 ws 重启时容易撞上 send 时刻：等重连再重试一次
                 logger.warning(
-                    "send_image 首调失败（%s），等 NapCat 重连后重试一次", first_exc
+                    "发送图片接口首次调用失败（%s），等 NapCat 重连后重试一次", first_exc
                 )
                 if not await self._wait_for_napcat(timeout=60.0):
-                    logger.error("NapCat 重连超时，放弃 send_image")
+                    logger.error("NapCat 重连超时，放弃发送图片")
                     return False, ""
                 response = await self.call_api(action, params)
             message_id = self._record_outbound_message(response)
             self.messages_sent += 1
             return True, message_id
         except Exception as e:
-            logger.exception(f"Failed to send image: {e!r}")
+            logger.exception(f"发送图片失败：{e!r}")
             return False, ""
 
     async def send_image(
@@ -639,7 +639,7 @@ class QQAdapter(PlatformAdapter):
                 frame.save(output, format="PNG", optimize=True)
                 return output.getvalue()
         except Exception as exc:
-            logger.debug("GIF 转 PNG 失败: %s", exc)
+            logger.debug("GIF 转 PNG 失败：%s", exc)
             return None
 
     async def send_group_message(self, group_id: str, content: str, reply_to_id: str | None = None) -> bool:
@@ -665,7 +665,7 @@ class QQAdapter(PlatformAdapter):
         if self._server:
             self._server.close()
             await self._server.wait_closed()
-        logger.info("Disconnected")
+        logger.info("QQ 适配器已断开连接")
 
     @property
     def is_connected(self) -> bool:

@@ -152,7 +152,7 @@ class ConversationJudge:
                 "sender_id": str(getattr(current_message, "sender_id", "") or ""),
             }
             logger.info(
-                "[目标判断] %s -> target=%s intent=%s reply=%s confidence=%.2f reason=%s",
+                "[目标判断] %s → 目标=%s，意图=%s，是否回复=%s，置信度=%.2f，理由=%s",
                 result.evidence["message_id"] or "no-id",
                 result.target,
                 result.intent,
@@ -164,7 +164,7 @@ class ConversationJudge:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("[目标判断] 调用失败，回退旧决策: %s", exc)
+            logger.warning("[目标判断] 调用失败，回退旧决策：%s", exc)
             return ConversationJudgeResult.unavailable(str(exc))
 
     async def review_reply(
@@ -229,7 +229,7 @@ class ConversationJudge:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.debug("[复读判断] 调用失败: %s", exc)
+            logger.debug("[复读判断] 调用失败：%s", exc)
             return ConversationJudgeResult.unavailable(str(exc))
 
     def _build_prompt(

@@ -56,7 +56,7 @@ class Personality:
             # `cls(**data)`，否则一个未知字段就让整个人格回退成默认值。
             return cls.from_dict(data if isinstance(data, dict) else {})
         except Exception as e:
-            logger.error(f"Failed to load personality from {path}: {e}")
+            logger.error(f"从 {path} 加载人格配置失败：{e}")
             return cls()
 
     @classmethod

@@ -27,7 +27,7 @@ class ClaudeProvider(LLMProvider):
             self.base_url += "/"
         self.base_url += "v1/messages"
 
-        logger.info(f"Initialized Claude provider: {self.base_url}, model: {self.model}")
+        logger.info(f"Claude 提供商已初始化：地址={self.base_url}，模型={self.model}")
 
     @property
     def provider_name(self) -> str:
@@ -75,7 +75,7 @@ class ClaudeProvider(LLMProvider):
                     for tool in request.tools
                 ]
                 logger.info(
-                    "[tool_use] Claude request 携带 %d 个工具: %s",
+                    "[工具调用] Claude 请求携带 %d 个工具：%s",
                     len(body["tools"]),
                     [t["name"] for t in body["tools"]],
                 )
@@ -90,7 +90,9 @@ class ClaudeProvider(LLMProvider):
                 ) as response:
                     if response.status != 200:
                         error_text = await response.text()
-                        logger.error(f"Claude API error: {response.status} - {error_text}")
+                        logger.error(
+                            f"Claude API 接口出错：{response.status} - {error_text}"
+                        )
                         raise Exception(f"API error: {response.status} - {error_text}")
 
                     result = await response.json()
@@ -109,7 +111,7 @@ class ClaudeProvider(LLMProvider):
                     })
 
             logger.info(
-                "[tool_use] Claude response: stop_reason=%s, content_len=%d, tool_calls=%d (%s)",
+                "[工具调用] Claude 返回：停止原因=%s，内容长度=%d，工具调用数=%d（%s）",
                 result.get("stop_reason", "stop"),
                 len(content),
                 len(tool_calls),
@@ -131,10 +133,10 @@ class ClaudeProvider(LLMProvider):
             )
 
         except aiohttp.ClientError as e:
-            logger.error(f"Client error: {e}")
+            logger.error(f"客户端请求出错：{e}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error in chat: {e}", exc_info=True)
+            logger.error(f"聊天请求发生未预期错误：{e}", exc_info=True)
             raise
 
     def format_claude_messages(self, messages) -> list:
@@ -267,7 +269,7 @@ class ClaudeProvider(LLMProvider):
                                 pass
 
         except Exception as e:
-            logger.error(f"Stream error: {e}", exc_info=True)
+            logger.error(f"流式聊天请求出错：{e}", exc_info=True)
             raise
 
     async def close(self) -> None:

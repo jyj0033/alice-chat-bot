@@ -112,7 +112,7 @@ class MemoryStorage:
         # 内存向量缓存：memory_id -> list[float]（LRU，有上限，防长期运行内存膨胀）
         self._embed_cache: OrderedDict[int, list] = OrderedDict()
         self._embed_cache_max = 2048
-        logger.info(f"Memory storage initialized at {db_path}")
+        logger.info(f"记忆存储已初始化：{db_path}")
 
     def _cache_embed(self, memory_id: int, vector: list) -> None:
         """写向量缓存（LRU 淘汰最旧，避免无限增长）"""
@@ -379,7 +379,7 @@ class MemoryStorage:
         ))
         self.conn.commit()
         memory.id = cursor.lastrowid
-        logger.debug(f"Stored memory: {memory.id}, type={memory.memory_type}")
+        logger.debug(f"记忆已保存：编号={memory.id}，类型={memory.memory_type}")
         return memory.id
 
     @_db_locked
@@ -1390,7 +1390,7 @@ class MemoryStorage:
         """, (days,))
         self.conn.commit()
         deleted = cursor.rowcount
-        logger.info(f"Cleaned up {deleted} old memories")
+        logger.info(f"已清理 {deleted} 条过期记忆")
         return deleted
 
     def _row_to_memory(self, row: sqlite3.Row) -> Memory:
@@ -1515,7 +1515,7 @@ class MemoryStorage:
             self.conn.commit()
             self._cache_embed(memory_id, vector)
         except Exception as e:
-            logger.error(f"Failed to save embedding for memory {memory_id}: {e}")
+            logger.error(f"保存记忆 {memory_id} 的向量失败：{e}")
 
     def clear_embed_cache(self, ids: set = None) -> None:
         """清理向量缓存（删除记忆后调用）"""
@@ -1742,7 +1742,7 @@ class MemoryStorage:
 
         self.conn.commit()
         if deleted:
-            logger.info(f"Time decay checked: {decayed} stale, {deleted} deleted")
+            logger.info(f"记忆衰减检查完成：{decayed} 条过期，删除 {deleted} 条")
         return {"decayed": decayed, "deleted": deleted}
 
     @_db_locked
@@ -1773,7 +1773,7 @@ class AsyncMemoryStorage:
                     # 与 QQ/Dashboard 共享的 SQLite 连接。
                     await asyncio.to_thread(self._storage.update_embedding, mid, vecs[0])
             except Exception as e:
-                logger.debug(f"Embedding on store skipped: {e}")
+                logger.debug(f"保存时生成向量失败，已跳过：{e}")
         return mid
 
     async def retrieve(
@@ -2026,7 +2026,7 @@ class AsyncMemoryStorage:
                 if result is not None:
                     return result
             except Exception as e:
-                logger.error(f"Vector search failed, fallback to TF-IDF: {e}")
+                logger.error(f"向量检索失败，回退 TF-IDF：{e}")
 
         return await asyncio.to_thread(
             self._storage.semantic_search, query, session, limit,
@@ -2100,7 +2100,7 @@ class AsyncMemoryStorage:
                 if m.id not in recalled_by_id:
                     recalled_by_id[m.id] = m
         except Exception as e:
-            logger.debug(f"Lexical recall skipped: {e}")
+            logger.debug(f"词法召回失败，已跳过：{e}")
         recalled = list(recalled_by_id.values())
 
         # 4. 重排

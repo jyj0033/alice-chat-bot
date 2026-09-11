@@ -198,7 +198,7 @@ class MemeManager:
             self.config = fresh.config
             # 配置路径改变时不切换当前对象的清单，避免 Web 保存配置造成数据漂移。
             if fresh.root != self.root:
-                logger.warning("表情库 storage_path 修改后将在重启时生效: %s", fresh.root)
+                logger.warning("表情库存储路径修改后将在重启时生效：%s", fresh.root)
             else:
                 # 配置更新时顺带同步磁盘最新清单：自动收集/其他入口可能已经
                 # 往 catalog.json 写入了新素材，运行时还停留在启动时的快照，
@@ -224,7 +224,7 @@ class MemeManager:
                 if isinstance(name, str) and isinstance(desc, dict):
                     self._catalog["categories"].setdefault(name, desc)
         except Exception as exc:
-            logger.warning("重载表情包清单失败，保留现有清单: %s", exc)
+            logger.warning("重载表情包清单失败，保留现有清单：%s", exc)
 
     def reload(self) -> None:
         """供外部入口（列表读取、发送前）同步磁盘最新清单。"""
@@ -254,7 +254,7 @@ class MemeManager:
                         if isinstance(value, dict)
                     }
         except Exception as exc:
-            logger.warning("读取表情包清单失败，将使用空清单: %s", exc)
+            logger.warning("读取表情包清单失败，将使用空清单：%s", exc)
         return default
 
     def _save_catalog(self) -> None:
@@ -1004,9 +1004,9 @@ class MemeManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("自动收集表情失败: %s", exc)
+                logger.debug("自动收集表情失败：%s", exc)
         if result:
-            logger.info("[表情库] 自动收集 %d 张，来源=%s", len(result), message.session_id)
+            logger.info("[表情库] 自动收集 %d 张，来源：%s", len(result), message.session_id)
         return result
 
     async def _download_segment_bytes(self, adapter: Any, segment: Any) -> bytes:
