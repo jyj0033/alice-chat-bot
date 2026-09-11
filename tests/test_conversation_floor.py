@@ -364,6 +364,28 @@ class ConversationFloorTests(unittest.TestCase):
         self.assertTrue(decision.should_speak)
         self.assertIn("动态判断", decision.reason)
 
+    def test_dynamic_interjection_can_override_rich_only_silence_plan(self):
+        manager = ConversationFloorManager()
+        current = self.message(
+            "u1",
+            "https://example.com/article",
+            0,
+            message_id="m-rich",
+        )
+
+        _, plan = manager.analyze(
+            current,
+            [current],
+            bot_id="bot",
+            mentioned_others=[],
+            ignore_other_target_signal=True,
+            allow_dynamic_interjection=True,
+            rich_message_only=True,
+            rich_type="link",
+        )
+
+        self.assertNotEqual(plan.action, ActionType.SILENT)
+
     def test_taboo_group_topic_does_not_trigger_unsolicited_interjection(self):
         """禁忌话题在群友互聊时不主动插话，明确问 bot 时交给生成器做边界回复。"""
         awareness = SocialAwarenessManager(taboo_topics=["政治宗教"])

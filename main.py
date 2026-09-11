@@ -3,6 +3,7 @@
 基于 AstrBot 设计的增强版主入口
 """
 import asyncio
+from dataclasses import replace
 import logging
 import random
 import signal
@@ -40,7 +41,7 @@ from modules.social.awareness import SocialAwarenessManager, SocialContext, Trig
 from modules.social.attention import AttentionManager, AttentionKeywordsDetector
 from modules.social.fatigue import FatigueManager
 from modules.social.enhanced_decider import EnhancedSpeakingDecider
-from modules.social.conversation_floor import ConversationFloorManager
+from modules.social.conversation_floor import ActionType, ConversationFloorManager
 from modules.social.conversation_judge import ConversationJudge, ConversationJudgeResult
 
 from modules.reply.generator import ReplyGenerator, ThinkingDelay, ResponseFilter
@@ -575,6 +576,14 @@ class GroupChatBot:
 
         # 每条群消息先做一次轻量的目标/接话意图判断；随机发言概率仍负责
         # 拟人化节奏，但不再独自决定“这句话是不是在对 Bot 说”。
+        self._configure_conversation_judge()
+
+    def _configure_conversation_judge(self) -> None:
+        """按当前配置创建目标判断器。
+
+        这个组件是无状态的，热更新时直接替换实例即可；正在执行的旧请求仍
+        会持有旧实例，不会因为 Web 保存配置而被中途改写。
+        """
         judge_config = self.config.get("conversation_judge", {}) or {}
         judge_provider_id = str(
             judge_config.get("provider_id") or self.active_provider_id or ""
@@ -585,7 +594,7 @@ class GroupChatBot:
         self.conversation_judge = ConversationJudge(
             provider=judge_provider,
             bot_id=str(self.config.get("qq", {}).get("self_id", "") or ""),
-            bot_name=bot_nickname,
+            bot_name=self.personality.name,
             enabled=judge_config.get("enabled", True),
             timeout=judge_config.get("timeout", 8.0),
             max_tokens=judge_config.get("max_tokens", 220),
@@ -742,6 +751,10 @@ class GroupChatBot:
             search_client, tool_llm = self._init_search()
             self.reply_generator.search_client = search_client
             self.reply_generator.tool_llm = tool_llm
+
+        # 目标/接话判断也使用独立 provider 配置；否则 Web 切换 provider、
+        # 超时或开关后，当前进程仍会继续使用启动时的旧判断器。
+        self._configure_conversation_judge()
 
         if self.meme_manager:
             self.meme_manager.update_config(self.config.get("meme_manager", {}))
@@ -1045,11 +1058,22 @@ class GroupChatBot:
             logger.warning("[表情库] 图片转 PNG 失败: %s", exc)
             return {"success": False, "error": "表情图片无法转换为 PNG", "item": item}
         try:
-            success = await self.qq_adapter.send_image(
-                session_id,
-                image_bytes,
-                reply_to_id=(reply_to_id or None),
-            )
+            send_with_id = getattr(self.qq_adapter, "send_image_with_id", None)
+            if callable(send_with_id):
+                success, outbound_message_id = await send_with_id(
+                    session_id,
+                    image_bytes,
+                    reply_to_id=(reply_to_id or None),
+                )
+            else:
+                success = await self.qq_adapter.send_image(
+                    session_id,
+                    image_bytes,
+                    reply_to_id=(reply_to_id or None),
+                )
+                outbound_message_id = str(
+                    getattr(self.qq_adapter, "last_sent_message_id", "") or ""
+                )
         except Exception as exc:
             logger.warning("[表情库] 发送失败: %s", exc)
             return {"success": False, "error": str(exc)}
@@ -1057,7 +1081,11 @@ class GroupChatBot:
             return {"success": False, "error": "QQ 适配器发送失败", "item": item}
         await asyncio.to_thread(manager.record_use, item.get("id", ""))
         logger.info("[表情库] 发送成功: %s -> %s", item.get("category", ""), session_id)
-        return {"success": True, "item": item}
+        return {
+            "success": True,
+            "item": item,
+            "message_id": str(outbound_message_id or ""),
+        }
 
     async def _judge_conversation_message(
         self,
@@ -1343,6 +1371,7 @@ class GroupChatBot:
         message: Message,
         direction: str,
         action_plan,
+        conversation_judgement: dict | None = None,
     ) -> tuple[object, bool]:
         """思考延迟后用最新群聊重新校验非定向行为计划。
 
@@ -1361,20 +1390,35 @@ class GroupChatBot:
         if not newer:
             return action_plan, False
 
-        cancel, cancel_reason = self.conversation_floor_manager.should_cancel(
-            action_plan,
-            recent,
-            bot_id=str(self.config.get("qq", {}).get("self_id", "")),
-        )
-        if cancel:
-            logger.info(f"[发送复核] 放弃回复：{cancel_reason}")
-            return None, True
+        judgement = conversation_judgement or {}
+        judgement_available = bool(judgement.get("available"))
+        dynamic_should_reply = bool(judgement.get("should_reply"))
+        dynamic_target = str(judgement.get("target") or "")
+
+        # 如果最新消息已经经过动态判断并明确允许参与，不能再用旧 plan
+        # 的机械“有人先回答/话题已变”信号把它取消；否则模型判断只在前一
+        # 步骤生效，到了发送复核又被旧规则覆盖。
+        if not (judgement_available and dynamic_should_reply):
+            cancel, cancel_reason = self.conversation_floor_manager.should_cancel(
+                action_plan,
+                recent,
+                bot_id=str(self.config.get("qq", {}).get("self_id", "")),
+            )
+            if cancel:
+                logger.info(f"[发送复核] 放弃回复：{cancel_reason}")
+                return None, True
 
         latest = newer[-1]
         self_id = str(self.config.get("qq", {}).get("self_id", ""))
-        if latest.directed_to_bot or (
-            latest.reply_to_qq and self_id
-            and str(latest.reply_to_qq) == self_id
+        if (
+            not judgement_available
+            and (
+                latest.directed_to_bot
+                or (
+                    latest.reply_to_qq and self_id
+                    and str(latest.reply_to_qq) == self_id
+                )
+            )
         ):
             # 新的定向消息应该由 _handle_message 创建的新任务负责，旧插话不抢答。
             logger.info("[发送复核] 新消息已明确对 bot 说，放弃旧插话")
@@ -1422,23 +1466,51 @@ class GroupChatBot:
 
         # 最新消息本身已经由快速路径写入上下文；这里仅重新计算发言权计划，
         # 不重新抽一次随机概率，避免同一条候选回复被随机数重复改变。
+        dynamic_is_directed = judgement_available and dynamic_target == "bot"
+        dynamic_continuing = dynamic_is_directed and str(
+            judgement.get("intent") or ""
+        ) in {"follow_up", "acknowledge", "answer"}
+        # 动态判断已经确认要参与时，不能再让旧的 @/回复机械信号或“纯链接
+        # 不点评”规则把 action plan 改回 silent；对话模型才是当前消息的
+        # 目标裁判，floor 只负责决定以多短的方式接话。
+        allow_dynamic_interjection = judgement_available and dynamic_should_reply
+        plan_rich_only = rich_message_only
+        if allow_dynamic_interjection and rich_type not in (
+            "image", "mface", "face", "video"
+        ):
+            plan_rich_only = False
         _, refreshed = self.conversation_floor_manager.analyze(
             latest,
             recent,
             bot_id=self_id,
             is_private=False,
-            directed_to_bot=False,
-            continuing=False,
+            directed_to_bot=dynamic_is_directed,
+            continuing=dynamic_continuing,
             mentioned_others=[
                 str(user_id)
                 for user_id in getattr(latest, "mentioned_user_ids", ())
                 if str(user_id) != self_id
             ],
+            ignore_other_target_signal=allow_dynamic_interjection,
+            dynamic_target_user_id=str(judgement.get("target_user_id") or ""),
+            allow_dynamic_interjection=allow_dynamic_interjection,
             topic_relevance=topic_relevance,
             is_question=latest_probe.is_direct_question,
-            rich_message_only=rich_message_only,
+            rich_message_only=plan_rich_only,
             rich_type=rich_type,
         )
+        if allow_dynamic_interjection and refreshed.action == ActionType.SILENT:
+            # 仍保留“短接话”边界，不把动态判断升级成长篇回答；这里只是
+            # 将没有机械 floor 分支的消息转成可执行的最小回复计划。
+            refreshed = replace(
+                refreshed,
+                action=ActionType.REACT,
+                tone="自然接一句，不复述前文",
+                max_chars=14,
+                wait_multiplier=1.0,
+                directed=False,
+                reason="动态判断允许参与，采用短接话",
+            )
         if refreshed.action.value == "silent":
             logger.info("[发送复核] 最新上下文不适合插话，放弃旧回复")
             return None, True
@@ -1660,11 +1732,18 @@ class GroupChatBot:
                     decision["context_marker"] = self._latest_user_context_marker(
                         session_id
                     )
+                else:
+                    # 旧判断只属于原始触发消息，不能在目标已经切换后继续
+                    # 作为新消息的生成约束；本轮改用本地 floor 的保守回退。
+                    conversation_judgement = {}
 
             # 思考期间群聊可能已经向前发展；普通插话过期时放弃，仍适合时
             # 把行为计划切换到最新群友消息，避免旧计划套新上下文。
             action_plan, plan_cancelled = self._refresh_action_plan_after_wait(
-                message, direction, action_plan
+                message,
+                direction,
+                action_plan,
+                conversation_judgement=conversation_judgement,
             )
             if plan_cancelled:
                 return
@@ -1877,10 +1956,31 @@ class GroupChatBot:
                         },
                         avoid_paraphrase=True,
                     )
-                    if retry_reply is None:
+                    # generate() 当前返回包含表情包工具结果的 dict；兼容旧版
+                    # 直接返回字符串，避免复读重答分支把 dict 当作文本继续处理。
+                    if isinstance(retry_reply, dict):
+                        retry_text = retry_reply.get("reply")
+                        retry_meme_category = retry_reply.get("meme_category")
+                        retry_meme_id = (retry_reply.get("meme_id") or "").strip()
+                        retry_meme_called = bool(retry_reply.get("meme_called"))
+                    else:
+                        retry_text = retry_reply
+                        retry_meme_category = None
+                        retry_meme_id = ""
+                        retry_meme_called = False
+
+                    retry_has_meme_intent = bool(
+                        retry_meme_called or retry_meme_category or retry_meme_id
+                    )
+                    if retry_text is None and not retry_has_meme_intent:
                         logger.info("[复读判断] 重答选择沉默")
                         return
-                    reply = retry_reply
+                    # 重答是完整替代结果，不能沿用上一版已经被判定为复读的
+                    # 工具调用或 marker；否则可能出现“新文字 + 旧表情包”。
+                    reply = retry_text if retry_text is not None else ""
+                    tool_meme_category = retry_meme_category
+                    tool_meme_id = retry_meme_id
+                    tool_meme_called = retry_meme_called
 
             # 表情包选择标记只在内部流转，不能进入群聊文本、记忆或日报。
             meme_category = None
@@ -2071,6 +2171,12 @@ class GroupChatBot:
                     )
                     meme_sent = bool(meme_result.get("success"))
                     meme_item = meme_result.get("item")
+                    if meme_sent and not first_sent_message_id:
+                        # 纯表情包回复也必须有真实消息 ID；否则下一条群友
+                        # 回复这张图时，目标判断器无法建立“回复了 Bot”的关系。
+                        first_sent_message_id = str(
+                            meme_result.get("message_id") or ""
+                        )
                     if not meme_sent:
                         logger.info("[表情库] 本轮没有可发送的表情: %s", meme_result.get("error", "未知原因"))
             finally:

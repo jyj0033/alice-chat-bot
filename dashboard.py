@@ -201,6 +201,12 @@ async def update_config(request: Request):
                 current.get('conversation_floor', {}), data['conversation_floor']
             )
 
+        # 群聊目标/接话判断器：由主进程热替换，保存后立即生效。
+        if 'conversation_judge' in data:
+            current['conversation_judge'] = deep_merge(
+                current.get('conversation_judge', {}), data['conversation_judge']
+            )
+
         if 'rich_media' in data:
             current['rich_media'] = deep_merge(
                 current.get('rich_media', {}), data['rich_media']

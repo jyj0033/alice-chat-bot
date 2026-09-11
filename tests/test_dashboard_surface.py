@@ -36,6 +36,11 @@ class DashboardSurfaceTests(unittest.TestCase):
         required_ids = {
             "page-behavior",
             "floor-active-window",
+            "judge-enabled",
+            "judge-provider-id",
+            "judge-timeout",
+            "judge-max-tokens",
+            "judge-context-messages",
             "rich-enabled",
             "rich-forward-enabled",
             "rich-links-enabled",

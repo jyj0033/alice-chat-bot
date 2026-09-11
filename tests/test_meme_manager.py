@@ -180,6 +180,25 @@ class MemeManagerTests(unittest.TestCase):
         with Image.open(BytesIO(sent[0])) as image:
             self.assertEqual(image.format, "PNG")
 
+    def test_send_meme_returns_outbound_message_id(self):
+        item = self.manager.add_bytes(_png_bytes(), category="吐槽")
+
+        class Adapter:
+            async def send_image_with_id(self, session_id, image_bytes, reply_to_id=None):
+                return True, "img-42"
+
+        from main import GroupChatBot
+
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.meme_manager = self.manager
+        bot.qq_adapter = Adapter()
+
+        import asyncio
+
+        result = asyncio.run(bot.send_meme("group_123", meme_id=item["id"]))
+        self.assertTrue(result["success"])
+        self.assertEqual(result["message_id"], "img-42")
+
     def test_auto_collect_reuses_enricher_and_respects_scope(self):
         content = _png_bytes((20, 180, 130))
         data_url = "data:image/png;base64," + base64.b64encode(content).decode("ascii")

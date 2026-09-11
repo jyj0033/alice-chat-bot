@@ -2350,6 +2350,17 @@
                 </div>
 
                 <div class="card">
+                    <div class="card-header"><div class="card-title"><span class="card-ico"><svg class="icon-sm"><use href="#i-cpu"/></svg></span>动态对话目标判断</div><span class="badge blue">LLM</span></div>
+                    <div class="form-grid">
+                        <div class="form-group"><label>启用动态判断</label><div class="toggle-row" style="padding-top: 6px; max-width: 120px;"><label class="toggle"><input type="checkbox" id="judge-enabled"><span class="toggle-slider"></span></label></div><div class="hint">结合上下文判断消息是在对谁说、是否接话；关闭后退回旧规则</div></div>
+                        <div class="form-group"><label>判断使用的 Provider</label><input type="text" id="judge-provider-id" placeholder="primary"><div class="hint">填写 LLM 配置中的 provider 名称，留空使用当前主模型</div></div>
+                        <div class="form-group"><label>判断超时（秒）</label><input type="number" id="judge-timeout" min="1" max="30" step="0.5"><div class="hint">超时会保守回退，不阻塞后续消息入库</div></div>
+                        <div class="form-group"><label>判断最大 Tokens</label><input type="number" id="judge-max-tokens" min="120" max="500" step="10"></div>
+                        <div class="form-group"><label>携带历史消息数</label><input type="number" id="judge-context-messages" min="6" max="30"><div class="hint">越大越能处理省略指代，但每条消息会增加一次判断成本</div></div>
+                    </div>
+                </div>
+
+                <div class="card">
                     <div class="card-header"><div class="card-title"><span class="card-ico"><svg class="icon-sm"><use href="#i-share"/></svg></span>富媒体总开关与转发</div></div>
                     <div class="form-grid">
                         <div class="form-group"><label>启用富媒体处理</label><div class="toggle-row" style="padding-top: 6px; max-width: 120px;"><label class="toggle"><input type="checkbox" id="rich-enabled"><span class="toggle-slider"></span></label></div></div>
@@ -4160,6 +4171,13 @@
             document.getElementById('floor-burst-threshold').value = floor.burst_message_threshold ?? 4;
             document.getElementById('floor-topic-shift').value = floor.topic_shift_threshold ?? 0.12;
 
+            const judge = config.conversation_judge || {};
+            document.getElementById('judge-enabled').checked = judge.enabled !== false;
+            document.getElementById('judge-provider-id').value = judge.provider_id || '';
+            document.getElementById('judge-timeout').value = judge.timeout ?? 8;
+            document.getElementById('judge-max-tokens').value = judge.max_tokens ?? 220;
+            document.getElementById('judge-context-messages').value = judge.context_messages ?? 16;
+
             const rich = config.rich_media || {};
             const forward = rich.forward || {};
             const links = rich.links || {};
@@ -4255,6 +4273,13 @@
                     burst_window_seconds: parseFloat(document.getElementById('floor-burst-window').value),
                     burst_message_threshold: parseInt(document.getElementById('floor-burst-threshold').value),
                     topic_shift_threshold: parseFloat(document.getElementById('floor-topic-shift').value)
+                },
+                conversation_judge: {
+                    enabled: document.getElementById('judge-enabled').checked,
+                    provider_id: document.getElementById('judge-provider-id').value.trim(),
+                    timeout: parseFloat(document.getElementById('judge-timeout').value),
+                    max_tokens: parseInt(document.getElementById('judge-max-tokens').value),
+                    context_messages: parseInt(document.getElementById('judge-context-messages').value)
                 },
                 rich_media: {
                     enabled: document.getElementById('rich-enabled').checked,
@@ -4357,7 +4382,7 @@
                 method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config)
             });
             const data = await res.json();
-            showToast(data.success ? '高级行为设置已保存（重启后生效）' : '保存失败: ' + (data.error || ''), data.success ? 'success' : 'error');
+            showToast(data.success ? '高级行为设置已保存（动态判断设置立即生效）' : '保存失败: ' + (data.error || ''), data.success ? 'success' : 'error');
         }
 
         async function testEmbedding() {

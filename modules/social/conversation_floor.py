@@ -440,7 +440,7 @@ class ConversationFloorManager:
             confidence = 0.38
             reason = "纯媒体消息只适合偶尔短反应"
             wait_multiplier = 0.8
-        elif rich_message_only:
+        elif rich_message_only and not allow_dynamic_interjection:
             action = ActionType.SILENT
             tone, max_chars = "像普通群友一样略过无人提问的分享", 0
             confidence = 0.9

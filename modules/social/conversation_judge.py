@@ -87,9 +87,18 @@ class ConversationJudge:
         self.bot_id = str(bot_id or "")
         self.bot_name = str(bot_name or "爱丽丝")
         self.enabled = bool(enabled)
-        self.timeout = max(1.0, float(timeout))
-        self.max_tokens = max(120, min(500, int(max_tokens)))
-        self.context_messages = max(6, min(30, int(context_messages)))
+        try:
+            self.timeout = max(1.0, float(timeout))
+        except (TypeError, ValueError):
+            self.timeout = 8.0
+        try:
+            self.max_tokens = max(120, min(500, int(max_tokens)))
+        except (TypeError, ValueError):
+            self.max_tokens = 220
+        try:
+            self.context_messages = max(6, min(30, int(context_messages)))
+        except (TypeError, ValueError):
+            self.context_messages = 16
 
     async def judge(
         self,
