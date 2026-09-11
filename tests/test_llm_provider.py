@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from modules.llm.base import ChatRequest
+from modules.llm.claude_provider import ClaudeProvider
 from modules.llm.openai_provider import OpenAIProvider
 
 
@@ -46,6 +47,28 @@ class OpenAIProviderResponseTests(unittest.IsolatedAsyncioTestCase):
             await provider.chat(ChatRequest(messages=[]))
 
         self.assertEqual(mock_create.call_args.kwargs["model"], "my/custom-model")
+
+
+class ClaudeProviderFormattingTests(unittest.TestCase):
+    def test_system_messages_are_kept_in_top_level_system_field(self):
+        provider = ClaudeProvider({
+            "api_key": "test-key",
+            "base_url": "https://gateway.example.com",
+            "model": "test-model",
+        })
+        request = ChatRequest()
+        request.add_system("人格约束")
+        request.add_system("目标判断结果")
+        request.add_user("当前消息")
+
+        self.assertEqual(
+            provider._format_system_prompt(request.messages),
+            "人格约束\n\n目标判断结果",
+        )
+        self.assertEqual(
+            provider.format_claude_messages(request.messages),
+            [{"role": "user", "content": "当前消息"}],
+        )
 
 
 if __name__ == "__main__":

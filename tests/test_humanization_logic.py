@@ -377,6 +377,65 @@ class HumanizationLogicTests(unittest.TestCase):
         prompt = manager.build_context_prompt("group_g1", bot_name="爱丽丝")
         self.assertIn("你自己说过的话", prompt)
 
+    def test_current_message_is_separated_from_history_and_relation_is_visible(self):
+        """生成阶段要把待回复消息单独标出，避免把整段前文当成复读对象。"""
+        manager = ContextManager()
+        manager.add_message(
+            "group_g1",
+            "u1",
+            "小明",
+            "刚才那个方案先放着",
+            message_id="m1",
+        )
+        manager.add_message(
+            "group_g1",
+            "u2",
+            "小红",
+            "那现在怎么办？",
+            message_id="m2",
+            mentioned_user_ids=["u1"],
+        )
+
+        prompt = manager.build_context_prompt(
+            "group_g1",
+            bot_name="爱丽丝",
+            bot_id="bot",
+            focus_message_id="m2",
+        )
+        self.assertIn("刚才那个方案先放着", prompt)
+        self.assertNotIn("那现在怎么办？", prompt)
+
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
+        request = generator._build_request(
+            context_prompt=prompt,
+            current_message="那现在怎么办？",
+            direction="group",
+            conversation_judgement={
+                "available": True,
+                "target": "group",
+                "intent": "follow_up",
+                "should_reply": True,
+            },
+            current_message_context={
+                "sender_id": "u2",
+                "sender_name": "小红",
+                "message_id": "m2",
+                "mentioned_user_ids": ["u1"],
+                "conversation_judgement": {
+                    "available": True,
+                    "target": "group",
+                    "intent": "follow_up",
+                    "should_reply": True,
+                },
+            },
+        )
+        user_prompt = request.messages[-1].content
+        self.assertIn("当前待回复消息", user_prompt)
+        self.assertIn("消息ID：m2", user_prompt)
+        self.assertIn("@对象：u1", user_prompt)
+        self.assertIn("相关历史上下文", user_prompt)
+        self.assertIn("不要把整段历史重新概括成回复", user_prompt)
+
     def test_profile_refusal_text_is_detected(self):
         """LLM 素材不足时的"无法提炼"拒绝文本不能存成用户画像。"""
         from main import GroupChatBot

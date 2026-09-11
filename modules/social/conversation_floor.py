@@ -168,6 +168,9 @@ class ConversationFloorManager:
         directed_to_bot: bool = False,
         continuing: bool = False,
         mentioned_others: list[str] | None = None,
+        ignore_other_target_signal: bool = False,
+        dynamic_target_user_id: str = "",
+        allow_dynamic_interjection: bool = False,
         topic_relevance: float = 0.5,
         is_question: bool = False,
         rich_message_only: bool = False,
@@ -222,14 +225,21 @@ class ConversationFloorManager:
             and 0 <= (now - previous_message.timestamp).total_seconds()
             <= self.other_target_context_seconds
         )
-        talking_to_other = bool(mentioned_others) or (
-            bool(replied_user)
-            and replied_user != str(bot_id or "")
-            and not directed_to_bot
-        ) or inferred_other_target
+        talking_to_other = (
+            not ignore_other_target_signal
+            and (
+                bool(mentioned_others)
+                or (
+                    bool(replied_user)
+                    and replied_user != str(bot_id or "")
+                    and not directed_to_bot
+                )
+                or inferred_other_target
+            )
+        )
         bot_has_floor = is_private or directed_to_bot or continuing
 
-        likely_target = replied_user
+        likely_target = str(dynamic_target_user_id or replied_user or "")
         if inferred_other_target:
             likely_target = str(previous_message.sender_id or "")
         if not likely_target and two_person_thread:
@@ -289,6 +299,7 @@ class ConversationFloorManager:
             topic_tokens=current_tokens,
             rich_message_only=rich_message_only,
             rich_type=rich_type,
+            allow_dynamic_interjection=allow_dynamic_interjection,
         )
         return floor, plan
 
@@ -363,6 +374,7 @@ class ConversationFloorManager:
         topic_tokens: set[str],
         rich_message_only: bool,
         rich_type: str,
+        allow_dynamic_interjection: bool,
     ) -> ActionPlan:
         expressive = self._is_expressive(current_message.content)
 
@@ -389,7 +401,7 @@ class ConversationFloorManager:
                 else "插话会打断正在进行的交流"
             )
             wait_multiplier = 1.0
-        elif same_sender_continuation and is_question:
+        elif same_sender_continuation and is_question and not allow_dynamic_interjection:
             # 同一用户短时间拆成多条发送时，最后一条问句通常仍是上一条
             # 的补充。先等这一轮表达结束，避免把问给群友的问题抢答。
             action = ActionType.SILENT

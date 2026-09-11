@@ -128,6 +128,23 @@ class ConversationFloorTests(unittest.TestCase):
         self.assertEqual(plan.action, ActionType.SILENT)
         self.assertIn("连续补充", plan.reason)
 
+    def test_dynamic_participation_can_override_same_sender_silence(self):
+        """模型判断当前确实适合接话时，不被机械的同人补充规则挡住。"""
+        first = self.message(
+            "u2", "你确定你用的是ds，而不是其他模型", 0, message_id="m1"
+        )
+        current = self.message("u2", "比如Gemini3f?", 6, message_id="m2")
+
+        _, plan = self.manager.analyze(
+            current,
+            [first, current],
+            bot_id="bot",
+            is_question=True,
+            allow_dynamic_interjection=True,
+        )
+
+        self.assertNotEqual(plan.action, ActionType.SILENT)
+
     def test_second_person_question_to_previous_group_member_is_silent(self):
         """无 @ 的“你确定”更像是在问上一位群友时，Bot 旁观。"""
         previous = self.message("u1", "我的鲸鱼娘说干好了", -10, message_id="m0")
@@ -311,6 +328,41 @@ class ConversationFloorTests(unittest.TestCase):
 
         self.assertFalse(decision.should_speak)
         self.assertEqual(decision.probability, 0.0)
+
+    def test_dynamic_judgement_can_choose_group_interjection(self):
+        plan = ActionPlan(
+            action=ActionType.SILENT,
+            target_message_id="m1",
+            target_user_id="u1",
+            confidence=0.9,
+            interruption_cost=0.95,
+            reason="机械规则建议旁观",
+            tone="保持旁观",
+            max_chars=0,
+            wait_multiplier=1.0,
+            directed=False,
+            is_question=True,
+            target_timestamp=self.now,
+        )
+        context = SocialContext(
+            message_content="这个我可以补充",
+            sender_id="u2",
+            group_id="g1",
+            session_id="group_g1",
+        )
+        context.extra["action_plan"] = plan
+        context.extra["conversation_judgement"] = {
+            "available": True,
+            "target": "other",
+            "intent": "add_info",
+            "should_reply": True,
+            "confidence": 0.84,
+        }
+
+        decision = EnhancedSpeakingDecider(base_probability=0.0).decide(context)
+
+        self.assertTrue(decision.should_speak)
+        self.assertIn("动态判断", decision.reason)
 
     def test_taboo_group_topic_does_not_trigger_unsolicited_interjection(self):
         """禁忌话题在群友互聊时不主动插话，明确问 bot 时交给生成器做边界回复。"""

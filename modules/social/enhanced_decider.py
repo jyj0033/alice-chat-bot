@@ -109,17 +109,36 @@ class EnhancedSpeakingDecider:
         modifiers = {}
         trigger_result = context.extra.get("trigger", {})
         action_plan = context.extra.get("action_plan")
+        judgement = context.extra.get("conversation_judgement", {}) or {}
+        judgement_available = bool(judgement.get("available"))
+        dynamic_target = str(judgement.get("target") or "")
+        dynamic_should_reply = bool(judgement.get("should_reply"))
+        dynamic_directed = (
+            judgement_available
+            and dynamic_target == "bot"
+            and dynamic_should_reply
+        )
+
+        # 动态目标判断是群聊是否参与的第一道裁判；旧的关键词/概率系统只在
+        # 判断服务不可用时兜底，避免“问号/昵称”把群友互聊强行拉成 Bot 对话。
+        if judgement_available and not dynamic_should_reply:
+            return SpeakingDecision(
+                should_speak=False,
+                probability=0.0,
+                reason="动态判断不参与",
+                modifiers={"target": dynamic_target},
+            )
 
         # === 1. 检查冷却（@ / 引用 / 当前正延续对话时跳过）===
         # 冷却用于限制“低概率随机插话”刷屏；明确对我说或 bot 刚回复过对方、
         # 对方正自然延续对话时，不应被冷却挡住，否则会错过真人之间 30-60s 的接话。
         if self.fatigue_manager.is_in_cooldown(session_id) and not (
             context.extra.get("is_private", False)
-            or context.mentioned_me
-            or context.reply_to_me
-            or self.is_conversation_with(session_id, context.sender_id)
+            or (not judgement_available and context.mentioned_me)
+            or (not judgement_available and context.reply_to_me)
+            or dynamic_directed
             or context.is_emergency
-            or trigger_result.get("forced_trigger", False)
+            or (not judgement_available and trigger_result.get("forced_trigger", False))
             or (action_plan is not None and action_plan.directed)
         ):
             remaining = self.fatigue_manager.get_cooldown_remaining(session_id)
@@ -140,6 +159,29 @@ class EnhancedSpeakingDecider:
                 modifiers={}
             )
 
+        # 动态判断器已经同时判断了“指向谁”和“是否现在参与”。只要它明确
+        # 建议参与，就不要再让旧的随机概率、同人补充或富媒体静默规则把这次
+        # 参与改回沉默；这些规则只在判断器不可用时作为降级策略。
+        if judgement_available and dynamic_should_reply:
+            confidence = float(judgement.get("confidence") or 0.0)
+            probability = max(0.7, min(0.99, confidence or 0.7))
+            target_text = {
+                "bot": "主要对 Bot 说",
+                "other": "对其他群友说但适合补充",
+                "group": "面向群聊且适合参与",
+                "unknown": "目标不明但适合参与",
+            }.get(dynamic_target, "适合参与")
+            return SpeakingDecision(
+                should_speak=True,
+                probability=probability,
+                reason=f"动态判断：{target_text}",
+                modifiers={
+                    "dynamic_target": dynamic_target,
+                    "intent": judgement.get("intent", ""),
+                    "dynamic_confidence": confidence,
+                },
+            )
+
         # 私聊中的每条普通消息天然都是对 bot 说的，不走群聊随机插话概率。
         if context.extra.get("is_private", False):
             return SpeakingDecision(
@@ -152,8 +194,9 @@ class EnhancedSpeakingDecider:
         if (
             context.extra.get("rich_message_only", False)
             and context.extra.get("rich_type") not in ("image", "mface", "face", "video")
-            and not context.mentioned_me
-            and not context.reply_to_me
+            and not dynamic_directed
+            and not (not judgement_available and context.mentioned_me)
+            and not (not judgement_available and context.reply_to_me)
             and not context.is_emergency
         ):
             return SpeakingDecision(
@@ -164,10 +207,11 @@ class EnhancedSpeakingDecider:
             )
         if (
             context.extra.get("taboo_topic", False)
-            and not context.mentioned_me
-            and not context.reply_to_me
+            and not dynamic_directed
+            and not (not judgement_available and context.mentioned_me)
+            and not (not judgement_available and context.reply_to_me)
             and not context.is_emergency
-            and not trigger_result.get("forced_trigger", False)
+            and not (not judgement_available and trigger_result.get("forced_trigger", False))
             and not (action_plan is not None and action_plan.directed)
         ):
             return SpeakingDecision(
@@ -179,8 +223,10 @@ class EnhancedSpeakingDecider:
         if (
             action_plan
             and action_plan.action == ActionType.SILENT
-            and not context.mentioned_me
-            and not context.reply_to_me
+            and not dynamic_directed
+            and not (judgement_available and dynamic_should_reply)
+            and not (not judgement_available and context.mentioned_me)
+            and not (not judgement_available and context.reply_to_me)
             and not context.is_emergency
         ):
             return SpeakingDecision(
@@ -194,7 +240,15 @@ class EnhancedSpeakingDecider:
             )
 
         # === 3. 强制触发检查 ===
-        if trigger_result.get("forced_trigger", False):
+        if dynamic_directed:
+            return SpeakingDecision(
+                should_speak=True,
+                probability=max(0.9, float(judgement.get("confidence") or 0.9)),
+                reason="动态判断：消息主要对 Bot 说",
+                modifiers={"dynamic_target": "bot", "intent": judgement.get("intent", "")},
+            )
+
+        if trigger_result.get("forced_trigger", False) and not judgement_available:
             reasons = trigger_result.get("reasons", ["强制触发"])
             return SpeakingDecision(
                 should_speak=True,
@@ -209,7 +263,10 @@ class EnhancedSpeakingDecider:
         reasons = trigger_result.get("reasons", [])
         has_nickname = any(r.startswith("昵称") for r in reasons)
         has_question = "直接提问" in reasons
-        if context.reply_to_me or (has_nickname and has_question):
+        if (
+            not judgement_available
+            and (context.reply_to_me or (has_nickname and has_question))
+        ):
             return SpeakingDecision(
                 should_speak=True,
                 probability=0.9,
@@ -261,10 +318,22 @@ class EnhancedSpeakingDecider:
         # 否则普通群友互聊也给 75% 加成会导致 bot 刷屏。
         trigger = context.extra.get("trigger", {})
         reasons = trigger.get("reasons", [])
+        judgement = context.extra.get("conversation_judgement", {}) or {}
+        judgement_available = bool(judgement.get("available"))
         is_directed = (
-            context.mentioned_me
-            or context.reply_to_me
-            or any(r.startswith(("昵称", "关键词", "被@", "被回复")) for r in reasons)
+            (
+                judgement_available
+                and judgement.get("target") == "bot"
+                and judgement.get("should_reply")
+            )
+            or (
+                not judgement_available
+                and (
+                    context.mentioned_me
+                    or context.reply_to_me
+                    or any(r.startswith(("昵称", "关键词", "被@", "被回复")) for r in reasons)
+                )
+            )
         )
         after_reply_bonus = self._get_after_reply_bonus(session_id, context.sender_id, is_directed)
         if after_reply_bonus > 0:
@@ -412,7 +481,9 @@ class EnhancedSpeakingDecider:
         if elapsed >= self.probability_duration:
             return 0.0
 
-        if not (is_directed or (sender_id and sender_id == entry.get("user_id", ""))):
+        # “最近回复过同一用户”只作为动态判断器的输入，不再单独给概率加成。
+        # 否则模型判断失败/尚未判断时，任何同一用户的普通消息都会被抬高。
+        if not is_directed:
             return 0.0
 
         # 线性衰减

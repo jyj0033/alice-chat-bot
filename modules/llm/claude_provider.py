@@ -49,6 +49,11 @@ class ClaudeProvider(LLMProvider):
                 "messages": self.format_claude_messages(request.messages),
                 "max_tokens": request.max_tokens or 1024,
             }
+            system_prompt = self._format_system_prompt(request.messages)
+            if system_prompt:
+                # Anthropic Messages API 的 system 是顶层字段，不是 messages 中
+                # 的一条 user 消息。保留层级，避免人设/行为约束被普通对话覆盖。
+                body["system"] = system_prompt
 
             if request.temperature is not None:
                 body["temperature"] = request.temperature
@@ -162,11 +167,8 @@ class ClaudeProvider(LLMProvider):
                 claude_content = content
 
             if msg.role == "system":
-                # Claude 不支持 system 消息，转换为 user 消息
-                result.append({
-                    "role": "user",
-                    "content": claude_content
-                })
+                # system 由 chat() 提取到 Anthropic 请求体顶层；不能降级为 user。
+                continue
             elif msg.role == "user":
                 result.append({
                     "role": "user",
@@ -178,6 +180,25 @@ class ClaudeProvider(LLMProvider):
                     "content": claude_content
                 })
         return result
+
+    @staticmethod
+    def _format_system_prompt(messages) -> str:
+        """合并 system 消息，供 Anthropic 顶层 system 字段使用。"""
+        parts = []
+        for msg in messages or []:
+            if getattr(msg, "role", "") != "system":
+                continue
+            content = getattr(msg, "content", "")
+            if isinstance(content, list):
+                content = "\n".join(
+                    str(item.get("text", ""))
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                )
+            content = str(content or "").strip()
+            if content:
+                parts.append(content)
+        return "\n\n".join(parts)
 
     @staticmethod
     def _image_url_to_source(url: str) -> dict:
@@ -211,6 +232,9 @@ class ClaudeProvider(LLMProvider):
                 "max_tokens": request.max_tokens or 1024,
                 "stream": True,
             }
+            system_prompt = self._format_system_prompt(request.messages)
+            if system_prompt:
+                body["system"] = system_prompt
 
             if request.temperature is not None:
                 body["temperature"] = request.temperature

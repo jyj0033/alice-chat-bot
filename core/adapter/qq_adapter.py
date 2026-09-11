@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import uuid
+from collections import deque
 from urllib.parse import quote
 
 import aiohttp
@@ -52,9 +53,13 @@ class QQAdapter(PlatformAdapter):
         self._clients: Set[websockets.WebSocketServerProtocol] = set()
         self._pending_api: dict[str, asyncio.Future] = {}
         self._message_tasks: set[asyncio.Task] = set()
+        # NapCat 重连或重复投递时，避免同一条消息重复触发回复。
+        self._seen_message_ids: set[str] = set()
+        self._seen_message_order = deque(maxlen=4000)
 
         # 消息 ID 计数器
         self._message_id = 0
+        self.last_sent_message_id = ""
 
         self.messages_sent = 0
         self.messages_received = 0
@@ -132,6 +137,9 @@ class QQAdapter(PlatformAdapter):
                 self.messages_received += 1
                 message_type = data.get("message_type", "private")
                 message = self._parse_message(data)
+                if message.message_id and not self._remember_message_id(message.message_id):
+                    logger.debug("Skip duplicated message: %s", message.message_id)
+                    return
                 logger.info(f"[{'群聊' if message_type == 'group' else '私聊'}] {message.sender_name}: {message.content[:50]}...")
                 task = asyncio.create_task(self._dispatch_message(message))
                 self._message_tasks.add(task)
@@ -157,6 +165,20 @@ class QQAdapter(PlatformAdapter):
             raise
         except Exception as exc:
             logger.error("Message callback failed: %s", exc, exc_info=True)
+
+    def _remember_message_id(self, message_id: str) -> bool:
+        """记录入站消息 ID；返回 False 表示近期已经处理过。"""
+        message_id = str(message_id or "").strip()
+        if not message_id:
+            return True
+        if message_id in self._seen_message_ids:
+            return False
+        if len(self._seen_message_order) >= self._seen_message_order.maxlen:
+            oldest = self._seen_message_order.popleft()
+            self._seen_message_ids.discard(oldest)
+        self._seen_message_order.append(message_id)
+        self._seen_message_ids.add(message_id)
+        return True
 
     def _resolve_api_response(self, echo: str, response: dict) -> None:
         future = self._pending_api.get(echo)
@@ -353,11 +375,14 @@ class QQAdapter(PlatformAdapter):
 
         # 检查是否 @ 了 bot，并收集 @ 的其他 QQ 号（区分"对bot说"和"对别人说"）
         mentioned_me = False
+        mentioned_user_ids: list[str] = []
         mentioned_others: list[str] = []
         for segment in segments:
             if segment.type != "at":
                 continue
             qq = segment.data.get("qq")
+            if qq is not None and str(qq) not in ("", "all"):
+                mentioned_user_ids.append(str(qq))
             if str(qq) == str(self.self_id):
                 mentioned_me = True
             elif qq is not None and str(qq) not in (str(self.self_id), "all"):
@@ -386,6 +411,7 @@ class QQAdapter(PlatformAdapter):
                 else json.dumps(raw_content, ensure_ascii=False, separators=(",", ":"))
             ),
             mentioned_me=mentioned_me,
+            mentioned_user_ids=list(dict.fromkeys(mentioned_user_ids)),
             mentioned_others=mentioned_others,
             reply_to_id=reply_to_id,
             reply_to_qq=reply_to_qq,
@@ -406,11 +432,16 @@ class QQAdapter(PlatformAdapter):
         """兼容旧调用：富媒体现在统一走结构化解析器。"""
         return render_segments(parse_message_segments(content))
 
-    async def send_message(self, session_id: str, content: str, reply_to_id: str | None = None) -> bool:
-        """发送消息（可选引用一条消息，供插话时指明回应对象）"""
+    async def send_message_with_id(
+        self,
+        session_id: str,
+        content: str,
+        reply_to_id: str | None = None,
+    ) -> tuple[bool, str]:
+        """发送消息并返回平台实际生成的消息 ID。"""
         if not self._clients:
             logger.error("No NapCat connected")
-            return False
+            return False, ""
 
         try:
             # OneBot v11 需要消息数组格式；带引用时在首段前加 reply 段。
@@ -435,9 +466,9 @@ class QQAdapter(PlatformAdapter):
             # 必须等待 NapCat 的 echo/retcode 回执；仅把指令写进 WebSocket
             # 不能证明 QQ 真的接受并发出了消息。
             try:
-                await self.call_api(message_data["action"], message_data["params"])
-                self.messages_sent += 1
-                return True
+                response = await self.call_api(
+                    message_data["action"], message_data["params"]
+                )
             except (asyncio.TimeoutError, ConnectionError, RuntimeError) as first_exc:
                 # NapCat 反向 ws 重启时容易撞上 send 时刻：等重连再重试一次
                 logger.warning(
@@ -445,26 +476,41 @@ class QQAdapter(PlatformAdapter):
                 )
                 if not await self._wait_for_napcat(timeout=60.0):
                     logger.error("NapCat 重连超时，放弃 send_message")
-                    return False
-                await self.call_api(message_data["action"], message_data["params"])
-                self.messages_sent += 1
-                return True
+                    return False, ""
+                response = await self.call_api(
+                    message_data["action"], message_data["params"]
+                )
+            message_id = self._record_outbound_message(response)
+            self.messages_sent += 1
+            return True, message_id
         except Exception as e:
             logger.exception(f"Failed to send: {e!r}")
-            return False
+            return False, ""
 
-    async def send_image(
+    async def send_message(
+        self,
+        session_id: str,
+        content: str,
+        reply_to_id: str | None = None,
+    ) -> bool:
+        """发送消息（可选引用一条消息，供插话时指明回应对象）。"""
+        success, _ = await self.send_message_with_id(
+            session_id, content, reply_to_id=reply_to_id
+        )
+        return success
+
+    async def send_image_with_id(
         self,
         session_id: str,
         image_bytes: bytes,
         reply_to_id: str | None = None,
-    ) -> bool:
-        """发送内嵌图片，使用 OneBot 的 base64 图片段，不依赖公网文件地址。"""
+    ) -> tuple[bool, str]:
+        """发送内嵌图片并返回平台实际生成的消息 ID。"""
         if not self._clients:
             logger.error("No NapCat connected")
-            return False
+            return False, ""
         if not image_bytes:
-            return False
+            return False, ""
 
         try:
             encoded = base64.b64encode(image_bytes).decode("ascii")
@@ -482,7 +528,7 @@ class QQAdapter(PlatformAdapter):
             # 先尝试保留原始 GIF（动画表情仍可正常发送）；只有 NapCat 明确
             # 拒绝后，才转首帧 PNG 重试，兼容部分实现对 GIF 编码的限制。
             try:
-                await self.call_api(action, params)
+                response = await self.call_api(action, params)
             except RuntimeError as exc:
                 png_bytes = self._gif_first_frame_png(image_bytes)
                 if not png_bytes:
@@ -503,15 +549,15 @@ class QQAdapter(PlatformAdapter):
                     session_id, png_message_array
                 )
                 try:
-                    await self.call_api(action, params)
+                    response = await self.call_api(action, params)
                 except (asyncio.TimeoutError, ConnectionError, RuntimeError) as first_exc:
                     logger.warning(
                         "send_image 首调失败（%s），等 NapCat 重连后重试一次", first_exc
                     )
                     if not await self._wait_for_napcat(timeout=60.0):
                         logger.error("NapCat 重连超时，放弃 send_image")
-                        return False
-                    await self.call_api(action, params)
+                        return False, ""
+                    response = await self.call_api(action, params)
             except (asyncio.TimeoutError, ConnectionError) as first_exc:
                 # NapCat 反向 ws 重启时容易撞上 send 时刻：等重连再重试一次
                 logger.warning(
@@ -519,13 +565,37 @@ class QQAdapter(PlatformAdapter):
                 )
                 if not await self._wait_for_napcat(timeout=60.0):
                     logger.error("NapCat 重连超时，放弃 send_image")
-                    return False
-                await self.call_api(action, params)
+                    return False, ""
+                response = await self.call_api(action, params)
+            message_id = self._record_outbound_message(response)
             self.messages_sent += 1
-            return True
+            return True, message_id
         except Exception as e:
             logger.exception(f"Failed to send image: {e!r}")
-            return False
+            return False, ""
+
+    async def send_image(
+        self,
+        session_id: str,
+        image_bytes: bytes,
+        reply_to_id: str | None = None,
+    ) -> bool:
+        """发送内嵌图片，使用 OneBot 的 base64 图片段，不依赖公网文件地址。"""
+        success, _ = await self.send_image_with_id(
+            session_id, image_bytes, reply_to_id=reply_to_id
+        )
+        return success
+
+    def _record_outbound_message(self, response: Any) -> str:
+        """记录 NapCat 回执里的出站消息 ID，供后续回复链识别 Bot。"""
+        if not isinstance(response, dict):
+            self.last_sent_message_id = ""
+            return ""
+        message_id = str(response.get("message_id") or "").strip()
+        self.last_sent_message_id = message_id
+        if message_id:
+            self._message_senders[message_id] = str(self.self_id or "")
+        return message_id
 
     @staticmethod
     def _build_send_message_request(

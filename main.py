@@ -41,6 +41,7 @@ from modules.social.attention import AttentionManager, AttentionKeywordsDetector
 from modules.social.fatigue import FatigueManager
 from modules.social.enhanced_decider import EnhancedSpeakingDecider
 from modules.social.conversation_floor import ConversationFloorManager
+from modules.social.conversation_judge import ConversationJudge, ConversationJudgeResult
 
 from modules.reply.generator import ReplyGenerator, ThinkingDelay, ResponseFilter
 
@@ -107,6 +108,7 @@ class GroupChatBot:
         self.fatigue_manager: Optional[FatigueManager] = None
         self.speaking_decider: Optional[EnhancedSpeakingDecider] = None
         self.conversation_floor_manager: Optional[ConversationFloorManager] = None
+        self.conversation_judge: Optional[ConversationJudge] = None
 
         # 回复生成
         self.reply_generator: Optional[ReplyGenerator] = None
@@ -120,6 +122,13 @@ class GroupChatBot:
         self._start_time: float = 0
         # 每会话正在进行的回复生成任务（同一会话同时只生成一条回复）
         self._reply_tasks: dict[str, asyncio.Task] = {}
+        self._reply_task_decisions: dict[str, dict] = {}
+        # 只保护同一会话的快速入库/状态更新；LLM 目标判断在锁外执行，
+        # 避免一次 8 秒的判断阻塞后续群消息进入上下文。
+        self._message_ingest_locks: dict[str, asyncio.Lock] = {}
+        # 目标判断按到达顺序完成，避免多个 LLM 调用乱序返回后旧消息反过来
+        # 抢占新消息的回复任务；它不影响前面的快速入库。
+        self._conversation_judge_locks: dict[str, asyncio.Lock] = {}
         self._rich_media_tasks: set[asyncio.Task] = set()
         self._meme_collect_tasks: set[asyncio.Task] = set()
         # 用户消息、Bot 回复等轻量记忆写入任务。单独跟踪，停止时等待/取消，
@@ -564,6 +573,31 @@ class GroupChatBot:
             command_prefixes=speaking_config.get("command_prefixes", ["/", "!", "#"]),
         )
 
+        # 每条群消息先做一次轻量的目标/接话意图判断；随机发言概率仍负责
+        # 拟人化节奏，但不再独自决定“这句话是不是在对 Bot 说”。
+        judge_config = self.config.get("conversation_judge", {}) or {}
+        judge_provider_id = str(
+            judge_config.get("provider_id") or self.active_provider_id or ""
+        )
+        judge_provider = self.llm_providers.get(judge_provider_id)
+        if judge_provider is None:
+            judge_provider = self.get_active_provider()
+        self.conversation_judge = ConversationJudge(
+            provider=judge_provider,
+            bot_id=str(self.config.get("qq", {}).get("self_id", "") or ""),
+            bot_name=bot_nickname,
+            enabled=judge_config.get("enabled", True),
+            timeout=judge_config.get("timeout", 8.0),
+            max_tokens=judge_config.get("max_tokens", 220),
+            context_messages=judge_config.get("context_messages", 16),
+        )
+        logger.info(
+            "✓ 群聊目标判断: enabled=%s, provider=%s, timeout=%.1fs",
+            self.conversation_judge.enabled,
+            judge_provider_id or "active",
+            self.conversation_judge.timeout,
+        )
+
     def _init_reply_generator(self) -> None:
         """初始化回复生成器"""
         thinking_config = self.config.get("thinking", {})
@@ -758,17 +792,12 @@ class GroupChatBot:
         )
         rich_trigger = self.trigger_detector.detect(rich_probe)
         rich_reasons = rich_trigger.get("reasons", [])
+        # 富媒体增强要知道“可能是对 Bot 说”还是普通分享，但这里的
+        # continuing 只是旧规则线索，不能在动态目标判断前把消息定性。
         rich_directed = (
             message.message_type == "private"
             or message.mentioned_me
             or is_reply_to_bot
-            or continuing
-            or rich_trigger.get("forced_trigger", False)
-            or "紧急" in rich_reasons
-            or (
-                any(reason.startswith("昵称") for reason in rich_reasons)
-                and rich_probe.is_direct_question
-            )
         )
         logger.info(f"[{message.group_id or '私聊'}] {message.sender_name}: {message.content[:50]}...")
 
@@ -793,13 +822,12 @@ class GroupChatBot:
             message.message_type == "private"
             or message.mentioned_me
             or is_reply_to_bot
-            or continuing
         )
-        logger.warning(
-            "[dir-trace] type=%s self_id=%s mentioned_me=%s reply_to_bot=%s continuing=%s directed=%s content=%r",
-            message.message_type, self.config.get("qq", {}).get("self_id", ""),
-            message.mentioned_me, is_reply_to_bot, continuing, directed_to_bot, message.content[:60],
+        recent_context_for_judgement = []
+        ingest_lock = self._message_ingest_locks.setdefault(
+            session_id, asyncio.Lock()
         )
+        await ingest_lock.acquire()
         try:
             # 进程重启后，先恢复该会话最近仍在上下文有效期内的 episodic 消息，
             # 再追加当前消息；这样首条消息不会让 Bot 突然失去刚才的对话。
@@ -839,8 +867,12 @@ class GroupChatBot:
                 message_id=message.message_id,
                 reply_to_id=message.reply_to_id,
                 reply_to_qq=message.reply_to_qq,
+                mentioned_user_ids=message.mentioned_user_ids,
                 directed_to_bot=directed_to_bot,
             )
+            recent_context_for_judgement = self.context_manager.get_window(
+                session_id
+            ).get_recent(30)
 
             # 长期记忆（内部已异步后台执行）
             self._store_long_term_memory(message, session_id)
@@ -855,6 +887,40 @@ class GroupChatBot:
             self._record_media_trail(message)
         except Exception as e:
             logger.error(f"Fast path error: {e}", exc_info=True)
+        finally:
+            # 只锁到快速入库结束；动态判断和回复生成必须在锁外，后续消息
+            # 才能继续进入上下文，供收尾窗口观察。
+            ingest_lock.release()
+
+        # 目标和接话意图由独立的轻量模型动态判断。它只返回结构化结果，
+        # 不生成回复；失败时由 _decide_reply 使用保守的旧逻辑回退。
+        judge_lock = self._conversation_judge_locks.setdefault(
+            session_id, asyncio.Lock()
+        )
+        async with judge_lock:
+            conversation_judgement = await self._judge_conversation_message(
+                message,
+                continuation_hint=continuing,
+                heuristic_reasons=rich_reasons,
+                recent_messages=recent_context_for_judgement,
+            )
+        if conversation_judgement.available:
+            self.context_manager.update_message_analysis(
+                session_id,
+                message.message_id,
+                directed_to_bot=(conversation_judgement.target == "bot"),
+                target=conversation_judgement.target,
+                intent=conversation_judgement.intent,
+                confidence=conversation_judgement.confidence,
+                reason=conversation_judgement.reason,
+            )
+            rich_directed = (
+                rich_directed
+                or (
+                    conversation_judgement.target == "bot"
+                    and conversation_judgement.should_reply
+                )
+            )
 
         # 富媒体增强可能涉及 NapCat API 或安全网页预览。它在后台执行，决策仍走
         # 快速路径；真正生成回复前会等待本条消息的增强结果。
@@ -882,28 +948,43 @@ class GroupChatBot:
             self._meme_collect_tasks.add(collect_task)
             collect_task.add_done_callback(self._meme_collect_tasks.discard)
 
-        # === 2. 发言决策（快，无 LLM 调用） ===
-        decision = self._decide_reply(message, is_reply_to_bot, continuing)
+        # === 2. 发言决策（目标判断已完成，下面只做本地策略合并） ===
+        decision = self._decide_reply(
+            message,
+            is_reply_to_bot,
+            continuing,
+            conversation_judgement=conversation_judgement,
+        )
         if not decision:
             return
         decision["enrichment_task"] = enrichment_task
+        decision["context_marker"] = self._latest_user_context_marker(session_id)
 
         # === 3. 调度回复生成（后台任务，避免阻塞接收循环） ===
         current = self._reply_tasks.get(session_id)
         if current and not current.done():
-            if decision["direction"].startswith("to_bot"):
-                # 正在生成时又来了更强的"对我说"信号 → 取消旧任务改回新消息
+            current_decision = self._reply_task_decisions.get(session_id) or {}
+            if (
+                decision["direction"].startswith("to_bot")
+                or current_decision.get("direction") == "group"
+            ):
+                # 新消息需要重新成为候选目标：定向消息优先替换旧任务；普通
+                # 插话任务也不能继续回答已经过期的旧消息。
                 current.cancel()
-                self._reply_tasks[session_id] = asyncio.create_task(
+                task = asyncio.create_task(
                     self._compose_and_send(message, decision)
                 )
+                self._reply_tasks[session_id] = task
+                self._reply_task_decisions[session_id] = decision
             else:
-                # 旧任务生成时会把新消息纳入上下文，无需另起一条回复
+                # 定向回复保留原问题；普通新消息会在上面的分支替换旧插话。
                 return
         else:
-            self._reply_tasks[session_id] = asyncio.create_task(
+            task = asyncio.create_task(
                 self._compose_and_send(message, decision)
             )
+            self._reply_tasks[session_id] = task
+            self._reply_task_decisions[session_id] = decision
 
     async def _collect_meme_after_enrichment(
         self,
@@ -978,11 +1059,65 @@ class GroupChatBot:
         logger.info("[表情库] 发送成功: %s -> %s", item.get("category", ""), session_id)
         return {"success": True, "item": item}
 
+    async def _judge_conversation_message(
+        self,
+        message: Message,
+        *,
+        continuation_hint: bool = False,
+        heuristic_reasons: list[str] | None = None,
+        recent_messages: list[Any] | None = None,
+    ) -> ConversationJudgeResult:
+        """对当前消息做动态目标/接话判断。"""
+        if message.message_type == "private":
+            return ConversationJudgeResult(
+                target="bot",
+                intent="answer" if self.trigger_detector else "follow_up",
+                should_reply=True,
+                confidence=0.99,
+                reference_message_id=str(message.message_id or ""),
+                target_user_id=str(message.sender_id or ""),
+                reason="私聊消息默认进入对话",
+                available=True,
+                evidence={"source": "private"},
+            )
+
+        judge = getattr(self, "conversation_judge", None)
+        if not judge:
+            return ConversationJudgeResult.unavailable("not_initialized")
+
+        try:
+            recent = (
+                list(recent_messages)
+                if recent_messages is not None
+                else self.context_manager.get_window(message.session_id).get_recent(
+                    judge.context_messages + 2
+                )
+            )
+            result = await judge.judge(
+                message,
+                recent,
+                heuristic_signals={
+                    "mentioned_me": message.mentioned_me,
+                    "mentioned_others": message.mentioned_others,
+                    "reply_to_me": self._is_reply_to_bot(message),
+                    "reply_to_qq": message.reply_to_qq or "",
+                    "continuation_hint": continuation_hint,
+                    "trigger_reasons": heuristic_reasons or [],
+                },
+            )
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[目标判断] 准备判断失败，回退旧决策: %s", exc)
+            return ConversationJudgeResult.unavailable(str(exc))
+
     def _decide_reply(
         self,
         message: Message,
         is_reply_to_bot: bool,
         continuing: bool = False,
+        conversation_judgement: ConversationJudgeResult | None = None,
     ) -> Optional[dict]:
         """发言决策（同步、快速）：返回回复参数，不发言则返回 None"""
         session_id = message.session_id
@@ -992,19 +1127,40 @@ class GroupChatBot:
         self_id = str(self.config.get("qq", {}).get("self_id", ""))
         quoted_bot = bool(message.reply_to_qq) and bool(self_id) and str(message.reply_to_qq) == self_id
 
-        # 引用/@了别人（非bot）→ 明显在跟别人说话，不当作对bot延续
-        talking_to_others = (
+        judge = (
+            conversation_judgement.to_dict()
+            if isinstance(conversation_judgement, ConversationJudgeResult)
+            else {}
+        )
+        judge_available = bool(judge.get("available"))
+        judge_target = str(judge.get("target") or "")
+        judge_should_reply = bool(judge.get("should_reply"))
+        judge_intent = str(judge.get("intent") or "")
+
+        # 旧规则只作为模型不可用时的回退线索；不再因为“最近回复过同一人”
+        # 自动把任意无标记消息定性成连续对话。
+        heuristic_talking_to_others = (
             bool(message.mentioned_others)
             or (bool(message.reply_to_qq) and not quoted_bot)
         )
-
-        # 延续对话：bot 最近确实回复成功过该用户，TA 没@没引用就接着对 bot 说。
-        continuing = continuing or (
-            not is_private
-            and not talking_to_others
-            and not message.mentioned_me
-            and self.speaking_decider.is_conversation_with(session_id, message.sender_id)
-        )
+        if judge_available:
+            # 动态判断是最终的目标依据；程序提取的 @/回复信息仍会放入模型上下文。
+            if not judge_should_reply:
+                logger.info(
+                    "[目标判断] 本轮不参与：target=%s intent=%s reason=%s",
+                    judge_target,
+                    judge_intent,
+                    judge.get("reason", ""),
+                )
+                return None
+            talking_to_others = judge_target == "other"
+            continuing = judge_target == "bot" and judge_intent in {
+                "follow_up", "acknowledge", "answer"
+            }
+        else:
+            # 判断服务不可用时保守降级：显式信号仍可回复，但不自动续接。
+            talking_to_others = heuristic_talking_to_others
+            continuing = False
 
         # 构建社交上下文
         context = SocialContext(
@@ -1031,6 +1187,8 @@ class GroupChatBot:
         )
         context.extra["rich_message_only"] = message.rich_only
         context.extra["rich_type"] = message.rich_type
+        context.extra["conversation_judgement"] = judge
+        context.extra["dynamic_target"] = judge_target if judge_available else ""
         context.extra["group_base_probability"] = group_config.get(
             "speaking_probability"
         )
@@ -1075,18 +1233,22 @@ class GroupChatBot:
                 reason.startswith("昵称")
                 for reason in trigger_result.get("reasons", [])
             )
-            directed_for_floor = (
-                is_private
-                or message.mentioned_me
-                or quoted_bot
-                or is_reply_to_bot
-                or continuing
-                or trigger_result.get("forced_trigger", False)
-                or context.is_emergency
-                or (floor_has_name and context.is_direct_question)
-            )
+            if judge_available:
+                directed_for_floor = is_private or judge_target == "bot"
+            else:
+                directed_for_floor = (
+                    is_private
+                    or message.mentioned_me
+                    or quoted_bot
+                    or is_reply_to_bot
+                    or trigger_result.get("forced_trigger", False)
+                    or context.is_emergency
+                    or (floor_has_name and context.is_direct_question)
+                )
             if directed_for_floor:
                 current_context_message.directed_to_bot = True
+            if judge_available and judge_intent == "answer":
+                context.is_direct_question = True
             floor, action_plan = self.conversation_floor_manager.analyze(
                 current_context_message,
                 recent_context_messages,
@@ -1095,6 +1257,19 @@ class GroupChatBot:
                 directed_to_bot=directed_for_floor,
                 continuing=continuing,
                 mentioned_others=message.mentioned_others,
+                ignore_other_target_signal=(
+                    judge_available and judge_should_reply
+                ),
+                allow_dynamic_interjection=(
+                    judge_available
+                    and judge_should_reply
+                    and judge_target != "bot"
+                ),
+                dynamic_target_user_id=(
+                    str(judge.get("target_user_id") or "")
+                    if judge_available
+                    else ""
+                ),
                 topic_relevance=context.topic_relevance,
                 is_question=context.is_direct_question,
                 rich_message_only=message.rich_only,
@@ -1123,14 +1298,16 @@ class GroupChatBot:
 
         if not should_speak:
             # 被明确点名却保持沉默 → 降低对发话人的关注（真人也会忙/没看见）
-            if message.mentioned_me or is_reply_to_bot:
+            if message.mentioned_me or is_reply_to_bot or (
+                judge_available and judge_target == "bot"
+            ):
                 # 私聊没有群号，用 session_id（private_xxx）作注意力键，避免所有私聊共用一个桶
                 self.attention_manager.on_no_reply(
                     message.group_id or session_id, message.sender_id
                 )
             return None
 
-        # 判断消息指向：
+        # 判断消息指向：动态判断可用时由模型结果决定；旧触发器仅作回退。
         # - 必须回：@、引用bot、强制触发、紧急
         # - 视为对我说：必须回，或（提到名字/昵称 且 带提问）
         # - 同一人延续对话：bot 刚回复过 TA，TA 没@没引用就接着对 bot 说 → 也算对我说
@@ -1142,16 +1319,14 @@ class GroupChatBot:
         has_question = any(r == "直接提问" for r in trigger_reasons)
         has_emergency = "紧急" in trigger_reasons
 
-        must_reply = is_private or message.mentioned_me or quoted_bot or forced or has_emergency
-        if must_reply or (has_name and has_question):
-            direction = "to_bot"
-        elif continuing:
-            # 延续对话是推断出来的指向：对方虽然刚和 bot 聊过，但这条也可能是
-            # 在补完自己上一句话（QQ 常见断句打字）或转头和别人说话。
-            # 用 implicit 档让 LLM 结合上下文判断，并保留沉默权。
-            direction = "to_bot_implicit"
+        if judge_available:
+            direction = "to_bot" if judge_target == "bot" else "group"
         else:
-            direction = "group"
+            must_reply = is_private or message.mentioned_me or quoted_bot or forced or has_emergency
+            if must_reply or (has_name and has_question):
+                direction = "to_bot"
+            else:
+                direction = "group"
         logger.debug(f"[指向] {direction} (触发: {trigger_reasons}, 延续对话={continuing})")
 
         return {
@@ -1160,6 +1335,7 @@ class GroupChatBot:
             "emotional_state": emotional_state,
             "context": context,
             "action_plan": action_plan,
+            "conversation_judgement": judge,
         }
 
     def _refresh_action_plan_after_wait(
@@ -1253,7 +1429,11 @@ class GroupChatBot:
             is_private=False,
             directed_to_bot=False,
             continuing=False,
-            mentioned_others=[],
+            mentioned_others=[
+                str(user_id)
+                for user_id in getattr(latest, "mentioned_user_ids", ())
+                if str(user_id) != self_id
+            ],
             topic_relevance=topic_relevance,
             is_question=latest_probe.is_direct_question,
             rich_message_only=rich_message_only,
@@ -1270,6 +1450,85 @@ class GroupChatBot:
             latest.message_id or latest.sender_id,
         )
         return refreshed, False
+
+    def _latest_user_context_message(self, session_id: str):
+        """返回会话中最新的群友消息对象。"""
+        recent = self.context_manager.get_window(session_id).get_recent(50)
+        for item in reversed(recent):
+            if not item.is_bot:
+                return item
+        return None
+
+    def _context_message_as_platform_message(
+        self,
+        session_id: str,
+        item,
+    ) -> Message:
+        """把窗口消息转换成动态判断器/生成器可复用的统一消息对象。"""
+        self_id = str(self.config.get("qq", {}).get("self_id", "") or "")
+        mentioned_ids = [
+            str(value) for value in getattr(item, "mentioned_user_ids", ()) if str(value)
+        ]
+        mentioned_others = [
+            value for value in mentioned_ids if value not in {self_id, "all"}
+        ]
+        content = str(getattr(item, "content", "") or "")
+        rich_type = ""
+        if content.startswith("[图片"):
+            rich_type = "image"
+        elif content.startswith(("[表情包", "[动画表情")):
+            rich_type = "mface"
+        elif content.startswith("[视频"):
+            rich_type = "video"
+        elif content.startswith("[链接"):
+            rich_type = "link"
+        return Message(
+            message_id=str(getattr(item, "message_id", "") or ""),
+            message_type="group",
+            sender_id=str(getattr(item, "sender_id", "") or ""),
+            sender_name=str(getattr(item, "sender_name", "") or "历史用户"),
+            group_id=str(session_id).removeprefix("group_"),
+            content=content,
+            raw_content=content,
+            mentioned_me=self_id in mentioned_ids if self_id else False,
+            mentioned_user_ids=mentioned_ids,
+            mentioned_others=mentioned_others,
+            reply_to_id=getattr(item, "reply_to_id", None),
+            reply_to_qq=getattr(item, "reply_to_qq", None),
+            outer_text=content,
+            rich_only=content.startswith((
+                "[链接", "[卡片", "[小程序", "[图片", "[表情包", "[动画表情",
+                "[视频", "[合并转发",
+            )),
+            rich_type=rich_type,
+        )
+
+    async def _judge_context_message(
+        self,
+        session_id: str,
+        item,
+        *,
+        continuation_hint: bool = False,
+    ) -> ConversationJudgeResult:
+        """等待期间有新消息时，对最新消息再次做目标判断。"""
+        judge = getattr(self, "conversation_judge", None)
+        if not judge or not item:
+            return ConversationJudgeResult.unavailable("not_initialized")
+        platform_message = self._context_message_as_platform_message(session_id, item)
+        recent = self.context_manager.get_window(session_id).get_recent(
+            judge.context_messages + 2
+        )
+        return await judge.judge(
+            platform_message,
+            recent,
+            heuristic_signals={
+                "mentioned_me": platform_message.mentioned_me,
+                "mentioned_others": platform_message.mentioned_others,
+                "reply_to_me": self._is_reply_to_bot(platform_message),
+                "reply_to_qq": platform_message.reply_to_qq or "",
+                "continuation_hint": continuation_hint,
+            },
+        )
 
     def _latest_user_context_marker(self, session_id: str):
         """返回会话里最新群友消息的稳定标记，用于检测收尾窗口是否被打断。"""
@@ -1334,6 +1593,10 @@ class GroupChatBot:
         emotional_state = decision["emotional_state"]
         context = decision["context"]
         action_plan = decision.get("action_plan")
+        conversation_judgement = decision.get("conversation_judgement") or {}
+        initial_plan_directed = bool(action_plan and action_plan.directed)
+        effective_context_item = None
+        effective_message_id = str(message.message_id or "")
 
         try:
             enrichment_task = decision.get("enrichment_task")
@@ -1344,9 +1607,6 @@ class GroupChatBot:
                     raise
                 except Exception as exc:
                     logger.debug("富媒体增强失败，使用占位符继续：%s", exc)
-
-            # === 检索长期记忆（排除当前消息，防止刚写入库的这条被自己召回） ===
-            memories = await self._retrieve_memories(message.content, session_id, exclude_id=message.message_id)
 
             # === 思考延迟（期间新消息会进入上下文，等对方把话说完） ===
             await self.thinking_delay.wait(
@@ -1361,6 +1621,45 @@ class GroupChatBot:
             # 定向回复按原有节奏及时处理；普通插话再补一个很短的 debounce，
             # 避免 LLM 只看到“享年4级”就抢先点评，错过后面紧接着的“猝/翻车”语境。
             await self._wait_for_group_settle(session_id, action_plan)
+
+            # 普通插话等待期间如果出现了新消息，先对最新消息重新做动态
+            # 目标判断；定向回复仍保留原始问题，不被旁边的新话题带走。
+            if (
+                message.message_type == "group"
+                and not initial_plan_directed
+                and decision.get("context_marker")
+                != self._latest_user_context_marker(session_id)
+            ):
+                latest_item = self._latest_user_context_message(session_id)
+                latest_judgement = await self._judge_context_message(
+                    session_id,
+                    latest_item,
+                    continuation_hint=False,
+                )
+                if latest_judgement.available:
+                    latest_id = str(getattr(latest_item, "message_id", "") or "")
+                    self.context_manager.update_message_analysis(
+                        session_id,
+                        latest_id,
+                        directed_to_bot=(latest_judgement.target == "bot"),
+                        target=latest_judgement.target,
+                        intent=latest_judgement.intent,
+                        confidence=latest_judgement.confidence,
+                        reason=latest_judgement.reason,
+                    )
+                    if not latest_judgement.should_reply:
+                        logger.info("[发送复核] 最新消息经动态判断不应参与")
+                        return
+                    if latest_judgement.target == "bot":
+                        # 新定向消息会由 _handle_message 的任务替换机制负责。
+                        logger.info("[发送复核] 最新消息已动态判断为对 Bot 说，放弃旧插话")
+                        return
+                    conversation_judgement = latest_judgement.to_dict()
+                    effective_context_item = latest_item
+                    effective_message_id = str(latest_id or "")
+                    decision["context_marker"] = self._latest_user_context_marker(
+                        session_id
+                    )
 
             # 思考期间群聊可能已经向前发展；普通插话过期时放弃，仍适合时
             # 把行为计划切换到最新群友消息，避免旧计划套新上下文。
@@ -1380,7 +1679,45 @@ class GroupChatBot:
                 ):
                     if str(candidate.message_id or "") == str(action_plan.target_message_id):
                         generation_message = candidate.content
+                        effective_context_item = candidate
+                        effective_message_id = str(candidate.message_id or "")
                         break
+
+            if effective_context_item is None and effective_message_id:
+                for candidate in reversed(
+                    self.context_manager.get_window(session_id).get_recent(50)
+                ):
+                    if str(candidate.message_id or "") == effective_message_id:
+                        effective_context_item = candidate
+                        break
+
+            effective_message = message
+            if effective_context_item is not None and (
+                str(getattr(effective_context_item, "message_id", "") or "")
+                != str(message.message_id or "")
+            ):
+                effective_message = self._context_message_as_platform_message(
+                    session_id, effective_context_item
+                )
+
+            # 普通插话的目标如果在动态判断后又变了，新的消息处理任务会重新
+            # 决定是否发言；旧任务不得把过期草稿发进群。
+            if (
+                message.message_type == "group"
+                and not initial_plan_directed
+                and decision.get("context_marker")
+                != self._latest_user_context_marker(session_id)
+                and effective_message_id == str(message.message_id or "")
+            ):
+                logger.info("[发送复核] 普通插话目标已过期，放弃旧草稿")
+                return
+
+            # 记忆查询按最终候选消息执行，避免等待后换了目标但仍召回旧问题。
+            memories = await self._retrieve_memories(
+                generation_message,
+                session_id,
+                exclude_id=effective_message_id or message.message_id,
+            )
 
             # === 构建提示词（此刻的上下文 = 思考期间的最新消息，不会回旧话题） ===
             context_prompt = self.context_manager.build_context_prompt(
@@ -1388,7 +1725,10 @@ class GroupChatBot:
                 bot_name=self.personality.name,
                 # 人格已经作为 system message 注入 ReplyGenerator，避免重复两遍。
                 persona_prompt="",
-                memories=memories
+                memories=memories,
+                bot_id=str(self.config.get("qq", {}).get("self_id", "") or ""),
+                focus_message_id=effective_message_id,
+                max_messages=self.context_manager.max_messages,
             )
 
             # === 注入最近群日报摘要：让 bot 知道"昨天/今天群里聊过啥，群友标签是啥" ===
@@ -1404,7 +1744,7 @@ class GroupChatBot:
                     and self._slang_config.get("enabled", True)
                 ):
                     glossary = await self.memory_storage.match_slang(
-                        f"{context_prompt}\n{message.content}",
+                        f"{context_prompt}\n{generation_message}",
                         session=session_id,
                         limit=self._slang_config.get("max_inject", 8),
                     )
@@ -1429,6 +1769,16 @@ class GroupChatBot:
                     action_plan=action_plan.to_dict() if action_plan else None,
                     session_id=session_id,
                     glossary=glossary,
+                    conversation_judgement=conversation_judgement,
+                    current_message_context={
+                        "sender_id": effective_message.sender_id,
+                        "sender_name": effective_message.sender_name,
+                        "message_id": effective_message.message_id,
+                        "mentioned_user_ids": effective_message.mentioned_user_ids,
+                        "reply_to_id": effective_message.reply_to_id,
+                        "reply_to_qq": effective_message.reply_to_qq,
+                        "conversation_judgement": conversation_judgement,
+                    },
                 )
             except asyncio.CancelledError:
                 raise
@@ -1471,6 +1821,66 @@ class GroupChatBot:
             # 文字发送直接走 send_meme 通道。
             if reply is None:
                 reply = ""
+
+            # 语义复读复核：先用低成本词面重叠筛出可疑草稿，再让动态判断器
+            # 区分“正常沿用关键词回答”和“只是把用户的话换个说法重述”。
+            judge = getattr(self, "conversation_judge", None)
+            review_text = reply
+            if self.meme_manager:
+                review_text = self.meme_manager.strip_directives(review_text)
+            recent_context_for_review = self.context_manager.get_window(
+                session_id
+            ).get_recent(16)
+            recent_texts = [
+                m.content for m in recent_context_for_review if not m.is_bot
+            ]
+            if (
+                judge
+                and review_text.strip()
+                and self.reply_generator.looks_like_paraphrase_candidate(
+                    review_text, recent_texts
+                )
+            ):
+                review = await judge.review_reply(
+                    effective_message,
+                    recent_context_for_review,
+                    review_text,
+                    direction=direction,
+                )
+                review_evidence = review.evidence or {}
+                if (
+                    review.available
+                    and review_evidence.get("is_paraphrase")
+                    and not review_evidence.get("adds_information")
+                ):
+                    logger.info(
+                        "[复读判断] 草稿被判定为语义复读，要求重新接话：%s",
+                        review.reason or "未增加信息",
+                    )
+                    retry_reply = await self.reply_generator.generate(
+                        context_prompt=context_prompt,
+                        current_message=generation_message,
+                        emotional_state=emotional_state,
+                        direction=direction,
+                        action_plan=action_plan.to_dict() if action_plan else None,
+                        session_id=session_id,
+                        glossary=glossary,
+                        conversation_judgement=conversation_judgement,
+                        current_message_context={
+                            "sender_id": effective_message.sender_id,
+                            "sender_name": effective_message.sender_name,
+                            "message_id": effective_message.message_id,
+                            "mentioned_user_ids": effective_message.mentioned_user_ids,
+                            "reply_to_id": effective_message.reply_to_id,
+                            "reply_to_qq": effective_message.reply_to_qq,
+                            "conversation_judgement": conversation_judgement,
+                        },
+                        avoid_paraphrase=True,
+                    )
+                    if retry_reply is None:
+                        logger.info("[复读判断] 重答选择沉默")
+                        return
+                    reply = retry_reply
 
             # 表情包选择标记只在内部流转，不能进入群聊文本、记忆或日报。
             meme_category = None
@@ -1534,6 +1944,14 @@ class GroupChatBot:
                     return
 
             # LLM 调用和模拟打字也会耗时，发送前再复核一次群聊局势。
+            if (
+                message.message_type == "group"
+                and not initial_plan_directed
+                and decision.get("context_marker")
+                != self._latest_user_context_marker(session_id)
+            ):
+                logger.info("[发送复核] 生成期间出现新消息，放弃过期草稿")
+                return
             if action_plan:
                 cancel, cancel_reason = self.conversation_floor_manager.should_cancel(
                     action_plan,
@@ -1566,12 +1984,26 @@ class GroupChatBot:
             from modules.reply.generator import split_reply_into_messages
 
             segments = split_reply_into_messages(reply)
-            # 插话进入群聊讨论时引用触发消息，让群友明确知道在回应哪一条；但
-            # 目标就是当前最新一条时不引用（真人不会引用别人刚说完的那句话），
-            # 只有目标和现在之间隔了新消息才需要指明对象。
-            # 明确对我说（directed）的消息本来就指向清楚，不用引用。
+            # 动态判断给出的引用目标优先使用；定向群聊回复也引用原消息，
+            # 避免 Bot 思考期间群里继续聊天后，看不出它到底在回答谁。
             quote_id = ""
-            if action_plan and not action_plan.directed and action_plan.target_message_id:
+            target_id = str(
+                conversation_judgement.get("reference_message_id")
+                or (action_plan.target_message_id if action_plan else "")
+                or effective_message_id
+                or ""
+            )
+            recent_ids = {
+                str(m.message_id or "")
+                for m in self.context_manager.get_window(session_id).get_recent(50)
+                if m.message_id
+            }
+            if target_id and target_id in recent_ids and (
+                direction == "to_bot"
+                or (action_plan and not action_plan.directed)
+            ):
+                quote_id = target_id
+            elif action_plan and not action_plan.directed and action_plan.target_message_id:
                 target_id = str(action_plan.target_message_id)
                 if any(
                     not m.is_bot
@@ -1581,6 +2013,7 @@ class GroupChatBot:
                 ):
                     quote_id = action_plan.target_message_id
             sent_segments = []
+            first_sent_message_id = ""
             meme_sent = False
             meme_item = None
             try:
@@ -1594,11 +2027,28 @@ class GroupChatBot:
                         if cancel:
                             logger.info(f"[分段复核] 停止剩余消息：{cancel_reason}")
                             break
-                    success = await self.qq_adapter.send_message(
-                        session_id, seg, reply_to_id=(quote_id if i == 0 else "")
+                    send_with_id = getattr(
+                        self.qq_adapter, "send_message_with_id", None
                     )
+                    if callable(send_with_id):
+                        success, outbound_message_id = await send_with_id(
+                            session_id,
+                            seg,
+                            reply_to_id=(quote_id if i == 0 else ""),
+                        )
+                    else:
+                        success = await self.qq_adapter.send_message(
+                            session_id,
+                            seg,
+                            reply_to_id=(quote_id if i == 0 else ""),
+                        )
+                        outbound_message_id = str(
+                            getattr(self.qq_adapter, "last_sent_message_id", "") or ""
+                        )
                     if success:
                         sent_segments.append(seg)
+                        if not first_sent_message_id:
+                            first_sent_message_id = str(outbound_message_id or "")
                         logger.info(f"[回复段{i+1}/{len(segments)}] {self.personality.name}: {seg[:50]}")
                         # 段间延迟，模拟真人打字停顿
                         if i < len(segments) - 1:
@@ -1639,7 +2089,7 @@ class GroupChatBot:
                         session_id,
                         group_id,
                         probability=probability,
-                        user_id=message.sender_id,
+                        user_id=effective_message.sender_id,
                     )
 
                     # 添加回复到上下文
@@ -1649,13 +2099,19 @@ class GroupChatBot:
                         sender_name=self.personality.name,
                         content=sent_reply,
                         is_bot=True,
-                        message_id="",
-                        reply_to_id=message.message_id,
-                        reply_to_qq=message.sender_id,  # bot 回复的是当前这条消息
+                        message_id=first_sent_message_id,
+                        reply_to_id=(quote_id or effective_message.message_id),
+                        reply_to_qq=effective_message.sender_id,
                     )
 
                     # bot 的回复也写入长期记忆，让会话历史两侧完整
-                    self._store_bot_memory(session_id, sent_reply)
+                    self._store_bot_memory(
+                        session_id,
+                        sent_reply,
+                        message_id=first_sent_message_id,
+                        reply_to_id=(quote_id or effective_message.message_id),
+                        reply_to_qq=effective_message.sender_id,
+                    )
                     self._store_group_analysis_bot_message(session_id, sent_reply)
 
             if not sent_segments and not meme_sent:
@@ -1698,6 +2154,7 @@ class GroupChatBot:
             # 释放会话锁：只有自己仍是当前登记的任务才移除，避免误删被更新的任务
             if self._reply_tasks.get(session_id) is asyncio.current_task():
                 self._reply_tasks.pop(session_id, None)
+                self._reply_task_decisions.pop(session_id, None)
 
     async def _enrich_context_message(
         self,
@@ -2006,6 +2463,16 @@ class GroupChatBot:
                     content=content,
                     is_bot=bool(meta.get("is_bot")),
                     message_id=message_id,
+                    reply_to_id=meta.get("reply_to_id"),
+                    reply_to_qq=meta.get("reply_to_qq"),
+                    mentioned_user_ids=meta.get("mentioned_user_ids") or [],
+                    directed_to_bot=bool(meta.get("directed_to_bot")),
+                    conversation_target=str(meta.get("conversation_target") or ""),
+                    conversation_intent=str(meta.get("conversation_intent") or ""),
+                    conversation_confidence=float(
+                        meta.get("conversation_confidence") or 0.0
+                    ),
+                    conversation_reason=str(meta.get("conversation_reason") or ""),
                     timestamp=memory.created_at,
                 )
                 restored_count += 1
@@ -2444,6 +2911,7 @@ class GroupChatBot:
         if not context_only and importance < 0.5:
             return
 
+        bot_config = getattr(self, "config", {}) or {}
         memory = Memory(
             content=f"{message.sender_name}：{content[:200]}",
             memory_type="episodic",
@@ -2456,6 +2924,13 @@ class GroupChatBot:
                 "message_id": message.message_id,  # 检索时排除当前消息自召回
                 "reply_to_id": message.reply_to_id,
                 "reply_to_qq": message.reply_to_qq,
+                "mentioned_user_ids": message.mentioned_user_ids,
+                "directed_to_bot": message.mentioned_me
+                or (
+                    str(message.reply_to_qq or "")
+                    == str(bot_config.get("qq", {}).get("self_id", ""))
+                    and bool(message.reply_to_qq)
+                ),
                 "profile_context_only": context_only,
                 # 有实义内容（非纯应声）：重启恢复会话窗口时只取这类消息，
                 # 避免“嗯”“好”“对”把真人对话挤出窗口。
@@ -2486,7 +2961,15 @@ class GroupChatBot:
         # 不阻塞消息处理主流程
         self._track_memory_task(_save())
 
-    def _store_bot_memory(self, session_id: str, content: str) -> None:
+    def _store_bot_memory(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        message_id: str = "",
+        reply_to_id: str | None = None,
+        reply_to_qq: str | None = None,
+    ) -> None:
         """把 bot 自己发出的消息写入 SQLite 情景记忆（异步后台执行）。
 
         用户消息走 _store_long_term_memory（按重要性筛选）；bot 的极短应声/表情
@@ -2511,6 +2994,9 @@ class GroupChatBot:
                 "sender_id": self_id,
                 "sender_name": self.personality.name,
                 "is_bot": True,
+                "message_id": str(message_id or ""),
+                "reply_to_id": reply_to_id,
+                "reply_to_qq": reply_to_qq,
                 # 有实义内容才能参与重启后的会话窗口恢复
                 "meaningful": len(content) >= 8
                 or any(mark in content for mark in ("?", "？", "!", "！")),
@@ -4135,6 +4621,9 @@ class GroupChatBot:
         await finish_tasks(memory_tasks, preserve_memory=True)
         self._tasks.clear()
         self._reply_tasks.clear()
+        self._reply_task_decisions.clear()
+        self._message_ingest_locks.clear()
+        self._conversation_judge_locks.clear()
         self._rich_media_tasks.clear()
         self._meme_collect_tasks.clear()
         self._digest_tasks.clear()
@@ -4310,6 +4799,13 @@ class GroupChatBot:
                 "settle_window_seconds": 0.7,
                 "settle_max_seconds": 2.4,
                 "other_target_context_seconds": 900
+            },
+            "conversation_judge": {
+                "enabled": True,
+                "provider_id": "primary",
+                "timeout": 8.0,
+                "max_tokens": 220,
+                "context_messages": 16,
             },
             "rich_media": {
                 "enabled": True,

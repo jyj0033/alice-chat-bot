@@ -59,7 +59,12 @@ class ContextMessage:
     message_id: str = ""
     reply_to_id: Optional[str] = None     # 被回复消息的 ID（平台原始字段）
     reply_to_qq: Optional[str] = None     # 被回复消息的发送者 QQ 号
+    mentioned_user_ids: tuple[str, ...] = ()  # 本条消息 @ 的全部 QQ 号（不含 all）
     directed_to_bot: bool = False         # 是否明确对 bot 说
+    conversation_target: str = ""         # 动态判断：bot / other / group / unknown
+    conversation_intent: str = ""         # 动态判断：answer / follow_up / ...
+    conversation_confidence: float = 0.0
+    conversation_reason: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -71,7 +76,12 @@ class ContextMessage:
             "message_id": self.message_id,
             "reply_to_id": self.reply_to_id,
             "reply_to_qq": self.reply_to_qq,
+            "mentioned_user_ids": list(self.mentioned_user_ids),
             "directed_to_bot": self.directed_to_bot,
+            "conversation_target": self.conversation_target,
+            "conversation_intent": self.conversation_intent,
+            "conversation_confidence": self.conversation_confidence,
+            "conversation_reason": self.conversation_reason,
         }
 
 
@@ -131,7 +141,9 @@ class ContextWindow:
         self,
         bot_name: str = "Bot",
         include_bot: bool = True,
-        max_messages: int = 30
+        max_messages: int = 30,
+        bot_id: str = "",
+        exclude_message_id: str = "",
     ) -> str:
         """构建对话文本，每条消息带 [时间] 前缀。
 
@@ -141,6 +153,11 @@ class ContextWindow:
         """
         lines = []
         recent = self.get_recent(max_messages)
+        if exclude_message_id:
+            recent = [
+                msg for msg in recent
+                if str(msg.message_id or "") != str(exclude_message_id)
+            ]
         now = datetime.now()
 
         # id → 窗口内出现过的全部昵称；昵称 → 使用它的全部 id
@@ -194,7 +211,7 @@ class ContextWindow:
         for msg in recent:
             if msg.message_id:
                 message_id_to_name[str(msg.message_id)] = display_name(msg)
-                if msg.content and not msg.is_bot:
+                if msg.content:
                     message_id_to_content[str(msg.message_id)] = msg.content
 
         for msg in recent:
@@ -229,12 +246,48 @@ class ContextWindow:
                 else:
                     pointer = f"(回@尾号{str(msg.reply_to_qq)[-4:]})"
 
+            annotations = []
+            if msg.mentioned_user_ids:
+                mentioned_names = []
+                for user_id in msg.mentioned_user_ids:
+                    user_id = str(user_id or "")
+                    if not user_id:
+                        continue
+                    if bot_id and user_id == str(bot_id):
+                        mentioned_names.append(f"{bot_name}(你)")
+                    else:
+                        mentioned_names.append(
+                            qq_to_name.get(user_id, f"QQ尾号{user_id[-4:]}")
+                        )
+                if mentioned_names:
+                    annotations.append("@" + "/@".join(mentioned_names))
+
+            if msg.directed_to_bot:
+                annotations.append("对你说")
+            if msg.conversation_target:
+                target_labels = {
+                    "bot": "动态判断对你说",
+                    "other": "动态判断对别人说",
+                    "group": "动态判断面向群聊",
+                    "unknown": "动态判断目标不明",
+                }
+                label = target_labels.get(msg.conversation_target)
+                if label:
+                    if msg.conversation_intent:
+                        label += f"/{msg.conversation_intent}"
+                    annotations.append(label)
+
             direction = ""
-            if msg.directed_to_bot and not msg.is_bot:
-                direction = "(对你说)"
+            if annotations:
+                direction = "(" + "；".join(annotations) + ")"
 
             time_str = format_message_time(msg.timestamp, now)
-            lines.append(f"[{time_str}] {speaker}{pointer}{direction}：{msg.content}")
+            pointer_text = pointer
+            if pointer_text and direction:
+                pointer_text += direction
+            elif direction:
+                pointer_text = direction
+            lines.append(f"[{time_str}] {speaker}{pointer_text}：{msg.content}")
 
         return "\n".join(lines)
 
@@ -296,7 +349,12 @@ class ContextManager:
         message_id: str = "",
         reply_to_id: Optional[str] = None,
         reply_to_qq: Optional[str] = None,
+        mentioned_user_ids: Optional[list[str] | tuple[str, ...]] = None,
         directed_to_bot: bool = False,
+        conversation_target: str = "",
+        conversation_intent: str = "",
+        conversation_confidence: float = 0.0,
+        conversation_reason: str = "",
         timestamp: Optional[datetime] = None,
     ) -> None:
         """添加消息到上下文"""
@@ -309,7 +367,14 @@ class ContextManager:
             message_id=message_id,
             reply_to_id=reply_to_id,
             reply_to_qq=reply_to_qq,
+            mentioned_user_ids=tuple(
+                dict.fromkeys(str(item) for item in (mentioned_user_ids or []) if str(item))
+            ),
             directed_to_bot=directed_to_bot,
+            conversation_target=str(conversation_target or ""),
+            conversation_intent=str(conversation_intent or ""),
+            conversation_confidence=float(conversation_confidence or 0.0),
+            conversation_reason=str(conversation_reason or ""),
             timestamp=timestamp or datetime.now(),
         ))
 
@@ -321,6 +386,14 @@ class ContextManager:
         content: str,
         is_bot: bool = False,
         message_id: str = "",
+        reply_to_id: Optional[str] = None,
+        reply_to_qq: Optional[str] = None,
+        mentioned_user_ids: Optional[list[str] | tuple[str, ...]] = None,
+        directed_to_bot: bool = False,
+        conversation_target: str = "",
+        conversation_intent: str = "",
+        conversation_confidence: float = 0.0,
+        conversation_reason: str = "",
         timestamp: Optional[datetime] = None,
     ) -> None:
         """把持久化历史消息补到会话窗口头部。"""
@@ -331,8 +404,49 @@ class ContextManager:
             content=content,
             is_bot=is_bot,
             message_id=message_id,
+            reply_to_id=reply_to_id,
+            reply_to_qq=reply_to_qq,
+            mentioned_user_ids=tuple(
+                dict.fromkeys(str(item) for item in (mentioned_user_ids or []) if str(item))
+            ),
+            directed_to_bot=directed_to_bot,
+            conversation_target=str(conversation_target or ""),
+            conversation_intent=str(conversation_intent or ""),
+            conversation_confidence=float(conversation_confidence or 0.0),
+            conversation_reason=str(conversation_reason or ""),
             timestamp=timestamp or datetime.now(),
         ))
+
+    def update_message_analysis(
+        self,
+        session_id: str,
+        message_id: str,
+        *,
+        directed_to_bot: Optional[bool] = None,
+        target: str = "",
+        intent: str = "",
+        confidence: Optional[float] = None,
+        reason: str = "",
+    ) -> bool:
+        """更新一条已进入窗口的消息的动态目标判断。"""
+        if not message_id:
+            return False
+        window = self.get_window(session_id)
+        for message in reversed(window.messages):
+            if str(message.message_id or "") != str(message_id):
+                continue
+            if directed_to_bot is not None:
+                message.directed_to_bot = bool(directed_to_bot)
+            if target:
+                message.conversation_target = str(target)
+            if intent:
+                message.conversation_intent = str(intent)
+            if confidence is not None:
+                message.conversation_confidence = max(0.0, min(1.0, float(confidence)))
+            if reason:
+                message.conversation_reason = str(reason)[:240]
+            return True
+        return False
 
     def update_message_content(
         self,
@@ -356,7 +470,9 @@ class ContextManager:
         bot_name: str = "Bot",
         persona_prompt: str = "",
         memories: list = None,
-        max_messages: int = 30
+        max_messages: int = 30,
+        bot_id: str = "",
+        focus_message_id: str = "",
     ) -> str:
         """构建上下文提示"""
         window = self.get_window(session_id)
@@ -400,7 +516,9 @@ class ContextManager:
         # 3. 最近对话
         conversation = window.build_conversation_text(
             bot_name=bot_name,
-            max_messages=max_messages
+            max_messages=max_messages,
+            bot_id=bot_id,
+            exclude_message_id=focus_message_id,
         )
         if conversation:
             parts.append(

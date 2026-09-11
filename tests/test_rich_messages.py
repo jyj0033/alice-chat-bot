@@ -226,6 +226,45 @@ class RichMessageFloorTests(unittest.TestCase):
 
 
 class NapCatApiResponseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_message_returns_ack_id_and_maps_bot_sender(self):
+        from core.adapter.qq_adapter import QQAdapter
+
+        sent = []
+        sent_event = asyncio.Event()
+
+        class Client:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+                sent_event.set()
+
+        adapter = QQAdapter({"self_id": "42"})
+        adapter._clients.add(Client())
+        task = asyncio.create_task(
+            adapter.send_message_with_id("group_123", "接着说", reply_to_id="m1")
+        )
+        await asyncio.wait_for(sent_event.wait(), timeout=1.0)
+        request = sent[0]
+        self.assertEqual(request["params"]["message"][0]["type"], "reply")
+
+        await adapter._handle_message(json.dumps({
+            "status": "ok",
+            "retcode": 0,
+            "data": {"message_id": 321},
+            "echo": request["echo"],
+        }))
+
+        self.assertEqual(await task, (True, "321"))
+        self.assertEqual(adapter.last_sent_message_id, "321")
+        self.assertEqual(adapter._message_senders["321"], "42")
+
+    async def test_duplicate_inbound_message_id_is_ignored(self):
+        from core.adapter.qq_adapter import QQAdapter
+
+        adapter = QQAdapter({"self_id": "42"})
+
+        self.assertTrue(adapter._remember_message_id("m1"))
+        self.assertFalse(adapter._remember_message_id("m1"))
+
     async def test_send_image_waits_for_napcat_ack(self):
         from core.adapter.qq_adapter import QQAdapter
 
