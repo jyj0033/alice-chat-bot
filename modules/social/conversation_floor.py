@@ -97,6 +97,7 @@ class ConversationFloorManager:
         settle_window_seconds: float = 0.7,
         settle_max_seconds: float = 2.4,
         other_target_context_seconds: float = 900.0,
+        direct_answer_max_chars: int = 80,
     ):
         self.active_window_seconds = active_window_seconds
         self.burst_window_seconds = burst_window_seconds
@@ -114,6 +115,10 @@ class ConversationFloorManager:
         self.other_target_context_seconds = max(
             0.0, float(other_target_context_seconds)
         )
+        try:
+            self.direct_answer_max_chars = max(1, int(direct_answer_max_chars))
+        except (TypeError, ValueError):
+            self.direct_answer_max_chars = 80
 
     @staticmethod
     def _previous_message(current_message: Any, recent_messages: list[Any]):
@@ -381,7 +386,8 @@ class ConversationFloorManager:
         if floor.bot_has_floor:
             if is_question:
                 action = ActionType.ANSWER
-                tone, max_chars = "直接、自然地回答", 20
+                # 明确问 bot 时要能把结论说完整；群聊普通插话仍保持短回复。
+                tone, max_chars = "直接、自然地回答", self.direct_answer_max_chars
             elif continuing:
                 action = ActionType.FOLLOW_UP
                 tone, max_chars = "像正在对聊一样自然延续", 18

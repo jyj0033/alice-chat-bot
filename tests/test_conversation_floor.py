@@ -61,6 +61,24 @@ class ConversationFloorTests(unittest.TestCase):
         self.assertEqual(floor.interruption_cost, 0.0)
         self.assertEqual(plan.action, ActionType.ANSWER)
         self.assertTrue(plan.directed)
+        self.assertEqual(plan.max_chars, 80)
+
+    def test_direct_answer_limit_can_follow_configuration(self):
+        manager = ConversationFloorManager(direct_answer_max_chars=120)
+        current = self.message(
+            "u1", "你觉得今晚吃什么？", 0, message_id="m1", directed=True
+        )
+
+        _, plan = manager.analyze(
+            current,
+            [current],
+            bot_id="bot",
+            directed_to_bot=True,
+            is_question=True,
+        )
+
+        self.assertEqual(plan.action, ActionType.ANSWER)
+        self.assertEqual(plan.max_chars, 120)
 
     def test_two_people_in_fast_dialogue_allow_short_agreement(self):
         messages = [

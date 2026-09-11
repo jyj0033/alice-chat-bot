@@ -36,23 +36,20 @@ EMOJI_RE = re.compile(
 )
 
 
-def limit_emoji(text: str, max_emoji: int = 1) -> str:
-    """把回复中的 emoji 限制在 max_emoji 个以内。
+def strip_emoji(text: str) -> str:
+    """移除文字回复中的 Emoji。
 
-    LLM 即使被要求不用 emoji 也常会带一两个，这里做兜底：
-    超过上限时保留最后一个，其余去掉，避免满屏表情。
+    Emoji 不再作为固定人格特征或后处理模板；表情包图片由独立的
+    meme_manager 链路处理。
     """
     if not text:
         return text
-    matches = list(EMOJI_RE.finditer(text))
-    if len(matches) <= max_emoji:
-        return text
-    # 只保留最后一个 emoji（连同它之后的文本），去掉它之前的全部 emoji
-    keep_start = matches[-1].start()
-    head = EMOJI_RE.sub('', text[:keep_start])
-    result = head + text[keep_start:]
-    result = re.sub(r'\s{2,}', ' ', result)
-    return result.strip()
+    return EMOJI_RE.sub('', text)
+
+
+def limit_emoji(text: str, max_emoji: int = 1) -> str:
+    """兼容旧调用；文字回复现在统一移除 Emoji。"""
+    return strip_emoji(text)
 
 
 def split_reply_into_messages(
@@ -228,7 +225,7 @@ class ReplyGenerator:
         context_prompt: str,
         current_message: str,
         emotional_state: EmotionalState = None,
-        temperature: float = 0.8,
+        temperature: float | None = None,
         session_context: Dict[str, Any] = None,
         direction: str = "to_bot",
         action_plan: Dict[str, Any] = None,
@@ -245,7 +242,7 @@ class ReplyGenerator:
             context_prompt: 上下文提示
             current_message: 当前消息
             emotional_state: 情感状态
-            temperature: 生成温度
+            temperature: 可选的单次生成温度；不传时读取当前 Provider 配置
             session_context: 会话上下文（群ID、用户ID等）
             direction: 消息指向 "to_bot"（明确对bot说） / "group"（群友互聊/对大家/自言自语）
             action_plan: 发言权系统生成的结构化行为计划
@@ -272,6 +269,7 @@ class ReplyGenerator:
             conversation_judgement,
             current_message_context,
             avoid_paraphrase,
+            temperature_override=temperature,
         )
 
         # 2. 联网搜索：先让 LLM 判断这条回复是否需要联网（关键词太局限且易误判，
@@ -423,7 +421,10 @@ class ReplyGenerator:
         self.replies_generated += 1
 
         # 7. 应用说话风格
-        reply = self.style_manager.apply_style(result)
+        reply = self.style_manager.apply_style(
+            result,
+            max_reply_length=self._get_base_reply_max_length(direction),
+        )
 
         # 7.5 笑声抑制：刚笑过就别再用「哈哈」起头
         reply = self._damp_laughter(session_id, reply)
@@ -435,8 +436,8 @@ class ReplyGenerator:
                 int(action_plan.get("max_chars", 0) or 0),
             )
 
-        # 8. emoji 兜底：最多保留 1 个
-        reply = limit_emoji(reply, max_emoji=1)
+        # 8. 清理文字 Emoji；表情包图片走独立发送通道
+        reply = strip_emoji(reply)
 
         # 9. 思考/打字延迟由 GroupChatBot._compose_and_send 统一处理。
         # 这里不再重复等待，避免一次回复串行等待两套延迟。
@@ -744,6 +745,46 @@ class ReplyGenerator:
                 calls.append({"id": "", "name": name, "arguments": {"query": query}})
         return calls
 
+    def _get_base_reply_max_length(self, direction: str) -> int:
+        """按消息指向选择基础回复上限。
+
+        群聊插话保持短小；明确对 bot 的问题需要留出完整回答空间。行为计划
+        的更短限制由最终的 ``_limit_action_length`` 单独执行，避免先截断内部
+        表情包工具标记。
+        """
+        style = self.style_manager.style
+        try:
+            group_limit = max(1, int(style.max_reply_length or 20))
+        except (TypeError, ValueError):
+            group_limit = 20
+
+        if direction not in ("to_bot", "to_bot_implicit"):
+            return group_limit
+
+        direct_value = getattr(style, "direct_max_reply_length", None)
+        if direct_value is None:
+            return group_limit
+        try:
+            direct_limit = int(direct_value or 80)
+        except (TypeError, ValueError):
+            direct_limit = 80
+        return max(1, direct_limit)
+
+    def _get_prompt_reply_max_length(
+        self,
+        direction: str,
+        action_plan: Dict[str, Any] = None,
+    ) -> int:
+        """取得提示词中的上限，行为计划可进一步收紧但不能放宽基础上限。"""
+        max_length = self._get_base_reply_max_length(direction)
+        try:
+            action_limit = int((action_plan or {}).get("max_chars", 0) or 0)
+        except (TypeError, ValueError):
+            action_limit = 0
+        if action_limit > 0:
+            max_length = min(max_length, action_limit)
+        return max(1, max_length)
+
     def _build_request(
         self,
         context_prompt: str,
@@ -757,26 +798,52 @@ class ReplyGenerator:
         conversation_judgement: Dict[str, Any] = None,
         current_message_context: Dict[str, Any] = None,
         avoid_paraphrase: bool = False,
+        temperature_override: float | None = None,
     ) -> ChatRequest:
         """构建 LLM 请求"""
 
-        # 根据情感状态调整温度
-        temp = 0.8
+        # 读取当前 Provider 配置。Provider 在 Web 热更新时会被替换，因此每次
+        # 构建请求都从当前实例读取，不能在 ReplyGenerator 初始化时复制一份旧值。
+        provider_config = getattr(self.llm, "config", {})
+        if not isinstance(provider_config, dict):
+            provider_config = {}
+        try:
+            configured_temperature = float(provider_config.get("temperature", 0.8))
+        except (TypeError, ValueError):
+            configured_temperature = 0.8
+        configured_temperature = max(0.0, min(2.0, configured_temperature))
+        if temperature_override is not None:
+            try:
+                configured_temperature = float(temperature_override)
+            except (TypeError, ValueError):
+                pass
+            configured_temperature = max(0.0, min(2.0, configured_temperature))
+        try:
+            configured_max_tokens = int(provider_config.get("max_tokens", 500))
+        except (TypeError, ValueError):
+            configured_max_tokens = 500
+        configured_max_tokens = max(1, min(8000, configured_max_tokens))
+        try:
+            top_p = float(provider_config.get("top_p", 0.9))
+        except (TypeError, ValueError):
+            top_p = 0.9
+        top_p = max(0.0, min(1.0, top_p))
+
+        # 根据情感状态在配置值附近做小幅调整，不再用固定的 0.6/0.8/0.9
+        # 覆盖 Web 配置。
+        temp = configured_temperature
         if emotional_state:
             # 兴奋时更有创意
             if emotional_state.energy > 0.8:
-                temp = 0.9
+                temp = min(2.0, configured_temperature + 0.1)
             # 疲惫时更保守
             elif emotional_state.energy < 0.3:
-                temp = 0.6
+                temp = max(0.0, configured_temperature - 0.2)
 
         request = ChatRequest(
             temperature=temp,
-            # 默认 200；注册了 send_meme tool 后至少需要 ~400-500 才能覆盖
-            # "正文回复 + tool_use JSON" 同时输出的场景（实测 MiniMax M3
-            # 在 200 时会把 token 耗在文本上、cut 时还没轮 tool_use）。
-            max_tokens=512,
-            top_p=0.9,
+            max_tokens=configured_max_tokens,
+            top_p=top_p,
         )
         # 显式带上 provider 的模型：ChatRequest 默认 "gpt-4o" 会对部分严格端点
         # （如 MiniMax OpenAI 兼容端点）报 unknown model，不能让默认值覆盖真实配置。
@@ -787,22 +854,8 @@ class ReplyGenerator:
         if self.personality_prompt:
             request.add_system(self.personality_prompt)
 
-        style = self.style_manager.style
-        try:
-            max_reply_length = max(1, int(style.max_reply_length or 20))
-        except (TypeError, ValueError):
-            max_reply_length = 20
-        emoji_frequency = style.emoji_frequency
-        if emoji_frequency > 1:
-            emoji_frequency /= 10
-        emoji_frequency = max(0.0, min(1.0, emoji_frequency))
-        if style.use_emoji and self.style_manager.emoji_set and emoji_frequency > 0:
-            emoji_guide = (
-                f"emoji 不是必需，只有语气真的合适时偶尔使用（约{round(emoji_frequency * 100)}%回复），"
-                "不要连续使用或为了装可爱硬加。"
-            )
-        else:
-            emoji_guide = "不要使用 emoji，保持纯文字。"
+        max_reply_length = self._get_prompt_reply_max_length(direction, action_plan)
+        emoji_guide = "不要使用 Emoji，保持纯文字。"
 
         # 回复长度硬约束 - 群聊回复必须简短才像真人
         meme_guide = ""
@@ -829,7 +882,7 @@ class ReplyGenerator:
             )
         request.add_system(
             f"回复长度要求：优先用一条短句，确需说明时再用两句，通常不超过{max_reply_length}个中文字符。"
-            "如果本轮行为计划给了更短上限，以行为计划为准。"
+            "明确问你的问题可以完整回答；如果本轮行为计划给了更短上限，以行为计划为准。"
             "能用一句话说清就别用两句；不要分点、不要加解释、不要复述对方的话；"
             "偶尔超短也行（几个字），但绝不能长篇大论。\n"
             f"{emoji_guide}\n"
@@ -889,20 +942,6 @@ class ReplyGenerator:
         style_guide = self.style_manager.get_style_guide()
         if style_guide:
             request.add_system(f"说话风格指导：{style_guide}")
-
-        # 高频口头禅：让 LLM 知道哪些是你的招牌词，分布更自然（不堆在一句话里）
-        try:
-            catchphrases = getattr(self.personality, "catchphrases", None) or []
-            if catchphrases:
-                phrase_list = "、".join(str(p) for p in catchphrases if str(p).strip())
-                if phrase_list:
-                    request.add_system(
-                        f"你的口头禅（用得自然像顺手，不是堆砌）：{phrase_list}。"
-                        "平均 2~3 句里偶尔冒一个，开场/转折/收尾最自然，"
-                        "不要每句都用，也不要刻意罗列。"
-                    )
-        except Exception:
-            pass
 
         # 添加情感状态指导
         if emotional_state:

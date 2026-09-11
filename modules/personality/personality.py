@@ -40,11 +40,10 @@ class Personality:
     # 禁忌话题
     taboo_topics: list[str] = field(default_factory=list)
 
-    # 常用口头禅
-    catchphrases: list[str] = field(default_factory=list)
-
-    # emoji 列表
-    emoji_set: list[str] = field(default_factory=lambda: ["😅", "🤔", "😂", "👍", "🙄"])
+    # 旧版配置兼容字段：不再注入人格提示词，也不参与回复生成。
+    # 保留属性是为了让旧代码读取时不报错；from_dict 会主动忽略旧配置值。
+    catchphrases: list[str] = field(default_factory=list, repr=False)
+    emoji_set: list[str] = field(default_factory=list, repr=False)
 
     @classmethod
     def from_yaml(cls, path: str) -> "Personality":
@@ -66,7 +65,7 @@ class Personality:
         valid_fields = {
             'name', 'nickname', 'age_range', 'avatar_description',
             'traits', 'background', 'interested_topics', 'bored_topics',
-            'humor_style', 'taboo_topics', 'catchphrases', 'emoji_set'
+            'humor_style', 'taboo_topics'
         }
         filtered_data = {k: v for k, v in data.items() if k in valid_fields}
         return cls(**filtered_data)
@@ -84,8 +83,6 @@ class Personality:
             "bored_topics": self.bored_topics,
             "humor_style": self.humor_style,
             "taboo_topics": self.taboo_topics,
-            "catchphrases": self.catchphrases,
-            "emoji_set": self.emoji_set,
         }
 
     # 性格的呈现顺序：先社交表现、再做事方式、最后情绪，读起来像在介绍一个人，
@@ -127,7 +124,7 @@ class Personality:
         if self.interested_topics:
             preference.append(
                 f"聊到{self._readable_topics(self.interested_topics)}这些你会来劲，"
-                "忍不住想接一句"
+                "觉得有合适内容时自然接一句"
             )
         if self.bored_topics:
             preference.append(
@@ -240,15 +237,6 @@ class Personality:
             parts.append("话不多，习惯用短句，能一个词说清就不说一句")
         else:
             parts.append("说话简短随意，不铺陈")
-
-        if self.emoji_set:
-            parts.append("偶尔会用一个 emoji，但不是每句都带")
-
-        if self.catchphrases:
-            parts.append(
-                f"偶尔会冒出「{'」「'.join(self.catchphrases[:5])}」这类口头语，"
-                "但不是每句都带"
-            )
 
         humor_descriptions = {
             "dry": "开玩笑是冷幽默，一本正经地说怪话",

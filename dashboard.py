@@ -76,6 +76,32 @@ def deep_merge(base, changes):
     return result
 
 
+def strip_removed_personality_fields(config):
+    """清理已移除的固定口头禅和文字 Emoji 配置。
+
+    旧配置仍可能保留这些键。运行时已经不再使用它们，Web 保存时顺便移除，
+    避免面板继续暴露出实际上不会生效的选项。
+    """
+    if not isinstance(config, dict):
+        return config
+    personality = config.get("personality")
+    if not isinstance(personality, dict):
+        return config
+    for key in ("catchphrases", "emoji_set"):
+        personality.pop(key, None)
+    style = personality.get("speaking_style")
+    if isinstance(style, dict):
+        for key in (
+            "common_words",
+            "filler_words",
+            "filler_frequency",
+            "use_emoji",
+            "emoji_frequency",
+        ):
+            style.pop(key, None)
+    return config
+
+
 def normalize_llm_config(config):
     """把旧版扁平 llm 配置映射为 Provider 结构。"""
     raw = config.get('llm', {}) if isinstance(config, dict) else {}
@@ -102,7 +128,7 @@ async def root():
 # API 端点
 @app.get("/api/config")
 async def get_config():
-    config = load_config()
+    config = strip_removed_personality_fields(load_config())
     normalize_llm_config(config)
     return mask_secrets(config)
 
@@ -122,7 +148,7 @@ async def update_config(request: Request):
                     provider = llm.setdefault(name, {})
                     if provider_data.get('api_key') and not str(provider_data['api_key']).startswith('*'):
                         provider['api_key'] = provider_data['api_key']
-                    for key in ['base_url', 'model', 'temperature', 'max_tokens', 'timeout', 'provider_type', 'enabled']:
+                    for key in ['base_url', 'model', 'temperature', 'max_tokens', 'top_p', 'timeout', 'provider_type', 'enabled']:
                         if key in provider_data:
                             provider[key] = provider_data[key]
 
@@ -239,6 +265,7 @@ async def update_config(request: Request):
                         ).get('api_key', '')
             current['search'] = deep_merge(current_search, new_search)
 
+        strip_removed_personality_fields(current)
         save_config(current)
         runtime_reloaded = reload_bot_runtime()
         return {
@@ -335,8 +362,6 @@ async def get_personality():
             "bored_topics": ["广告", "政治"],
             "humor_style": "dry",
             "taboo_topics": [],
-            "catchphrases": [],
-            "emoji_set": ["😅", "🤔", "😂", "👍", "🙄"],
             "description": ""
         }
     personality = bot_instance.personality.to_dict()
@@ -1107,6 +1132,7 @@ async def add_provider(request: Request):
             'timeout': data.get('timeout', 120),
             'temperature': data.get('temperature', 0.8),
             'max_tokens': data.get('max_tokens', 2000),
+            'top_p': data.get('top_p', 0.9),
             'enabled': data.get('enabled', True),
         }
 

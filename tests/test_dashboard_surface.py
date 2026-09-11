@@ -68,8 +68,8 @@ class DashboardSurfaceTests(unittest.TestCase):
             "group-analysis-retention",
             "group-analysis-session",
             "group-analysis-reports",
-            "style-common-words",
             "style-max-reply",
+            "style-direct-max-reply",
             "typing-min-length",
             "memory-pagination",
             "memory-prev",
@@ -104,6 +104,11 @@ class DashboardSurfaceTests(unittest.TestCase):
         self.assertNotIn("qq-ws-url", self.parser.ids)
         # OCR 已被视觉模型取代，不应再暴露单独配置
         self.assertNotIn("rich-ocr-enabled", self.parser.ids)
+        self.assertNotIn("style-common-words", self.parser.ids)
+        self.assertNotIn("style-filler-words", self.parser.ids)
+        self.assertNotIn("style-use-emoji", self.parser.ids)
+        self.assertNotIn("personality-catchphrases", self.parser.ids)
+        self.assertNotIn("personality-emojis", self.parser.ids)
 
     def test_memory_list_uses_server_pagination_and_search_debounce(self):
         self.assertIn("page_size", self.html)

@@ -277,6 +277,7 @@ class GroupChatBot:
                             "timeout": provider_config.get("timeout", 120),
                             "temperature": provider_config.get("temperature", 0.8),
                             "max_tokens": provider_config.get("max_tokens", 2000),
+                            "top_p": provider_config.get("top_p", 0.9),
                         }
                     )
                     self.llm_providers[name] = provider
@@ -492,12 +493,11 @@ class GroupChatBot:
         )
 
         # 说话风格
-        style_config = self.config.get("personality", {}).get("speaking_style", {})
-        speaking_style = SpeakingStyle.from_dict(style_config) if style_config else SpeakingStyle()
+        style_config = self.config.get("personality", {}).get("speaking_style", {}) or {}
+        speaking_style = SpeakingStyle.from_dict(style_config)
 
         self.speaking_style_manager = SpeakingStyleManager(
-            speaking_style,
-            emoji_set=self.personality.emoji_set
+            speaking_style
         )
 
         # 错字生成器
@@ -508,6 +508,42 @@ class GroupChatBot:
             min_chinese_chars=typing_config.get("min_chinese_chars", 3),
             min_message_length=typing_config.get("min_message_length", 10),
         )
+
+    def _refresh_personality_runtime(self) -> None:
+        """热更新人格提示词和说话风格，但保留情绪/注意力等会话状态。"""
+        personality_config = self.config.get("personality", {}) or {}
+        self.personality = Personality.from_dict(personality_config)
+
+        style_config = personality_config.get("speaking_style", {}) or {}
+        speaking_style = SpeakingStyle.from_dict(
+            style_config if isinstance(style_config, dict) else {}
+        )
+        if self.speaking_style_manager is None:
+            self.speaking_style_manager = SpeakingStyleManager(speaking_style)
+        else:
+            self.speaking_style_manager.style = speaking_style
+            self.speaking_style_manager.emoji_set = []
+
+        if self.conversation_floor_manager:
+            direct_limit = speaking_style.direct_max_reply_length
+            if direct_limit is None:
+                direct_limit = speaking_style.max_reply_length
+            try:
+                self.conversation_floor_manager.direct_answer_max_chars = max(
+                    1, int(direct_limit)
+                )
+            except (TypeError, ValueError):
+                self.conversation_floor_manager.direct_answer_max_chars = 80
+
+        if self.reply_generator:
+            self.reply_generator.personality_prompt = self.personality.build_persona_prompt()
+            self.reply_generator.style_manager = self.speaking_style_manager
+            self.reply_generator.bot_name = self.personality.name
+            self.reply_generator.taboo_topics = [
+                str(topic).strip()
+                for topic in (self.personality.taboo_topics or [])
+                if str(topic).strip()
+            ]
 
     def _init_social(self) -> None:
         """初始化社交感知"""
@@ -576,6 +612,9 @@ class GroupChatBot:
         )
 
         # 群聊发言权：判断谁在和谁说话、当前插嘴成本以及候选行为。
+        personality_style_config = (
+            self.config.get("personality", {}).get("speaking_style", {}) or {}
+        )
         self.conversation_floor_manager = ConversationFloorManager(
             active_window_seconds=floor_config.get("active_window_seconds", 45),
             burst_window_seconds=floor_config.get("burst_window_seconds", 12),
@@ -585,6 +624,9 @@ class GroupChatBot:
             settle_max_seconds=floor_config.get("settle_max_seconds", 2.4),
             other_target_context_seconds=floor_config.get(
                 "other_target_context_seconds", 900
+            ),
+            direct_answer_max_chars=personality_style_config.get(
+                "direct_max_reply_length", 80
             ),
         )
 
@@ -773,6 +815,7 @@ class GroupChatBot:
     def apply_runtime_config(self) -> None:
         """重新读取 Web 配置并热更新可安全替换的运行组件。"""
         self._load_config()
+        self._refresh_personality_runtime()
         self._init_llm()
 
         if self.reply_generator:
@@ -5015,18 +5058,12 @@ class GroupChatBot:
                 "bored_topics": ["广告推销", "政治敏感话题", "重复的无聊话题"],
                 "humor_style": "dry",
                 "taboo_topics": [],
-                "catchphrases": [],
-                "emoji_set": ["😅", "🤔", "😂", "👍", "🙄"],
                 "speaking_style": {
-                    "common_words": [],
                     "banned_words": [],
-                    "filler_words": ["呃", "嗯", "那个", "这个"],
-                    "filler_frequency": 0.08,
                     "max_reply_length": 20,
+                    "direct_max_reply_length": 80,
                     "use_ellipsis": True,
                     "ellipsis_frequency": 0.06,
-                    "use_emoji": True,
-                    "emoji_frequency": 0.2,
                     "formality": 0.3,
                     "enthusiasm": 0.6,
                     "use_exclamation": True
@@ -5040,6 +5077,7 @@ class GroupChatBot:
                     "model": "gpt-4o",
                     "temperature": 0.8,
                     "max_tokens": 500,
+                    "top_p": 0.9,
                     "timeout": 120,
                     "enabled": True
                 }

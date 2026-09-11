@@ -1388,10 +1388,6 @@
                             <textarea id="personality-taboo" placeholder="每行一个话题"></textarea>
                         </div>
                         <div class="form-group">
-                            <label>口头禅</label>
-                            <textarea id="personality-catchphrases" placeholder="每行一个口头禅"></textarea>
-                        </div>
-                        <div class="form-group">
                             <label>幽默风格</label>
                             <select id="personality-humor">
                                 <option value="dry">冷幽默</option>
@@ -1399,10 +1395,6 @@
                                 <option value="self-deprecating">自嘲</option>
                                 <option value="sarcastic">讽刺</option>
                             </select>
-                        </div>
-                        <div class="form-group">
-                            <label>常用 Emoji</label>
-                            <input type="text" id="personality-emojis" placeholder="逗号分隔，例如: 大笑, 笑哭">
                         </div>
                     </div>
                     <div class="btn-group" style="margin-top: 18px;">
@@ -1504,6 +1496,10 @@
                             <div class="form-group">
                                 <label>Max Tokens</label>
                                 <input type="number" id="provider-max-tokens" value="2000" min="50" max="8000">
+                            </div>
+                            <div class="form-group">
+                                <label>Top P</label>
+                                <input type="number" id="provider-top-p" value="0.9" min="0" max="1" step="0.05">
                             </div>
                             <div class="form-group">
                                 <label>启用</label>
@@ -2466,12 +2462,9 @@
                 <div class="card">
                     <div class="card-header"><div class="card-title"><span class="card-ico"><svg class="icon-sm"><use href="#i-keyboard"/></svg></span>说话与打字风格</div></div>
                     <div class="form-grid">
-                        <div class="form-group"><label>常用词 / 口头语</label><input type="text" id="style-common-words" placeholder="话说, 其实, 感觉"></div>
-                        <div class="form-group"><label>语气词</label><input type="text" id="style-filler-words" placeholder="嗯, 呃, 那个"></div>
                         <div class="form-group"><label>禁用词</label><input type="text" id="style-banned-words" placeholder="逐个替换为星号"></div>
                         <div class="form-group"><label>单条最大字符</label><input type="number" id="style-max-reply" min="10" max="1000"></div>
-                        <div class="form-group"><label>使用 Emoji</label><div class="toggle-row" style="padding-top: 6px; max-width: 120px;"><label class="toggle"><input type="checkbox" id="style-use-emoji"><span class="toggle-slider"></span></label></div></div>
-                        <div class="form-group"><label>Emoji 频率</label><input type="number" id="style-emoji-frequency" min="0" max="1" step="0.01"></div>
+                        <div class="form-group"><label>明确问答最大字符</label><input type="number" id="style-direct-max-reply" min="20" max="2000"></div>
                         <div class="form-group"><label>使用省略号</label><div class="toggle-row" style="padding-top: 6px; max-width: 120px;"><label class="toggle"><input type="checkbox" id="style-use-ellipsis"><span class="toggle-slider"></span></label></div></div>
                         <div class="form-group"><label>使用感叹号</label><div class="toggle-row" style="padding-top: 6px; max-width: 120px;"><label class="toggle"><input type="checkbox" id="style-use-exclamation"><span class="toggle-slider"></span></label></div></div>
                         <div class="form-group"><label>正式程度</label><input type="number" id="style-formality" min="0" max="1" step="0.01"></div>
@@ -2949,6 +2942,7 @@
             document.getElementById('provider-timeout').value = '120';
             document.getElementById('provider-temperature').value = '0.8';
             document.getElementById('provider-max-tokens').value = '2000';
+            document.getElementById('provider-top-p').value = '0.9';
             document.getElementById('provider-enabled').checked = true;
             document.getElementById('delete-provider-btn').style.display = 'none';
             document.getElementById('test-result').style.display = 'none';
@@ -2973,6 +2967,7 @@
             document.getElementById('provider-timeout').value = provider.timeout || 120;
             document.getElementById('provider-temperature').value = provider.temperature || 0.8;
             document.getElementById('provider-max-tokens').value = provider.max_tokens || 2000;
+            document.getElementById('provider-top-p').value = provider.top_p ?? 0.9;
             document.getElementById('provider-enabled').checked = provider.enabled !== false;
             document.getElementById('delete-provider-btn').style.display = name !== 'primary' ? 'inline-flex' : 'none';
             document.getElementById('test-result').style.display = 'none';
@@ -3000,6 +2995,7 @@
                 timeout: parseInt(document.getElementById('provider-timeout').value),
                 temperature: parseFloat(document.getElementById('provider-temperature').value),
                 max_tokens: parseInt(document.getElementById('provider-max-tokens').value),
+                top_p: parseFloat(document.getElementById('provider-top-p').value),
                 enabled: document.getElementById('provider-enabled').checked,
             };
 
@@ -4258,12 +4254,9 @@
             document.getElementById('cooldown-trigger').value = cooldown.trigger_threshold ?? 0.3;
 
             const style = config.personality?.speaking_style || {};
-            document.getElementById('style-common-words').value = (style.common_words || []).join(', ');
-            document.getElementById('style-filler-words').value = (style.filler_words || ['呃', '嗯', '那个', '这个']).join(', ');
             document.getElementById('style-banned-words').value = (style.banned_words || []).join(', ');
             document.getElementById('style-max-reply').value = style.max_reply_length ?? 20;
-            document.getElementById('style-use-emoji').checked = style.use_emoji !== false;
-            document.getElementById('style-emoji-frequency').value = style.emoji_frequency ?? 0.2;
+            document.getElementById('style-direct-max-reply').value = style.direct_max_reply_length ?? 80;
             document.getElementById('style-use-ellipsis').checked = style.use_ellipsis !== false;
             document.getElementById('style-use-exclamation').checked = style.use_exclamation !== false;
             document.getElementById('style-formality').value = style.formality ?? 0.3;
@@ -4368,12 +4361,9 @@
                 },
                 personality: {
                     speaking_style: {
-                        common_words: listValue('style-common-words'),
-                        filler_words: listValue('style-filler-words'),
                         banned_words: listValue('style-banned-words'),
                         max_reply_length: parseInt(document.getElementById('style-max-reply').value),
-                        use_emoji: document.getElementById('style-use-emoji').checked,
-                        emoji_frequency: parseFloat(document.getElementById('style-emoji-frequency').value),
+                        direct_max_reply_length: parseInt(document.getElementById('style-direct-max-reply').value),
                         use_ellipsis: document.getElementById('style-use-ellipsis').checked,
                         use_exclamation: document.getElementById('style-use-exclamation').checked,
                         formality: parseFloat(document.getElementById('style-formality').value),
@@ -4452,9 +4442,7 @@
             document.getElementById('personality-interests').value = (persona.interested_topics || []).join('\n');
             document.getElementById('personality-bored').value = (persona.bored_topics || []).join('\n');
             document.getElementById('personality-taboo').value = (persona.taboo_topics || []).join('\n');
-            document.getElementById('personality-catchphrases').value = (persona.catchphrases || []).join('\n');
             document.getElementById('personality-humor').value = persona.humor_style || 'dry';
-            document.getElementById('personality-emojis').value = (persona.emoji_set || []).join(', ');
         }
 
         function resetPersonality() {
@@ -4465,7 +4453,6 @@
             const interests = document.getElementById('personality-interests').value.split('\n').map(k => k.trim()).filter(k => k);
             const bored = document.getElementById('personality-bored').value.split('\n').map(k => k.trim()).filter(k => k);
             const taboo = document.getElementById('personality-taboo').value.split('\n').map(k => k.trim()).filter(Boolean);
-            const catchphrases = document.getElementById('personality-catchphrases').value.split('\n').map(k => k.trim()).filter(Boolean);
             const config = {
                 personality: {
                     name: document.getElementById('personality-name').value,
@@ -4477,9 +4464,7 @@
                     interested_topics: interests,
                     bored_topics: bored,
                     taboo_topics: taboo,
-                    catchphrases: catchphrases,
                     humor_style: document.getElementById('personality-humor').value,
-                    emoji_set: listValue('personality-emojis'),
                     traits: {
                         openness: parseFloat(document.getElementById('trait-openness').value),
                         conscientiousness: parseFloat(document.getElementById('trait-conscientiousness').value),

@@ -20,9 +20,11 @@ class SpeakingStyle:
     """说话风格参数"""
 
     # 词汇层面
-    common_words: list[str] = field(default_factory=list)  # 常用词/口头禅
+    # 以下几项是旧版配置兼容字段，已不再用于提示词或后处理，避免把回复
+    # 固定成一组可识别的口头禅/模板词。
+    common_words: list[str] = field(default_factory=list, repr=False)
     banned_words: list[str] = field(default_factory=list)  # 避免的词
-    filler_words: list[str] = field(default_factory=lambda: ["呃", "嗯", "那个", "这个"])
+    filler_words: list[str] = field(default_factory=list, repr=False)
 
     # 句式层面
     min_sentence_length: int = 5   # 最短句子
@@ -31,18 +33,19 @@ class SpeakingStyle:
 
     # 回复长度
     max_reply_length: int = 20     # 单条回复最大字符数（超长会被智能截断）
+    direct_max_reply_length: int | None = None  # 明确问 bot 时的最大字符数
 
-    # 语气词后处理频率：LLM 本身就会自然使用语气词，这层只是偶尔补一点
-    # 口语感的兜底。给高了会出现「这个哈哈哈哈」这类机械拼接。
-    filler_frequency: float = 0.08
+    # 旧版语气词后处理参数，仅保留以兼容旧配置。
+    filler_frequency: float = field(default=0.0, repr=False)
 
     # 标点与格式
     use_ellipsis: bool = True      # 是否使用省略号
     # 省略号后处理频率：给高了会拼出「真人！...」「汗流浃背哈哈...」这类
     # 机械痕迹（原实现是 15% 盲目追加）。
     ellipsis_frequency: float = 0.06
-    use_emoji: bool = True         # 是否使用emoji
-    emoji_frequency: float = 0.2   # emoji使用频率 (0-1)
+    # 旧版 Emoji 参数，仅保留以兼容旧配置；文字 Emoji 统一禁用。
+    use_emoji: bool = field(default=False, repr=False)
+    emoji_frequency: float = field(default=0.0, repr=False)
     use_question_marks: bool = True  # 结尾是否加"？"表示好奇
 
     # 语气层面
@@ -57,24 +60,35 @@ class SpeakingStyle:
     @classmethod
     def from_dict(cls, data: dict) -> "SpeakingStyle":
         """从字典加载，忽略未知字段（避免配置中的多余键报错）"""
-        known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        removed = {
+            "common_words",
+            "filler_words",
+            "filler_frequency",
+            "use_emoji",
+            "emoji_frequency",
+        }
+        known = {
+            k: v
+            for k, v in data.items()
+            if k in cls.__dataclass_fields__ and k not in removed
+        }
+        if "direct_max_reply_length" not in data:
+            # 新配置默认给明确问答更大空间；直接构造旧版 SpeakingStyle 时
+            # 则保留旧的 max_reply_length 语义，由上层按缺省值回退。
+            known["direct_max_reply_length"] = 80
         return cls(**known)
 
     def to_dict(self) -> dict:
         """转换为字典"""
         return {
-            "common_words": self.common_words,
             "banned_words": self.banned_words,
-            "filler_words": self.filler_words,
             "min_sentence_length": self.min_sentence_length,
             "max_sentence_length": self.max_sentence_length,
             "avg_sentence_length_range": self.avg_sentence_length_range,
             "max_reply_length": self.max_reply_length,
-            "filler_frequency": self.filler_frequency,
+            "direct_max_reply_length": self.direct_max_reply_length,
             "use_ellipsis": self.use_ellipsis,
             "ellipsis_frequency": self.ellipsis_frequency,
-            "use_emoji": self.use_emoji,
-            "emoji_frequency": self.emoji_frequency,
             "use_question_marks": self.use_question_marks,
             "formality": self.formality,
             "enthusiasm": self.enthusiasm,
@@ -89,25 +103,12 @@ class SpeakingStyleManager:
 
     def __init__(self, style: SpeakingStyle, emoji_set: list[str] = None):
         self.style = style
-        # 空列表表示用户明确关闭/清空 emoji，不应被 `or` 当成未配置而恢复默认值。
-        self.emoji_set = (
-            list(emoji_set)
-            if emoji_set is not None
-            else ["😅", "🤔", "😂", "👍", "🙄", "😏", "🤷", "👀"]
-        )
+        # 保留旧参数签名，避免第三方初始化代码报错；文字 Emoji 已统一关闭。
+        self.emoji_set = []
 
     def get_style_guide(self) -> str:
         """获取风格指南字符串（发给 LLM 的说话风格约束）"""
         parts = []
-        if self.style.common_words:
-            parts.append(f"常用口头禅：{', '.join(self.style.common_words[:3])}")
-        if self.style.filler_words:
-            # 只列词会被 LLM 读成"要求每句都用"，实测导致 1/3 回复都以
-            # 语气词开头。这里明确说明是"偶尔"，默认直接说事。
-            parts.append(
-                f"语气词（如{('、'.join(self.style.filler_words[:3]))}）偶尔用就行，"
-                "别每句话都以语气词开头，大多数时候直接说事更自然"
-            )
         if self.style.formality >= 0.7:
             parts.append("用词相对稳重，但不要写成公文")
         elif self.style.formality <= 0.3:
@@ -122,7 +123,7 @@ class SpeakingStyleManager:
             parts.append("语气有温度，但不刻意卖热情")
         return "；".join(parts) if parts else ""
 
-    def apply_style(self, text: str) -> str:
+    def apply_style(self, text: str, max_reply_length: int = None) -> str:
         """
         对生成的文本应用说话风格
 
@@ -137,77 +138,20 @@ class SpeakingStyleManager:
 
         result = text
 
-        # 1. 替换/添加口头禅
-        result = self._apply_catchphrases(result)
-
-        # 2. 添加语气词
-        result = self._apply_fillers(result)
-
-        # 3. 处理标点
+        # 1. 处理标点
         result = self._apply_punctuation(result)
 
-        # 4. 添加 emoji
-        result = self._apply_emoji(result)
+        # 2. 长度调整
+        result = self._adjust_length(result, max_reply_length=max_reply_length)
 
-        # 5. 长度调整
-        result = self._adjust_length(result)
-
-        # 6. 移除禁用词
+        # 3. 移除禁用词
         result = self._remove_banned_words(result)
 
-        # 关闭 emoji 时，既不自动追加，也不保留模型自行生成的 emoji，
-        # 这样面板配置和最终消息不会互相打架。
-        if not self.style.use_emoji or not self.emoji_set:
-            result = _EMOJI_RE.sub("", result)
+        # 文字 Emoji 不属于固定人格特征：既不自动添加，也清理模型偶尔生成的
+        # Emoji。表情包图片仍由 meme_manager 独立处理，不受这里影响。
+        result = _EMOJI_RE.sub("", result)
 
         return result
-
-    def _apply_catchphrases(self, text: str) -> str:
-        """应用口头禅"""
-        if not self.style.common_words:
-            return text
-
-        # 30% 概率使用口头禅
-        if random.random() < 0.3:
-            phrase = random.choice(self.style.common_words)
-            # 在合适位置插入
-            words = text.split()
-            if len(words) > 2:
-                insert_pos = random.randint(1, len(words) - 1)
-                words.insert(insert_pos, phrase)
-                return "".join(words)
-
-        return text
-
-    # 已经带口语色彩的开头：叹词、语气词、笑声、附和词。这些前面再加语气词
-    # 会拼出「这个哈哈哈哈」「那个嗯…」这种没人会说的话。
-    _NO_FILLER_PREFIXES = (
-        "呃", "嗯", "那个", "这个", "啊", "哦", "噢", "唉", "诶", "欸",
-        "哈", "笑", "草", "绷", "确实", "话说", "对", "是", "不", "行",
-        "好", "我靠", "卧槽", "牛", "6",
-    )
-
-    def _apply_fillers(self, text: str) -> str:
-        """句首偶尔添加语气词。
-
-        这一层只是"补一点口语感"的兜底，不是语气词的主要来源——LLM 自己
-        就会自然地用。历史上概率给到 0.2 且不看内容，导致 1/3 的回复以
-        「呃/嗯/那个/这个」开头，还会拼出「这个哈哈哈哈」这类机械痕迹。
-        因此：低频率 + 只在平铺直叙的长句前面加。
-        """
-        if not self.style.filler_words:
-            return text
-        if random.random() > max(0.0, min(1.0, self.style.filler_frequency)):
-            return text
-
-        stripped = text.lstrip()
-        # 短句自成语气（「来了来了」），前面加语气词只会显得拖沓
-        if len(stripped) < 6:
-            return text
-        if stripped.startswith(self._NO_FILLER_PREFIXES):
-            return text
-
-        return random.choice(self.style.filler_words) + text
 
     # 句尾已经自带语气的情况：再追加省略号会拼出「真人！...」「哈哈...」
     # 这类没人会写的组合。
@@ -232,30 +176,14 @@ class SpeakingStyleManager:
 
         return text
 
-    def _apply_emoji(self, text: str) -> str:
-        """添加 emoji（低频，像真人偶尔发一个）"""
-        if not self.style.use_emoji or not self.emoji_set:
-            return text
 
-        # 兼容 0-1 概率与 0-10 刻度（配置文件里可能是面板刻度值）
-        freq = self.style.emoji_frequency
-        if freq > 1:
-            freq = freq / 10
-        freq = max(0.0, min(1.0, freq))
-
-        if random.random() < freq:
-            emoji = random.choice(self.emoji_set)
-            # 在句尾或合适位置添加
-            if text.endswith(("。", ".", "！", "!")):
-                return text[:-1] + emoji + text[-1]
-            else:
-                return text + emoji
-
-        return text
-
-    def _adjust_length(self, text: str) -> str:
+    def _adjust_length(self, text: str, max_reply_length: int = None) -> str:
         """调整文本长度 - 超长时按句子边界智能截断（兜底）"""
-        max_len = self.style.max_reply_length
+        max_len = (
+            max_reply_length
+            if max_reply_length is not None
+            else self.style.max_reply_length
+        )
         if not text or len(text) <= max_len:
             return text
 
@@ -324,16 +252,12 @@ class SpeakingStyleManager:
 def create_default_style() -> SpeakingStyle:
     """创建默认说话风格"""
     return SpeakingStyle(
-        common_words=["话说", "其实", "感觉", "好像", "有点"],
-        filler_words=["呃", "嗯", "那个"],
-        filler_frequency=0.08,
         min_sentence_length=5,
         max_sentence_length=50,
         max_reply_length=20,
+        direct_max_reply_length=80,
         avg_sentence_length_range=(10, 30),
         use_ellipsis=True,
-        use_emoji=True,
-        emoji_frequency=0.2,
         formality=0.3,
         enthusiasm=0.6,
         humor=0.5,

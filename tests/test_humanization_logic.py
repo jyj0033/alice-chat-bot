@@ -530,55 +530,54 @@ class HumanizationLogicTests(unittest.TestCase):
             _Memory("甲：我长期在芜湖从事电催工作，平时常玩原神和绝区零，已经坚持很多年了")
         ))
 
-    # === 语气词后处理 ===
+    # === 固定口头禅与 Emoji 已移除 ===
 
-    def test_filler_never_prepended_to_colloquial_openings(self):
-        """已经带口语色彩的开头不再叠语气词（避免「这个哈哈哈哈」「那个嗯…」）。"""
+    def test_filler_injection_is_disabled(self):
+        """即使旧配置要求语气词，也不能通过后处理固定 bot 的开头。"""
         from modules.personality.speaking_style import (
             SpeakingStyle,
             SpeakingStyleManager,
         )
-        # 频率拉满，只验证护栏是否拦住
+        # 旧参数仍可被构造，但不再产生任何注入。
         style = SpeakingStyle(
-            filler_words=["呃", "嗯", "那个", "这个"], filler_frequency=1.0
+            filler_words=["呃", "嗯", "那个", "这个"],
+            filler_frequency=1.0,
+            use_ellipsis=False,
+            use_exclamation=False,
         )
         manager = SpeakingStyleManager(style)
-        for text in (
-            "哈哈哈赵云乱杀也太爽了",
-            "嗯感觉有点憨",
-            "那个等等蕾米是谁啊",
-            "确实，推送算法有时候真的看不懂",
-            "草这也太离谱了吧",
-            "对，乌鸦那个配色确实像",
-        ):
-            self.assertEqual(manager._apply_fillers(text), text, text)
+        for text in ("限定池是夏活的安洁莉娜和珊比", "来了来了"):
+            self.assertEqual(manager.apply_style(text), text, text)
 
-    def test_filler_skips_short_replies(self):
-        """「来了来了」这类短句自成语气，前面加语气词只会拖沓。"""
+    def test_configured_catchphrases_are_not_used(self):
+        """旧版常用词配置不会再被插入回复。"""
         from modules.personality.speaking_style import (
             SpeakingStyle,
             SpeakingStyleManager,
         )
-        style = SpeakingStyle(filler_words=["那个"], filler_frequency=1.0)
-        manager = SpeakingStyleManager(style)
-        self.assertEqual(manager._apply_fillers("来了来了"), "来了来了")
-        # 平铺直叙的长句才是这层该服务的场景
-        self.assertEqual(
-            manager._apply_fillers("限定池是夏活的安洁莉娜和珊比"),
-            "那个限定池是夏活的安洁莉娜和珊比",
+        style = SpeakingStyle(
+            common_words=["话说"],
+            filler_words=["那个"],
+            filler_frequency=1.0,
+            use_ellipsis=False,
+            use_exclamation=False,
         )
+        manager = SpeakingStyleManager(style)
+        self.assertEqual(manager.apply_style("限定池是夏活的安洁莉娜和珊比"), "限定池是夏活的安洁莉娜和珊比")
 
-    def test_filler_frequency_defaults_low(self):
-        """默认频率要足够低：历史上 0.2 导致 1/3 回复以语气词开头。"""
+    def test_removed_style_fields_are_disabled_by_default(self):
+        """固定语气词和 Emoji 的默认配置应为空/关闭。"""
         from modules.personality.speaking_style import (
             SpeakingStyle,
             create_default_style,
         )
-        self.assertLessEqual(SpeakingStyle().filler_frequency, 0.1)
-        self.assertLessEqual(create_default_style().filler_frequency, 0.1)
+        self.assertEqual(SpeakingStyle().filler_words, [])
+        self.assertEqual(SpeakingStyle().filler_frequency, 0.0)
+        self.assertFalse(SpeakingStyle().use_emoji)
+        self.assertEqual(create_default_style().filler_words, [])
 
-    def test_style_guide_tells_llm_fillers_are_occasional(self):
-        """发给 LLM 的风格指导不能只列语气词（会被读成"每句都要用"）。"""
+    def test_style_guide_omits_fixed_words(self):
+        """风格提示词不再注入固定口头禅或语气词。"""
         from modules.personality.speaking_style import (
             SpeakingStyle,
             SpeakingStyleManager,
@@ -586,23 +585,19 @@ class HumanizationLogicTests(unittest.TestCase):
         guide = SpeakingStyleManager(
             SpeakingStyle(filler_words=["呃", "嗯", "那个"])
         ).get_style_guide()
-        self.assertIn("偶尔", guide)
-        self.assertIn("直接说事", guide)
+        self.assertNotIn("呃", guide)
+        self.assertNotIn("嗯", guide)
+        self.assertNotIn("偶尔", guide)
 
-    def test_empty_emoji_set_is_respected(self):
-        """清空 emoji 配置后不能偷偷恢复默认表情，也不能随机选择空列表。"""
+    def test_emoji_is_always_removed(self):
+        """旧配置即使打开 Emoji，最终文字回复也保持纯文字。"""
         from modules.personality.speaking_style import SpeakingStyle, SpeakingStyleManager
 
         manager = SpeakingStyleManager(
-            SpeakingStyle(use_emoji=True, emoji_frequency=1.0), emoji_set=[]
+            SpeakingStyle(use_emoji=True, emoji_frequency=1.0), emoji_set=["😂"]
         )
         self.assertEqual(manager.emoji_set, [])
-        self.assertEqual(manager._apply_emoji("确实"), "确实")
-
-        plain_manager = SpeakingStyleManager(
-            SpeakingStyle(use_emoji=False), emoji_set=["😂"]
-        )
-        self.assertNotIn("😂", plain_manager.apply_style("这也太离谱了😂"))
+        self.assertNotIn("😂", manager.apply_style("这也太离谱了😂"))
 
     def test_personality_yaml_ignores_side_fields(self):
         """YAML 里带 speaking_style 等旁支配置时，核心人格仍应正常加载。"""
@@ -627,6 +622,14 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertEqual(personality.name, "爱丽丝")
         self.assertEqual(personality.background, "普通大学生")
 
+        legacy = Personality.from_dict(
+            {"name": "爱丽丝", "catchphrases": ["话说"], "emoji_set": ["😂"]}
+        )
+        self.assertEqual(legacy.catchphrases, [])
+        self.assertEqual(legacy.emoji_set, [])
+        self.assertNotIn("catchphrases", legacy.to_dict())
+        self.assertNotIn("emoji_set", legacy.to_dict())
+
     def test_reply_prompt_uses_style_limits_and_taboo_boundary(self):
         """生成提示词应和面板风格配置一致，并明确说明禁忌话题的处理方式。"""
         from modules.personality.speaking_style import SpeakingStyle, SpeakingStyleManager
@@ -647,9 +650,51 @@ class HumanizationLogicTests(unittest.TestCase):
             message.content for message in request.messages if message.role == "system"
         )
         self.assertIn("通常不超过42", system_text)
-        self.assertIn("不要使用 emoji", system_text)
+        self.assertIn("不要使用 Emoji", system_text)
         self.assertIn("「政治」", system_text)
         self.assertIn("不要联网搜索", system_text)
+
+    def test_reply_request_uses_current_provider_generation_settings(self):
+        """主回复请求应读取 Provider 配置，而不是使用生成器内的固定值。"""
+        from modules.llm.base import ChatResponse
+
+        class _Provider:
+            model = "test-model"
+            config = {"temperature": 0.35, "max_tokens": 321, "top_p": 0.65}
+
+            async def chat(self, request):
+                return ChatResponse(content="", model=self.model)
+
+        request = ReplyGenerator(llm_provider=_Provider())._build_request(
+            context_prompt="",
+            current_message="你好",
+        )
+        self.assertEqual(request.temperature, 0.35)
+        self.assertEqual(request.max_tokens, 321)
+        self.assertEqual(request.top_p, 0.65)
+        self.assertEqual(request.model, "test-model")
+
+    def test_reply_length_is_longer_for_direct_questions(self):
+        """群聊插话短、明确问答完整，不能共用 20 字硬上限。"""
+        generator = ReplyGenerator(llm_provider=None)
+        group_request = generator._build_request(
+            context_prompt="",
+            current_message="大家在聊游戏",
+            direction="group",
+        )
+        direct_request = generator._build_request(
+            context_prompt="",
+            current_message="你觉得这个方案为什么不行？",
+            direction="to_bot",
+        )
+        group_system = "\n".join(
+            message.content for message in group_request.messages if message.role == "system"
+        )
+        direct_system = "\n".join(
+            message.content for message in direct_request.messages if message.role == "system"
+        )
+        self.assertIn("通常不超过20", group_system)
+        self.assertIn("通常不超过80", direct_system)
 
     def test_emotion_guide_surfaces_current_emotion(self):
         """短期情绪应影响实际语气提示，而不只是影响概率。"""
@@ -766,6 +811,8 @@ class HumanizationLogicTests(unittest.TestCase):
         for spec_marker in ("===", "agreeableness", "extraversion", "(值:", "行为准则"):
             self.assertNotIn(spec_marker, prompt, spec_marker)
         self.assertIn("你叫爱丽丝", prompt)
+        self.assertNotIn("口头禅", prompt)
+        self.assertNotIn("emoji", prompt.lower())
 
     def test_persona_does_not_encourage_long_sentences(self):
         """人格说「句子可以稍长」会和短句硬约束直接打架。"""

@@ -44,7 +44,6 @@ def test_personality():
             "agreeableness": 0.7,
         },
         "interested_topics": ["游戏", "动漫"],
-        "emoji_set": ["😅", "🤔", "😂"],
     }
 
     personality = Personality.from_dict(personality_config)
