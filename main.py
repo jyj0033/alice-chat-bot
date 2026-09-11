@@ -130,6 +130,9 @@ class GroupChatBot:
         # 目标判断按到达顺序完成，避免多个 LLM 调用乱序返回后旧消息反过来
         # 抢占新消息的回复任务；它不影响前面的快速入库。
         self._conversation_judge_locks: dict[str, asyncio.Lock] = {}
+        # 同一会话的入站版本号。目标判断可能排队数秒，版本号用来在真正
+        # 调模型前丢弃已经被后续群消息覆盖的普通候选，减少过期判断和费用。
+        self._session_message_versions: dict[str, int] = {}
         self._rich_media_tasks: set[asyncio.Task] = set()
         self._meme_collect_tasks: set[asyncio.Task] = set()
         # 用户消息、Bot 回复等轻量记忆写入任务。单独跟踪，停止时等待/取消，
@@ -841,6 +844,7 @@ class GroupChatBot:
             session_id, asyncio.Lock()
         )
         await ingest_lock.acquire()
+        message_version = None
         try:
             # 进程重启后，先恢复该会话最近仍在上下文有效期内的 episodic 消息，
             # 再追加当前消息；这样首条消息不会让 Bot 突然失去刚才的对话。
@@ -886,6 +890,10 @@ class GroupChatBot:
             recent_context_for_judgement = self.context_manager.get_window(
                 session_id
             ).get_recent(30)
+            self._session_message_versions[session_id] = (
+                self._session_message_versions.get(session_id, 0) + 1
+            )
+            message_version = self._session_message_versions[session_id]
 
             # 长期记忆（内部已异步后台执行）
             self._store_long_term_memory(message, session_id)
@@ -911,12 +919,34 @@ class GroupChatBot:
             session_id, asyncio.Lock()
         )
         async with judge_lock:
-            conversation_judgement = await self._judge_conversation_message(
-                message,
-                continuation_hint=continuing,
-                heuristic_reasons=rich_reasons,
-                recent_messages=recent_context_for_judgement,
+            # 非显式定向的旧消息不值得在队列里继续消耗一次 LLM 判断：后面
+            # 的消息才是当前群聊状态。显式 @/引用 Bot 仍保留，避免用户的
+            # 定向问题因为旁边新消息到达而被静默。
+            explicit_directed = (
+                message.message_type == "private"
+                or message.mentioned_me
+                or is_reply_to_bot
             )
+            if (
+                message.message_type == "group"
+                and not explicit_directed
+                and self._session_message_versions.get(session_id, 0)
+                != message_version
+            ):
+                conversation_judgement = ConversationJudgeResult.unavailable(
+                    "stale_message"
+                )
+                logger.info(
+                    "[目标判断] 跳过已过期的普通消息：%s",
+                    message.message_id or message.sender_id,
+                )
+            else:
+                conversation_judgement = await self._judge_conversation_message(
+                    message,
+                    continuation_hint=continuing,
+                    heuristic_reasons=rich_reasons,
+                    recent_messages=recent_context_for_judgement,
+                )
         if conversation_judgement.available:
             self.context_manager.update_message_analysis(
                 session_id,
@@ -971,7 +1001,12 @@ class GroupChatBot:
         if not decision:
             return
         decision["enrichment_task"] = enrichment_task
-        decision["context_marker"] = self._latest_user_context_marker(session_id)
+        # 这里必须记录“触发本次候选回复的那条消息”，不能记录判断完成时
+        # 的最新消息。目标判断可能耗时数秒；如果期间又来了群消息，记录
+        # latest 会让旧任务误以为自己仍然是最新候选，继续回答旧话题。
+        decision["context_marker"] = self._context_marker_for_message(
+            session_id, message
+        )
 
         # === 3. 调度回复生成（后台任务，避免阻塞接收循环） ===
         current = self._reply_tasks.get(session_id)
@@ -1244,19 +1279,11 @@ class GroupChatBot:
         window = self.context_manager.get_window(session_id)
         recent_context_messages = window.get_recent(12)
         action_plan = None
-        current_is_latest = bool(recent_context_messages) and (
-            (
-                bool(message.message_id)
-                and recent_context_messages[-1].message_id == message.message_id
-            )
-            or (
-                not message.message_id
-                and recent_context_messages[-1].sender_id == message.sender_id
-                and recent_context_messages[-1].content == message.content
-            )
-        )
-        if current_is_latest:
-            current_context_message = recent_context_messages[-1]
+        # Bot 自己刚刚发出的回复可能已经追加到窗口末尾，因此不能用
+        # `window[-1]` 判断；这里只比较“最新的群友消息”。
+        current_is_latest = self._is_latest_user_message(session_id, message)
+        current_context_message = self._context_item_for_message(session_id, message)
+        if current_is_latest and current_context_message is not None:
             floor_has_name = any(
                 reason.startswith("昵称")
                 for reason in trigger_result.get("reasons", [])
@@ -1355,6 +1382,22 @@ class GroupChatBot:
                 direction = "to_bot"
             else:
                 direction = "group"
+
+        # 目标判断排队期间，后面的群友消息可能已经先进入窗口。普通插话
+        # 只能针对最新一条群友消息创建候选任务；否则 action_plan 为空时，
+        # 收尾/发送复核没有可靠的过期边界，旧消息会在新消息之后抢答。
+        # 定向消息（包括模型识别出的隐式续话）仍保留原问题，交给发送前的
+        # 定向回复逻辑处理。
+        if (
+            message.message_type == "group"
+            and not current_is_latest
+            and direction == "group"
+        ):
+            logger.info(
+                "[发言决策] 消息已过期，跳过普通插话：%s",
+                message.message_id or message.sender_id,
+            )
+            return None
         logger.debug(f"[指向] {direction} (触发: {trigger_reasons}, 延续对话={continuing})")
 
         return {
@@ -1602,22 +1645,61 @@ class GroupChatBot:
             },
         )
 
+    @staticmethod
+    def _context_marker(item):
+        """返回窗口消息的稳定标记；同时兼容平台 Message 和 ContextMessage。"""
+        timestamp = getattr(item, "timestamp", None)
+        if hasattr(timestamp, "isoformat"):
+            timestamp = timestamp.isoformat()
+        return (
+            str(getattr(item, "message_id", "") or ""),
+            str(timestamp or ""),
+            str(getattr(item, "sender_id", "") or ""),
+            str(getattr(item, "content", "") or ""),
+        )
+
+    @staticmethod
+    def _context_item_matches_message(item, message: Message) -> bool:
+        """判断窗口中的消息是否对应一条刚收到的平台消息。"""
+        item_id = str(getattr(item, "message_id", "") or "")
+        message_id = str(getattr(message, "message_id", "") or "")
+        if item_id and message_id:
+            return item_id == message_id
+        return (
+            str(getattr(item, "sender_id", "") or "")
+            == str(getattr(message, "sender_id", "") or "")
+            and str(getattr(item, "content", "") or "")
+            == str(getattr(message, "content", "") or "")
+        )
+
     def _latest_user_context_marker(self, session_id: str):
         """返回会话里最新群友消息的稳定标记，用于检测收尾窗口是否被打断。"""
         recent = self.context_manager.get_window(session_id).get_recent(30)
         for item in reversed(recent):
-            if item.is_bot:
-                continue
-            timestamp = getattr(item, "timestamp", None)
-            if hasattr(timestamp, "isoformat"):
-                timestamp = timestamp.isoformat()
-            return (
-                str(item.message_id or ""),
-                str(timestamp or ""),
-                str(item.sender_id or ""),
-                str(item.content or ""),
-            )
+            if not item.is_bot:
+                return self._context_marker(item)
         return None
+
+    def _context_marker_for_message(self, session_id: str, message: Message):
+        """返回某条入站消息在窗口中的标记，而不是调用时刻的 latest 标记。"""
+        item = self._context_item_for_message(session_id, message)
+        if item is not None:
+            return self._context_marker(item)
+        # 快速路径异常时仍给出可比较的退化标记；后续会被最新消息检测挡住。
+        return self._context_marker(message)
+
+    def _context_item_for_message(self, session_id: str, message: Message):
+        """找出窗口中对应的入站消息，忽略之后追加的 Bot 回复。"""
+        recent = self.context_manager.get_window(session_id).get_recent(50)
+        for item in reversed(recent):
+            if not item.is_bot and self._context_item_matches_message(item, message):
+                return item
+        return None
+
+    def _is_latest_user_message(self, session_id: str, message: Message) -> bool:
+        """判断入站消息是否仍是窗口里最新的群友消息。"""
+        latest = self._latest_user_context_message(session_id)
+        return bool(latest and self._context_item_matches_message(latest, message))
 
     async def _wait_for_group_settle(self, session_id: str, action_plan) -> None:
         """等待普通群聊短暂安静，再把最新上下文交给 LLM。
@@ -1666,7 +1748,11 @@ class GroupChatBot:
         context = decision["context"]
         action_plan = decision.get("action_plan")
         conversation_judgement = decision.get("conversation_judgement") or {}
-        initial_plan_directed = bool(action_plan and action_plan.directed)
+        # 动态判断为 bot 的隐式续话即使在排队期间变成了“非最新用户消息”，
+        # 仍应保留原问题的定向回复语义；普通群聊插话则必须在收尾时重新判断。
+        initial_plan_directed = bool(
+            (action_plan and action_plan.directed) or direction == "to_bot"
+        )
         effective_context_item = None
         effective_message_id = str(message.message_id or "")
 
@@ -3230,6 +3316,12 @@ class GroupChatBot:
     )
     # 名词性词性（含数词、时间词，覆盖「我是95年的」这类）
     _NOUNISH_POS = ("n", "j", "eng", "m", "t", "s", "f")
+    # 没有 jieba 时用于识别“我是/我在”后面的动词、语气词。这里只拦
+    # 明显的转折/宾语结构，保留“我在看电影”“我是学生”这类正常自述。
+    _NON_NOUNISH_TAIL_PREFIXES = (
+        "说", "想", "要", "帮", "让", "能", "会", "是不是",
+        "看我", "看谁", "吗", "吧", "呢", "啊", "呀", "了",
+    )
 
     @classmethod
     def _is_self_statement(cls, content: str) -> bool:
@@ -3269,16 +3361,21 @@ class GroupChatBot:
     def _tail_is_nounish(cls, tail: str) -> bool:
         """判断「我是/我在」后面接的是不是名词性成分。"""
         # 「我是…的」是典型判断句（我是玩周瑜的），照样算身份陈述
-        if tail.rstrip("。！!？?～~ ").endswith("的"):
+        normalized = tail.strip()
+        if normalized.rstrip("。！!？?～~ ").endswith("的"):
             return True
+        if not normalized or normalized.startswith(cls._NON_NOUNISH_TAIL_PREFIXES):
+            return False
         try:
             import jieba.posseg as pseg
-            for word, flag in pseg.cut(tail):
+            for word, flag in pseg.cut(normalized):
                 if not word.strip():
                     continue
                 return flag.startswith(cls._NOUNISH_POS)
         except Exception:
-            return True  # 没有 jieba 就不做这层过滤，保持旧行为
+            # 没有分词器时采用保守回退：至少需要两个有效字符，避免
+            # “我是吧/我是说……”等语气或话头被记成个人事实。
+            return len(normalized.strip("。！!？?～~ ")) >= 2
         return False
 
     def _is_meaningful_chat(self, memory) -> bool:
@@ -4730,6 +4827,7 @@ class GroupChatBot:
         self._reply_task_decisions.clear()
         self._message_ingest_locks.clear()
         self._conversation_judge_locks.clear()
+        self._session_message_versions.clear()
         self._rich_media_tasks.clear()
         self._meme_collect_tasks.clear()
         self._digest_tasks.clear()

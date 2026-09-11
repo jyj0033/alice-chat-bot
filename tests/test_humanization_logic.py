@@ -322,6 +322,63 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertEqual(reply.reply_to_qq, "7")
         self.assertEqual(reply.content, "回复内容")
 
+    def test_qq_parser_does_not_turn_missing_ids_into_none_text(self):
+        adapter = self._qq_adapter_class()({"self_id": "42"})
+        message = adapter._parse_message(
+            {
+                "message_type": "group",
+                "group_id": None,
+                "user_id": None,
+                "sender": {},
+                "message": "异常事件",
+            }
+        )
+
+        self.assertEqual(message.message_id, "")
+        self.assertEqual(message.sender_id, "")
+        self.assertEqual(message.group_id, "")
+        self.assertNotIn("None", message.sender_name)
+
+    def test_latest_user_marker_ignores_bot_reply_at_window_tail(self):
+        from core.adapter.base import Message
+        from main import GroupChatBot
+
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.context_manager = ContextManager()
+        bot.context_manager.add_message(
+            "group_g1", "u1", "小明", "原始问题", message_id="m1"
+        )
+        message = Message(
+            message_id="m1",
+            message_type="group",
+            sender_id="u1",
+            sender_name="小明",
+            group_id="g1",
+            content="原始问题",
+        )
+        bot.context_manager.add_message(
+            "group_g1", "bot", "爱丽丝", "刚刚回答", is_bot=True, message_id="b1"
+        )
+
+        self.assertTrue(bot._is_latest_user_message("group_g1", message))
+        self.assertEqual(
+            bot._context_marker_for_message("group_g1", message)[0], "m1"
+        )
+
+        newer = Message(
+            message_id="m2",
+            message_type="group",
+            sender_id="u2",
+            sender_name="小红",
+            group_id="g1",
+            content="换个话题",
+        )
+        bot.context_manager.add_message(
+            "group_g1", "u2", "小红", "换个话题", message_id="m2"
+        )
+        self.assertFalse(bot._is_latest_user_message("group_g1", message))
+        self.assertTrue(bot._is_latest_user_message("group_g1", newer))
+
     # === "被嫌弃降级" 触发判定 ===
 
     def test_sticker_description_does_not_trigger_frustration(self):

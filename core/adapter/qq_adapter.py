@@ -393,17 +393,25 @@ class QQAdapter(PlatformAdapter):
             mentioned_me = True
 
         sender = data.get("sender", {}) or {}
+        message_type = data.get("message_type", "private") or "private"
+        sender_id = str(data.get("user_id", "") or "")
         message = Message(
-            message_id=str(data.get("message_id", "")),
-            message_type=data.get("message_type", "private"),
-            sender_id=str(data.get("user_id", "")),
+            # OneBot 的这些字段在异常/模拟事件中可能缺失；不能把 None
+            # 变成字面量 "None"，否则去重和引用关系会被污染。
+            message_id=str(data.get("message_id", "") or ""),
+            message_type=message_type,
+            sender_id=sender_id,
             # 群名片比 QQ 昵称更符合群友实际看到的称呼。
             sender_name=(
                 sender.get("card")
                 or sender.get("nickname")
-                or f"User_{data.get('user_id', '')}"
+                or f"User_{sender_id}"
             ),
-            group_id=str(data.get("group_id", "")) if data.get("message_type") == "group" else None,
+            group_id=(
+                str(data.get("group_id", "") or "")
+                if message_type == "group"
+                else None
+            ),
             content=content,
             raw_content=(
                 raw_content

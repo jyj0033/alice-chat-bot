@@ -258,7 +258,19 @@ class TopicAnalyzer:
             import jieba
             return [w.strip() for w in jieba.cut(text) if w.strip()]
         except Exception:
-            return [text]
+            # jieba 是可选依赖；不能因为本地精简环境没有它，就把一整段
+            # 描述（如“手游端游主机都OK”）当成一个词，导致“手游”永远
+            # 匹配不上。中文回退使用二字滑窗，至少保住常见话题短词的命中。
+            tokens = []
+            for chunk in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text.lower()):
+                if re.fullmatch(r"[\u4e00-\u9fff]+", chunk):
+                    tokens.extend(
+                        chunk[index:index + 2]
+                        for index in range(len(chunk) - 1)
+                    )
+                else:
+                    tokens.append(chunk)
+            return tokens
 
     def analyze_relevance(self, message: str) -> float:
         """分析话题相关性（0.5 为中性；命中兴趣词升、厌倦词降）"""
