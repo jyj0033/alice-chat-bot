@@ -51,6 +51,17 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
+# 第三方组件的信息日志通常是英文且重复；保留警告和错误，避免污染 Bot 中文日志。
+for _quiet_logger_name in (
+    "asyncio",
+    "jieba",
+    "websockets",
+    "websockets.server",
+    "uvicorn",
+    "uvicorn.error",
+    "uvicorn.access",
+):
+    logging.getLogger(_quiet_logger_name).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # 第一人称代词：只认「我」会漏掉习惯说「俺」「咱」的人——他们的自述永远
