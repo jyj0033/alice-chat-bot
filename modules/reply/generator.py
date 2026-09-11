@@ -368,6 +368,7 @@ class ReplyGenerator:
         else:
             passed, result = self.response_filter.filter(reply)
         if not passed:
+            logger.warning(f"[meme-exit] filter rejected: {result}")
             logger.info(f"Reply filtered: {result}")
             self.replies_filtered += 1
             return None
@@ -425,6 +426,10 @@ class ReplyGenerator:
         # 9. 思考/打字延迟由 GroupChatBot._compose_and_send 统一处理。
         # 这里不再重复等待，避免一次回复串行等待两套延迟。
 
+        logger.warning(
+            "[meme-exit] reply=%r, cat=%r, id=%r, called=%s",
+            reply, meme_category, meme_id, meme_called,
+        )
         return {
             "reply": reply,
             # meme_called 表达"LLM 真的调了 send_meme"这个事实。

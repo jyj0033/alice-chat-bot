@@ -2803,12 +2803,12 @@
                 body: JSON.stringify(config)
             });
             const data = await res.json();
-            showToast(data.success ? '搜索配置已保存（重启后生效）' : '保存失败: ' + (data.error || ''), data.success ? 'success' : 'error');
+            showToast(data.success ? '搜索配置已保存并已应用' : '保存失败: ' + (data.error || ''), data.success ? 'success' : 'error');
             if (data.success) loadLLMConfig();
         }
 
         function loadVisionConfig(config) {
-            const vision = config.image?.vision || {};
+            const vision = { ...(config.rich_media?.image?.vision || {}), ...(config.image?.vision || {}) };
             document.getElementById('vision-enabled').checked = vision.enabled !== false;
             document.getElementById('vision-provider-type').value = vision.provider_type || 'anthropic';
             document.getElementById('vision-api-key').value = vision.api_key || '';
@@ -2844,7 +2844,7 @@
                 body: JSON.stringify(config)
             });
             const data = await res.json();
-            showToast(data.success ? '视觉模型已保存（重启后生效）' : '保存失败: ' + (data.error || ''), data.success ? 'success' : 'error');
+            showToast(data.success ? '视觉模型已保存并已应用' : '保存失败: ' + (data.error || ''), data.success ? 'success' : 'error');
             if (data.success) loadLLMConfig();
         }
 

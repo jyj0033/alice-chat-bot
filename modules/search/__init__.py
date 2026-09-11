@@ -66,7 +66,7 @@ class SearchClient:
 
         self._backends: dict[str, object] = {}
         for name, backend_cls in BACKENDS.items():
-            cfg = backends_cfg.get(name, {}) or {}
+            cfg = dict(backends_cfg.get(name, {}) or {})
             if cfg.get("api_key"):
                 try:
                     self._backends[name] = backend_cls(cfg.pop("api_key"), **cfg)

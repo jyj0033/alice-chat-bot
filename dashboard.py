@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, Response
 import uvicorn
-import yaml
+from core.config_store import load_config as load_config_file, mask_secrets, save_config as save_config_file
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +46,23 @@ def set_bot(bot):
 
 
 def load_config():
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f) or {}
-    return {}
+    return load_config_file(CONFIG_FILE)
 
 
 def save_config(cfg):
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+    save_config_file(cfg, CONFIG_FILE)
+
+
+def reload_bot_runtime() -> bool:
+    """让 Web 保存的 Provider/Token 配置立即作用于当前进程。"""
+    if not bot_instance or not hasattr(bot_instance, "apply_runtime_config"):
+        return False
+    try:
+        bot_instance.apply_runtime_config()
+        return True
+    except Exception:
+        logger.exception("Web 配置热更新失败")
+        return False
 
 
 def deep_merge(base, changes):
@@ -95,36 +102,9 @@ async def root():
 # API 端点
 @app.get("/api/config")
 async def get_config():
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f) or {}
-    else:
-        config = {}
-    # 隐藏 API Keys
-    if 'llm' in config:
-        for name, provider in normalize_llm_config(config).items():
-            if isinstance(provider, dict) and 'api_key' in provider:
-                provider['api_key'] = '********' if provider['api_key'] else ''
-    if 'memory' in config and isinstance(config.get('memory'), dict):
-        emb = config['memory'].get('embedding')
-        if isinstance(emb, dict) and emb.get('api_key'):
-            emb['api_key'] = '********'
-    if 'qq' in config and isinstance(config.get('qq'), dict):
-        if config['qq'].get('access_token'):
-            config['qq']['access_token'] = '********'
-    if 'image' in config and isinstance(config.get('image'), dict):
-        vision = config['image'].get('vision')
-        if isinstance(vision, dict) and vision.get('api_key'):
-            vision['api_key'] = '********'
-    if 'search' in config and isinstance(config.get('search'), dict):
-        search = config['search']
-        if isinstance(search.get('llm'), dict) and search['llm'].get('api_key'):
-            search['llm']['api_key'] = '********'
-        for name in ('bocha', 'doubao'):
-            backend = (search.get('backends') or {}).get(name)
-            if isinstance(backend, dict) and backend.get('api_key'):
-                backend['api_key'] = '********'
-    return config
+    config = load_config()
+    normalize_llm_config(config)
+    return mask_secrets(config)
 
 
 @app.post("/api/config")
@@ -254,12 +234,16 @@ async def update_config(request: Request):
             current['search'] = deep_merge(current_search, new_search)
 
         save_config(current)
-        # 表情库的开关和收集参数可以在运行中立即生效；其他配置仍按原有逻辑在重启后完整加载。
-        if 'meme_manager' in data and bot_instance:
-            manager = getattr(bot_instance, 'meme_manager', None)
-            if manager:
-                manager.update_config(current.get('meme_manager', {}))
-        return {"success": True, "message": "配置已保存"}
+        runtime_reloaded = reload_bot_runtime()
+        return {
+            "success": True,
+            "message": (
+                "配置已保存并已应用"
+                if runtime_reloaded
+                else "配置已保存，部分设置将在重启后生效"
+            ),
+            "runtime_reloaded": runtime_reloaded,
+        }
     except Exception as e:
         return {"success": False, "error": str(e) if e else "Unknown error"}
 
@@ -1121,7 +1105,16 @@ async def add_provider(request: Request):
         }
 
         save_config(current)
-        return {"success": True, "message": f"Provider '{name}' added"}
+        runtime_reloaded = reload_bot_runtime()
+        return {
+            "success": True,
+            "message": (
+                f"Provider '{name}' added and applied"
+                if runtime_reloaded
+                else f"Provider '{name}' added"
+            ),
+            "runtime_reloaded": runtime_reloaded,
+        }
     except Exception as e:
         return {"success": False, "error": str(e) if e else "Unknown error"}
 
@@ -1140,7 +1133,16 @@ async def delete_provider(name: str):
 
         del llm[name]
         save_config(current)
-        return {"success": True, "message": f"Provider '{name}' deleted"}
+        runtime_reloaded = reload_bot_runtime()
+        return {
+            "success": True,
+            "message": (
+                f"Provider '{name}' deleted and applied"
+                if runtime_reloaded
+                else f"Provider '{name}' deleted"
+            ),
+            "runtime_reloaded": runtime_reloaded,
+        }
     except Exception as e:
         return {"success": False, "error": str(e) if e else "Unknown error"}
 
@@ -1191,9 +1193,12 @@ async def test_vision(request: Request):
         data = await request.json()
         api_key = (data.get("api_key") or "").strip()
         if api_key.startswith('*'):
-            api_key = str(
-                load_config().get("image", {}).get("vision", {}).get("api_key", "")
-            ).strip()
+            current = load_config()
+            image = current.get("image", {}) or {}
+            rich_media_image = (current.get("rich_media", {}) or {}).get("image", {}) or {}
+            vision_config = dict(rich_media_image.get("vision", {}) or {})
+            vision_config.update(image.get("vision", {}) or {})
+            api_key = str(vision_config.get("api_key", "")).strip()
         if not api_key:
             return {"success": False, "error": "API Key 不能为空"}
         provider_type = data.get("provider_type") or "anthropic"

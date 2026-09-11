@@ -69,10 +69,10 @@ SCREENSHOT_HINTS = (
     "手机界面", "聊天记录", "聊天界面", "设置页面", "应用界面", "网页截图",
     "订单", "二维码", "条形码", "收款码", "付款码", "验证码", "通知栏",
 )
+# 普通图片只接受明确的表情包语义；“哈哈/可爱/这张图”等泛聊天词不再作为
+# 自动入库依据，避免一条普通图片配一句情绪话就被收进图库。
 MEME_SIGNAL_HINTS = (
-    "表情包", "梗图", "meme", "动图", "gif", "哈哈", "笑死", "笑不活", "笑哭",
-    "破防", "无语", "离谱", "可爱", "太真实", "蚌埠住", "救命", "绝了",
-    "吐槽", "阴阳", "发个图", "这图", "这个图", "这张图",
+    "表情包", "梗图", "meme",
 )
 CATEGORY_HINTS = {
     "开心": ("哈哈", "笑死", "笑不活", "笑哭", "开心", "高兴", "庆祝", "得意", "好耶"),
@@ -888,7 +888,15 @@ class MemeManager:
 
     @staticmethod
     def _has_meme_signal(message: Any, segment: Any) -> bool:
-        hint_text = MemeManager._segment_hint_text(message, segment)
+        # 只看发送者文字和富媒体语义摘要，不把随机文件名/文件 ID 当成语义。
+        data = getattr(segment, "data", {}) or {}
+        values = [
+            getattr(message, "outer_text", ""),
+            getattr(segment, "summary", ""),
+        ]
+        if isinstance(data, dict):
+            values.append(data.get("objective_summary", ""))
+        hint_text = " ".join(str(value or "") for value in values).strip().lower()
         return any(hint in hint_text for hint in MEME_SIGNAL_HINTS)
 
     @staticmethod

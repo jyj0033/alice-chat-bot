@@ -30,6 +30,7 @@ sys.path.insert(0, str(REPO))
 
 from modules.llm.base import ChatMessage, ChatRequest  # noqa: E402
 from modules.llm.openai_provider import create_provider  # noqa: E402
+from core.config_store import load_config as load_config_file  # noqa: E402
 
 ALLOWED_CATEGORIES = {"待整理", "开心", "无语", "吐槽", "鼓励", "卖萌", "震惊", "其他"}
 
@@ -57,13 +58,7 @@ PROMPT = """请识别这张图片，严格按下面的 JSON 输出，不要输�
 
 def _load_config() -> dict[str, Any]:
     cfg_path = REPO / "config" / "config.yaml"
-    try:
-        import yaml
-    except ImportError:
-        logger.critical("PyYAML 未安装")
-        raise SystemExit(1)
-    with cfg_path.open(encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    return load_config_file(cfg_path)
 
 
 def _init_vision(cfg: dict[str, Any]) -> Any:

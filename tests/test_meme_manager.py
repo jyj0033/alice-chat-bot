@@ -10,7 +10,7 @@ import unittest
 from PIL import Image
 
 from core.adapter.base import Message
-from core.adapter.rich_content import MessageSegment
+from core.adapter.rich_content import MessageSegment, parse_message_segments
 from modules.meme_manager import MemeManager
 from modules.reply.generator import ReplyGenerator
 
@@ -65,6 +65,17 @@ class MemeManagerTests(unittest.TestCase):
         self.assertIsNotNone(item_and_bytes)
         self.assertEqual(item_and_bytes[1], content)
         self.assertTrue((Path(self.temp_dir.name) / "开心" / first["filename"]).is_file())
+
+    def test_sub_type_does_not_promote_plain_image_to_mface(self):
+        segments = parse_message_segments([
+            {"type": "image", "data": {"file": "ordinary.jpg", "sub_type": "1"}},
+        ])
+        self.assertEqual(segments[0].type, "image")
+
+        marketface = parse_message_segments([
+            {"type": "image", "data": {"file": "marketface", "sub_type": "1"}},
+        ])
+        self.assertEqual(marketface[0].type, "mface")
 
     def test_data_url_directive_and_delete(self):
         content = _png_bytes((255, 120, 160))
@@ -193,7 +204,7 @@ class MemeManagerTests(unittest.TestCase):
             sender_name="小明",
             group_id="123",
             content="这张可以",
-            outer_text="哈哈这张好好笑",
+            outer_text="这是一个表情包，哈哈",
             segments=[MessageSegment(type="image")],
         )
         adapter = SimpleNamespace(self_id="bot", rich_media_enricher=Enricher())
@@ -244,6 +255,11 @@ class MemeManagerTests(unittest.TestCase):
         self.assertEqual(asyncio.run(manager.collect_message(message, adapter)), [])
         self.assertEqual(calls, 0)
 
+        message.outer_text = "哈哈这张好好笑"
+        self.assertEqual(asyncio.run(manager.collect_message(message, adapter)), [])
+        self.assertEqual(calls, 0)
+
+        message.outer_text = "看一下"
         message.segments[0].summary = "[图片，内容：一张聊天截图]"
         self.assertEqual(asyncio.run(manager.collect_message(message, adapter)), [])
         self.assertEqual(calls, 0)

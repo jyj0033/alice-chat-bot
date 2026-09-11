@@ -1,0 +1,24 @@
+# .dockerignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+.git
+.gitignore
+.env
+*.md
+tests
+.pytest_cache
+.coverage
+htmlcov
+.idea
+.vscode
+config/secrets.yaml
+config/*.bak
+*.log

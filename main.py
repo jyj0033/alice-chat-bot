@@ -22,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from core.event_bus import EventBus, Event, EventType
 from core.adapter.qq_adapter import QQAdapter
 from core.adapter.base import Message
+from core.adapter.rich_media import RichMediaEnricher
+from core.config_store import load_config as load_config_file, save_config as save_config_file
 
 from modules.llm.openai_provider import create_provider, LLMProvider
 from modules.memory.storage import MemoryStorage, AsyncMemoryStorage, Memory
@@ -204,13 +206,11 @@ class GroupChatBot:
             # 创建默认配置文件
             logger.info("No config file found, creating default configuration...")
             default_config = self._get_default_config()
-            with open(config_file, 'w', encoding='utf-8') as f:
-                yaml.dump(default_config, f, allow_unicode=True, default_flow_style=False)
+            save_config_file(default_config, config_file)
             self.config = default_config
             logger.info(f"✓ Default config created at {config_file}")
         else:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                self.config = yaml.safe_load(f) or {}
+            self.config = load_config_file(config_file)
 
         # 加载人格配置
         personality_config = self.config.get("personality", {})
@@ -633,6 +633,15 @@ class GroupChatBot:
     def _init_vision_provider(self) -> Optional[Any]:
         """初始化视觉模型 Provider（图片→文字描述）。未启用/失败返回 None，不阻断启动。"""
         image_config = self.config.get("image", {}) or {}
+        rich_media_image = (self.config.get("rich_media", {}) or {}).get("image", {}) or {}
+        image_config = {**rich_media_image, **image_config}
+        if isinstance(rich_media_image.get("vision"), dict) and isinstance(
+            image_config.get("vision"), dict
+        ):
+            image_config["vision"] = {
+                **rich_media_image["vision"],
+                **image_config["vision"],
+            }
         vision_config = image_config.get("vision", {}) or {}
         if not vision_config.get("enabled", False):
             return None
@@ -659,15 +668,26 @@ class GroupChatBot:
             logger.error(f"✗ Failed to init vision provider: {e}")
             return None
 
-    def _init_qq_adapter(self) -> None:
-        """初始化 QQ 适配器"""
-        qq_config = self.config.get("qq", {})
-        # 顶层 image 段（to_text_scope/prompt/vision 等）合并进 rich_media 配置。
-        rich_media_config = dict(self.config.get("rich_media", qq_config.get("rich_media", {})))
+    def _get_rich_media_config(self) -> dict:
+        """合并兼容的 rich_media/image 配置，供启动和热更新共用。"""
+        qq_config = self.config.get("qq", {}) or {}
+        rich_media_config = dict(
+            self.config.get("rich_media", qq_config.get("rich_media", {})) or {}
+        )
         image_config = self.config.get("image", {}) or {}
         if image_config:
             merged_image = {**rich_media_config.get("image", {}), **image_config}
+            base_vision = rich_media_config.get("image", {}).get("vision", {})
+            override_vision = image_config.get("vision", {})
+            if isinstance(base_vision, dict) and isinstance(override_vision, dict):
+                merged_image["vision"] = {**base_vision, **override_vision}
             rich_media_config["image"] = merged_image
+        return rich_media_config
+
+    def _init_qq_adapter(self) -> None:
+        """初始化 QQ 适配器"""
+        qq_config = self.config.get("qq", {}) or {}
+        rich_media_config = self._get_rich_media_config()
         adapter_config = {
             **qq_config,
             "rich_media": rich_media_config,
@@ -677,6 +697,36 @@ class GroupChatBot:
             on_message=self._handle_message,
             vision_provider=self._init_vision_provider(),
         )
+
+    def apply_runtime_config(self) -> None:
+        """重新读取 Web 配置并热更新可安全替换的运行组件。"""
+        self._load_config()
+        self._init_llm()
+
+        if self.reply_generator:
+            self.reply_generator.llm = self.get_active_provider()
+            search_client, tool_llm = self._init_search()
+            self.reply_generator.search_client = search_client
+            self.reply_generator.tool_llm = tool_llm
+
+        if self.meme_manager:
+            self.meme_manager.update_config(self.config.get("meme_manager", {}))
+
+        if self.qq_adapter:
+            qq_config = self.config.get("qq", {}) or {}
+            rich_media_config = self._get_rich_media_config()
+            self.qq_adapter.config = {
+                **qq_config,
+                "rich_media": rich_media_config,
+            }
+            self.qq_adapter.self_id = qq_config.get("self_id", "")
+            self.qq_adapter.access_token = qq_config.get("access_token", "")
+            self.qq_adapter.rich_media_enricher = RichMediaEnricher(
+                rich_media_config,
+                self.qq_adapter.call_api,
+                vision_provider=self._init_vision_provider(),
+            )
+        logger.info("✓ Web 配置已热更新（正在进行的请求继续使用旧实例）")
 
     async def _handle_message(self, message: Message) -> None:
         """处理接收到的消息
@@ -1461,7 +1511,7 @@ class GroupChatBot:
                 for m in self.context_manager.get_window(session_id).get_recent(12)
                 if not m.is_bot
             ]
-            if reply and self.reply_generator.is_parroting(reply, recent_texts):
+            if reply and self.reply_generator.is_parroting(reply, recent_texts) and not has_meme_intent:
                 logger.info(f"[复读] 放弃回复（复述了群友原话）：{reply[:40]}")
                 if direction == "to_bot":
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
@@ -1470,7 +1520,10 @@ class GroupChatBot:
             # 兜底：极短回复（≤8 字）只是把对方最后一句的关键词原样重复，
             # 没有补充任何新信息（典型："确实真实""就是真实""对"）。
             # 这种复读群里会被直接当成废话，提前挡掉让 LLM 重答。
-            if reply and recent_texts:
+            # 注意：LLM 调 send_meme 时偶尔会写几个字尾巴（如"发个"+"调工具"），
+            # 复读检测会把尾巴和原话前缀误判，但用户真正要的是图，丢掉整条不可接受。
+            # 有图要发就跳过复读检查。
+            if reply and recent_texts and not has_meme_intent:
                 last_msg = recent_texts[-1].strip()
                 if last_msg and self.reply_generator.is_short_echo(reply, last_msg):
                     logger.info(

@@ -132,10 +132,9 @@ def _from_onebot_segment(segment_type: str, data: dict[str, Any]) -> list[Messag
         return [MessageSegment(type=segment_type, data=dict(data))]
 
     normalized = segment_type
-    if segment_type == "image" and (
-        str(data.get("file", "")).lower() == "marketface"
-        or str(data.get("sub_type", "")) in ("1", "7")
-    ):
+    # 只有 OneBot 明确标记为 marketface 时才当作市场表情。
+    # sub_type=1/7 在不同实现中可能代表普通/闪照等图片状态，不能据此放行。
+    if segment_type == "image" and str(data.get("file", "")).lower() == "marketface":
         normalized = "mface"
 
     if segment_type in ("json", "xml", "lightapp", "share"):
