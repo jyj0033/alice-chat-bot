@@ -1242,6 +1242,7 @@ class GroupChatBot:
                 recent,
                 heuristic_signals={
                     "mentioned_me": message.mentioned_me,
+                    "mentioned_user_ids": message.mentioned_user_ids,
                     "mentioned_others": message.mentioned_others,
                     "reply_to_me": self._is_reply_to_bot(message),
                     "reply_to_qq": message.reply_to_qq or "",
@@ -1721,6 +1722,7 @@ class GroupChatBot:
             recent,
             heuristic_signals={
                 "mentioned_me": platform_message.mentioned_me,
+                "mentioned_user_ids": platform_message.mentioned_user_ids,
                 "mentioned_others": platform_message.mentioned_others,
                 "reply_to_me": self._is_reply_to_bot(platform_message),
                 "reply_to_qq": platform_message.reply_to_qq or "",
@@ -2140,12 +2142,20 @@ class GroupChatBot:
             recent_texts = [
                 m.content for m in recent_context_for_review if not m.is_bot
             ]
+            paraphrase_candidate = (
+                self.reply_generator.looks_like_paraphrase_candidate(
+                    review_text, recent_texts
+                )
+            )
+            evidence_candidate = self.reply_generator.needs_semantic_review(
+                review_text,
+                effective_message.content,
+                recent_texts,
+            )
             if (
                 judge
                 and review_text.strip()
-                and self.reply_generator.looks_like_paraphrase_candidate(
-                    review_text, recent_texts
-                )
+                and (paraphrase_candidate or evidence_candidate)
             ):
                 review = await judge.review_reply(
                     effective_message,
@@ -2154,14 +2164,36 @@ class GroupChatBot:
                     direction=direction,
                 )
                 review_evidence = review.evidence or {}
-                if (
-                    review.available
-                    and review_evidence.get("is_paraphrase")
+                paraphrase_issue = bool(
+                    review_evidence.get("is_paraphrase")
                     and not review_evidence.get("adds_information")
+                )
+                unsupported_issue = bool(
+                    review_evidence.get("unsupported_assumption")
+                )
+                clarification_issue = bool(
+                    review_evidence.get("needs_clarification")
+                )
+                if review.available and (
+                    paraphrase_issue or unsupported_issue or clarification_issue
                 ):
+                    if paraphrase_issue:
+                        review_label = "语义复读"
+                    elif unsupported_issue:
+                        review_label = "把未确认信息当成事实"
+                    else:
+                        review_label = "指代不清，需要澄清"
+                    review_hint = str(review.reason or "").strip()
+                    if unsupported_issue:
+                        review_hint = (
+                            f"{review_hint}；" if review_hint else ""
+                        ) + "不要把猜测或未知图片内容当成事实"
+                    elif clarification_issue and not review_hint:
+                        review_hint = "当前指代不清，先澄清对象或保持沉默"
                     logger.info(
-                        "[复读判断] 草稿被判定为语义复读，要求重新接话：%s",
-                        review.reason or "未增加信息",
+                        "[语义复核] 草稿被判定为%s，要求重新生成：%s",
+                        review_label,
+                        review_hint or "未通过语义复核",
                     )
                     retry_reply = await self.reply_generator.generate(
                         context_prompt=context_prompt,
@@ -2181,7 +2213,8 @@ class GroupChatBot:
                             "reply_to_qq": effective_message.reply_to_qq,
                             "conversation_judgement": conversation_judgement,
                         },
-                        avoid_paraphrase=True,
+                        avoid_paraphrase=paraphrase_issue,
+                        reply_review_hint=review_hint,
                     )
                     # generate() 当前返回包含表情包工具结果的 dict；兼容旧版
                     # 直接返回字符串，避免复读重答分支把 dict 当作文本继续处理。
@@ -2799,10 +2832,14 @@ class GroupChatBot:
                 if memory.created_at < cutoff:
                     break
                 meta = memory.metadata or {}
-                # 只恢复「有实义内容」的消息：纯应声/仅上下文的历史不是一个
-                # 可衔接的对话（见写入端的 meaningful 标记），跳过它们，
-                # 避免重启后窗口被“嗯”“好”“对”刷满而挤掉真人对话。
-                if meta.get("profile_context_only") or not meta.get("meaningful"):
+                # 只恢复「有实义内容」的消息；纯应声/仅上下文的历史不是一个
+                # 可衔接的对话，跳过它们。仅保留显式 @/回复的关系消息，供
+                # 目标判断延续指向，避免重启后丢掉“上一条 @ 了谁”的证据。
+                relationship_only = bool(meta.get("relationship_only"))
+                if (
+                    (meta.get("profile_context_only") and not relationship_only)
+                    or (not meta.get("meaningful") and not relationship_only)
+                ):
                     continue
                 message_id = str(meta.get("message_id") or "")
                 if current_message_id and message_id == str(current_message_id):
@@ -2872,6 +2909,8 @@ class GroupChatBot:
                 "is_bot": False,
                 "reply_to_id": message.reply_to_id,
                 "reply_to_qq": message.reply_to_qq,
+                "mentioned_user_ids": list(message.mentioned_user_ids or []),
+                "mentioned_others": list(message.mentioned_others or []),
             },
         )
 
@@ -3246,9 +3285,10 @@ class GroupChatBot:
         if message.rich_type:
             content = f"{content} [{message.rich_type}]".strip()
         has_reply = bool(message.reply_to_id or message.reply_to_qq)
+        has_explicit_target = bool(message.mentioned_user_ids) or has_reply
         # 明确回复的“我也是”“对”等极短接话也要留下，方便画像提炼时读取前后文；
         # 它们会被标记为仅上下文，不会进入画像事实或普通记忆召回。
-        if not content or (len(content) < 4 and not has_reply):
+        if not content or (len(content) < 4 and not has_explicit_target):
             return
         # 转发的领取口令/推广模板不是这个人说的话，不进长期记忆
         if self._is_promo_text(content):
@@ -3258,10 +3298,20 @@ class GroupChatBot:
         # 普通短闲聊不进长期库，避免“说过一句就记住”；明确对 bot 说、
         # 自我描述和较完整的分享/吐槽仍然保留。带引用的短句另存为“仅上下文”，
         # 供画像理解前后文，但不会作为这个人的画像证据。
-        context_only = has_reply and not (
+        context_only = has_explicit_target and not (
             message.mentioned_me or self_statement or len(content) > 20
         )
-        if not (message.mentioned_me or self_statement or len(content) > 20 or context_only):
+        # 纯 @ 在平台解析后通常只剩这个占位符；它虽没有实义文本，但仍是
+        # 目标延续所需的关系证据。
+        relationship_only = context_only or (
+            has_explicit_target and content == "[无法识别的消息]"
+        )
+        if not (
+            message.mentioned_me
+            or self_statement
+            or len(content) > 20
+            or relationship_only
+        ):
             return
 
         importance = 0.25 if context_only else 0.3
@@ -3272,7 +3322,9 @@ class GroupChatBot:
         if any(kw in content for kw in self._PERSONAL_KEYWORDS):
             importance += 0.3 if self_statement else 0.1
 
-        if not context_only and importance < 0.5:
+        # 纯 @/短回复没有稳定语义，不参与画像和普通召回；但重启后目标判断仍
+        # 需要知道它明确指向过谁，所以单独标记为“仅关系上下文”。
+        if not context_only and not relationship_only and importance < 0.5:
             return
 
         bot_config = getattr(self, "config", {}) or {}
@@ -3295,20 +3347,27 @@ class GroupChatBot:
                     == str(bot_config.get("qq", {}).get("self_id", ""))
                     and bool(message.reply_to_qq)
                 ),
-                "profile_context_only": context_only,
+                "profile_context_only": context_only or relationship_only,
                 # 有实义内容（非纯应声）：重启恢复会话窗口时只取这类消息，
                 # 避免“嗯”“好”“对”把真人对话挤出窗口。
-                "meaningful": not context_only
-                and (message.mentioned_me or self_statement or len(content) > 20),
+                "meaningful": relationship_only
+                or (
+                    not context_only
+                    and (message.mentioned_me or self_statement or len(content) > 20)
+                ),
+                "relationship_only": relationship_only,
             },
         )
 
         async def _save():
             try:
                 # 写入去重：同会话同发送者已有近似内容 → 强化旧记忆，不新增重复条目
-                dup = await self.memory_storage.find_similar(
-                    session_id, message.sender_id, content
-                )
+                # 关系消息即使正文都是“无法识别”，@对象也可能不同，不能按正文去重。
+                dup = None
+                if not relationship_only:
+                    dup = await self.memory_storage.find_similar(
+                        session_id, message.sender_id, content
+                    )
                 if dup is not None:
                     boost = max(0.05, memory.importance - dup.importance)
                     await self.memory_storage.bump_memories([dup.id], importance_boost=boost)

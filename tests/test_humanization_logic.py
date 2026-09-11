@@ -730,6 +730,35 @@ class HumanizationLogicTests(unittest.TestCase):
         for reply in ("对面强度不太够吧这", "才6箭啊那确实亏", "满愿这活动设计有问题"):
             self.assertFalse(ReplyGenerator.is_parroting(reply, recent), reply)
 
+    def test_uncertain_media_acknowledgement_is_sent_for_semantic_review(self):
+        """未知图片配上「好像」转述时，泛泛致谢要交给语义复核。"""
+        self.assertTrue(
+            ReplyGenerator.needs_semantic_review(
+                "谢了哈～",
+                "这个男人好像在夸你什么",
+                ["[无法识别的消息]", "[图片]"],
+            )
+        )
+        self.assertFalse(
+            ReplyGenerator.needs_semantic_review(
+                "这人挺有意思",
+                "这个男人好像在夸你什么",
+                ["[图片]"],
+            )
+        )
+
+    def test_reply_review_hint_is_injected_into_retry_prompt(self):
+        request = ReplyGenerator(llm_provider=None)._build_request(
+            context_prompt="",
+            current_message="这个男人好像在夸你什么",
+            reply_review_hint="不要把未知图片内容当成事实",
+        )
+        system_text = "\n".join(
+            message.content for message in request.messages if message.role == "system"
+        )
+        self.assertIn("语义复核提示", system_text)
+        self.assertIn("未知图片内容", system_text)
+
     # === 省略号与笑声频率 ===
 
     def test_ellipsis_not_appended_after_tone_marks(self):

@@ -87,6 +87,52 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.available)
         self.assertIn("invalid_json", result.error)
 
+    async def test_prompt_keeps_previous_explicit_target_for_same_sender(self):
+        provider = _FakeProvider(
+            '{"target":"unknown","intent":"silent",'
+            '"should_reply":false,"confidence":0.9,"reason":"指向不明"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot", bot_name="爱丽丝")
+        current = self._message(
+            message_id="m3",
+            sender_id="u2",
+            sender_name="小红",
+            content="这个男人好像在夸你什么",
+            mentioned_user_ids=[],
+            reply_to_id=None,
+            reply_to_qq=None,
+        )
+        history = [
+            ContextMessage(
+                sender_id="u1",
+                sender_name="小明",
+                content="发张图看看",
+                message_id="m0",
+            ),
+            ContextMessage(
+                sender_id="u2",
+                sender_name="小红",
+                content="[无法识别的消息]",
+                message_id="m1",
+                mentioned_user_ids=("u1",),
+            ),
+            ContextMessage(
+                sender_id="u2",
+                sender_name="小红",
+                content="[图片]",
+                message_id="m2",
+            ),
+            current,
+        ]
+
+        result = await judge.judge(current, history)
+
+        self.assertTrue(result.evidence["target_continuity"])
+        prompt = provider.requests[0].messages[-1].content
+        self.assertIn("@=u1(小明)", prompt)
+        self.assertIn("最近一次明确@/回复的对象", prompt)
+        self.assertIn("不能因为出现‘你’", prompt)
+
     async def test_invalid_review_output_does_not_claim_a_review(self):
         provider = _FakeProvider("暂时看不懂")
         judge = ConversationJudge(provider, bot_id="bot")
@@ -112,6 +158,33 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.should_reply)
         self.assertEqual(result.intent, "silent")
         self.assertTrue(result.evidence["is_paraphrase"])
+
+    async def test_review_flags_unsupported_media_assumption(self):
+        provider = _FakeProvider(
+            '{"is_paraphrase":false,"adds_information":true,'
+            '"unsupported_assumption":true,"needs_clarification":true,'
+            '"replacement_hint":"图片内容未确认"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot")
+
+        result = await judge.review_reply(
+            self._message(content="这个男人好像在夸你什么"),
+            [
+                ContextMessage(
+                    sender_id="u2",
+                    sender_name="小红",
+                    content="[图片]",
+                    message_id="m1",
+                )
+            ],
+            "谢了哈～",
+            direction="group",
+        )
+
+        self.assertTrue(result.available)
+        self.assertFalse(result.should_reply)
+        self.assertTrue(result.evidence["unsupported_assumption"])
+        self.assertTrue(result.evidence["needs_clarification"])
 
     async def test_review_meme_send_result_is_structured(self):
         provider = _FakeProvider(

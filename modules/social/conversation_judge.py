@@ -131,6 +131,10 @@ class ConversationJudge:
             "自言自语和多人插话都要结合上下文区分。"
             "不要因为出现问号、昵称或关键词就机械判定为问 Alice。"
             "也不要因为 Alice 刚回复过某人就默认下一句仍然是对 Alice 说。\n"
+            "历史中的‘同一发言者的目标延续线索’只是语义证据，不是硬规则："
+            "当前没有新@/回复时，要判断是否仍在延续原对象；‘你’不等于 Alice。"
+            "如果对象冲突、话题已切换或证据不足，优先 target=unknown、should_reply=false，"
+            "不要替群友猜测对话对象。\n"
             "只输出一个 JSON 对象，不要输出 Markdown、解释、思维过程或额外文字。"
             "字段必须是：target（bot/other/group/unknown）、"
             "intent（answer/follow_up/acknowledge/add_info/react/silent）、"
@@ -150,6 +154,15 @@ class ConversationJudge:
             result.evidence = {
                 "message_id": str(getattr(current_message, "message_id", "") or ""),
                 "sender_id": str(getattr(current_message, "sender_id", "") or ""),
+                "target_continuity": bool(
+                    self._build_target_continuity_hint(
+                        current_message,
+                        recent_messages,
+                        self._build_user_name_map(
+                            [*(recent_messages or []), current_message]
+                        ),
+                    )
+                ),
             }
             logger.info(
                 "[目标判断] %s → 目标=%s，意图=%s，是否回复=%s，置信度=%.2f，理由=%s",
@@ -179,18 +192,36 @@ class ConversationJudge:
         if not self.enabled or not self.provider:
             return ConversationJudgeResult.unavailable("provider_unavailable")
 
-        history = self._render_messages(recent_messages)
-        current = self._render_message(current_message, current=True)
+        current_id = str(getattr(current_message, "message_id", "") or "")
+        known_users = self._build_user_name_map(
+            [*(recent_messages or []), current_message]
+        )
+        history = self._render_messages(
+            recent_messages,
+            exclude_id=current_id,
+            known_users=known_users,
+        )
+        current = self._render_message(
+            current_message,
+            current=True,
+            known_users=known_users,
+        )
         prompt = (
-            "判断下面这条 Bot 草稿是不是把用户刚说的话或前文换一种说法重复了一遍，"
-            "而没有真正接话、回答或增加信息。正常使用同一个关键词、对问题直接回答，"
-            "不算复读；只有主要内容等价于复述/总结原话才算。\n\n"
+            "判断下面这条 Bot 草稿是否真正理解并接住了当前消息。重点检查两类问题：\n"
+            "1. 是不是把用户刚说的话或前文换一种说法重复了一遍，而没有真正接话、回答或增加信息；\n"
+            "2. 是不是把‘好像/似乎/可能’这类不确定转述当成了已确认事实。"
+            "如果上下文只有[图片]、[视频]或[无法识别的消息]占位，没有客观描述，"
+            "Bot不能假装知道画面内容；例如用户说‘好像在夸你’，直接回‘谢谢’可能就是无根据的确认，"
+            "更合适的做法通常是澄清、谨慎回应或保持沉默。\n"
+            "正常使用同一个关键词、对问题直接回答不算复读；只有主要内容等价于复述/总结原话才算。\n\n"
             f"【最近上下文】\n{history or '（无）'}\n\n"
             f"【当前消息】\n{current}\n\n"
             f"【Bot草稿】\n{reply}\n\n"
             f"【回复方向】{direction}\n"
             "只输出 JSON：{\"is_paraphrase\":true/false,"
             "\"adds_information\":true/false,"
+            "\"unsupported_assumption\":true/false,"
+            "\"needs_clarification\":true/false,"
             "\"replacement_hint\":\"不超过30字\"}。不要输出解释或思维过程。"
         )
         request = ChatRequest(
@@ -200,7 +231,7 @@ class ConversationJudge:
             top_p=0.1,
         )
         request.add_system(
-            "你是对话质量检查器。只做语义复读判断，不评价人格，不负责改写。"
+            "你是对话质量检查器。只做语义复读和证据充分性判断，不评价人格，不负责改写。"
             "只输出要求的 JSON，不要输出思维过程。"
         )
         request.add_user(prompt)
@@ -215,15 +246,28 @@ class ConversationJudge:
             adds_information = self._parse_bool(
                 payload.get("adds_information"), not is_paraphrase
             )
+            unsupported_assumption = self._parse_bool(
+                payload.get("unsupported_assumption"), False
+            )
+            needs_clarification = self._parse_bool(
+                payload.get("needs_clarification"), False
+            )
+            quality_issue = (
+                (is_paraphrase and not adds_information)
+                or unsupported_assumption
+                or needs_clarification
+            )
             return ConversationJudgeResult(
-                intent="silent" if is_paraphrase and not adds_information else "react",
-                should_reply=not (is_paraphrase and not adds_information),
-                confidence=0.8 if is_paraphrase else 0.6,
+                intent="silent" if quality_issue else "react",
+                should_reply=not quality_issue,
+                confidence=0.8 if quality_issue else 0.6,
                 reason=str(payload.get("replacement_hint") or "")[:80],
                 available=True,
                 evidence={
                     "is_paraphrase": is_paraphrase,
                     "adds_information": adds_information,
+                    "unsupported_assumption": unsupported_assumption,
+                    "needs_clarification": needs_clarification,
                 },
             )
         except asyncio.CancelledError:
@@ -329,12 +373,34 @@ class ConversationJudge:
         heuristic_signals: dict[str, Any],
     ) -> str:
         current_id = str(getattr(current_message, "message_id", "") or "")
-        history = self._render_messages(recent_messages, exclude_id=current_id)
+        known_users = self._build_user_name_map(
+            [*(recent_messages or []), current_message]
+        )
+        history = self._render_messages(
+            recent_messages,
+            exclude_id=current_id,
+            known_users=known_users,
+        )
         signals = self._render_signals(heuristic_signals)
-        current = self._render_message(current_message, current=True)
+        current = self._render_message(
+            current_message,
+            current=True,
+            known_users=known_users,
+        )
+        continuity = self._build_target_continuity_hint(
+            current_message,
+            recent_messages,
+            known_users,
+        )
+        continuity_block = (
+            f"【同一发言者的目标延续线索（语义证据，不是硬规则）】\n{continuity}\n\n"
+            if continuity
+            else ""
+        )
         return (
             f"【Bot】{self.bot_name}（QQ:{self.bot_id or '未知'}）\n"
             f"【历史对话】\n{history or '（没有可用历史）'}\n\n"
+            f"{continuity_block}"
             f"【当前待判断消息】\n{current}\n\n"
             f"【程序提取的线索（仅供参考，不能替代语义判断）】\n{signals or '（无）'}\n\n"
             "请判断当前消息主要对谁说，以及 Alice 是否应该现在发言。"
@@ -345,16 +411,24 @@ class ConversationJudge:
         messages: list[Any],
         *,
         exclude_id: str = "",
+        known_users: dict[str, str] | None = None,
     ) -> str:
         rows = []
         for message in list(messages or [])[-self.context_messages :]:
             message_id = str(getattr(message, "message_id", "") or "")
             if exclude_id and message_id and message_id == exclude_id:
                 continue
-            rows.append(self._render_message(message))
+            rows.append(self._render_message(message, known_users=known_users))
         return "\n".join(rows)
 
-    def _render_message(self, message: Any, *, current: bool = False) -> str:
+    def _render_message(
+        self,
+        message: Any,
+        *,
+        current: bool = False,
+        known_users: dict[str, str] | None = None,
+    ) -> str:
+        known_users = known_users or {}
         sender_id = str(getattr(message, "sender_id", "") or "")
         sender_name = str(getattr(message, "sender_name", "") or "未知用户")
         if bool(getattr(message, "is_bot", False)) or (
@@ -371,15 +445,24 @@ class ConversationJudge:
         reply_to_id = str(getattr(message, "reply_to_id", "") or "")
         reply_to_qq = str(getattr(message, "reply_to_qq", "") or "")
         if reply_to_id or reply_to_qq:
-            annotations.append(
-                "回复=" + "/".join(x for x in (reply_to_id, reply_to_qq) if x)
+            reply_ref = "/".join(
+                x for x in (reply_to_id, reply_to_qq) if x
             )
+            if reply_to_qq:
+                reply_ref += f"({self._format_user_reference(reply_to_qq, known_users)})"
+            annotations.append("回复=" + reply_ref)
         mentions = getattr(message, "mentioned_user_ids", None)
         if mentions is None:
             mentions = []
         mentions = [str(value) for value in mentions if str(value)]
         if mentions:
-            annotations.append("@=" + ",".join(mentions))
+            annotations.append(
+                "@="
+                + ",".join(
+                    self._format_user_reference(value, known_users)
+                    for value in mentions
+                )
+            )
         if bool(getattr(message, "directed_to_bot", False)):
             annotations.append("旧规则线索=可能对Bot")
         dynamic_target = str(getattr(message, "conversation_target", "") or "")
@@ -389,11 +472,120 @@ class ConversationJudge:
         suffix = f" [{'；'.join(annotations)}]" if annotations else ""
         return f"{prefix}{sender}{suffix}：{str(getattr(message, 'content', '') or '')[:500]}"
 
+    def _build_user_name_map(self, messages: list[Any]) -> dict[str, str]:
+        """从当前判断窗口建立 QQ→昵称映射，避免模型只看到难以辨认的数字。"""
+        users: dict[str, str] = {}
+        for message in messages or []:
+            user_id = str(getattr(message, "sender_id", "") or "")
+            user_name = str(getattr(message, "sender_name", "") or "").strip()
+            if user_id and user_name and user_name != "未知用户":
+                users[user_id] = user_name[:40]
+        if self.bot_id:
+            users[self.bot_id] = self.bot_name
+        return users
+
+    def _format_user_reference(
+        self,
+        user_id: str,
+        known_users: dict[str, str] | None = None,
+    ) -> str:
+        """渲染 @/回复对象，同时保留原始 QQ 号作为硬证据。"""
+        user_id = str(user_id or "")
+        if not user_id:
+            return "未知用户"
+        known_users = known_users or {}
+        user_name = known_users.get(user_id, "")
+        if user_name:
+            return f"{user_id}({user_name})"
+        return f"{user_id}(未知用户)"
+
+    def _build_target_continuity_hint(
+        self,
+        current_message: Any,
+        recent_messages: list[Any],
+        known_users: dict[str, str] | None = None,
+    ) -> str:
+        """提取同一发言者最近一次明确指向，交给模型做动态语义判断。"""
+        known_users = known_users or {}
+        all_messages = list(recent_messages or []) + [current_message]
+        message_senders = {
+            str(getattr(message, "message_id", "") or ""): str(
+                getattr(message, "sender_id", "") or ""
+            )
+            for message in all_messages
+            if str(getattr(message, "message_id", "") or "")
+        }
+        sender_id = str(getattr(current_message, "sender_id", "") or "")
+        current_id = str(getattr(current_message, "message_id", "") or "")
+
+        latest = None
+        for message in list(recent_messages or []):
+            if str(getattr(message, "message_id", "") or "") == current_id:
+                continue
+            if str(getattr(message, "sender_id", "") or "") != sender_id:
+                continue
+            targets = self._explicit_target_ids(message, message_senders)
+            if targets:
+                latest = (message, targets)
+
+        if not latest:
+            return ""
+
+        target_message, target_ids = latest
+        target_text = "、".join(
+            self._format_user_reference(target_id, known_users)
+            for target_id in target_ids
+        )
+        target_message_id = str(
+            getattr(target_message, "message_id", "") or "无编号"
+        )
+        current_targets = self._explicit_target_ids(
+            current_message, message_senders
+        )
+        if current_targets:
+            current_note = (
+                "当前消息已经出现新的@/回复对象，请优先按当前对象和当前语义判断，"
+                "不要机械沿用上一条。"
+            )
+        else:
+            current_note = (
+                "当前消息没有新的@/回复对象；请判断它是否仍在延续这次指向。"
+            )
+        return (
+            f"同一发言者最近一次明确@/回复的对象是：{target_text}（消息id={target_message_id}）。"
+            f"{current_note}如果当前内容更像发给该群友、自己补完上一句或已经换话题，"
+            "不能因为出现‘你’、问句或 Bot 刚才说过话就自动改判为对 Bot；"
+            "指向确实不清时，使用 target=unknown 并保持 should_reply=false。"
+        )
+
+    def _explicit_target_ids(
+        self,
+        message: Any,
+        message_senders: dict[str, str] | None = None,
+    ) -> list[str]:
+        """提取一条消息显式 @ 或回复的对象，去重并排除 @全体。"""
+        targets = []
+        for value in getattr(message, "mentioned_user_ids", None) or []:
+            value = str(value or "")
+            if value and value.lower() not in {"all", "everyone"}:
+                targets.append(value)
+        reply_to_qq = str(getattr(message, "reply_to_qq", "") or "")
+        if reply_to_qq:
+            targets.append(reply_to_qq)
+        elif getattr(message, "reply_to_id", None) and message_senders:
+            replied_sender = message_senders.get(
+                str(getattr(message, "reply_to_id", "") or "")
+            )
+            if replied_sender:
+                targets.append(replied_sender)
+        return list(dict.fromkeys(targets))
+
     @staticmethod
     def _render_signals(signals: dict[str, Any]) -> str:
         entries = []
         for key in (
             "mentioned_me",
+            "mentioned_user_ids",
             "mentioned_others",
             "reply_to_me",
             "reply_to_qq",

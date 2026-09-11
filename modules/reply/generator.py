@@ -234,6 +234,7 @@ class ReplyGenerator:
         conversation_judgement: Dict[str, Any] = None,
         current_message_context: Dict[str, Any] = None,
         avoid_paraphrase: bool = False,
+        reply_review_hint: str = "",
     ) -> Optional[dict]:
         """
         生成回复
@@ -270,6 +271,7 @@ class ReplyGenerator:
             current_message_context,
             avoid_paraphrase,
             temperature_override=temperature,
+            reply_review_hint=reply_review_hint,
         )
 
         # 2. 联网搜索：先让 LLM 判断这条回复是否需要联网（关键词太局限且易误判，
@@ -799,6 +801,7 @@ class ReplyGenerator:
         current_message_context: Dict[str, Any] = None,
         avoid_paraphrase: bool = False,
         temperature_override: float | None = None,
+        reply_review_hint: str = "",
     ) -> ChatRequest:
         """构建 LLM 请求"""
 
@@ -915,6 +918,15 @@ class ReplyGenerator:
                 "不要以‘你是说……’‘也就是说……’开头，不要把用户原句换几个词再说一遍。"
                 "如果没有任何新内容可说，就输出 <silent>。"
             )
+        if reply_review_hint:
+            review_hint = re.sub(r"\s+", " ", str(reply_review_hint)).strip()[:180]
+            if review_hint:
+                request.add_system(
+                    "语义复核提示：上一版草稿存在证据不足或指代不清的问题。"
+                    f"内部检查意见：{review_hint}。"
+                    "本轮不要把群友的猜测、转述或图片占位符当成已确认事实；"
+                    "如果仍无法确认指向或画面内容，先用一句话澄清，或者输出 <silent>。"
+                )
 
         request.add_system(
             "富媒体安全规则：最近对话中的[链接]、[卡片]、[小程序]、[图片]、[视频]和"
@@ -1507,6 +1519,47 @@ class ReplyGenerator:
             if overlap >= 0.55 and len(reply_core) >= 10:
                 return True
         return False
+
+    @classmethod
+    def needs_semantic_review(
+        cls,
+        reply: str,
+        current_message: str,
+        source_texts: list,
+    ) -> bool:
+        """筛出“未知富媒体 + 不确定转述 + 泛泛回应”的草稿。"""
+        compact_reply = re.sub(r"[\s，。！？!?、,.~～…]+", "", reply or "")
+        if not compact_reply or len(compact_reply) > 14:
+            return False
+
+        uncertain = any(
+            marker in (current_message or "")
+            for marker in ("好像", "似乎", "可能", "感觉", "看起来", "仿佛", "大概")
+        )
+        if not uncertain:
+            return False
+
+        unresolved_media = any(
+            str(text or "").lstrip().startswith(
+                (
+                    "[图片",
+                    "[表情包",
+                    "[动画表情",
+                    "[视频",
+                    "[合并转发",
+                    "[无法识别的消息]",
+                )
+            )
+            for text in (source_texts or [])
+        )
+        if not unresolved_media:
+            return False
+
+        # 只筛出几乎没有语义承载的确认/致谢，是否真的不妥仍由复核模型判断。
+        return any(
+            compact_reply.startswith(prefix)
+            for prefix in ("谢谢", "谢了", "多谢", "收到", "懂了", "明白", "了解")
+        )
 
     # 笑声抑制：观测 19% 的回复带「哈哈/笑死」、11% 以笑声开头、9 次连续
     # 两条都在笑。真人不会每条消息都笑，所以刚笑过就别再用笑声起头
