@@ -1094,6 +1094,15 @@ class GroupChatBot:
         session_id = str(session_id or "").strip()
         if not session_id.startswith(("group_", "private_")):
             return {"success": False, "error": "会话格式不正确"}
+        if automatic:
+            available, remaining = manager.auto_send_available(session_id)
+            if not available:
+                if not manager.auto_send_enabled:
+                    return {"success": False, "error": "自动发送未启用"}
+                return {
+                    "success": False,
+                    "error": f"自动发图冷却中，还需 {remaining:.0f} 秒",
+                }
 
         # 发送前同步磁盘最新清单：自动收集的新素材可能未进运行内存，
         # 避免「列表能看到、发送却说不存在」。
@@ -1140,6 +1149,9 @@ class GroupChatBot:
             return {"success": False, "error": str(exc)}
         if not success:
             return {"success": False, "error": "QQ 适配器发送失败", "item": item}
+        if automatic:
+            manager.remember_choice(session_id, item.get("id", ""))
+            manager.record_auto_send(session_id)
         await asyncio.to_thread(manager.record_use, item.get("id", ""))
         logger.info("[表情库] 发送成功：分类=%s，会话=%s", item.get("category", ""), session_id)
         return {
@@ -1673,6 +1685,64 @@ class GroupChatBot:
             },
         )
 
+    async def _prepare_automatic_meme(
+        self,
+        session_id: str,
+        current_message: Message,
+        reply: str,
+        direction: str,
+        *,
+        category: str | None = None,
+        meme_id: str = "",
+    ) -> tuple[dict[str, Any] | None, str]:
+        """为自动发图挑选候选素材，并做发送前语义复核。"""
+        manager = self.meme_manager
+        if not manager:
+            return None, "表情库未初始化"
+        if not manager.auto_send_enabled:
+            return None, "自动发送未启用"
+
+        available, remaining = manager.auto_send_available(session_id)
+        if not available:
+            return None, f"自动发图冷却中，还需 {remaining:.0f} 秒"
+
+        await asyncio.to_thread(manager.reload)
+        if meme_id:
+            candidate = await asyncio.to_thread(manager.resolve, meme_id)
+        else:
+            candidate = await asyncio.to_thread(
+                manager.choose,
+                category or "",
+                session_id,
+                remember=False,
+            )
+        if not candidate:
+            return None, "没有找到匹配的表情素材"
+
+        judge = getattr(self, "conversation_judge", None)
+        if not judge:
+            return None, "语义复核器不可用"
+        recent = self.context_manager.get_window(session_id).get_recent(16)
+        try:
+            review = await judge.review_meme_send(
+                current_message,
+                recent,
+                candidate,
+                reply=reply,
+                direction=direction,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return None, f"表情语义复核失败：{exc}"
+        if (
+            not review.available
+            or not review.should_reply
+            or not (review.evidence or {}).get("should_send_meme")
+        ):
+            return None, review.reason or "当前语境不适合发图"
+        return candidate, review.reason or "语境匹配"
+
     @staticmethod
     def _context_marker(item):
         """返回窗口消息的稳定标记；同时兼容平台 Message 和 ContextMessage。"""
@@ -2099,16 +2169,19 @@ class GroupChatBot:
             # 表情包选择标记只在内部流转，不能进入群聊文本、记忆或日报。
             meme_category = None
             meme_id = tool_meme_id  # 工具调用优先；下面兜底仍允许 marker 走老路
+            marker_requested = False
             if self.meme_manager:
                 # 工具调用已经给出 meme_category / meme_id 时，LLM 偶发残留的
                 # [[表情:xxx]] marker 也要从 reply 里剥干净，避免重复发图/重复标签。
-                reply, marker_category = self.meme_manager.extract_directive(reply or "")
+                raw_reply = reply or ""
+                reply, marker_category = self.meme_manager.extract_directive(raw_reply)
+                marker_requested = reply != raw_reply or marker_category is not None
                 if isinstance(marker_category, str) and marker_category.startswith("@id:"):
                     candidate_id = marker_category[4:]
                     if not meme_id:
                         meme_id = candidate_id
                 else:
-                    if not tool_meme_category and marker_category:
+                    if not tool_meme_called and marker_category is not None:
                         tool_meme_category = marker_category
                 # 兜底：解析失败残留的标记（如 LLM 输出了格式外的变体）不能原样发进
                 # 群里，剥成普通文字后再继续，避免”[[表情:xxx:yyy”直接出现在聊天里。
@@ -2118,6 +2191,7 @@ class GroupChatBot:
                 if recovered_category and not meme_id and not tool_meme_category:
                     tool_meme_category = recovered_category
                 if residue != reply:
+                    marker_requested = True
                     logger.warning(
                         "[表情库] 残留标记未解析成功，已剥离并回收分类 %s: %s",
                         recovered_category or "<空>",
@@ -2127,6 +2201,31 @@ class GroupChatBot:
                 # 工具调用优先：send_meme 已经告诉系统要发图，marker 路径只用来
                 # 兜老 LLM 输出；正常情况直接以 tool_use 为准。
                 meme_category = tool_meme_category
+
+            # 只有真实工具调用或被剥离的内部标记才算发图请求。
+            # meme_category="" 本身可能只是“未指定分类”，不能单独作为依据。
+            meme_requested = bool(tool_meme_called or marker_requested)
+            if meme_requested:
+                candidate, candidate_reason = await self._prepare_automatic_meme(
+                    session_id,
+                    effective_message,
+                    reply,
+                    direction,
+                    category=meme_category,
+                    meme_id=meme_id,
+                )
+                if candidate:
+                    meme_id = str(candidate.get("id") or "")
+                    meme_category = str(candidate.get("category") or "")
+                else:
+                    logger.info("[表情复核] 取消自动发图：%s", candidate_reason)
+                    meme_requested = False
+                    tool_meme_category = None
+                    tool_meme_id = ""
+                    tool_meme_called = False
+                    meme_category = None
+                    meme_id = ""
+            has_meme_intent = meme_requested
 
             # 复读兜底：把群友的原话原样说一遍不如不说。表情包识别摘要会引用
             # 前文原话，短反应档下 LLM 容易直接抓那句引文当自己的发言。
@@ -2179,7 +2278,7 @@ class GroupChatBot:
             # === 过滤回复 ===
             passed, result = (
                 (True, "")
-                if not reply and meme_category is not None
+                if not reply and meme_requested
                 else self.response_filter.filter(reply)
             )
             if not passed:
@@ -2275,15 +2374,15 @@ class GroupChatBot:
 
                 # 文本完整发送后再发图，避免一条回复被拆成“半句文字 + 表情”。
                 text_complete = len(sent_segments) == len(segments)
-                if meme_category is not None and text_complete:
+                if meme_requested and text_complete:
                     meme_result = await self.send_meme(
                         session_id,
                         meme_id=meme_id,
                         category=meme_category,
                         reply_to_id=(quote_id if not segments else ""),
-                        # LLM 通过 send_meme 工具显式要求发图 ≠ 后台自动广播，
-                        # 不应受 auto_send_enabled 闸门影响（那个开关只挡"没被点名就乱发"）。
-                        automatic=False,
+                        # 这是模型在回复过程中主动选择的自动发图，必须经过
+                        # auto_send_enabled 闸门；Web 手动发送仍使用 automatic=False。
+                        automatic=True,
                     )
                     meme_sent = bool(meme_result.get("success"))
                     meme_item = meme_result.get("item")
@@ -4956,6 +5055,7 @@ class GroupChatBot:
                 "storage_path": "data/memes",
                 "auto_collect_enabled": False,
                 "auto_send_enabled": False,
+                "auto_send_cooldown_seconds": 60,
                 "collect_private": False,
                 "collect_scope": [],
                 "collect_plain_images": False,

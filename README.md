@@ -209,6 +209,7 @@ meme_manager:
   max_images_per_message: 2
   daily_collect_limit: 80
   collect_cooldown_seconds: 15
+  auto_send_cooldown_seconds: 60
 ```
 
 表情库配置在管理面板保存后，开关、收集范围、每日上限和冷却会立即作用于当前进程；存储路径仍建议重启后生效。自动收集只复用现有富媒体下载和 OneBot 图片发送链路，不会把图片 URL、原始二进制或内部选择标记写进普通对话提示词。

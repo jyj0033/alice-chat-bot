@@ -232,6 +232,95 @@ class ConversationJudge:
             logger.debug("[复读判断] 调用失败：%s", exc)
             return ConversationJudgeResult.unavailable(str(exc))
 
+    async def review_meme_send(
+        self,
+        current_message: Any,
+        recent_messages: list[Any],
+        meme: dict[str, Any],
+        *,
+        reply: str = "",
+        direction: str = "group",
+    ) -> ConversationJudgeResult:
+        """复核候选表情包是否适合当前语境。"""
+        if not self.enabled or not self.provider:
+            return ConversationJudgeResult.unavailable("provider_unavailable")
+
+        current_id = str(getattr(current_message, "message_id", "") or "")
+        history = self._render_messages(recent_messages, exclude_id=current_id)
+        current = self._render_message(current_message, current=True)
+        category = str((meme or {}).get("category") or "待整理")
+        meaning = str((meme or {}).get("meaning") or "").strip()
+        tags = "、".join(
+            str(tag).strip()
+            for tag in ((meme or {}).get("tags") or [])
+            if str(tag).strip()
+        )
+        prompt = (
+            "判断 Bot 这次是否真的应该自动发送候选表情包。不要因为模型已经提出发图"
+            "就默认同意，必须结合当前消息和最近对话判断图片是否贴切、是否有自然的情绪"
+            "或梗的对应关系，以及发送后是否会打断群聊。\n\n"
+            f"【最近上下文】\n{history or '（无）'}\n\n"
+            f"【当前消息】\n{current}\n\n"
+            f"【Bot文字回复】\n{reply or '（只发图）'}\n\n"
+            f"【候选表情包】分类={category}；含义={meaning or '未填写'}；标签={tags or '无'}\n"
+            f"【回复方向】{direction}\n\n"
+            "适合发送：图片含义与当前内容直接匹配，能自然表达反应、吐槽、安慰或接梗。"
+            "不适合发送：只是普通事实/技术回答、图片含义不清或与当前话题无关、"
+            "为了凑频率硬塞、或者会让 Bot 显得在复读和刷屏。\n"
+            "只输出 JSON：{\"should_send_meme\":true/false,"
+            "\"confidence\":0到1,\"reason\":\"不超过40字\"}。不要输出解释或思维过程。"
+        )
+        request = ChatRequest(
+            model=getattr(self.provider, "model", "") or "",
+            temperature=0.0,
+            max_tokens=min(self.max_tokens, 160),
+            top_p=0.1,
+        )
+        request.add_system(
+            "你是自动发图的最终语义复核器，只判断候选表情是否适合，"
+            "不负责生成文字。只输出要求的 JSON，不要输出思维过程。"
+        )
+        request.add_user(prompt)
+        try:
+            response = await asyncio.wait_for(
+                self.provider.chat(request), timeout=self.timeout
+            )
+            payload = self._parse_json(getattr(response, "content", ""))
+            if not payload or not any(
+                key in payload for key in ("should_send_meme", "should_send")
+            ):
+                raise ValueError("missing_meme_review_field")
+            should_send = self._parse_bool(
+                payload.get("should_send_meme", payload.get("should_send")),
+                False,
+            )
+            confidence = self._parse_float(payload.get("confidence"), 0.0)
+            result = ConversationJudgeResult(
+                target="group",
+                intent="react" if should_send else "silent",
+                should_reply=should_send,
+                confidence=confidence,
+                reason=str(payload.get("reason") or "")[:80],
+                available=True,
+                evidence={
+                    "should_send_meme": should_send,
+                    "meme_id": str((meme or {}).get("id") or ""),
+                },
+            )
+            logger.info(
+                "[表情复核] 候选=%s，是否发送=%s，置信度=%.2f，理由=%s",
+                str((meme or {}).get("id") or "")[:10] or "无编号",
+                should_send,
+                result.confidence,
+                result.reason,
+            )
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[表情复核] 调用失败：%s", exc)
+            return ConversationJudgeResult.unavailable(str(exc))
+
     def _build_prompt(
         self,
         current_message: Any,

@@ -113,6 +113,45 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.intent, "silent")
         self.assertTrue(result.evidence["is_paraphrase"])
 
+    async def test_review_meme_send_result_is_structured(self):
+        provider = _FakeProvider(
+            '{"should_send_meme":true,"confidence":0.91,"reason":"和当前吐槽很贴"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot")
+
+        result = await judge.review_meme_send(
+            self._message(),
+            [],
+            {
+                "id": "meme-1",
+                "category": "吐槽",
+                "meaning": "翻白眼看热闹",
+                "tags": ["自动收集"],
+            },
+            reply="这也太离谱了",
+            direction="group",
+        )
+
+        self.assertTrue(result.available)
+        self.assertTrue(result.should_reply)
+        self.assertEqual(result.intent, "react")
+        self.assertTrue(result.evidence["should_send_meme"])
+        prompt = provider.requests[0].messages[-1].content
+        self.assertIn("翻白眼看热闹", prompt)
+        self.assertIn("这也太离谱了", prompt)
+
+    async def test_invalid_meme_review_output_is_not_approved(self):
+        provider = _FakeProvider('{"reason":"无法判断"}')
+        judge = ConversationJudge(provider, bot_id="bot")
+
+        result = await judge.review_meme_send(
+            self._message(),
+            [],
+            {"id": "meme-1", "category": "吐槽", "meaning": "看热闹"},
+        )
+
+        self.assertFalse(result.available)
+
     def test_parse_result_accepts_partial_but_meaningful_json(self):
         result = ConversationJudge.parse_result(
             '{"target":"bot","intent":"answer"}'

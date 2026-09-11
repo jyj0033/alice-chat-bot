@@ -2194,6 +2194,11 @@
                             <div class="hint">只在回复标记明确选择时发送，不会每条都发</div>
                         </div>
                         <div class="form-group">
+                            <label>自动发图冷却（秒）</label>
+                            <input type="number" id="meme-auto-send-cooldown" min="0" max="86400" value="60">
+                            <div class="hint">同一会话两次自动发图的最短间隔；填 0 表示不限制</div>
+                        </div>
+                        <div class="form-group">
                             <label>默认收集分类</label>
                             <select id="meme-default-category"></select>
                         </div>
@@ -3467,6 +3472,7 @@
                 document.getElementById('meme-skip-screenshots').checked = meme.skip_screenshots !== false;
                 document.getElementById('meme-max-dimension').value = meme.max_collect_dimension ?? 2400;
                 document.getElementById('meme-auto-send').checked = meme.auto_send_enabled === true;
+                document.getElementById('meme-auto-send-cooldown').value = meme.auto_send_cooldown_seconds ?? 60;
                 document.getElementById('meme-collect-scope').value = (meme.collect_scope || []).join(', ');
                 document.getElementById('meme-daily-limit').value = meme.daily_collect_limit ?? 80;
                 document.getElementById('meme-cooldown').value = meme.collect_cooldown_seconds ?? 15;
@@ -3547,6 +3553,7 @@
                     skip_screenshots: document.getElementById('meme-skip-screenshots').checked,
                     max_collect_dimension: parseInt(document.getElementById('meme-max-dimension').value) || 2400,
                     auto_send_enabled: document.getElementById('meme-auto-send').checked,
+                    auto_send_cooldown_seconds: Math.max(0, Math.min(86400, parseFloat(document.getElementById('meme-auto-send-cooldown').value) || 0)),
                     default_category: document.getElementById('meme-default-category').value || '待整理',
                     collect_scope: listValue('meme-collect-scope'),
                     daily_collect_limit: parseInt(document.getElementById('meme-daily-limit').value) || 0,

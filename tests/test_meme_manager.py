@@ -11,6 +11,7 @@ from PIL import Image
 
 from core.adapter.base import Message
 from core.adapter.rich_content import MessageSegment, parse_message_segments
+from modules.llm.base import ChatResponse
 from modules.meme_manager import MemeManager
 from modules.reply.generator import ReplyGenerator
 
@@ -93,6 +94,10 @@ class MemeManagerTests(unittest.TestCase):
         cleaned, category = self.manager.extract_directive("收到 &&meme:随机&&")
         self.assertEqual(cleaned, "收到")
         self.assertEqual(category, "")
+        cleaned, category = self.manager.extract_directive("别发错了 [[表情:不存在!]]")
+        self.assertEqual(cleaned, "别发错了")
+        self.assertIsNotNone(category)
+        self.assertIsNone(self.manager.choose(category, "group_123"))
         cleaned, category = self.manager.extract_directive(
             f"好，就发这张 [[表情:编号:{item['id'][:10]}]]"
         )
@@ -112,6 +117,78 @@ class MemeManagerTests(unittest.TestCase):
         self.assertTrue(self.manager.delete(item["id"]))
         self.assertIsNone(self.manager.get(item["id"]))
         self.assertFalse(self.manager.delete(item["id"]))
+
+    def test_no_meme_tool_call_is_distinct_from_random_meme_request(self):
+        generator = ReplyGenerator(
+            llm_provider=None,
+            bot_name="爱丽丝",
+            meme_manager=self.manager,
+        )
+        no_call = ChatResponse(content="正常回复", model="test")
+        random_call = ChatResponse(
+            content="",
+            model="test",
+            tool_calls=[{"name": "send_meme", "arguments": {}}],
+        )
+
+        self.assertEqual(
+            generator._extract_send_meme_call(no_call),
+            (None, "", False),
+        )
+        self.assertEqual(
+            generator._extract_send_meme_call(random_call),
+            ("", "", True),
+        )
+        leaked_random = ChatResponse(
+            content=(
+                '<invoke name="send_meme">'
+                '<parameter name="query">随机</parameter>'
+                '</invoke>'
+            ),
+            model="test",
+        )
+        self.assertEqual(
+            generator._extract_send_meme_call(leaked_random),
+            ("", "", True),
+        )
+        self.assertEqual(
+            generator._strip_native_tool_markup(
+                '接一句 <invoke name="send_meme">'
+                '<parameter name="query">随机</parameter>'
+                '</invoke> 就好'
+            ),
+            "接一句 就好",
+        )
+
+    def test_auto_send_off_does_not_register_meme_tool(self):
+        generator = ReplyGenerator(
+            llm_provider=None,
+            bot_name="爱丽丝",
+            meme_manager=self.manager,
+        )
+
+        request = generator._build_request(
+            context_prompt="",
+            current_message="普通回复",
+            session_id="group_123",
+        )
+
+        self.assertEqual(request.tools, [])
+
+        self.manager.add_bytes(_png_bytes(), category="吐槽", meaning="吐槽反应")
+        self.manager.update_config({
+            "storage_path": self.temp_dir.name,
+            "auto_send_enabled": True,
+        })
+        request = generator._build_request(
+            context_prompt="",
+            current_message="普通回复",
+            session_id="group_123",
+        )
+        self.assertTrue(any(
+            tool.get("function", {}).get("name") == "send_meme"
+            for tool in request.tools
+        ))
 
     def test_new_entries_only_accept_png_or_jpeg_and_send_as_png(self):
         with self.assertRaises(ValueError):
@@ -179,6 +256,75 @@ class MemeManagerTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         with Image.open(BytesIO(sent[0])) as image:
             self.assertEqual(image.format, "PNG")
+
+    def test_automatic_send_respects_auto_send_switch(self):
+        item = self.manager.add_bytes(_png_bytes(), category="吐槽")
+
+        class Adapter:
+            async def send_image(self, session_id, image_bytes, reply_to_id=None):
+                raise AssertionError("自动发送关闭时不应触发适配器")
+
+        from main import GroupChatBot
+
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.meme_manager = self.manager
+        bot.qq_adapter = Adapter()
+
+        import asyncio
+
+        result = asyncio.run(
+            bot.send_meme("group_123", meme_id=item["id"], automatic=True)
+        )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "自动发送未启用")
+
+    def test_automatic_send_respects_per_session_cooldown(self):
+        self.manager.update_config({
+            "storage_path": self.temp_dir.name,
+            "auto_send_enabled": True,
+            "auto_send_cooldown_seconds": 60,
+        })
+        item = self.manager.add_bytes(_png_bytes(), category="吐槽")
+        sent = []
+
+        class Adapter:
+            async def send_image(self, session_id, image_bytes, reply_to_id=None):
+                sent.append(session_id)
+                return True
+
+        from main import GroupChatBot
+
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.meme_manager = self.manager
+        bot.qq_adapter = Adapter()
+
+        import asyncio
+
+        first = asyncio.run(
+            bot.send_meme("group_123", meme_id=item["id"], automatic=True)
+        )
+        second = asyncio.run(
+            bot.send_meme("group_123", meme_id=item["id"], automatic=True)
+        )
+        manual = asyncio.run(
+            bot.send_meme("group_123", meme_id=item["id"], automatic=False)
+        )
+
+        self.assertTrue(first["success"])
+        self.assertFalse(second["success"])
+        self.assertIn("自动发图冷却中", second["error"])
+        self.assertTrue(manual["success"])
+        self.assertEqual(sent, ["group_123", "group_123"])
+
+    def test_unknown_category_does_not_fall_back_to_random(self):
+        self.manager.add_bytes(_png_bytes(), category="吐槽")
+
+        self.assertIsNone(self.manager.choose("不存在的分类", "group_123"))
+        invalid_category, _ = self.manager.resolve_tool_call(
+            {"category": "不存在!"}, session_id="group_123"
+        )
+        self.assertIsNone(self.manager.choose(invalid_category, "group_123"))
+        self.assertIsNotNone(self.manager.choose("吐槽", "group_123"))
 
     def test_send_meme_returns_outbound_message_id(self):
         item = self.manager.add_bytes(_png_bytes(), category="吐槽")

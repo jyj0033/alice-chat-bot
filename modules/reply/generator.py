@@ -256,7 +256,8 @@ class ReplyGenerator:
             dict 形如 ``{"reply": str, "meme_category": str | None, "meme_id": str}``：
             - ``reply`` 是要发给群友的纯文本（已剥离 tool_call / marker）
             - ``meme_category`` / ``meme_id`` 来自 send_meme 工具调用，交给
-              外层 main.py 走独立发图通道；二者都为空时表示本轮没有选表情包。
+              外层 main.py 走独立发图通道；是否真的调用工具由 ``meme_called`` 表示。
+              工具调用但未指定分类时 ``meme_category`` 为空，表示全库随机选择。
         """
         # 1. 构建请求
         request = self._build_request(
@@ -286,7 +287,9 @@ class ReplyGenerator:
         )
         # 工具调用：send_meme 是结构化输出，正常路径走原生 tool_use，
         # 异常端点漏成 `<invoke>` 文本时再走 _extract_native_tool_calls 兜底。
-        meme_category = ""
+        # None 表示本轮没有发图请求；空字符串只表示模型确实调用了
+        # send_meme 但没有指定分类，交给外层随机选图。
+        meme_category = None
         meme_id = ""
         meme_called = False
         if need_search:
@@ -316,6 +319,10 @@ class ReplyGenerator:
 
         # 4. 清理思考过程
         reply = self._clean_thinking_process(reply)
+        if meme_called:
+            # 某些兼容端点会把工具调用泄漏到 content；既然已经识别出 send_meme，
+            # 这些 XML 只是内部协议，不能随文字一起发到群里。
+            reply = self._strip_native_tool_markup(reply)
 
         # 4.5 搜索路径没产出可用回复（空/残留工具标记）→ 用主 LLM 干净重答一轮，
         #     保证 to_bot 一定有回应，group 则按 LLM 是否愿意参与决定。
@@ -335,6 +342,8 @@ class ReplyGenerator:
                     cat2, id2, called2 = self._extract_send_meme_call(resp2)
                     if called2:
                         meme_category, meme_id, meme_called = cat2, id2, called2
+                if meme_called:
+                    reply2 = self._strip_native_tool_markup(reply2)
                 # 重答也走 tool_use 且没文字 → 别再兜底，否则会无限循环
                 if not reply2 and not meme_called:
                     if direction != "to_bot":
@@ -368,7 +377,7 @@ class ReplyGenerator:
 
         # 6. 过滤回复
         # 注意：LLM 调 send_meme 只发图 → reply 必为空但合法，不能被「空回复」过滤器吞掉。
-        # main.py 也有同样的过滤逻辑，那里已用 meme_category is not None 守过；这里用 meme_called 守。
+        # 这里用 meme_called 守；普通回复没有工具调用时仍按空回复处理。
         if not reply and meme_called:
             passed, result = True, ""
         else:
@@ -440,8 +449,7 @@ class ReplyGenerator:
             "reply": reply,
             # meme_called 表达"LLM 真的调了 send_meme"这个事实。
             # meme_category 即使空（LLM 调了 send_meme({}) 想随机抽）也必须保留空串，
-            # 不能 fold 成 None——下游 main.py 用 `meme_category is not None` 判断
-            # 是否有图要发，会被这个细节吞掉整条响应。
+            # 不能 fold 成 None——下游 main.py 需要区分“工具没调用”和“工具请求随机”。
             "meme_category": meme_category,
             "meme_id": meme_id,
             "meme_called": meme_called,
@@ -652,7 +660,21 @@ class ReplyGenerator:
         """判断文本里是否残留工具调用标记（MiniMax 泄漏的兜底信号）。"""
         return any(tag in content for tag in ("<tool_call>", "<invoke", "<]minimax", "<parameter"))
 
-    def _extract_send_meme_call(self, response) -> tuple[str, str, bool]:
+    @staticmethod
+    def _strip_native_tool_markup(content: str) -> str:
+        """移除已经识别的原生工具 XML，保留工具调用前后的正常文字。"""
+        text = str(content or "")
+        text = re.sub(
+            r"<invoke\s*name=[\"'][^\"']+[\"']>[\s\S]*?</invoke>",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(r"</?(?:parameter|query)\b[^>]*>", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        return text.strip()
+
+    def _extract_send_meme_call(self, response) -> tuple[str | None, str, bool]:
         """从 ChatResponse 里挑出 send_meme 工具调用，返回 (category, meme_id, called)。
 
         结构化 tool_use 走 OpenAI/Anthropic 原生协议；MiniMax 偶发把工具调用
@@ -680,11 +702,17 @@ class ReplyGenerator:
         for tc in self._extract_native_tool_calls(content):
             if (tc.get("name") or "").strip() == "send_meme":
                 args = tc.get("arguments") or {}
-                # 泄漏协议里 arguments 形态不一致：直接当作 category 字段
-                category = _safe_meme_label(args.get("category") or args.get("query") or "")
-                meme_id = _safe_meme_label(args.get("meme_id") or "")
+                # 泄漏协议里 arguments 形态不一致：query 实际上承载的是选图分类，
+                # 先映射成统一字段，确保“随机”和非法分类都走同一套解析规则。
+                if isinstance(args, dict) and not args.get("category") and args.get("query"):
+                    args = {**args, "category": args.get("query")}
+                category, meme_id = self.meme_manager.resolve_tool_call(
+                    args, session_id=""
+                )
                 return category, meme_id, True
-        return "", "", False
+        # 不要用空字符串表示“没有调用”。空字符串在这里有明确含义：
+        # 工具已调用，但模型没有指定分类，外层可以随机选图。
+        return None, "", False
 
     @staticmethod
     def _extract_native_tool_calls(content: str) -> list[dict]:
@@ -778,14 +806,14 @@ class ReplyGenerator:
 
         # 回复长度硬约束 - 群聊回复必须简短才像真人
         meme_guide = ""
-        # 注意：meme_capability 不再被 auto_send_enabled 短路——
-        # 即便用户关掉了 auto_send（不想让 bot 频繁发图），只要 meme_manager 存在，
-        # 就把 send_meme 工具的能力告诉 LLM。auto_send 只控制"频次/触发门槛"，
-        # 不应该抹掉 LLM 主动选择发图的权利。
-        # 旧逻辑的 bug：auto_send=False → meme_guide="" → system prompt 写"你只能发纯文字"，
-        # LLM 信 system prompt 不信 tools，结果 tool 定义发了 LLM 也不调。
+        # 自动发送关闭时不向模型暴露发图工具；即使模型偶尔残留旧 marker，
+        # 外层 send_meme(automatic=True) 仍会再次拦截。Web 手动发送走另一条
+        # automatic=False 的链路，不受这个开关影响。
         meme_capability = ""
-        if self.meme_manager:
+        meme_auto_enabled = bool(
+            self.meme_manager and self.meme_manager.auto_send_enabled
+        )
+        if meme_auto_enabled:
             try:
                 meme_guide = self.meme_manager.build_prompt_guide()
             except Exception:
@@ -794,6 +822,10 @@ class ReplyGenerator:
                 "发送能力：普通情况下发送纯文字；如果真的适合，可以调用 send_meme 工具"
                 "（category 选分类、meme_id 精确选图、random 随便来一张）让系统替你发一张表情包。"
                 "可以只发图不发文字，也可以文字+图并存；调用即代表真的要让 bot 发图，不要用文字描述「想发图」。"
+            )
+        elif self.meme_manager:
+            meme_capability = (
+                "表情包自动发送当前已关闭。本轮不要调用 send_meme，也不要输出表情包内部标记。"
             )
         request.add_system(
             f"回复长度要求：优先用一条短句，确需说明时再用两句，通常不超过{max_reply_length}个中文字符。"
@@ -805,20 +837,17 @@ class ReplyGenerator:
             "大部分回复不需要带笑声，也不要习惯性用「...」结尾。\n"
             f"{meme_capability}"
         )
-        if self.meme_manager and meme_guide:
+        if meme_auto_enabled and meme_guide:
             request.add_system(meme_guide)
         # 注册 send_meme 工具调用：从根上避免 LLM 输出 `[[表情:xxx]]` /
         # `[表情:无语]` / `&&meme:xxx&&` 等半截 marker 漏到群里。
         # LLM 真的要发图就调工具，工具调用会被外层 main.py 当作"想发图"
         # 单独走 send_meme 通道，不会再混进 reply 文本。
-        # 注意：不依赖 meme_guide 是否非空——auto_send_enabled=False 时
-        # build_prompt_guide() 会返回 ""，但 send_meme tool 该注册还得注册，
-        # 否则 LLM 没有任何可用工具，marker 兜底也得依赖 LLM 输出 marker 字符串。
-        if self.meme_manager:
+        if meme_auto_enabled and meme_guide:
             try:
                 request.tools.append(self.meme_manager.tool_definition())
             except Exception as exc:
-                logger.debug("[工具调用] 注册表情发送工具失败，继续使用标记兜底：%s", exc)
+                logger.debug("[工具调用] 注册表情发送工具失败：%s", exc)
 
         # 参与规则 - 根据消息指向决定「该不该插嘴」
         request.add_system(self._build_participation_guide(direction))
