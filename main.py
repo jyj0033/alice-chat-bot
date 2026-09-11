@@ -2133,7 +2133,7 @@ class GroupChatBot:
             judge = getattr(self, "conversation_judge", None)
             review_text = reply
             if self.meme_manager:
-                review_text = self.meme_manager.strip_directives(review_text)
+                review_text, _ = self.meme_manager.strip_directives(review_text)
             recent_context_for_review = self.context_manager.get_window(
                 session_id
             ).get_recent(16)
