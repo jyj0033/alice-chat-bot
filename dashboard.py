@@ -1282,4 +1282,5 @@ async def restart():
 def run_dashboard(bot, host: str = "0.0.0.0", port: int = 30080):
     set_bot(bot)
     logger.info(f"正在启动 Web 管理面板：{host}:{port}")
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    # Uvicorn 的启动信息由框架固定输出英文；保留告警/错误，避免混入 Bot 中文日志。
+    uvicorn.run(app, host=host, port=port, log_level="warning")

@@ -3397,6 +3397,8 @@ class GroupChatBot:
         if not normalized or normalized.startswith(cls._NON_NOUNISH_TAIL_PREFIXES):
             return False
         try:
+            import jieba
+            jieba.setLogLevel(logging.WARNING)
             import jieba.posseg as pseg
             for word, flag in pseg.cut(normalized):
                 if not word.strip():

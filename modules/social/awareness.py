@@ -256,6 +256,7 @@ class TopicAnalyzer:
     def _tokenize(text: str) -> list[str]:
         try:
             import jieba
+            jieba.setLogLevel(logging.WARNING)
             return [w.strip() for w in jieba.cut(text) if w.strip()]
         except Exception:
             # jieba 是可选依赖；不能因为本地精简环境没有它，就把一整段

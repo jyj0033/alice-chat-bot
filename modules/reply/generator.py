@@ -1099,6 +1099,7 @@ class ReplyGenerator:
         # （如把「这个哈哈648一单走起」切出「这个哈哈648一」）。
         try:
             import jieba
+            jieba.setLogLevel(logging.WARNING)
             words = [w for w in jieba.cut(text) if w.strip()]
         except Exception:
             words = []
