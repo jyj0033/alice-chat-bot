@@ -182,6 +182,125 @@ class HumanizationLogicTests(unittest.TestCase):
         )
         self.assertEqual(emotion.detect_emotion_keywords("谢谢"), (0.0, ""))
 
+    def _judgement_context(self, judgement, **extra):
+        context = SocialContext(
+            message_content="早",
+            sender_id="u1",
+            group_id="g1",
+            session_id="group_g1",
+        )
+        context.extra["trigger"] = {}
+        context.extra["conversation_judgement"] = judgement
+        context.extra.update(extra)
+        return context
+
+    def test_other_target_without_should_reply_is_hard_skip(self):
+        decider = EnhancedSpeakingDecider(base_probability=1.0)
+        context = self._judgement_context(
+            {
+                "available": True,
+                "target": "other",
+                "should_reply": False,
+                "intent": "answer",
+                "confidence": 0.9,
+                "evidence": {},
+            }
+        )
+        decision = decider.decide(context)
+        self.assertFalse(decision.should_speak)
+        self.assertEqual(decision.reason, "动态判断不参与")
+
+    def test_group_target_without_should_reply_uses_probability(self):
+        from unittest.mock import patch
+
+        decider = EnhancedSpeakingDecider(base_probability=1.0)
+        context = self._judgement_context(
+            {
+                "available": True,
+                "target": "group",
+                "should_reply": False,
+                "intent": "silent",
+                "confidence": 0.9,
+                "evidence": {},
+            }
+        )
+        with patch("modules.social.enhanced_decider.random.random", return_value=0.0), patch(
+            "modules.social.enhanced_decider.random.uniform", return_value=0.0
+        ):
+            decision = decider.decide(context)
+        self.assertTrue(decision.should_speak)
+        self.assertNotEqual(decision.reason, "动态判断不参与")
+
+    def test_unknown_target_without_should_reply_uses_probability(self):
+        from unittest.mock import patch
+
+        decider = EnhancedSpeakingDecider(base_probability=1.0)
+        context = self._judgement_context(
+            {
+                "available": True,
+                "target": "unknown",
+                "should_reply": False,
+                "intent": "silent",
+                "confidence": 0.85,
+                "evidence": {},
+            }
+        )
+        with patch("modules.social.enhanced_decider.random.random", return_value=0.0), patch(
+            "modules.social.enhanced_decider.random.uniform", return_value=0.0
+        ):
+            decision = decider.decide(context)
+        self.assertTrue(decision.should_speak)
+        self.assertNotEqual(decision.reason, "动态判断不参与")
+
+    def test_group_reply_to_other_still_skips_probability(self):
+        decider = EnhancedSpeakingDecider(base_probability=1.0)
+        context = self._judgement_context(
+            {
+                "available": True,
+                "target": "group",
+                "should_reply": False,
+                "intent": "react",
+                "confidence": 0.8,
+                "evidence": {},
+            },
+            reply_to_other=True,
+        )
+        decision = decider.decide(context)
+        self.assertFalse(decision.should_speak)
+        self.assertEqual(decision.reason, "动态判断不参与")
+
+    def test_continuity_veto_still_hard_skips(self):
+        decider = EnhancedSpeakingDecider(base_probability=1.0)
+        context = self._judgement_context(
+            {
+                "available": True,
+                "target": "unknown",
+                "should_reply": False,
+                "intent": "silent",
+                "confidence": 0.9,
+                "evidence": {"continuity_veto": True},
+            }
+        )
+        decision = decider.decide(context)
+        self.assertFalse(decision.should_speak)
+        self.assertEqual(decision.reason, "动态判断不参与")
+
+    def test_judge_should_reply_still_forces_speak(self):
+        decider = EnhancedSpeakingDecider(base_probability=0.0)
+        context = self._judgement_context(
+            {
+                "available": True,
+                "target": "group",
+                "should_reply": True,
+                "intent": "acknowledge",
+                "confidence": 0.72,
+                "evidence": {},
+            }
+        )
+        decision = decider.decide(context)
+        self.assertTrue(decision.should_speak)
+        self.assertIn("动态判断", decision.reason)
+
     def test_group_probability_override_is_used(self):
         decider = EnhancedSpeakingDecider(base_probability=0.02)
         default_context = SocialContext(

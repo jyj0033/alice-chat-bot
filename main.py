@@ -644,8 +644,9 @@ class GroupChatBot:
             command_prefixes=speaking_config.get("command_prefixes", ["/", "!", "#"]),
         )
 
-        # 每条群消息先做一次轻量的目标/接话意图判断；随机发言概率仍负责
-        # 拟人化节奏，但不再独自决定“这句话是不是在对 Bot 说”。
+        # 每条群消息先做一次轻量的目标/接话意图判断。互聊由判断器否决；
+        # 面向全群的闲聊仍由随机发言概率负责拟人化节奏，判断器不再独自
+        # 决定“没点名就不许说话”。
         self._configure_conversation_judge()
 
     def _configure_conversation_judge(self) -> None:
@@ -1289,8 +1290,19 @@ class GroupChatBot:
             or (bool(message.reply_to_qq) and not quoted_bot)
         )
         if judge_available:
-            # 动态判断是最终的目标依据；程序提取的 @/回复信息仍会放入模型上下文。
-            if not judge_should_reply:
+            # 动态判断是“对谁说”的依据；没点头时，只有互聊才整轮跳过。
+            talking_to_others = judge_target == "other" or heuristic_talking_to_others
+            continuing = (
+                judge_target == "bot"
+                and judge_should_reply
+                and judge_intent in {"follow_up", "acknowledge", "answer"}
+            )
+            allow_chance = ConversationJudge.allows_probabilistic_interjection(
+                judge,
+                mentioned_others=bool(message.mentioned_others),
+                reply_to_other=heuristic_talking_to_others,
+            )
+            if not judge_should_reply and not allow_chance:
                 logger.info(
                     "[目标判断] 本轮不参与：目标=%s，意图=%s，理由=%s",
                     judge_target,
@@ -1298,10 +1310,13 @@ class GroupChatBot:
                     judge.get("reason", ""),
                 )
                 return None
-            talking_to_others = judge_target == "other"
-            continuing = judge_target == "bot" and judge_intent in {
-                "follow_up", "acknowledge", "answer"
-            }
+            if not judge_should_reply and allow_chance:
+                logger.info(
+                    "[目标判断] 不强制参与，交给随机插话：目标=%s，意图=%s，理由=%s",
+                    judge_target,
+                    judge_intent,
+                    judge.get("reason", ""),
+                )
         else:
             # 判断服务不可用时保守降级：显式信号仍可回复，但不自动续接。
             talking_to_others = heuristic_talking_to_others
@@ -1334,6 +1349,8 @@ class GroupChatBot:
         context.extra["rich_type"] = message.rich_type
         context.extra["conversation_judgement"] = judge
         context.extra["dynamic_target"] = judge_target if judge_available else ""
+        context.extra["mentioned_others"] = bool(message.mentioned_others)
+        context.extra["reply_to_other"] = heuristic_talking_to_others
         context.extra["group_base_probability"] = group_config.get(
             "speaking_probability"
         )

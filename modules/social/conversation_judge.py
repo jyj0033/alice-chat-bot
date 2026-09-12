@@ -10,6 +10,8 @@
 显式 @、回复段和消息顺序都作为模型输入证据保留。模型判断之后还会再套一层
 硬规则：同一发言者刚在明确对别人说话、当前又没有 @/引用 Bot 时，不允许
 因为出现「你」或问号就改判为对 Bot；对 Bot 的引用目标只能是当前消息。
+面向全群的打招呼、开放提问和闲聊吐槽允许参与；互聊仍保持沉默。
+模型没点头时，group/unknown 还可以交给低概率随机插话，other 不行。
 """
 
 from __future__ import annotations
@@ -125,6 +127,36 @@ class ConversationJudge:
         except (TypeError, ValueError):
             self.context_messages = 16
 
+    @staticmethod
+    def allows_probabilistic_interjection(
+        judgement: dict[str, Any] | ConversationJudgeResult | None,
+        *,
+        mentioned_others: bool = False,
+        reply_to_other: bool = False,
+    ) -> bool:
+        """Judge 未强制参与时，是否还允许走低概率随机插话。
+
+        互聊（target=other）、对 Bot 但判定沉默、以及「刚在对别人说」的延续否决
+        一律不准。面向全群或目标不明、且当前没有 @/回复其他人时可以交给旧概率。
+        """
+        if isinstance(judgement, ConversationJudgeResult):
+            data = judgement.to_dict()
+        else:
+            data = dict(judgement or {})
+        if not data.get("available"):
+            return True
+        if data.get("should_reply"):
+            return False
+        target = str(data.get("target") or "")
+        if target in {"other", "bot"}:
+            return False
+        evidence = data.get("evidence") or {}
+        if evidence.get("continuity_veto"):
+            return False
+        if mentioned_others or reply_to_other:
+            return False
+        return target in {"group", "unknown"}
+
     async def judge(
         self,
         current_message: Any,
@@ -152,16 +184,29 @@ class ConversationJudge:
         request.add_system(
             "你是群聊对话目标判断器，不是回复生成器。"
             "请结合消息顺序、发送者、@对象、回复对象和语义判断当前消息的真正指向，"
-            "并判断 Alice 是否应该参与。群聊中的省略主语、接着上一句、转头问别人、"
-            "自言自语和多人插话都要结合上下文区分。"
+            "并判断 Alice 是否应该参与。Alice 是群成员，不是只在被点名时才说话的客服。"
+            "群聊中的省略主语、接着上一句、转头问别人、自言自语和多人插话都要结合上下文区分。"
             "不要因为出现问号、昵称或关键词就机械判定为问 Alice。"
             "也不要因为 Alice 刚回复过某人就默认下一句仍然是对 Alice 说。\n"
+            "【应当 should_reply=true】"
+            "target=bot：明确@/回复/叫「爱丽丝」「小艾」在对她说话或提问；"
+            "target=group：面向全群的打招呼（早、早上好、孩子们）、"
+            "开放提问（有无人、有无、谁来、找人聊天）、"
+            "随口分享后适合接一句的闲聊吐槽。"
+            "面向全群时 intent 用 acknowledge/react/answer/add_info，"
+            "不要因为没@Alice 就改成 silent 或 should_reply=false。\n"
+            "【应当 should_reply=false】"
+            "target=other：正在回复/@其他群友，或同一人刚在对别人说、当前没有新的指向；"
+            "广告、卡片、合并转发、纯链接、无法识别的消息；"
+            "两人对聊的中间句、自言自语补完上一句。\n"
             "同一发言者最近一次明确@/回复的对象如果是其他群友，而当前消息没有新的"
             "@/引用 Bot，不能因为出现‘你’、问号或附近有图片就改判为对 Bot；"
-            "应保持 target=other 或 unknown，should_reply=false。\n"
+            "应保持 target=other，should_reply=false。\n"
             "reference_message_id 只能填当前待判断消息的 id，不要填旁边的图片或别人的消息。\n"
-            "如果对象冲突、话题已切换或证据不足，优先 target=unknown、should_reply=false，"
-            "不要替群友猜测对话对象。\n"
+            "能确定是在对某个群友说：target=other、should_reply=false。"
+            "面向全群且适合随口接一句：target=group、should_reply=true。"
+            "只有既不像对特定人说、也不像适合接的闲聊时，才用 target=unknown、should_reply=false。"
+            "不要把面向全群的话一律判成 silent。\n"
             "只输出一个 JSON 对象，不要输出 Markdown、解释、思维过程或额外文字。"
             "字段必须是：target（bot/other/group/unknown）、"
             "intent（answer/follow_up/acknowledge/add_info/react/silent）、"

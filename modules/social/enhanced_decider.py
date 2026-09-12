@@ -12,6 +12,7 @@ from typing import Optional, Tuple
 from .awareness import SocialContext, SocialAwarenessManager
 from .attention import AttentionManager, AttentionKeywordsDetector
 from .conversation_floor import ActionType
+from .conversation_judge import ConversationJudge
 from .fatigue import FatigueManager
 
 logger = logging.getLogger(__name__)
@@ -119,15 +120,21 @@ class EnhancedSpeakingDecider:
             and dynamic_should_reply
         )
 
-        # 动态目标判断是群聊是否参与的第一道裁判；旧的关键词/概率系统只在
-        # 判断服务不可用时兜底，避免“问号/昵称”把群友互聊强行拉成 Bot 对话。
+        # 动态目标判断负责“这句话是不是在对 Bot / 别人说”。
+        # 互聊（other）或对 Bot 但判定沉默时硬跳过；面向全群/目标不明时
+        # 仍走旧的低概率随机插话，避免没被点名就完全闭嘴。
         if judgement_available and not dynamic_should_reply:
-            return SpeakingDecision(
-                should_speak=False,
-                probability=0.0,
-                reason="动态判断不参与",
-                modifiers={"target": dynamic_target},
-            )
+            if not ConversationJudge.allows_probabilistic_interjection(
+                judgement,
+                mentioned_others=bool(context.extra.get("mentioned_others")),
+                reply_to_other=bool(context.extra.get("reply_to_other")),
+            ):
+                return SpeakingDecision(
+                    should_speak=False,
+                    probability=0.0,
+                    reason="动态判断不参与",
+                    modifiers={"target": dynamic_target},
+                )
 
         # === 1. 检查冷却（@ / 引用 / 当前正延续对话时跳过）===
         # 冷却用于限制“低概率随机插话”刷屏；明确对我说或 bot 刚回复过对方、

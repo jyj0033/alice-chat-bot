@@ -443,6 +443,85 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("名字", reason)
 
+    def test_allows_probabilistic_interjection_for_group_and_unknown(self):
+        group = {
+            "available": True,
+            "target": "group",
+            "should_reply": False,
+            "evidence": {},
+        }
+        unknown = {
+            "available": True,
+            "target": "unknown",
+            "should_reply": False,
+            "evidence": {},
+        }
+        self.assertTrue(ConversationJudge.allows_probabilistic_interjection(group))
+        self.assertTrue(ConversationJudge.allows_probabilistic_interjection(unknown))
+
+    def test_allows_probabilistic_interjection_blocks_other_and_veto(self):
+        other = {
+            "available": True,
+            "target": "other",
+            "should_reply": False,
+            "evidence": {},
+        }
+        vetoed = {
+            "available": True,
+            "target": "unknown",
+            "should_reply": False,
+            "evidence": {"continuity_veto": True},
+        }
+        bot_silent = {
+            "available": True,
+            "target": "bot",
+            "should_reply": False,
+            "evidence": {},
+        }
+        replied_other = {
+            "available": True,
+            "target": "group",
+            "should_reply": False,
+            "evidence": {},
+        }
+        self.assertFalse(ConversationJudge.allows_probabilistic_interjection(other))
+        self.assertFalse(ConversationJudge.allows_probabilistic_interjection(vetoed))
+        self.assertFalse(ConversationJudge.allows_probabilistic_interjection(bot_silent))
+        self.assertFalse(
+            ConversationJudge.allows_probabilistic_interjection(
+                replied_other, reply_to_other=True
+            )
+        )
+        self.assertFalse(
+            ConversationJudge.allows_probabilistic_interjection(
+                replied_other, mentioned_others=True
+            )
+        )
+
+    async def test_system_prompt_allows_group_chime_in(self):
+        provider = _FakeProvider(
+            '{"target":"group","intent":"acknowledge","should_reply":true,'
+            '"confidence":0.7,"reason":"群里打招呼"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot", bot_name="爱丽丝")
+        current = self._message(
+            message_id="m1",
+            content="早",
+            mentioned_user_ids=[],
+            reply_to_id=None,
+            reply_to_qq=None,
+        )
+
+        result = await judge.judge(current, [])
+
+        system = provider.requests[0].messages[0].content
+        self.assertIn("面向全群", system)
+        self.assertIn("打招呼", system)
+        self.assertIn("开放提问", system)
+        self.assertNotIn("证据不足，优先 target=unknown", system)
+        self.assertEqual(result.target, "group")
+        self.assertTrue(result.should_reply)
+
     def test_unrelated_later_message_does_not_divert(self):
         current = self._message(
             message_id="m3",
