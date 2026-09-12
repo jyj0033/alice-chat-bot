@@ -1997,9 +1997,9 @@
                         <div class="form-group">
                             <label>自动发送日报</label>
                             <div class="toggle-row" style="padding-top: 6px; max-width: 120px;">
-                                <label class="toggle"><input type="checkbox" id="group-analysis-auto"><span class="toggle-slider"></span></label>
+                                <label class="toggle"><input type="checkbox" id="group-analysis-auto" checked><span class="toggle-slider"></span></label>
                             </div>
-                            <div class="hint">默认关闭，避免突然增加 LLM 调用</div>
+                            <div class="hint">默认开启，每天到点自动生成并发送到群里</div>
                         </div>
                         <div class="form-group">
                             <label>自动时间</label>
@@ -3210,7 +3210,7 @@
             document.getElementById('memory-db-path').value = mem.db_path || 'data/memory.db';
             const groupAnalysis = mem.group_analysis || {};
             document.getElementById('group-analysis-enabled').checked = groupAnalysis.enabled !== false;
-            document.getElementById('group-analysis-auto').checked = groupAnalysis.auto_enabled === true;
+            document.getElementById('group-analysis-auto').checked = groupAnalysis.auto_enabled !== false;
             const analysisTimes = Array.isArray(groupAnalysis.auto_times)
                 ? groupAnalysis.auto_times : [groupAnalysis.auto_time || '23:50'];
             document.getElementById('group-analysis-times').value = analysisTimes.join(', ');

@@ -372,8 +372,7 @@ class GroupChatBot:
             f"每{self._digest_config['interval_messages']}条消息总结一次"
         )
 
-        # 群聊日报：默认不自动发送，避免升级后突然增加 LLM 调用和群消息；
-        # Dashboard 手动触发不受 auto_enabled 影响。
+        # 群聊日报：默认到点自动生成并发送；Dashboard 手动触发不受 auto_enabled 影响。
         analysis_cfg = memory_config.get("group_analysis", {}) or {}
         auto_times = analysis_cfg.get("auto_times", analysis_cfg.get("auto_time", "23:50"))
         if isinstance(auto_times, str):
@@ -382,7 +381,7 @@ class GroupChatBot:
             auto_times = ["23:50"]
         self._group_analysis_config = {
             "enabled": bool(analysis_cfg.get("enabled", True)),
-            "auto_enabled": bool(analysis_cfg.get("auto_enabled", False)),
+            "auto_enabled": bool(analysis_cfg.get("auto_enabled", True)),
             "auto_times": [str(value).strip() for value in auto_times if str(value).strip()][:8]
             or ["23:50"],
             "min_messages": max(3, min(5000, int(analysis_cfg.get("min_messages", 10)))),
@@ -3287,7 +3286,7 @@ class GroupChatBot:
     async def _maybe_group_analysis(self) -> None:
         """在配置时间窗口内为有素材的群自动生成日报。"""
         config = getattr(self, "_group_analysis_config", {}) or {}
-        if not config.get("enabled", True) or not config.get("auto_enabled", False):
+        if not config.get("enabled", True) or not config.get("auto_enabled", True):
             return
         now = datetime.now()
         if not any(
@@ -5379,7 +5378,7 @@ class GroupChatBot:
                 },
                 "group_analysis": {
                     "enabled": True,
-                    "auto_enabled": False,
+                    "auto_enabled": True,
                     "auto_times": ["23:50"],
                     "min_messages": 10,
                     "max_messages": 500,
