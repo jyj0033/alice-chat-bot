@@ -7,8 +7,9 @@
 * 如果参与，应该回答、续接、附和还是补充信息；
 * 回复应该引用哪条消息。
 
-显式 @、回复段和消息顺序都作为模型输入证据保留，但不在这里写死“必回”
-或“必静默”。真实群聊中的省略、转话题和多人插话需要结合上下文判断。
+显式 @、回复段和消息顺序都作为模型输入证据保留。模型判断之后还会再套一层
+硬规则：同一发言者刚在明确对别人说话、当前又没有 @/引用 Bot 时，不允许
+因为出现「你」或问号就改判为对 Bot；对 Bot 的引用目标只能是当前消息。
 """
 
 from __future__ import annotations
@@ -23,6 +24,30 @@ from typing import Any
 from modules.llm.base import ChatRequest
 
 logger = logging.getLogger(__name__)
+
+_VOCATIVE_RE = re.compile(
+    r"(?:了|吧|啊|呀|呢|哦|哈|嘛)([\u4e00-\u9fff]{2,4})$"
+)
+_OTHER_TITLES = frozenset(
+    {
+        "团长",
+        "队长",
+        "老板",
+        "老师",
+        "班长",
+        "组长",
+        "馆长",
+        "会长",
+        "室长",
+        "主席",
+        "大哥",
+        "大姐",
+        "师兄",
+        "师姐",
+        "学长",
+        "学姐",
+    }
+)
 
 
 @dataclass
@@ -131,15 +156,17 @@ class ConversationJudge:
             "自言自语和多人插话都要结合上下文区分。"
             "不要因为出现问号、昵称或关键词就机械判定为问 Alice。"
             "也不要因为 Alice 刚回复过某人就默认下一句仍然是对 Alice 说。\n"
-            "历史中的‘同一发言者的目标延续线索’只是语义证据，不是硬规则："
-            "当前没有新@/回复时，要判断是否仍在延续原对象；‘你’不等于 Alice。"
+            "同一发言者最近一次明确@/回复的对象如果是其他群友，而当前消息没有新的"
+            "@/引用 Bot，不能因为出现‘你’、问号或附近有图片就改判为对 Bot；"
+            "应保持 target=other 或 unknown，should_reply=false。\n"
+            "reference_message_id 只能填当前待判断消息的 id，不要填旁边的图片或别人的消息。\n"
             "如果对象冲突、话题已切换或证据不足，优先 target=unknown、should_reply=false，"
             "不要替群友猜测对话对象。\n"
             "只输出一个 JSON 对象，不要输出 Markdown、解释、思维过程或额外文字。"
             "字段必须是：target（bot/other/group/unknown）、"
             "intent（answer/follow_up/acknowledge/add_info/react/silent）、"
             "should_reply（true/false）、confidence（0到1）、"
-            "reference_message_id（相关消息ID，没有就空字符串）、"
+            "reference_message_id（当前消息ID，没有就空字符串）、"
             "target_user_id（如果主要对某个群友说则填QQ号，否则空字符串）、"
             "reason（不超过40字的简短依据）。"
         )
@@ -164,6 +191,12 @@ class ConversationJudge:
                     )
                 ),
             }
+            result = self.apply_safety_overrides(
+                result,
+                current_message,
+                recent_messages,
+                heuristic_signals or {},
+            )
             logger.info(
                 "[目标判断] %s → 目标=%s，意图=%s，是否回复=%s，置信度=%.2f，理由=%s",
                 result.evidence["message_id"] or "no-id",
@@ -579,6 +612,206 @@ class ConversationJudge:
             if replied_sender:
                 targets.append(replied_sender)
         return list(dict.fromkeys(targets))
+
+    def apply_safety_overrides(
+        self,
+        result: ConversationJudgeResult,
+        current_message: Any,
+        recent_messages: list[Any] | None = None,
+        heuristic_signals: dict[str, Any] | None = None,
+    ) -> ConversationJudgeResult:
+        """钉死引用目标，并否决「刚在对别人说却被改判成问 Bot」的结果。"""
+        signals = heuristic_signals or {}
+        recent_messages = list(recent_messages or [])
+        current_id = str(getattr(current_message, "message_id", "") or "")
+        all_messages = [*recent_messages, current_message]
+        message_senders = {
+            str(getattr(message, "message_id", "") or ""): str(
+                getattr(message, "sender_id", "") or ""
+            )
+            for message in all_messages
+            if str(getattr(message, "message_id", "") or "")
+        }
+
+        if current_id:
+            if result.target == "bot":
+                if (
+                    result.reference_message_id
+                    and result.reference_message_id != current_id
+                ):
+                    result.evidence["dropped_reference_message_id"] = (
+                        result.reference_message_id
+                    )
+                result.reference_message_id = current_id
+                result.evidence["pinned_reference"] = True
+            elif result.should_reply and not result.reference_message_id:
+                result.reference_message_id = current_id
+
+        points_to_bot = self._current_points_to_bot(
+            current_message, message_senders, signals
+        )
+        continuity = self._same_sender_continuity(
+            current_message, recent_messages, message_senders
+        )
+        if (
+            result.target == "bot"
+            and not points_to_bot
+            and continuity
+            and continuity.get("points_to_other")
+            and not continuity.get("points_to_bot")
+        ):
+            other_id = str(continuity.get("target_user_id") or "")
+            result.evidence["model_target"] = result.target
+            result.evidence["continuity_veto"] = True
+            result.evidence["continuity_source"] = str(
+                continuity.get("source_id") or ""
+            )
+            result.target = "other" if other_id else "unknown"
+            result.should_reply = False
+            result.intent = "silent"
+            if other_id:
+                result.target_user_id = other_id
+            result.reason = "硬规则：同一人刚在对别人说，当前没有@/引用Bot"
+            logger.info(
+                "[目标判断] 延续否决 %s：上一对象=%s",
+                current_id or "no-id",
+                other_id or continuity.get("judged") or "other",
+            )
+        return result
+
+    def _current_points_to_bot(
+        self,
+        message: Any,
+        message_senders: dict[str, str],
+        signals: dict[str, Any],
+    ) -> bool:
+        """只认显式 @/引用/点名，不把旧的 directed_to_bot 分析标记当成证据。"""
+        if signals.get("mentioned_me") or signals.get("reply_to_me"):
+            return True
+        if bool(getattr(message, "mentioned_me", False)):
+            return True
+        targets = self._explicit_target_ids(message, message_senders)
+        if self.bot_id and self.bot_id in targets:
+            return True
+        content = str(getattr(message, "content", "") or "")
+        for name in (self.bot_name, "爱丽丝", "小艾"):
+            if name and name in content:
+                return True
+        return False
+
+    def _same_sender_continuity(
+        self,
+        current_message: Any,
+        recent_messages: list[Any],
+        message_senders: dict[str, str],
+    ) -> dict[str, Any] | None:
+        """同一发言者最近一次明确指向：显式 @/回复优先，其次已落盘的动态判断。"""
+        sender_id = str(getattr(current_message, "sender_id", "") or "")
+        current_id = str(getattr(current_message, "message_id", "") or "")
+        latest: dict[str, Any] | None = None
+        for message in recent_messages or []:
+            if str(getattr(message, "message_id", "") or "") == current_id:
+                continue
+            if str(getattr(message, "sender_id", "") or "") != sender_id:
+                continue
+            explicit = [
+                target
+                for target in self._explicit_target_ids(message, message_senders)
+                if target
+            ]
+            judged = str(getattr(message, "conversation_target", "") or "")
+            if not explicit and judged not in {"bot", "other"}:
+                continue
+            other_ids = [target for target in explicit if target != self.bot_id]
+            if explicit:
+                points_to_bot = bool(self.bot_id and self.bot_id in explicit)
+                points_to_other = bool(other_ids) and not points_to_bot
+            else:
+                points_to_bot = judged == "bot"
+                points_to_other = judged == "other"
+            latest = {
+                "source_id": str(getattr(message, "message_id", "") or ""),
+                "target_ids": other_ids,
+                "target_user_id": other_ids[0] if other_ids else "",
+                "points_to_other": points_to_other,
+                "points_to_bot": points_to_bot,
+                "judged": judged,
+            }
+        return latest
+
+    @staticmethod
+    def name_tokens(name: str) -> set[str]:
+        text = re.sub(r"[（(].*?[）)]", " ", str(name or ""))
+        tokens: set[str] = set()
+        for part in re.split(r"[\s\-_|/／,，.。!！?？~～·]+", text):
+            part = part.strip()
+            if len(part) >= 2:
+                tokens.add(part)
+            if len(part) >= 4:
+                tokens.add(part[-2:])
+        return tokens
+
+    @classmethod
+    def followup_diverts_directed_reply(
+        cls,
+        current_message: Any,
+        later_messages: list[Any],
+        *,
+        bot_id: str = "",
+        bot_names: list[str] | None = None,
+        known_users: dict[str, str] | None = None,
+    ) -> str:
+        """同一人在思考期间改口对别人说时，返回撤稿原因。"""
+        later_messages = [message for message in (later_messages or []) if message is not None]
+        if not later_messages:
+            return ""
+        bot_id = str(bot_id or "")
+        bot_name_set = {
+            str(name).strip()
+            for name in (bot_names or [])
+            if str(name).strip()
+        }
+        sender_id = str(getattr(current_message, "sender_id", "") or "")
+        known_users = dict(known_users or {})
+        other_name_tokens: set[str] = set()
+        for user_id, user_name in known_users.items():
+            if not user_id or user_id in {sender_id, bot_id}:
+                continue
+            other_name_tokens.update(cls.name_tokens(user_name))
+        other_name_tokens -= bot_name_set
+
+        for message in later_messages:
+            if str(getattr(message, "sender_id", "") or "") != sender_id:
+                continue
+            explicit = []
+            for value in getattr(message, "mentioned_user_ids", None) or []:
+                value = str(value or "")
+                if value and value.lower() not in {"all", "everyone"}:
+                    explicit.append(value)
+            reply_to_qq = str(getattr(message, "reply_to_qq", "") or "")
+            if reply_to_qq:
+                explicit.append(reply_to_qq)
+            others = [
+                target
+                for target in dict.fromkeys(explicit)
+                if target and target != bot_id
+            ]
+            if others:
+                return "同一人思考期间@/回复了别人"
+            judged = str(getattr(message, "conversation_target", "") or "")
+            if judged == "other":
+                return "同一人思考期间已被判断为对别人说"
+            content = str(getattr(message, "content", "") or "").strip()
+            if any(token and token in content for token in other_name_tokens):
+                return "同一人思考期间点了别人的名字"
+            compact = re.sub(r"[。！？!?…\s]+$", "", content)
+            match = _VOCATIVE_RE.search(compact)
+            vocative = match.group(1) if match else ""
+            if vocative and vocative not in bot_name_set and (
+                vocative in _OTHER_TITLES or vocative in other_name_tokens
+            ):
+                return f"同一人思考期间改口喊了{vocative}"
+        return ""
 
     @staticmethod
     def _render_signals(signals: dict[str, Any]) -> str:

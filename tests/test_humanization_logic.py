@@ -747,6 +747,31 @@ class HumanizationLogicTests(unittest.TestCase):
             )
         )
 
+    def test_unseen_picture_identity_claim_is_blocked(self):
+        """没看见图却说「都是群里的老面孔」，必须拦下来。"""
+        reply = "认识啊，都是群里的老面孔了"
+        self.assertTrue(
+            ReplyGenerator.claims_unseen_media(
+                reply,
+                "这里面出现的你都认识？",
+                ["[图片]", "燃尽了"],
+            )
+        )
+        self.assertTrue(
+            ReplyGenerator.needs_semantic_review(
+                reply,
+                "这里面出现的你都认识？",
+                ["[图片]"],
+            )
+        )
+        self.assertFalse(
+            ReplyGenerator.claims_unseen_media(
+                "先去吃饭了",
+                "这里面出现的你都认识？",
+                ["[图片]"],
+            )
+        )
+
     def test_reply_review_hint_is_injected_into_retry_prompt(self):
         request = ReplyGenerator(llm_provider=None)._build_request(
             context_prompt="",

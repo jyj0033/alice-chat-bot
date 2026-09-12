@@ -233,6 +233,243 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.target, "bot")
         self.assertTrue(result.should_reply)
 
+    async def test_continuity_vetoes_false_bot_target_without_mention(self):
+        """同一人刚在回复别人时，不能因为「你都认识？」就改判成问 Bot。"""
+        provider = _FakeProvider(
+            '{"target":"bot","intent":"answer","should_reply":true,'
+            '"confidence":0.85,"reference_message_id":"pic1",'
+            '"reason":"上一句发图，结合语境是在问Alice"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot", bot_name="爱丽丝")
+        current = self._message(
+            message_id="m3",
+            sender_id="u2",
+            sender_name="luguan",
+            content="这里面出现的你都认识？",
+            mentioned_user_ids=[],
+            reply_to_id=None,
+            reply_to_qq=None,
+        )
+        history = [
+            ContextMessage(
+                sender_id="u3",
+                sender_name="Silver_Wing",
+                content="[图片]",
+                message_id="pic1",
+            ),
+            ContextMessage(
+                sender_id="u1",
+                sender_name="江雨衿",
+                content="怎么没看见无职",
+                message_id="m1",
+            ),
+            ContextMessage(
+                sender_id="u2",
+                sender_name="luguan",
+                content="不知道",
+                message_id="m2",
+                reply_to_id="m1",
+                reply_to_qq="u1",
+            ),
+            current,
+        ]
+
+        result = await judge.judge(current, history)
+
+        self.assertTrue(result.available)
+        self.assertNotEqual(result.target, "bot")
+        self.assertFalse(result.should_reply)
+        self.assertTrue(result.evidence.get("continuity_veto"))
+        self.assertEqual(result.reference_message_id, "m3")
+
+    async def test_judged_other_target_also_vetoes_false_bot(self):
+        """即使没有 reply 段，上一句动态判断已是 other 也要否决。"""
+        provider = _FakeProvider(
+            '{"target":"bot","intent":"answer","should_reply":true,'
+            '"confidence":0.9,"reason":"在问Alice"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot", bot_name="爱丽丝")
+        current = self._message(
+            message_id="m3",
+            sender_id="u2",
+            sender_name="luguan",
+            content="这里面出现的你都认识？",
+            mentioned_user_ids=[],
+            reply_to_id=None,
+            reply_to_qq=None,
+        )
+        history = [
+            ContextMessage(
+                sender_id="u2",
+                sender_name="luguan",
+                content="不知道",
+                message_id="m2",
+                conversation_target="other",
+            ),
+            current,
+        ]
+
+        result = await judge.judge(current, history)
+
+        self.assertFalse(result.should_reply)
+        self.assertNotEqual(result.target, "bot")
+        self.assertTrue(result.evidence.get("continuity_veto"))
+
+    async def test_explicit_bot_mention_is_not_vetoed(self):
+        """当前句真的 @ 了 Bot，即使上一句在对别人说，也允许回答。"""
+        provider = _FakeProvider(
+            '{"target":"bot","intent":"answer","should_reply":true,'
+            '"confidence":0.9,"reference_message_id":"pic1","reason":"点名Alice"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot", bot_name="爱丽丝")
+        current = self._message(
+            message_id="m3",
+            sender_id="u2",
+            sender_name="luguan",
+            content="爱丽丝你看这个",
+            mentioned_user_ids=["bot"],
+            reply_to_id=None,
+            reply_to_qq=None,
+        )
+        history = [
+            ContextMessage(
+                sender_id="u2",
+                sender_name="luguan",
+                content="不知道",
+                message_id="m2",
+                reply_to_qq="u1",
+            ),
+            current,
+        ]
+
+        result = await judge.judge(
+            current,
+            history,
+            heuristic_signals={"mentioned_me": True},
+        )
+
+        self.assertEqual(result.target, "bot")
+        self.assertTrue(result.should_reply)
+        self.assertFalse(result.evidence.get("continuity_veto"))
+        self.assertEqual(result.reference_message_id, "m3")
+        self.assertEqual(result.evidence.get("dropped_reference_message_id"), "pic1")
+
+    async def test_bot_reference_is_pinned_to_current_message(self):
+        """对 Bot 的引用不能落在旁边的图片上。"""
+        provider = _FakeProvider(
+            '{"target":"bot","intent":"answer","should_reply":true,'
+            '"confidence":0.8,"reference_message_id":"pic1","reason":"在问图"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot", bot_name="爱丽丝")
+        current = self._message(
+            message_id="m2",
+            sender_id="u2",
+            sender_name="小红",
+            content="爱丽丝这是谁",
+            mentioned_user_ids=["bot"],
+            reply_to_id=None,
+            reply_to_qq=None,
+        )
+        history = [
+            ContextMessage(
+                sender_id="u3",
+                sender_name="Silver_Wing",
+                content="[图片]",
+                message_id="pic1",
+            ),
+            current,
+        ]
+
+        result = await judge.judge(
+            current,
+            history,
+            heuristic_signals={"mentioned_me": True},
+        )
+
+        self.assertEqual(result.target, "bot")
+        self.assertEqual(result.reference_message_id, "m2")
+
+    def test_followup_vocative_diverts_directed_reply(self):
+        current = self._message(
+            message_id="m3",
+            sender_id="u2",
+            sender_name="luguan",
+            content="这里面出现的你都认识？",
+            mentioned_user_ids=[],
+            reply_to_id=None,
+            reply_to_qq=None,
+        )
+        later = [
+            ContextMessage(
+                sender_id="u2",
+                sender_name="luguan",
+                content="那你也可以进去了团长",
+                message_id="m4",
+            )
+        ]
+        reason = ConversationJudge.followup_diverts_directed_reply(
+            current,
+            later,
+            bot_id="bot",
+            bot_names=["爱丽丝", "小艾"],
+            known_users={"u1": "江雨衿", "u2": "luguan"},
+        )
+        self.assertIn("团长", reason)
+
+    def test_followup_other_name_diverts_directed_reply(self):
+        current = self._message(
+            message_id="m3",
+            sender_id="u2",
+            sender_name="luguan",
+            content="这里面出现的你都认识？",
+            mentioned_user_ids=[],
+            reply_to_id=None,
+            reply_to_qq=None,
+        )
+        later = [
+            ContextMessage(
+                sender_id="u2",
+                sender_name="luguan",
+                content="雨衿你看这个",
+                message_id="m4",
+            )
+        ]
+        reason = ConversationJudge.followup_diverts_directed_reply(
+            current,
+            later,
+            bot_id="bot",
+            bot_names=["爱丽丝"],
+            known_users={"u1": "江       雨衿（永别了，牢笼！）", "u2": "luguan"},
+        )
+        self.assertIn("名字", reason)
+
+    def test_unrelated_later_message_does_not_divert(self):
+        current = self._message(
+            message_id="m3",
+            sender_id="u2",
+            sender_name="luguan",
+            content="爱丽丝帮我看看",
+            mentioned_user_ids=["bot"],
+            reply_to_id=None,
+            reply_to_qq=None,
+        )
+        later = [
+            ContextMessage(
+                sender_id="u2",
+                sender_name="luguan",
+                content="就是刚才那个报错",
+                message_id="m4",
+            )
+        ]
+        reason = ConversationJudge.followup_diverts_directed_reply(
+            current,
+            later,
+            bot_id="bot",
+            bot_names=["爱丽丝"],
+            known_users={"u1": "江雨衿", "u2": "luguan"},
+        )
+        self.assertEqual(reason, "")
+
 
 if __name__ == "__main__":
     unittest.main()

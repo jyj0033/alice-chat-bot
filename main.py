@@ -1815,6 +1815,25 @@ class GroupChatBot:
             == str(getattr(message, "content", "") or "")
         )
 
+    def _later_messages_from_same_sender(self, session_id: str, message: Message):
+        """思考等待期间，同一发送者在当前消息之后补的话。"""
+        current_id = str(message.message_id or "")
+        sender_id = str(message.sender_id or "")
+        later = []
+        passed = not current_id
+        for item in self.context_manager.get_window(session_id).get_recent(40):
+            if getattr(item, "is_bot", False):
+                continue
+            item_id = str(getattr(item, "message_id", "") or "")
+            if current_id and item_id == current_id:
+                passed = True
+                continue
+            if not passed:
+                continue
+            if str(getattr(item, "sender_id", "") or "") == sender_id:
+                later.append(item)
+        return later
+
     def _latest_user_context_marker(self, session_id: str):
         """返回会话里最新群友消息的稳定标记，用于检测收尾窗口是否被打断。"""
         recent = self.context_manager.get_window(session_id).get_recent(30)
@@ -1922,6 +1941,36 @@ class GroupChatBot:
             # 定向回复按原有节奏及时处理；普通插话再补一个很短的 debounce，
             # 避免 LLM 只看到“享年4级”就抢先点评，错过后面紧接着的“猝/翻车”语境。
             await self._wait_for_group_settle(session_id, action_plan)
+
+            # 定向回复默认保留原问题，但同一人在思考期间改口对别人说时必须撤稿，
+            # 否则会把「你都认识？」这类群友互问误答成对 Bot 说。
+            if message.message_type == "group":
+                later_from_sender = self._later_messages_from_same_sender(
+                    session_id, message
+                )
+                if later_from_sender:
+                    known_users = {
+                        str(item.sender_id): str(item.sender_name or "")
+                        for item in self.context_manager.get_window(
+                            session_id
+                        ).get_recent(40)
+                        if item.sender_id
+                    }
+                    divert_reason = ConversationJudge.followup_diverts_directed_reply(
+                        message,
+                        later_from_sender,
+                        bot_id=str(self.config.get("qq", {}).get("self_id", "") or ""),
+                        bot_names=[
+                            getattr(self.personality, "name", "") or "",
+                            getattr(self.personality, "nickname", "") or "",
+                            "爱丽丝",
+                            "小艾",
+                        ],
+                        known_users=known_users,
+                    )
+                    if divert_reason:
+                        logger.info("[发送复核] %s，放弃草稿", divert_reason)
+                        return
 
             # 普通插话等待期间如果出现了新消息，先对最新消息重新做动态
             # 目标判断；定向回复仍保留原始问题，不被旁边的新话题带走。
@@ -2332,6 +2381,17 @@ class GroupChatBot:
                         self.attention_manager.on_no_reply(group_id, message.sender_id)
                     return
 
+            if reply and not has_meme_intent and self.reply_generator.claims_unseen_media(
+                reply, effective_message.content, recent_texts
+            ):
+                logger.info(
+                    "[语义复核] 未看见图却描述画面，放弃回复：%s",
+                    reply[:40],
+                )
+                if direction == "to_bot":
+                    self.attention_manager.on_no_reply(group_id, message.sender_id)
+                return
+
             # LLM 调用和模拟打字也会耗时，发送前再复核一次群聊局势。
             if (
                 message.message_type == "group"
@@ -2373,15 +2433,19 @@ class GroupChatBot:
             from modules.reply.generator import split_reply_into_messages
 
             segments = split_reply_into_messages(reply)
-            # 动态判断给出的引用目标优先使用；定向群聊回复也引用原消息，
-            # 避免 Bot 思考期间群里继续聊天后，看不出它到底在回答谁。
+            # 对 Bot 说的话必须引用当前正在回答的那条，不能让模型把旁边的
+            # 图片或别人的消息填进 reference_message_id。普通插话仍可用动态
+            # 判断给出的引用目标。
             quote_id = ""
-            target_id = str(
-                conversation_judgement.get("reference_message_id")
-                or (action_plan.target_message_id if action_plan else "")
-                or effective_message_id
-                or ""
-            )
+            if direction == "to_bot":
+                target_id = str(effective_message_id or message.message_id or "")
+            else:
+                target_id = str(
+                    conversation_judgement.get("reference_message_id")
+                    or (action_plan.target_message_id if action_plan else "")
+                    or effective_message_id
+                    or ""
+                )
             recent_ids = {
                 str(m.message_id or "")
                 for m in self.context_manager.get_window(session_id).get_recent(50)

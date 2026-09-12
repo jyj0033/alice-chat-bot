@@ -1520,6 +1520,43 @@ class ReplyGenerator:
                 return True
         return False
 
+    _UNRESOLVED_MEDIA_PREFIXES = (
+        "[图片",
+        "[表情包",
+        "[动画表情",
+        "[视频",
+        "[合并转发",
+        "[无法识别的消息]",
+    )
+    _UNSEEN_MEDIA_CLAIM_RE = re.compile(
+        r"(老面孔|都认识|认得出|图里|画面里|照片里|这里面|看着像|长得像|画面上)"
+    )
+
+    @classmethod
+    def _has_unresolved_media(cls, source_texts: list) -> bool:
+        return any(
+            str(text or "").lstrip().startswith(cls._UNRESOLVED_MEDIA_PREFIXES)
+            for text in (source_texts or [])
+        )
+
+    @classmethod
+    def claims_unseen_media(
+        cls,
+        reply: str,
+        current_message: str = "",
+        source_texts: list | None = None,
+    ) -> bool:
+        """未看见图/视频内容时，草稿却在陈述画面里是谁或长什么样。"""
+        sources = list(source_texts or [])
+        if current_message:
+            sources = [current_message, *sources]
+        if not cls._has_unresolved_media(sources):
+            return False
+        text = str(reply or "").strip()
+        if not text:
+            return False
+        return bool(cls._UNSEEN_MEDIA_CLAIM_RE.search(text))
+
     @classmethod
     def needs_semantic_review(
         cls,
@@ -1529,7 +1566,14 @@ class ReplyGenerator:
     ) -> bool:
         """筛出“未知富媒体 + 不确定转述 + 泛泛回应”的草稿。"""
         compact_reply = re.sub(r"[\s，。！？!?、,.~～…]+", "", reply or "")
-        if not compact_reply or len(compact_reply) > 14:
+        if not compact_reply:
+            return False
+
+        sources = [current_message, *(source_texts or [])]
+        if cls.claims_unseen_media(reply, current_message, source_texts):
+            return True
+
+        if len(compact_reply) > 14:
             return False
 
         uncertain = any(
@@ -1539,20 +1583,7 @@ class ReplyGenerator:
         if not uncertain:
             return False
 
-        unresolved_media = any(
-            str(text or "").lstrip().startswith(
-                (
-                    "[图片",
-                    "[表情包",
-                    "[动画表情",
-                    "[视频",
-                    "[合并转发",
-                    "[无法识别的消息]",
-                )
-            )
-            for text in (source_texts or [])
-        )
-        if not unresolved_media:
+        if not cls._has_unresolved_media(sources):
             return False
 
         # 只筛出几乎没有语义承载的确认/致谢，是否真的不妥仍由复核模型判断。
