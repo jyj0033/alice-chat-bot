@@ -27,6 +27,7 @@ except ModuleNotFoundError:  # 允许只运行纯解析逻辑/精简测试环境
 from .base import Message
 from .rich_content import (
     MessageSegment,
+    describe_media_in_words,
     parse_message_segments,
     refresh_message_content,
     render_segments,
@@ -158,12 +159,18 @@ class RichMediaEnricher:
                         if enriched:
                             self._stats["image_to_text"] += 1
                             self._record_recognition(message, segment)
+                        else:
+                            segment.summary = describe_media_in_words(segment.type)
+                            enriched = True
                         changed = enriched or changed
                     elif self.image_ocr_enabled and directed:
                         enriched = await self._ocr_image(segment)
                         if enriched:
                             self._stats["image_ocr"] += 1
                         changed = enriched or changed
+                    elif not (segment.summary and "画面是" in segment.summary):
+                        segment.summary = describe_media_in_words(segment.type)
+                        changed = True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -358,7 +365,7 @@ class RichMediaEnricher:
             self._cache_put(self._ocr_cache, cache_key, cached)
         if not cached:
             return False
-        segment.summary = f"[图片，识别到文字：{cached[:160]}]"
+        segment.summary = describe_media_in_words("image", f"上面写着：{cached[:160]}")
         return True
 
     @staticmethod
@@ -413,17 +420,15 @@ class RichMediaEnricher:
 
         if not desc:
             return False
-        prefix = "[表情包，内容：" if segment.type == "mface" else "[图片，内容："
         if desc == SENSITIVE_IMAGE_NOTE:
-            # 敏感图：直接落占位文案，让 LLM 知道"爱丽丝看了不想看"，而不是空占位。
-            segment.summary = f"{prefix}{SENSITIVE_IMAGE_NOTE}]"
+            segment.summary = describe_media_in_words(segment.type, "爱丽丝不想看")
             return True
         metadata = getattr(segment, "data", None)
         if isinstance(metadata, dict):
             # 表情库使用这一份不带群聊语境的描述；segment.summary 仍保留给
             # 普通回复链路使用，避免把“图片是什么”和“当时在回应谁”混成一个字段。
             metadata["objective_summary"] = desc[:240]
-        segment.summary = f"{prefix}{desc[:100]}]"
+        segment.summary = describe_media_in_words(segment.type, desc[:100])
         return True
 
     async def _call_vision(

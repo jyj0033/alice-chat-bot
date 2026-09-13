@@ -1,6 +1,7 @@
 """回复处境：上下文格式、跨群去重、被赶闭嘴、模板泄漏。"""
 import unittest
 
+from core.adapter.rich_content import describe_media_in_words
 from modules.memory.context import (
     ContextManager,
     asks_about_unseen_media,
@@ -28,14 +29,34 @@ class ReplySituationTests(unittest.TestCase):
     def test_unseen_image_is_opaque(self):
         self.assertTrue(is_unresolved_media("[图片] [image]"))
         self.assertFalse(is_unresolved_media("[图片，内容：一只猫]"))
-        self.assertEqual(opaque_media_content("[图片]"), '<unseen type="图片"/>')
+        self.assertEqual(opaque_media_content("[图片]"), "一张图，看不清画面。")
+        self.assertEqual(
+            opaque_media_content("[图片，内容：一只橘猫趴在桌上]"),
+            "一张图，画面是一只橘猫趴在桌上。",
+        )
         self.assertTrue(asks_about_unseen_media("这里面出现的你都认识？"))
 
         manager = ContextManager()
         manager.add_message("g1", "u1", "小明", "[图片] [image]", message_id="p1")
         text = manager.get_window("g1").build_conversation_text("爱丽丝")
-        self.assertIn('<unseen type="图片"/>', text)
+        self.assertIn("一张图，看不清画面。", text)
         self.assertNotIn("[图片] [image]", text)
+        self.assertNotIn("<unseen", text)
+
+    def test_describe_media_in_words(self):
+        self.assertEqual(
+            describe_media_in_words("image", "一只橘猫趴在桌上"),
+            "一张图，画面是一只橘猫趴在桌上。",
+        )
+        self.assertEqual(describe_media_in_words("mface"), "一张表情，看不清画面。")
+
+    def test_described_image_stays_natural_language(self):
+        manager = ContextManager()
+        manager.add_message(
+            "g1", "u1", "小明", "一张图，画面是白发角色闭眼捂脸。", message_id="p1"
+        )
+        text = manager.get_window("g1").build_conversation_text("爱丽丝")
+        self.assertIn("一张图，画面是白发角色闭眼捂脸。", text)
 
     def test_prompt_echo_is_detected(self):
         self.assertTrue(

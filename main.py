@@ -761,19 +761,36 @@ class GroupChatBot:
                 **rich_media_image["vision"],
                 **image_config["vision"],
             }
-        vision_config = image_config.get("vision", {}) or {}
-        if not vision_config.get("enabled", False):
+        vision_config = dict(image_config.get("vision", {}) or {})
+        primary = (self.config.get("llm") or {}).get("primary") or {}
+        # 视觉密钥/地址没单独配时，直接复用主对话模型（MiniMax-M3 本身能看图）。
+        if not str(vision_config.get("api_key") or "").strip() or str(
+            vision_config.get("api_key") or ""
+        ).startswith("*"):
+            vision_config["api_key"] = primary.get("api_key", "")
+        if not str(vision_config.get("base_url") or "").strip():
+            vision_config["base_url"] = primary.get("base_url") or (
+                "https://api.minimaxi.com/anthropic"
+            )
+        if not str(vision_config.get("model") or "").strip():
+            vision_config["model"] = primary.get("model") or "MiniMax-M3"
+        if not str(vision_config.get("provider_type") or "").strip():
+            vision_config["provider_type"] = primary.get("provider_type") or "anthropic"
+        if vision_config.get("enabled") is False:
+            return None
+        if not str(vision_config.get("api_key") or "").strip():
+            logger.warning("视觉模型没有密钥，图片无法转成描述")
             return None
         try:
             provider = create_provider(
-                vision_config.get("provider_type", "openai"),
+                vision_config.get("provider_type", "anthropic"),
                 {
-                    "provider_type": vision_config.get("provider_type", "openai"),
+                    "provider_type": vision_config.get("provider_type", "anthropic"),
                     "api_key": vision_config.get("api_key", ""),
                     "base_url": vision_config.get(
-                        "base_url", "https://api.openai.com/v1"
+                        "base_url", "https://api.minimaxi.com/anthropic"
                     ),
-                    "model": vision_config.get("model", "gpt-4o-mini"),
+                    "model": vision_config.get("model", "MiniMax-M3"),
                     "timeout": vision_config.get("timeout", 60),
                     "temperature": vision_config.get("temperature", 0.4),
                     "max_tokens": 300,
@@ -5421,11 +5438,11 @@ class GroupChatBot:
                     "group_interval_seconds": 60,
                     "group_max_images": 4,
                     "vision": {
-                        "enabled": False,
-                        "provider_type": "openai",
+                        "enabled": True,
+                        "provider_type": "anthropic",
                         "api_key": "",
-                        "base_url": "https://api.openai.com/v1",
-                        "model": "gpt-4o-mini",
+                        "base_url": "https://api.minimaxi.com/anthropic",
+                        "model": "MiniMax-M3",
                         "timeout": 60
                     }
                 }

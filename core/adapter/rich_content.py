@@ -301,6 +301,24 @@ def _first_url(data: dict[str, Any]) -> str:
     return ""
 
 
+def describe_media_in_words(kind: str, description: str = "") -> str:
+    """把图片/表情/视频写成自然语言，供上下文和生成使用。"""
+    desc = re.sub(r"\s+", " ", str(description or "")).strip().rstrip("。．. ")
+    if kind in {"video"}:
+        return f"一段视频，画面是{desc}。" if desc else "一段视频，看不清画面。"
+    if kind in {"mface", "face"}:
+        noun = "表情"
+    elif kind in {"image", "图片"}:
+        noun = "图"
+    elif kind in {"表情包", "动画表情", "表情"}:
+        noun = "表情"
+    elif kind in {"视频"}:
+        return f"一段视频，画面是{desc}。" if desc else "一段视频，看不清画面。"
+    else:
+        return desc
+    return f"一张{noun}，画面是{desc}。" if desc else f"一张{noun}，看不清画面。"
+
+
 def _segment_summary(segment_type: str, data: dict[str, Any]) -> str:
     labels = {
         "image": "图片", "mface": "表情包", "face": "QQ表情",
@@ -315,11 +333,12 @@ def _segment_summary(segment_type: str, data: dict[str, Any]) -> str:
         return f"[文件：{name}]" if name else "[文件]"
     if segment_type == "video":
         name = _human_filename(data.get("name"))
-        return f"[视频：{name}]" if name else "[视频]"
-    if segment_type == "image":
+        return describe_media_in_words("video", name)
+    if segment_type in {"image", "mface", "face"}:
         summary = _short(data.get("summary"), 60)
-        if summary and summary not in ("[图片]", "图片"):
-            return f"[图片：{summary}]"
+        if summary in ("[图片]", "图片", "[表情包]", "表情包", ""):
+            summary = ""
+        return describe_media_in_words(segment_type, summary)
     return f"[{label}]"
 
 

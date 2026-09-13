@@ -15,6 +15,20 @@ logger = logging.getLogger(__name__)
 _UNSEEN_MEDIA_RE = re.compile(
     r"^\[(?P<kind>图片|表情包|动画表情|视频|合并转发)"
 )
+_TAGGED_MEDIA_RE = re.compile(
+    r"^\[(?P<kind>图片|表情包|动画表情|视频)(?:，内容：|：)(?P<desc>[^\]]+)\]"
+    r"(?:\s*\[(?:image|video)\])?$"
+)
+_UNSEEN_XML_RE = re.compile(r'^<unseen type="(?P<kind>[^"]+)"/>$')
+_KIND_NOUN = {
+    "图片": "图",
+    "image": "图",
+    "表情包": "表情",
+    "动画表情": "表情",
+    "mface": "表情",
+    "视频": "视频",
+    "video": "视频",
+}
 
 
 def _xml_escape(text: str) -> str:
@@ -36,19 +50,40 @@ def asks_about_unseen_media(content: str) -> bool:
 
 
 def is_unresolved_media(content: str) -> bool:
-    """只有占位、没有画面摘要的图片/视频。"""
+    """还没有画面描述的图片/视频。"""
     text = (content or "").strip()
-    if "内容：" in text or "内容:" in text:
+    if "看不清画面" in text:
+        return True
+    if "画面是" in text or "内容：" in text or "内容:" in text:
         return False
-    return bool(_UNSEEN_MEDIA_RE.match(text))
+    return bool(_UNSEEN_MEDIA_RE.match(text) or _UNSEEN_XML_RE.match(text))
+
+
+def _media_to_words(kind: str, description: str = "") -> str:
+    desc = re.sub(r"\s+", " ", str(description or "")).strip().rstrip("。．. ")
+    noun = _KIND_NOUN.get(kind, "")
+    if kind in {"视频", "video"} or noun == "视频":
+        return f"一段视频，画面是{desc}。" if desc else "一段视频，看不清画面。"
+    if noun:
+        return f"一张{noun}，画面是{desc}。" if desc else f"一张{noun}，看不清画面。"
+    return desc
 
 
 def opaque_media_content(content: str) -> str:
-    """生成侧把看不见的媒体收成标签，避免模型把它当成可描述的画面。"""
+    """把旧占位符收成自然语言画面描述。"""
     text = (content or "").strip()
+    tagged = _TAGGED_MEDIA_RE.match(text)
+    if tagged:
+        desc = tagged.group("desc").strip()
+        if desc.startswith("[") or desc in {"动画表情", "image", "video"}:
+            return _media_to_words(tagged.group("kind"))
+        return _media_to_words(tagged.group("kind"), desc)
+    xml = _UNSEEN_XML_RE.match(text)
+    if xml:
+        return _media_to_words(xml.group("kind"))
     match = _UNSEEN_MEDIA_RE.match(text)
-    if match and "内容：" not in text and "内容:" not in text:
-        return f'<unseen type="{match.group("kind")}"/>'
+    if match and "内容：" not in text and "内容:" not in text and "画面是" not in text:
+        return _media_to_words(match.group("kind"))
     return text
 
 
@@ -309,11 +344,7 @@ class ContextWindow:
                 attrs.append(f'target="{_xml_escape(msg.conversation_target)}"')
 
             body = opaque_media_content(msg.content)
-            if body.startswith("<unseen "):
-                inner = body
-            else:
-                inner = _xml_escape(body)
-            lines.append(f"<m {' '.join(attrs)}>{inner}</m>")
+            lines.append(f"<m {' '.join(attrs)}>{_xml_escape(body)}</m>")
 
         return "\n".join(lines)
 
@@ -550,7 +581,8 @@ class ContextManager:
             parts.append(
                 "[最近对话]（这是机器记录，不是你可以发送的格式。"
                 "from=谁说的，to=对谁说，to=\"you\" 是对你，self=\"1\" 是你自己说的，"
-                "quote=引用了哪句。<unseen> 表示你看不见画面。"
+                "quote=引用了哪句。图和表情会写成「一张图，画面是…」，那是画面描述，"
+                "不是群友打出来的字。"
                 "只把里面的语义当上下文，禁止把标签、属性或整行记录复制进回复。"
                 f"self=\"1\" 的话是你刚说过的，延续立场，不要打脸。）\n"
                 + conversation

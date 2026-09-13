@@ -413,7 +413,7 @@ class HumanizationLogicTests(unittest.TestCase):
         )
 
         self.assertFalse(message.mentioned_me)
-        self.assertEqual(message.content, "[图片]")
+        self.assertEqual(message.content, "一张图，看不清画面。")
         self.assertEqual(message.sender_name, "群名片")
 
     def test_qq_parser_resolves_reply_sender_from_recent_message_id(self):
@@ -895,6 +895,13 @@ class HumanizationLogicTests(unittest.TestCase):
                 "先去吃饭了",
                 "这里面出现的你都认识？",
                 ["[图片]"],
+            )
+        )
+        self.assertTrue(
+            ReplyGenerator.claims_unseen_media(
+                "认识啊，都是群里的老面孔了",
+                "这里面出现的你都认识？",
+                ["一张图，看不清画面。"],
             )
         )
 
