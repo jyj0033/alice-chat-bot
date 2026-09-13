@@ -28,7 +28,11 @@ from core.config_store import load_config as load_config_file, save_config as sa
 
 from modules.llm.openai_provider import create_provider, LLMProvider
 from modules.memory.storage import MemoryStorage, AsyncMemoryStorage, Memory
-from modules.memory.context import ContextManager
+from modules.memory.context import (
+    ContextManager,
+    asks_about_unseen_media,
+    is_unresolved_media,
+)
 from modules.group_analysis import GroupDailyAnalysis
 from modules.meme_manager import MemeManager
 
@@ -43,6 +47,7 @@ from modules.social.fatigue import FatigueManager
 from modules.social.enhanced_decider import EnhancedSpeakingDecider
 from modules.social.conversation_floor import ActionType, ConversationFloorManager
 from modules.social.conversation_judge import ConversationJudge, ConversationJudgeResult
+from modules.social.session_awareness import SessionAwareness
 
 from modules.reply.generator import ReplyGenerator, ThinkingDelay, ResponseFilter
 
@@ -609,6 +614,7 @@ class GroupChatBot:
             bored_topics=self.personality.bored_topics,
             taboo_topics=self.personality.taboo_topics,
         )
+        self.session_awareness = SessionAwareness()
 
         # 群聊发言权：判断谁在和谁说话、当前插嘴成本以及候选行为。
         personality_style_config = (
@@ -1272,6 +1278,28 @@ class GroupChatBot:
         self_id = str(self.config.get("qq", {}).get("self_id", ""))
         quoted_bot = bool(message.reply_to_qq) and bool(self_id) and str(message.reply_to_qq) == self_id
 
+        awareness = getattr(self, "session_awareness", None)
+        if awareness and message.message_type == "group":
+            bot_names = [
+                getattr(self.personality, "name", "") or "",
+                getattr(self.personality, "nickname", "") or "",
+                "小爱",
+            ]
+            if awareness.is_silence_request(
+                message.content or getattr(message, "outer_text", "") or "",
+                bot_names=bot_names,
+                mentioned_me=bool(message.mentioned_me),
+                reply_to_me=is_reply_to_bot,
+            ):
+                awareness.mute(session_id)
+                logger.info("[社交] 被要求闭嘴，本轮不回")
+                return None
+            if awareness.is_muted(session_id) and not (
+                message.mentioned_me or is_reply_to_bot
+            ):
+                logger.info("[社交] 本群刚被赶，先不插话")
+                return None
+
         judge = (
             conversation_judgement.to_dict()
             if isinstance(conversation_judgement, ConversationJudgeResult)
@@ -1499,6 +1527,17 @@ class GroupChatBot:
         logger.debug(
             f"[指向] {direction}（触发：{trigger_reasons}，延续对话={continuing}）"
         )
+
+        if (
+            awareness
+            and message.message_type == "group"
+            and not (message.mentioned_me or is_reply_to_bot)
+            and not awareness.claim_utterance(
+                session_id, message.sender_id, message.content
+            )
+        ):
+            logger.info("[社交] 同一句话已在其他群处理，本群跳过")
+            return None
 
         return {
             "direction": direction,
@@ -2143,15 +2182,11 @@ class GroupChatBot:
                     session_id=session_id,
                     glossary=glossary,
                     conversation_judgement=conversation_judgement,
-                    current_message_context={
-                        "sender_id": effective_message.sender_id,
-                        "sender_name": effective_message.sender_name,
-                        "message_id": effective_message.message_id,
-                        "mentioned_user_ids": effective_message.mentioned_user_ids,
-                        "reply_to_id": effective_message.reply_to_id,
-                        "reply_to_qq": effective_message.reply_to_qq,
-                        "conversation_judgement": conversation_judgement,
-                    },
+                    current_message_context=self._reply_situation_fields(
+                        session_id,
+                        effective_message,
+                        conversation_judgement,
+                    ),
                 )
             except asyncio.CancelledError:
                 raise
@@ -2269,15 +2304,11 @@ class GroupChatBot:
                         session_id=session_id,
                         glossary=glossary,
                         conversation_judgement=conversation_judgement,
-                        current_message_context={
-                            "sender_id": effective_message.sender_id,
-                            "sender_name": effective_message.sender_name,
-                            "message_id": effective_message.message_id,
-                            "mentioned_user_ids": effective_message.mentioned_user_ids,
-                            "reply_to_id": effective_message.reply_to_id,
-                            "reply_to_qq": effective_message.reply_to_qq,
-                            "conversation_judgement": conversation_judgement,
-                        },
+                        current_message_context=self._reply_situation_fields(
+                            session_id,
+                            effective_message,
+                            conversation_judgement,
+                        ),
                         avoid_paraphrase=paraphrase_issue,
                         reply_review_hint=review_hint,
                     )
@@ -2590,6 +2621,13 @@ class GroupChatBot:
                         reply_to_qq=effective_message.sender_id,
                     )
                     self._store_group_analysis_bot_message(session_id, sent_reply)
+                    awareness = getattr(self, "session_awareness", None)
+                    if awareness:
+                        awareness.mark_sent(
+                            session_id,
+                            effective_message.sender_id,
+                            effective_message.content,
+                        )
 
             if not sent_segments and not meme_sent:
                 logger.error("回复发送失败")
@@ -4941,6 +4979,45 @@ class GroupChatBot:
 
         return memories
 
+    def _reply_situation_fields(
+        self,
+        session_id: str,
+        message: Message,
+        conversation_judgement: dict | None = None,
+    ) -> dict:
+        """当前要回的那一句：引用对象、自己刚说过的话、看不见的图。"""
+        window = self.context_manager.get_window(session_id)
+        recent = window.get_recent(20)
+        quoted_content = ""
+        quoted_sender = ""
+        reply_to_id = str(getattr(message, "reply_to_id", "") or "")
+        if reply_to_id:
+            for item in recent:
+                if str(item.message_id or "") == reply_to_id:
+                    quoted_content = item.content
+                    quoted_sender = "you" if item.is_bot else item.sender_name
+                    break
+        own_recent = [item.content for item in recent if item.is_bot][-3:]
+        nearby = [getattr(message, "content", "") or ""] + [
+            item.content for item in recent[-6:]
+        ]
+        return {
+            "sender_id": getattr(message, "sender_id", ""),
+            "sender_name": getattr(message, "sender_name", ""),
+            "message_id": getattr(message, "message_id", ""),
+            "mentioned_user_ids": getattr(message, "mentioned_user_ids", []),
+            "reply_to_id": getattr(message, "reply_to_id", ""),
+            "reply_to_qq": getattr(message, "reply_to_qq", ""),
+            "conversation_judgement": conversation_judgement or {},
+            "quoted_content": quoted_content,
+            "quoted_sender": quoted_sender,
+            "own_recent": own_recent,
+            "unseen_media": any(is_unresolved_media(text) for text in nearby),
+            "asks_about_media": asks_about_unseen_media(
+                getattr(message, "content", "") or ""
+            ),
+        }
+
     async def _augment_context_with_group_reports(
         self, session_id: str, context_prompt: str
     ) -> str:
@@ -4959,28 +5036,20 @@ class GroupChatBot:
         if not reports:
             return context_prompt
 
-        # 取报告里有用的两段：话题 + 群友标签（忽略金句/逆天等闲聊段子）
-        blocks: list[str] = ["\n[近期群日报摘要]（这些是昨天/前天群里聊过的主题和群友标签，"
-                              "用得上就顺手提一下，不要主动复述）："]
+        # 只注入群友印象，不注入话题清单——后者会把模型推成播报腔。
+        blocks: list[str] = ["\n[你记得的群友印象]（用来认人，不要当新闻播报）："]
         used = False
         for report in reports:
             meta = report.metadata or {}
             report_date = meta.get("report_date") or "?"
             content = report.content or ""
             profiles_segment = _extract_section(content, "我给几位群友留了个小标签", "我注意到的话题")
-            topics_segment = _extract_section(content, "我注意到的话题", "我忍不住记下的几句")
-            if not topics_segment and not profiles_segment:
+            if not profiles_segment:
                 continue
             blocks.append(f"--- {report_date} ---")
-            if topics_segment:
-                used = True
-                # 截短：每段最多 3 行，避免 prompt 过长
-                short_topics = "\n".join(topics_segment.splitlines()[:3])
-                blocks.append(f"话题：\n{short_topics}")
-            if profiles_segment:
-                used = True
-                short_profiles = "\n".join(profiles_segment.splitlines()[:5])
-                blocks.append(f"群友标签：\n{short_profiles}")
+            used = True
+            short_profiles = "\n".join(profiles_segment.splitlines()[:5])
+            blocks.append(short_profiles)
         if not used:
             return context_prompt
         return context_prompt + "\n" + "\n".join(blocks)

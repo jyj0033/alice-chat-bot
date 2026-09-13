@@ -388,9 +388,13 @@ class HumanizationLogicTests(unittest.TestCase):
 
         text = manager.get_window("group_g1").build_conversation_text("爱丽丝")
 
-        self.assertIn("小明(对你说)：爱丽丝在吗", text)
-        # 引用对象在窗口内时，顺带给出其内容，让 LLM 明白"回@谁"具体引用了什么
-        self.assertIn("小红(回@小明：爱丽丝在吗)：他刚才还在", text)
+        self.assertIn('from="小明"', text)
+        self.assertIn('to="you"', text)
+        self.assertIn("爱丽丝在吗", text)
+        self.assertIn('from="小红"', text)
+        self.assertIn('to="小明"', text)
+        self.assertIn('quote="爱丽丝在吗"', text)
+        self.assertIn("他刚才还在", text)
 
     def test_qq_parser_keeps_non_text_meaning_and_does_not_treat_at_all_as_me(self):
         adapter = self._qq_adapter_class()({"self_id": "42"})
@@ -548,10 +552,13 @@ class HumanizationLogicTests(unittest.TestCase):
             "group_g1", "bot", "爱丽丝", "那个我好像还没抽", is_bot=True
         )
         text = manager.get_window("group_g1").build_conversation_text("爱丽丝")
-        self.assertIn("爱丽丝(你)：那个我好像还没抽", text)
+        self.assertIn('from="爱丽丝"', text)
+        self.assertIn('self="1"', text)
+        self.assertIn("那个我好像还没抽", text)
 
         prompt = manager.build_context_prompt("group_g1", bot_name="爱丽丝")
-        self.assertIn("你自己说过的话", prompt)
+        self.assertIn("self=\"1\"", prompt)
+        self.assertIn("禁止把标签", prompt)
 
     def test_current_message_is_separated_from_history_and_relation_is_visible(self):
         """生成阶段要把待回复消息单独标出，避免把整段前文当成复读对象。"""
@@ -607,10 +614,10 @@ class HumanizationLogicTests(unittest.TestCase):
         )
         user_prompt = request.messages[-1].content
         self.assertIn("当前待回复消息", user_prompt)
-        self.assertIn("消息ID：m2", user_prompt)
+        self.assertIn("发送者：小红", user_prompt)
         self.assertIn("@对象：u1", user_prompt)
         self.assertIn("相关历史上下文", user_prompt)
-        self.assertIn("不要把整段历史重新概括成回复", user_prompt)
+        self.assertIn("只回答当前待回复消息", user_prompt)
 
     def test_profile_refusal_text_is_detected(self):
         """LLM 素材不足时的"无法提炼"拒绝文本不能存成用户画像。"""

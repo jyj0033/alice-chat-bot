@@ -4,12 +4,52 @@
 """
 import asyncio
 import logging
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional, Deque
 
 logger = logging.getLogger(__name__)
+
+_UNSEEN_MEDIA_RE = re.compile(
+    r"^\[(?P<kind>图片|表情包|动画表情|视频|合并转发)"
+)
+
+
+def _xml_escape(text: str) -> str:
+    return (
+        (text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("\n", " ")
+    )
+
+
+_ASKS_MEDIA_RE = re.compile(r"(这里面|图里|画面|照片里|都认识|认得出|看着像)")
+
+
+def asks_about_unseen_media(content: str) -> bool:
+    return bool(_ASKS_MEDIA_RE.search(content or ""))
+
+
+def is_unresolved_media(content: str) -> bool:
+    """只有占位、没有画面摘要的图片/视频。"""
+    text = (content or "").strip()
+    if "内容：" in text or "内容:" in text:
+        return False
+    return bool(_UNSEEN_MEDIA_RE.match(text))
+
+
+def opaque_media_content(content: str) -> str:
+    """生成侧把看不见的媒体收成标签，避免模型把它当成可描述的画面。"""
+    text = (content or "").strip()
+    match = _UNSEEN_MEDIA_RE.match(text)
+    if match and "内容：" not in text and "内容:" not in text:
+        return f'<unseen type="{match.group("kind")}"/>'
+    return text
 
 
 def format_message_time(dt: datetime, now: datetime = None) -> str:
@@ -145,7 +185,7 @@ class ContextWindow:
         bot_id: str = "",
         exclude_message_id: str = "",
     ) -> str:
-        """构建对话文本，每条消息带 [时间] 前缀。
+        """构建对话记录：用 XML 标签而不是「[刚刚] 某人(对你说)：」这种可发送格式。
 
         身份归一：同一 QQ 号改群名片后，窗口里会同时出现"旧名/新名"，
         若原样输出，LLM 会把一个人当成两个人。这里把每个 QQ 号统一到
@@ -190,7 +230,7 @@ class ContextWindow:
             下一句像劝别人一样说"抽就完事了"）。
             """
             if msg.is_bot:
-                return f"{bot_name}(你)"
+                return bot_name
             name = canonical_name.get(msg.sender_id, msg.sender_name)
             if not msg.sender_id:
                 return name
@@ -219,75 +259,61 @@ class ContextWindow:
                 continue
 
             speaker = display_name(msg)
+            attrs = [
+                f't="{_xml_escape(format_message_time(msg.timestamp, now))}"',
+                f'from="{_xml_escape(speaker)}"',
+            ]
+            if msg.is_bot:
+                attrs.append('self="1"')
 
-            # 标注回复指向：这条消息是"回复谁"的（A→B，或 →@bot）
-            pointer = ""
+            reply_target = ""
+            snippet = ""
             if msg.reply_to_id or msg.reply_to_qq:
-                target = None
                 if msg.reply_to_id:
-                    target = message_id_to_name.get(str(msg.reply_to_id))
-                if not target and msg.reply_to_qq:
-                    target = qq_to_name.get(str(msg.reply_to_qq))
-                if target:
-                    if target == speaker:
-                        pointer = f"(回@{target}自己)"
-                    else:
-                        # 引用对象在窗口内时顺带给出其内容（图片则为识别摘要），
-                        # 让 LLM 明白"回@谁"具体引用了什么，避免把引用的话当成别人的发言。
-                        snippet = ""
-                        if msg.reply_to_id:
-                            snippet = (message_id_to_content.get(str(msg.reply_to_id), "") or "").strip()
-                        if snippet:
-                            pointer = f"(回@{target}：{snippet[:24]})"
-                        else:
-                            pointer = f"(回@{target})"
-                elif str(msg.reply_to_qq or "") in ("", "0"):
-                    pointer = "(回复某条消息)"
+                    reply_target = message_id_to_name.get(str(msg.reply_to_id), "")
+                if not reply_target and msg.reply_to_qq:
+                    reply_target = qq_to_name.get(str(msg.reply_to_qq), "")
+                if msg.reply_to_id:
+                    snippet = (
+                        message_id_to_content.get(str(msg.reply_to_id), "") or ""
+                    ).strip()
+
+            to_you = bool(msg.directed_to_bot) or (
+                bool(bot_id)
+                and any(str(uid) == str(bot_id) for uid in msg.mentioned_user_ids)
+            ) or (
+                bool(bot_id)
+                and str(msg.reply_to_qq or "") == str(bot_id)
+            ) or (bool(bot_name) and reply_target == bot_name)
+            if to_you:
+                attrs.append('to="you"')
+            elif reply_target and reply_target != speaker:
+                attrs.append(f'to="{_xml_escape(reply_target)}"')
+            if snippet:
+                attrs.append(f'quote="{_xml_escape(opaque_media_content(snippet)[:40])}"')
+
+            mentioned_names = []
+            for user_id in msg.mentioned_user_ids:
+                user_id = str(user_id or "")
+                if not user_id:
+                    continue
+                if bot_id and user_id == str(bot_id):
+                    mentioned_names.append("you")
                 else:
-                    pointer = f"(回@尾号{str(msg.reply_to_qq)[-4:]})"
-
-            annotations = []
-            if msg.mentioned_user_ids:
-                mentioned_names = []
-                for user_id in msg.mentioned_user_ids:
-                    user_id = str(user_id or "")
-                    if not user_id:
-                        continue
-                    if bot_id and user_id == str(bot_id):
-                        mentioned_names.append(f"{bot_name}(你)")
-                    else:
-                        mentioned_names.append(
-                            qq_to_name.get(user_id, f"QQ尾号{user_id[-4:]}")
-                        )
-                if mentioned_names:
-                    annotations.append("@" + "/@".join(mentioned_names))
-
-            if msg.directed_to_bot:
-                annotations.append("对你说")
+                    mentioned_names.append(
+                        qq_to_name.get(user_id, f"QQ尾号{user_id[-4:]}")
+                    )
+            if mentioned_names:
+                attrs.append(f'at="{_xml_escape("/".join(mentioned_names))}"')
             if msg.conversation_target:
-                target_labels = {
-                    "bot": "动态判断对你说",
-                    "other": "动态判断对别人说",
-                    "group": "动态判断面向群聊",
-                    "unknown": "动态判断目标不明",
-                }
-                label = target_labels.get(msg.conversation_target)
-                if label:
-                    if msg.conversation_intent:
-                        label += f"/{msg.conversation_intent}"
-                    annotations.append(label)
+                attrs.append(f'target="{_xml_escape(msg.conversation_target)}"')
 
-            direction = ""
-            if annotations:
-                direction = "(" + "；".join(annotations) + ")"
-
-            time_str = format_message_time(msg.timestamp, now)
-            pointer_text = pointer
-            if pointer_text and direction:
-                pointer_text += direction
-            elif direction:
-                pointer_text = direction
-            lines.append(f"[{time_str}] {speaker}{pointer_text}：{msg.content}")
+            body = opaque_media_content(msg.content)
+            if body.startswith("<unseen "):
+                inner = body
+            else:
+                inner = _xml_escape(body)
+            lines.append(f"<m {' '.join(attrs)}>{inner}</m>")
 
         return "\n".join(lines)
 
@@ -522,10 +548,11 @@ class ContextManager:
         )
         if conversation:
             parts.append(
-                "[最近对话]（[时间]表示距现在多久，如\"昨天 20:15\"是昨晚的事；"
-                "标注\"回@某人\"表示回复对象，标注\"对你说\"表示消息明确指向你；"
-                f"「{bot_name}(你)」开头的是你自己说过的话——延续自己的立场，"
-                "不要把自己的话当成别人说的，不要重复或反驳自己）\n"
+                "[最近对话]（这是机器记录，不是你可以发送的格式。"
+                "from=谁说的，to=对谁说，to=\"you\" 是对你，self=\"1\" 是你自己说的，"
+                "quote=引用了哪句。<unseen> 表示你看不见画面。"
+                "只把里面的语义当上下文，禁止把标签、属性或整行记录复制进回复。"
+                f"self=\"1\" 的话是你刚说过的，延续立场，不要打脸。）\n"
                 + conversation
             )
 

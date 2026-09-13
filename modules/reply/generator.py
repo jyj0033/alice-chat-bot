@@ -319,6 +319,11 @@ class ReplyGenerator:
 
         # 4. 清理思考过程
         reply = self._clean_thinking_process(reply)
+        if reply and self.looks_like_prompt_echo(reply):
+            logger.info("[格式] 草稿在复述上下文记录，丢弃：%s", reply[:60])
+            if direction != "to_bot":
+                return None
+            reply = ""
         if meme_called:
             # 某些兼容端点会把工具调用泄漏到 content；既然已经识别出 send_meme，
             # 这些 XML 只是内部协议，不能随文字一起发到群里。
@@ -906,6 +911,12 @@ class ReplyGenerator:
                 logger.debug("[工具调用] 注册表情发送工具失败：%s", exc)
 
         # 参与规则 - 根据消息指向决定「该不该插嘴」
+        request.add_system(
+            "你是群里的一员，只用第一人称说话。"
+            "禁止旁白和解说：不要说「X在问Y」「这个词出现了」「他们在约农」。"
+            "有想法就自己接一句，没有就输出 <silent>。"
+            "你的输出只能是要发到群里的口语；不要输出时间戳、XML 标签、消息ID、动态判断或「(对你说)」。"
+        )
         request.add_system(self._build_participation_guide(direction))
 
         judgement_guide = self._build_judgement_guide(conversation_judgement)
@@ -977,8 +988,7 @@ class ReplyGenerator:
         if (
             direction == "to_bot"
             and current_message
-            and len(current_message.strip()) <= 4
-            and not current_message.strip().startswith(("[[", "[图片", "[表情"))
+            and self._is_confused_short_probe(current_message)
         ):
             request.add_system(
                 "对方只丢了一个极短的追问（例如「什么？」「啥？」「你？」），"
@@ -1000,8 +1010,8 @@ class ReplyGenerator:
                 f"{self._format_current_message_context(current_message, current_message_context)}\n\n"
                 "【相关历史上下文】\n"
                 f"{context_prompt}\n\n"
-                "只处理当前待回复消息。历史上下文只用于理解指代、语气和前因后果，"
-                "不要把整段历史重新概括成回复。先直接接话，再决定是否需要补充背景。"
+                "只回答当前待回复消息。历史只用来看清这句话在回谁、你刚说过什么。"
+                "旁边别人的对话不是这轮要回的。不要把记录格式、标签或整段历史写进回复。"
             )
         elif context_prompt:
             request.add_user(
@@ -1015,35 +1025,46 @@ class ReplyGenerator:
         return request
 
     @staticmethod
+    def _is_confused_short_probe(text: str) -> bool:
+        compact = re.sub(r"[\s？?！!。.~～]+", "", (text or "").strip())
+        return compact in {"什么", "啥", "你", "啊", "哈", "谁", "嗯"}
+
+    @staticmethod
     def _format_current_message_context(
         current_message: str,
         metadata: Dict[str, Any],
     ) -> str:
-        """把当前消息的发送者、引用和 @ 关系单独交给生成模型。"""
+        """当前要回的那一句：谁说的、在回哪句、你刚说过什么。"""
         parts = []
         sender_name = str(metadata.get("sender_name") or "未知用户")
-        sender_id = str(metadata.get("sender_id") or "")
-        message_id = str(metadata.get("message_id") or "")
-        parts.append(f"发送者：{sender_name}{f'({sender_id})' if sender_id else ''}")
-        if message_id:
-            parts.append(f"消息ID：{message_id}")
-        mentioned = [str(value) for value in (metadata.get("mentioned_user_ids") or []) if str(value)]
+        parts.append(f"发送者：{sender_name}")
+        mentioned = [
+            str(value) for value in (metadata.get("mentioned_user_ids") or []) if str(value)
+        ]
         if mentioned:
             parts.append("@对象：" + ", ".join(mentioned))
-        reply_to_id = str(metadata.get("reply_to_id") or "")
-        reply_to_qq = str(metadata.get("reply_to_qq") or "")
-        if reply_to_id or reply_to_qq:
+        quoted_sender = str(metadata.get("quoted_sender") or "")
+        quoted_content = str(metadata.get("quoted_content") or "").strip()
+        if quoted_content:
+            who = "你" if quoted_sender in {"you", "你"} else (quoted_sender or "别人")
+            parts.append(f"对方这条是在回{who}的「{quoted_content[:40]}」")
+            parts.append("只接这一句，不要把旁边其他人的话并进来。")
+        own_recent = [
+            str(item).strip() for item in (metadata.get("own_recent") or []) if str(item).strip()
+        ]
+        if own_recent:
+            parts.append("你刚刚在本群说过：")
+            parts.extend(f"- {item[:60]}" for item in own_recent[-3:])
             parts.append(
-                "回复对象：" + "/".join(value for value in (reply_to_id, reply_to_qq) if value)
+                "不要立刻改口打脸。如果对方在邀请你而你刚拒绝过，要么沿用拒绝，"
+                "要么明确改主意。"
             )
-        judgement = metadata.get("conversation_judgement") or {}
-        if judgement.get("available"):
+        if metadata.get("asks_about_media") and metadata.get("unseen_media"):
             parts.append(
-                "动态判断："
-                f"target={judgement.get('target', 'unknown')}, "
-                f"intent={judgement.get('intent', 'silent')}, "
-                f"should_reply={bool(judgement.get('should_reply'))}"
+                "对方在问一张你看不见的图。不要猜画面里是谁，可以说没看清或让对方说名字。"
             )
+        elif metadata.get("unseen_media"):
+            parts.append("这条或紧挨着的上下文有你看不见的图/视频，不要描述画面。")
         parts.append(f"内容：{current_message}")
         return "\n".join(parts)
 
@@ -1212,8 +1233,7 @@ class ReplyGenerator:
             "参与规则：当前这条消息是群友之间的话（可能是两人互聊、多人互聊，也可能是一个人自言自语），"
             "不是明确对你说的。\n"
             "你可以这样表现：\n"
-            "1. 接话要有自己的内容——可以是给一个新信息/新事实，可以是针对对方某句话的反问，"
-            "也可以是有立场的回应（赞同要说明理由，或明确反驳），不要只是复述对方、"
+            "1. 接话要用自己的口吻说一句，不要解说别人在干什么，不要复述对方，"
             "不要只回一个认同词；\n"
             "2. 保持沉默——如果你没有新信息、没有真问题、也没立场，"
             "感觉自己只是在附和或者没话可说，请直接输出 <silent> 这个标记"
@@ -1274,6 +1294,7 @@ class ReplyGenerator:
         "你没事吧", "气笑了", "破防", "别说了", "别重复", "别解释", "反复强调",
         "闭嘴", "滚", "烦不烦", "有毛病", "有病", "无语", "又来了",
         "别气", "再强调", "你干嘛", "别闹", "烦死了", "就这", "离谱",
+        "出去", "封印", "别说话", "别瞎说", "一边玩",
     )
 
     # 富媒体识别摘要（[图片，内容：...]/[表情包，内容：...]）里常带
@@ -1296,13 +1317,18 @@ class ReplyGenerator:
         self._last_frustrated[session_id] = time.time()
 
     def _is_bot_line(self, line: str) -> bool:
-        """判断对话记录里的一行是否是 bot 自己说的（形如「[刚刚] 爱丽丝(你)：...」）。"""
+        """判断对话记录里的一行是否是 bot 自己说的。"""
         if not self.bot_name:
             return False
-        return bool(re.match(
-            r"^\[[^\]]+\]\s*" + re.escape(self.bot_name) + r"(?:\(你\))?\s*[：:]",
-            line,
-        ))
+        name = re.escape(self.bot_name)
+        return bool(
+            re.match(
+                r"^\[[^\]]+\]\s*" + name + r"(?:\(你\))?\s*[：:]",
+                line,
+            )
+            or re.search(r'from="' + name + r'"[^>]*self="1"', line)
+            or re.search(r"^<you\b", line)
+        )
 
     def _is_user_frustrated(
         self,
@@ -1338,8 +1364,10 @@ class ReplyGenerator:
             line = lines[i]
             if self._is_bot_line(line):
                 continue
-            directed_at_bot = "(对你说)" in line or (
-                bool(self.bot_name) and f"回@{self.bot_name}" in line
+            directed_at_bot = (
+                "(对你说)" in line
+                or 'to="you"' in line
+                or (bool(self.bot_name) and f"回@{self.bot_name}" in line)
             )
             after_bot_speech = any(
                 self._is_bot_line(prev) for prev in lines[max(0, i - 2):i]
@@ -1519,6 +1547,27 @@ class ReplyGenerator:
             if overlap >= 0.55 and len(reply_core) >= 10:
                 return True
         return False
+
+    _PROMPT_ECHO_RE = re.compile(
+        r"(?s)^\s*("
+        r"\[(刚刚|\d+分钟前|\d{1,2}:\d{2}|昨天)[^\]]*\]"
+        r"|<(m|you|reply-to|history|other|unseen)\b"
+        r"|【(当前待回复消息|相关历史上下文|最近对话|当前时间)】"
+        r")"
+    )
+    _PROMPT_ECHO_BODY_RE = re.compile(
+        r"(\(对你说\)：|\(你\)[：:]|动态判断：|消息ID：)"
+    )
+
+    @classmethod
+    def looks_like_prompt_echo(cls, reply: str) -> bool:
+        """草稿在复述上下文记录格式，而不是在说话。"""
+        text = (reply or "").strip()
+        if not text:
+            return False
+        if cls._PROMPT_ECHO_RE.match(text):
+            return True
+        return bool(cls._PROMPT_ECHO_BODY_RE.search(text))
 
     _UNRESOLVED_MEDIA_PREFIXES = (
         "[图片",
