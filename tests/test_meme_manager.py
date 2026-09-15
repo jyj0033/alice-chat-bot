@@ -105,6 +105,15 @@ class MemeManagerTests(unittest.TestCase):
         self.assertEqual(category, f"@id:{item['id'][:10]}")
         self.assertEqual(self.manager.resolve(item["id"][:10])["id"], item["id"])
 
+        # 半截双方括号不能从第二个 `[` 开始匹配，否则会把第一个 `[` 泄漏到群里。
+        for broken in ("[[表情:无语]", "[[表情:无语"):
+            cleaned, category = self.manager.extract_directive(broken)
+            self.assertEqual(cleaned, "")
+            self.assertEqual(category, "无语")
+            cleaned, category = self.manager.strip_directives(broken)
+            self.assertEqual(cleaned, "")
+            self.assertEqual(category, "无语")
+
         self.manager.update_config({
             "storage_path": self.temp_dir.name,
             "auto_send_enabled": True,

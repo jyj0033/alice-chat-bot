@@ -487,6 +487,14 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertEqual(
             bot._context_marker_for_message("group_g1", message)[0], "m1"
         )
+        before_enrichment = bot._latest_user_context_marker("group_g1")
+        bot.context_manager.get_window("group_g1").get_recent(2)[0].content = (
+            "原始问题 一张图，画面是一个人。"
+        )
+        self.assertEqual(
+            before_enrichment,
+            bot._latest_user_context_marker("group_g1"),
+        )
 
         newer = Message(
             message_id="m2",
@@ -501,6 +509,34 @@ class HumanizationLogicTests(unittest.TestCase):
         )
         self.assertFalse(bot._is_latest_user_message("group_g1", message))
         self.assertTrue(bot._is_latest_user_message("group_g1", newer))
+
+    def test_pure_media_gate_requires_objective_visual_evidence(self):
+        from core.adapter.base import Message
+        from main import GroupChatBot
+
+        unresolved = Message(
+            message_id="pic1",
+            message_type="group",
+            sender_id="u1",
+            sender_name="小明",
+            group_id="g1",
+            content="一张图，看不清画面。",
+            rich_only=True,
+            rich_type="image",
+        )
+        resolved = Message(
+            message_id="pic2",
+            message_type="group",
+            sender_id="u1",
+            sender_name="小明",
+            group_id="g1",
+            content="一张图，画面是一个人站在街边。",
+            rich_only=True,
+            rich_type="image",
+        )
+
+        self.assertFalse(GroupChatBot._has_objective_media_evidence(unresolved))
+        self.assertTrue(GroupChatBot._has_objective_media_evidence(resolved))
 
     # === "被嫌弃降级" 触发判定 ===
 
@@ -872,6 +908,23 @@ class HumanizationLogicTests(unittest.TestCase):
                 ["[图片]"],
             )
         )
+        self.assertTrue(
+            ReplyGenerator.needs_reply_quality_review(
+                "谢了哈～",
+                "这个男人好像在夸你什么 一张图，画面是一个人（视觉识别不确定）。",
+                [],
+                direction="to_bot",
+            )
+        )
+        self.assertTrue(
+            ReplyGenerator.needs_reply_quality_review(
+                "他们聊打游戏的，没我事。",
+                "大家在聊游戏",
+                [],
+                direction="group",
+            )
+        )
+        self.assertTrue(ReplyGenerator.looks_like_incomplete("我觉得应该先看和"))
 
     def test_unseen_picture_identity_claim_is_blocked(self):
         """没看见图却说「都是群里的老面孔」，必须拦下来。"""

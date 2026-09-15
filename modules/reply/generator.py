@@ -1585,10 +1585,13 @@ class ReplyGenerator:
 
     @classmethod
     def _has_unresolved_media(cls, source_texts: list) -> bool:
-        return any(
-            str(text or "").lstrip().startswith(cls._UNRESOLVED_MEDIA_PREFIXES)
-            for text in (source_texts or [])
-        )
+        for text in (source_texts or []):
+            value = str(text or "").lstrip()
+            if value.startswith(cls._UNRESOLVED_MEDIA_PREFIXES):
+                return True
+            if "视觉识别不确定" in value or "看不清画面" in value:
+                return True
+        return False
 
     @classmethod
     def claims_unseen_media(
@@ -1641,6 +1644,79 @@ class ReplyGenerator:
         return any(
             compact_reply.startswith(prefix)
             for prefix in ("谢谢", "谢了", "多谢", "收到", "懂了", "明白", "了解")
+        )
+
+    _QUALITY_MEDIA_MARKERS = (
+        "[图片", "[表情包", "[动画表情", "[视频", "[合并转发",
+        "[无法识别的消息]", "一张图", "一张表情", "一段视频",
+    )
+    _INCOMPLETE_TAILS = (
+        "，", ",", "、", "：", ":", "和", "跟", "与", "及", "以及",
+        "但是", "因为", "所以", "如果", "虽然", "然后", "现在", "而且",
+    )
+    _META_COMMENTARY_MARKERS = (
+        "没我事", "不关我事", "和我没关系", "跟我没关系", "他们聊",
+        "我不参与", "我不插话", "我该不该说", "我该不该参与",
+        "我刚说", "我刚才说", "我刚才回复", "我应该说什么",
+    )
+
+    @classmethod
+    def has_media_context(cls, current_message: str, source_texts: list) -> bool:
+        """判断附近上下文是否包含图片、视频等需要核对的外部材料。"""
+        return any(
+            any(marker in str(text or "") for marker in cls._QUALITY_MEDIA_MARKERS)
+            for text in [current_message, *(source_texts or [])]
+        )
+
+    @classmethod
+    def looks_like_incomplete(cls, reply: str) -> bool:
+        """只做发送前质量预筛，不负责判断是否应该接话。"""
+        text = re.sub(r"\s+", "", str(reply or "")).strip()
+        if len(text) < 4:
+            return False
+        if text.count("（") != text.count("）") or text.count("(") != text.count(")"):
+            return True
+        return text.endswith(cls._INCOMPLETE_TAILS)
+
+    @classmethod
+    def looks_like_meta_commentary(cls, reply: str) -> bool:
+        """筛出解释自己是否插话的草稿，交给语义复核器最终判断。"""
+        text = str(reply or "").strip()
+        return bool(text) and any(marker in text for marker in cls._META_COMMENTARY_MARKERS)
+
+    @classmethod
+    def needs_reply_quality_review(
+        cls,
+        reply: str,
+        current_message: str,
+        source_texts: list,
+        *,
+        direction: str = "group",
+    ) -> bool:
+        """筛选需要动态语义复核的草稿。"""
+        if not str(reply or "").strip():
+            return False
+
+        nearby_sources = list((source_texts or [])[-4:])
+        media_context = cls.has_media_context(current_message, nearby_sources)
+        if media_context:
+            media_sources = [current_message, *nearby_sources]
+            compact = re.sub(r"[\s，。！？!?、,.~～…]+", "", reply or "")
+            # 图片识别不确定时，连“谢了”也不能直接当成确认；交给轻量模型
+            # 根据当前图片描述和原句判断到底是在回应谁、是否真的在夸 Bot。
+            if cls._has_unresolved_media(media_sources):
+                return True
+            if len(compact) <= 8 and compact.startswith(
+                ("谢谢", "谢了", "多谢", "收到", "懂了", "明白", "了解")
+            ):
+                return True
+
+        if cls.looks_like_incomplete(reply):
+            return True
+        if direction == "group" and cls.looks_like_meta_commentary(reply):
+            return True
+        return cls.looks_like_paraphrase_candidate(reply, source_texts) or cls.needs_semantic_review(
+            reply, current_message, source_texts
         )
 
     # 笑声抑制：观测 19% 的回复带「哈哈/笑死」、11% 以笑声开头、9 次连续

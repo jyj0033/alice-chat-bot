@@ -266,7 +266,7 @@ class ConversationJudge:
         *,
         direction: str = "group",
     ) -> ConversationJudgeResult:
-        """判断草稿是否只是复述前文；只在可疑草稿上调用。"""
+        """复核草稿是否复读、越过证据、句子残缺或变成元话语。"""
         if not self.enabled or not self.provider:
             return ConversationJudgeResult.unavailable("provider_unavailable")
 
@@ -287,8 +287,11 @@ class ConversationJudge:
         prompt = (
             "判断下面这条 Bot 草稿是否真正理解并接住了当前消息。重点检查两类问题：\n"
             "1. 是不是把用户刚说的话或前文换一种说法重复了一遍，而没有真正接话、回答或增加信息；\n"
-            "2. 是不是把‘好像/似乎/可能’这类不确定转述当成了已确认事实。"
-            "如果上下文只有[图片]、[视频]或[无法识别的消息]占位，没有客观描述，"
+            "2. 是不是把‘好像/似乎/可能’这类不确定转述当成了已确认事实；\n"
+            "3. 回复是否在句法上完整，是否出现‘我该不该参与’‘他们聊、没我事’这类元话语，"
+            "而不是自然回应当前消息；如果是群聊插话，元话语通常应当丢弃或重写。"
+            "如果上下文只有[图片]、[视频]或[无法识别的消息]占位，或图片摘要标注‘视觉识别不确定’，"
+            "没有足够客观证据，"
             "Bot不能假装知道画面内容；例如用户说‘好像在夸你’，直接回‘谢谢’可能就是无根据的确认，"
             "更合适的做法通常是澄清、谨慎回应或保持沉默。\n"
             "正常使用同一个关键词、对问题直接回答不算复读；只有主要内容等价于复述/总结原话才算。\n\n"
@@ -300,6 +303,9 @@ class ConversationJudge:
             "\"adds_information\":true/false,"
             "\"unsupported_assumption\":true/false,"
             "\"needs_clarification\":true/false,"
+            "\"incomplete\":true/false,"
+            "\"meta_commentary\":true/false,"
+            "\"on_topic\":true/false,"
             "\"replacement_hint\":\"不超过30字\"}。不要输出解释或思维过程。"
         )
         request = ChatRequest(
@@ -318,7 +324,18 @@ class ConversationJudge:
                 self.provider.chat(request), timeout=self.timeout
             )
             payload = self._parse_json(getattr(response, "content", ""))
-            if not payload:
+            if not payload or not any(
+                key in payload
+                for key in (
+                    "is_paraphrase",
+                    "adds_information",
+                    "unsupported_assumption",
+                    "needs_clarification",
+                    "incomplete",
+                    "meta_commentary",
+                    "on_topic",
+                )
+            ):
                 raise ValueError("invalid_json_result")
             is_paraphrase = self._parse_bool(payload.get("is_paraphrase"), False)
             adds_information = self._parse_bool(
@@ -330,10 +347,18 @@ class ConversationJudge:
             needs_clarification = self._parse_bool(
                 payload.get("needs_clarification"), False
             )
+            incomplete = self._parse_bool(payload.get("incomplete"), False)
+            meta_commentary = self._parse_bool(
+                payload.get("meta_commentary"), False
+            )
+            on_topic = self._parse_bool(payload.get("on_topic"), True)
             quality_issue = (
                 (is_paraphrase and not adds_information)
                 or unsupported_assumption
                 or needs_clarification
+                or incomplete
+                or meta_commentary
+                or not on_topic
             )
             return ConversationJudgeResult(
                 intent="silent" if quality_issue else "react",
@@ -346,6 +371,9 @@ class ConversationJudge:
                     "adds_information": adds_information,
                     "unsupported_assumption": unsupported_assumption,
                     "needs_clarification": needs_clarification,
+                    "incomplete": incomplete,
+                    "meta_commentary": meta_commentary,
+                    "on_topic": on_topic,
                 },
             )
         except asyncio.CancelledError:

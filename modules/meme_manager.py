@@ -56,6 +56,12 @@ DIRECTIVE_RE = re.compile(
     r"&&\s*meme\s*(?::|：)\s*([^&]*?)\s*&&)",
     re.IGNORECASE,
 )
+# 双方括号但漏掉末尾的 `]`。必须在单方括号兜底之前匹配，
+# 否则 `[[表情:无语]` 会从第二个 `[` 开始匹配，留下第一个 `[`。
+HALF_OPEN_DOUBLE_RE = re.compile(
+    r"\[\[\s*(?:表情|表情包|meme)\s*(?::|：)\s*([^\]\n]*)",
+    re.IGNORECASE,
+)
 # 兜底：LLM 经常把 "[[表情:xxx]]" 随手写成 "[表情:xxx]"（少打一个 [），
 # 也可能写到一半没闭合（"[表情包:开心"）。这两种情况都按指令尝试
 # 解析和剥离，避免半截 marker 直接发到群里。
@@ -640,6 +646,20 @@ class MemeManager:
             cleaned = (raw[:match.start()] + raw[match.end():]).strip()
             cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
             return cleaned, category
+        # 双方括号半截形式要整体吃掉，不能退回单方括号匹配。
+        half_double = HALF_OPEN_DOUBLE_RE.search(raw)
+        if half_double:
+            selection = (half_double.group(1) or "").strip()
+            end = half_double.end()
+            if end < len(raw) and raw[end] == "]":
+                end += 1
+            if selection in {"随机", "随便", "任意", ""}:
+                category = ""
+            else:
+                category = _safe_category(selection, "") or INVALID_CATEGORY
+            cleaned = (raw[:half_double.start()] + raw[end:]).strip()
+            cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+            return cleaned, category
         # 兜底单方括号 / 半截：拿到分类名就走，让上层 try 选图
         sb = SINGLE_BRACKET_RE.search(raw)
         if sb:
@@ -669,15 +689,19 @@ class MemeManager:
         for m in DIRECTIVE_RE.finditer(text):
             sel = (m.group(1) or m.group(2) or "").strip()
             spans.append((m.start(), m.end(), sel))
-        # 双方括号但漏闭合 `[[表情:xxx`
-        for m in re.finditer(
-            r"\[\[\s*(?:表情|表情包|meme)\s*[:：]\s*([^\]\n]*)",
-            text,
-            flags=re.IGNORECASE,
-        ):
+        # 双方括号但漏闭合 `[[表情:xxx`。先收集这一类，下面的单方括号
+        # 匹配会跳过落在这些 span 内部的第二个 `[`。
+        for m in HALF_OPEN_DOUBLE_RE.finditer(text):
             spans.append((m.start(), m.end(), m.group(1).strip()))
+        double_spans = [
+            (start, end)
+            for start, end, _ in spans
+            if text[start:start + 2] == "[["
+        ]
         # 单方括号 `[表情:xxx`
         for m in SINGLE_BRACKET_RE.finditer(text):
+            if any(start <= m.start() < end for start, end in double_spans):
+                continue
             spans.append((m.start(), m.end(), m.group(1).strip()))
 
         # 去重：起点相同的 span 保留先匹配的（优先级：完整 > 半截双方 > 单方括号）

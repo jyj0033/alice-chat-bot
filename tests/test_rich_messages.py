@@ -12,7 +12,7 @@ from core.adapter.rich_content import (
     render_outer_text,
     render_segments,
 )
-from core.adapter.rich_media import RichMediaEnricher, _validate_http_url
+from core.adapter.rich_media import RichMediaEnricher, VisionResult, _validate_http_url
 from modules.memory.context import ContextMessage
 from modules.social.conversation_floor import ActionType, ConversationFloorManager
 
@@ -25,7 +25,7 @@ class RichMessageParsingTests(unittest.TestCase):
             {"type": "image", "data": {"file": "a.jpg", "url": secret_url}},
         ])
 
-        self.assertEqual(render_segments(segments), "看看这个 [图片]")
+        self.assertEqual(render_segments(segments), "看看这个 一张图，看不清画面。")
         self.assertEqual(render_outer_text(segments), "看看这个")
         self.assertEqual(segments[-1].url, secret_url)
         self.assertNotIn("top-secret", render_segments(segments))
@@ -109,6 +109,21 @@ class RichMessageParsingTests(unittest.TestCase):
 
 
 class RichMediaEnricherTests(unittest.IsolatedAsyncioTestCase):
+    def test_vision_result_requires_structured_evidence(self):
+        result = RichMediaEnricher._parse_vision_result(
+            '{"description":"黑发双马尾人物，手里拿着杯子",'
+            '"confidence":0.91,"uncertain":false}'
+        )
+        self.assertIsInstance(result, VisionResult)
+        self.assertEqual(result.description, "黑发双马尾人物，手里拿着杯子")
+        self.assertEqual(result.confidence, 0.91)
+        self.assertFalse(result.uncertain)
+
+        # 兼容旧视觉模型的纯文本输出，但必须带不确定标记，交给后续复核。
+        legacy = RichMediaEnricher._parse_vision_result("一张看不清的图片")
+        self.assertEqual(legacy.description, "一张看不清的图片")
+        self.assertTrue(legacy.uncertain)
+
     def test_image_prompt_requires_objective_visual_description(self):
         enricher = RichMediaEnricher({}, lambda *_: None)
         prompt = enricher._build_image_prompt(
@@ -119,6 +134,7 @@ class RichMediaEnricherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("客观描述", prompt)
         self.assertIn("只描述画面、人物表情和图片文字", prompt)
         self.assertIn("不要把前文人物、事件、评价或原话写进图片描述", prompt)
+        self.assertIn('"confidence"', prompt)
         self.assertNotIn("结合前文判断这张图在说什么、在回应谁", prompt)
 
     async def test_forward_expands_with_bounded_readable_excerpts(self):
@@ -165,7 +181,7 @@ class RichMediaEnricherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][1], {"message_id": "f-1"})
         self.assertIn("共2条", message.content)
         self.assertIn("小明：周六吃火锅", message.content)
-        self.assertIn("小红：[图片]", message.content)
+        self.assertIn("小红：一张图，看不清画面。", message.content)
         self.assertEqual(message.outer_text, "")
 
     async def test_link_preview_runs_only_for_directed_message_by_default(self):

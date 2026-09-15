@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import replace
 import logging
 import random
+import re
 import signal
 import sys
 import threading
@@ -1099,17 +1100,26 @@ class GroupChatBot:
         decision["context_marker"] = self._context_marker_for_message(
             session_id, message
         )
+        decision["explicit_directed"] = bool(
+            message.message_type == "private"
+            or message.mentioned_me
+            or is_reply_to_bot
+        )
 
         # === 3. 调度回复生成（后台任务，避免阻塞接收循环） ===
         current = self._reply_tasks.get(session_id)
         if current and not current.done():
             current_decision = self._reply_task_decisions.get(session_id) or {}
+            current_explicit_directed = bool(
+                current_decision.get("explicit_directed")
+            )
+            new_explicit_directed = bool(decision.get("explicit_directed"))
             if (
-                decision["direction"].startswith("to_bot")
-                or current_decision.get("direction") == "group"
+                new_explicit_directed
+                or not current_explicit_directed
             ):
-                # 新消息需要重新成为候选目标：定向消息优先替换旧任务；普通
-                # 插话任务也不能继续回答已经过期的旧消息。
+                # 只有显式 @/引用 Bot 的问题可以压住已有任务；隐式续话也
+                # 必须给后来的群消息让位，避免旧上下文抢答最新话题。
                 current.cancel()
                 task = asyncio.create_task(
                     self._compose_and_send(message, decision)
@@ -1117,7 +1127,7 @@ class GroupChatBot:
                 self._reply_tasks[session_id] = task
                 self._reply_task_decisions[session_id] = decision
             else:
-                # 定向回复保留原问题；普通新消息会在上面的分支替换旧插话。
+                # 当前任务是显式定向回复，新消息没有显式指向 Bot，保留原问题。
                 return
         else:
             task = asyncio.create_task(
@@ -1861,13 +1871,39 @@ class GroupChatBot:
         return candidate, review.reason or "语境匹配"
 
     @staticmethod
+    def _has_objective_media_evidence(message: Message) -> bool:
+        """判断纯图片消息是否已有可供生成使用的客观画面摘要。"""
+        content = str(getattr(message, "content", "") or "").strip()
+        if not content:
+            return False
+        if any(
+            marker in content
+            for marker in (
+                "看不清画面",
+                "[图片]",
+                "[表情包]",
+                "[QQ表情]",
+                "视觉识别不确定",
+            )
+        ):
+            return False
+        return bool(re.search(r"画面是", content))
+
+    @staticmethod
     def _context_marker(item):
         """返回窗口消息的稳定标记；同时兼容平台 Message 和 ContextMessage。"""
+        message_id = str(getattr(item, "message_id", "") or "")
+        if message_id:
+            # 富媒体增强会异步改写 content；有平台消息 id 时只比较身份，
+            # 避免“识图完成”被误当成新群消息，触发旧任务反复切换。
+            return (
+                message_id,
+                str(getattr(item, "sender_id", "") or ""),
+            )
         timestamp = getattr(item, "timestamp", None)
         if hasattr(timestamp, "isoformat"):
             timestamp = timestamp.isoformat()
         return (
-            str(getattr(item, "message_id", "") or ""),
             str(timestamp or ""),
             str(getattr(item, "sender_id", "") or ""),
             str(getattr(item, "content", "") or ""),
@@ -1935,14 +1971,29 @@ class GroupChatBot:
         latest = self._latest_user_context_message(session_id)
         return bool(latest and self._context_item_matches_message(latest, message))
 
-    async def _wait_for_group_settle(self, session_id: str, action_plan) -> None:
+    async def _wait_for_group_settle(
+        self,
+        session_id: str,
+        action_plan,
+        *,
+        explicit_directed: bool | None = None,
+    ) -> None:
         """等待普通群聊短暂安静，再把最新上下文交给 LLM。
 
         这是插话和定向回复的边界：明确 @/引用 bot 的消息不走这里；普通群聊
         只等待一个很短的 idle 窗口。新消息会重置 idle 计时，但总等待有上限，
         所以热闹群聊最终仍会进入一次最新上下文的判断。
         """
-        if not action_plan or action_plan.directed or not self.conversation_floor_manager:
+        directed_without_settle = (
+            action_plan
+            and action_plan.directed
+            and (explicit_directed is None or explicit_directed)
+        )
+        if (
+            not action_plan
+            or directed_without_settle
+            or not self.conversation_floor_manager
+        ):
             return
 
         floor = self.conversation_floor_manager
@@ -1982,11 +2033,9 @@ class GroupChatBot:
         context = decision["context"]
         action_plan = decision.get("action_plan")
         conversation_judgement = decision.get("conversation_judgement") or {}
-        # 动态判断为 bot 的隐式续话即使在排队期间变成了“非最新用户消息”，
-        # 仍应保留原问题的定向回复语义；普通群聊插话则必须在收尾时重新判断。
-        initial_plan_directed = bool(
-            (action_plan and action_plan.directed) or direction == "to_bot"
-        )
+        # 只有真实 @/引用/私聊才拥有定向回复的过期保护；模型判断出的隐式
+        # 续话仍要服从后续群消息，避免把猜测当成硬指向。
+        explicit_directed = bool(decision.get("explicit_directed"))
         effective_context_item = None
         effective_message_id = str(message.message_id or "")
 
@@ -2000,6 +2049,23 @@ class GroupChatBot:
                 except Exception as exc:
                     logger.debug("富媒体增强失败，使用占位符继续：%s", exc)
 
+            # 等富媒体增强完成后再检查，避免把本来可以识别的图片在决策
+            # 阶段提前当成“看不清”。普通群聊无客观摘要时不制造无依据回应；
+            # 明确 @/引用 Bot 仍允许生成诚实的澄清回复。
+            if (
+                message.message_type == "group"
+                and direction == "group"
+                and not explicit_directed
+                and message.rich_only
+                and message.rich_type in {"image", "mface", "face"}
+                and not self._has_objective_media_evidence(message)
+            ):
+                logger.info(
+                    "[媒体复核] 图片没有客观识别摘要，普通群聊本轮不插话：%s",
+                    message.message_id or message.sender_id,
+                )
+                return
+
             # === 思考延迟（期间新消息会进入上下文，等对方把话说完） ===
             await self.thinking_delay.wait(
                 message_length=len(message.content),
@@ -2012,7 +2078,11 @@ class GroupChatBot:
 
             # 定向回复按原有节奏及时处理；普通插话再补一个很短的 debounce，
             # 避免 LLM 只看到“享年4级”就抢先点评，错过后面紧接着的“猝/翻车”语境。
-            await self._wait_for_group_settle(session_id, action_plan)
+            await self._wait_for_group_settle(
+                session_id,
+                action_plan,
+                explicit_directed=explicit_directed,
+            )
 
             # 定向回复默认保留原问题，但同一人在思考期间改口对别人说时必须撤稿，
             # 否则会把「你都认识？」这类群友互问误答成对 Bot 说。
@@ -2048,7 +2118,7 @@ class GroupChatBot:
             # 目标判断；定向回复仍保留原始问题，不被旁边的新话题带走。
             if (
                 message.message_type == "group"
-                and not initial_plan_directed
+                and not explicit_directed
                 and decision.get("context_marker")
                 != self._latest_user_context_marker(session_id)
             ):
@@ -2133,7 +2203,7 @@ class GroupChatBot:
             # 决定是否发言；旧任务不得把过期草稿发进群。
             if (
                 message.message_type == "group"
-                and not initial_plan_directed
+                and not explicit_directed
                 and decision.get("context_marker")
                 != self._latest_user_context_marker(session_id)
                 and effective_message_id == str(message.message_id or "")
@@ -2269,10 +2339,16 @@ class GroupChatBot:
                 effective_message.content,
                 recent_texts,
             )
+            quality_candidate = self.reply_generator.needs_reply_quality_review(
+                review_text,
+                effective_message.content,
+                recent_texts,
+                direction=direction,
+            )
             if (
                 judge
                 and review_text.strip()
-                and (paraphrase_candidate or evidence_candidate)
+                and (paraphrase_candidate or evidence_candidate or quality_candidate)
             ):
                 review = await judge.review_reply(
                     effective_message,
@@ -2291,15 +2367,31 @@ class GroupChatBot:
                 clarification_issue = bool(
                     review_evidence.get("needs_clarification")
                 )
+                incomplete_issue = bool(review_evidence.get("incomplete"))
+                meta_commentary_issue = bool(
+                    review_evidence.get("meta_commentary")
+                )
+                off_topic_issue = review_evidence.get("on_topic") is False
                 if review.available and (
-                    paraphrase_issue or unsupported_issue or clarification_issue
+                    paraphrase_issue
+                    or unsupported_issue
+                    or clarification_issue
+                    or incomplete_issue
+                    or meta_commentary_issue
+                    or off_topic_issue
                 ):
                     if paraphrase_issue:
                         review_label = "语义复读"
                     elif unsupported_issue:
                         review_label = "把未确认信息当成事实"
-                    else:
+                    elif clarification_issue:
                         review_label = "指代不清，需要澄清"
+                    elif incomplete_issue:
+                        review_label = "句子不完整"
+                    elif meta_commentary_issue:
+                        review_label = "元话语"
+                    else:
+                        review_label = "偏离当前话题"
                     review_hint = str(review.reason or "").strip()
                     if unsupported_issue:
                         review_hint = (
@@ -2307,6 +2399,12 @@ class GroupChatBot:
                         ) + "不要把猜测或未知图片内容当成事实"
                     elif clarification_issue and not review_hint:
                         review_hint = "当前指代不清，先澄清对象或保持沉默"
+                    elif incomplete_issue and not review_hint:
+                        review_hint = "把句子说完整，或直接保持沉默"
+                    elif meta_commentary_issue and not review_hint:
+                        review_hint = "不要解释自己是否插话，直接回应当前消息或保持沉默"
+                    elif off_topic_issue and not review_hint:
+                        review_hint = "只回应当前消息，不要转去概括旁边的对话"
                     logger.info(
                         "[语义复核] 草稿被判定为%s，要求重新生成：%s",
                         review_label,
@@ -2459,7 +2557,7 @@ class GroupChatBot:
             # LLM 调用和模拟打字也会耗时，发送前再复核一次群聊局势。
             if (
                 message.message_type == "group"
-                and not initial_plan_directed
+                and not explicit_directed
                 and decision.get("context_marker")
                 != self._latest_user_context_marker(session_id)
             ):

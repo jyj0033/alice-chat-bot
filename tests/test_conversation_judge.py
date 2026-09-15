@@ -186,6 +186,37 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.evidence["unsupported_assumption"])
         self.assertTrue(result.evidence["needs_clarification"])
 
+    async def test_review_flags_meta_commentary_and_incomplete_reply(self):
+        provider = _FakeProvider(
+            '{"is_paraphrase":false,"adds_information":true,'
+            '"unsupported_assumption":false,"needs_clarification":false,'
+            '"incomplete":true,"meta_commentary":true,"on_topic":true,'
+            '"replacement_hint":"直接接当前话题"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot")
+
+        result = await judge.review_reply(
+            self._message(content="大家在聊游戏"),
+            [],
+            "他们聊游戏的，没我事。",
+            direction="group",
+        )
+
+        self.assertTrue(result.available)
+        self.assertFalse(result.should_reply)
+        self.assertTrue(result.evidence["incomplete"])
+        self.assertTrue(result.evidence["meta_commentary"])
+
+    async def test_review_payload_without_quality_fields_is_unavailable(self):
+        provider = _FakeProvider('{"replacement_hint":"看起来还行"}')
+        judge = ConversationJudge(provider, bot_id="bot")
+
+        result = await judge.review_reply(
+            self._message(), [], "看起来还行", direction="group"
+        )
+
+        self.assertFalse(result.available)
+
     async def test_review_meme_send_result_is_structured(self):
         provider = _FakeProvider(
             '{"should_send_meme":true,"confidence":0.91,"reason":"和当前吐槽很贴"}'

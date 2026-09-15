@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, deque
+from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
 import ipaddress
+import json
 import logging
 import re
 import socket
@@ -38,6 +40,16 @@ logger = logging.getLogger(__name__)
 # 视觉模型判定图片敏感/违规被拒时的占位描述：不暴露原图，只说明爱丽丝不想看。
 # 作为摘要写入上下文后，LLM 会明白 bot 不愿讨论该内容，而不是当成"没有描述"。
 SENSITIVE_IMAGE_NOTE = "爱丽丝不喜欢看这个内容"
+
+
+@dataclass(frozen=True)
+class VisionResult:
+    """视觉模型返回的最小、可审计结果。"""
+
+    description: str
+    confidence: float = 0.5
+    uncertain: bool = True
+
 
 ApiCaller = Callable[[str, dict[str, Any], float | None], Awaitable[Any]]
 
@@ -107,7 +119,7 @@ class RichMediaEnricher:
 
         self._preview_cache: OrderedDict[str, tuple[float, tuple[str, str]]] = OrderedDict()
         self._ocr_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
-        self._image_desc_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self._image_desc_cache: OrderedDict[str, tuple[float, VisionResult]] = OrderedDict()
         self._cache_size = max(16, int(config.get("cache_size", 256)))
         # 最近图片识别结果（供 Web 面板复核识别是否正确），最旧自动丢弃
         self._recognition_log: deque[dict] = deque(maxlen=60)
@@ -194,12 +206,16 @@ class RichMediaEnricher:
     def _record_recognition(self, message: Message, segment: MessageSegment) -> None:
         """记录一次成功的图片识别结果。"""
         try:
+            metadata = getattr(segment, "data", {}) or {}
             self._recognition_log.append({
                 "ts": datetime.now().isoformat(timespec="seconds"),
                 "session_id": message.session_id,
+                "message_id": str(message.message_id or ""),
                 "sender": message.sender_name,
                 "rich_type": segment.type,
                 "description": (segment.summary or "").strip(),
+                "confidence": round(float(metadata.get("vision_confidence", 0.0) or 0.0), 3),
+                "uncertain": bool(metadata.get("vision_uncertain", True)),
             })
         except Exception as exc:
             logger.debug("保存识别记录失败：%s", exc)
@@ -401,7 +417,14 @@ class RichMediaEnricher:
         group_image_urls：同一人此前连续发的图片（[{url, file}, ...]）。非空时把
         整组一起喂给视觉模型判断整体含义，此时不读/不写缓存（组含义随上下文变化）。
         """
-        image_ref = segment.unique_id or segment.url
+        # 有些 OneBot 实现只给 file/file_id，不给 url 或 file_unique；不能让
+        # 这些图片全部共用空字符串缓存键，否则后一张图会复用前一张的描述。
+        image_ref = (
+            segment.unique_id
+            or segment.url
+            or segment.file_id
+            or segment.file
+        )
         # 注意：哪怕 image_ref 为空也继续走，让 _call_vision 尝试用 segment.file
         # 兜底。原来的早 return 会让 NapCat 只发 file 没 url/unique_id 的图片
         # 完全没有识别机会，群里 bot 看到 "[图片]" 占位只能瞎回。
@@ -409,26 +432,34 @@ class RichMediaEnricher:
         is_group = bool(group_image_urls and self.image_group_enabled)
         if is_group:
             # 组识别结果依赖整组上下文，不能复用单图缓存，避免"旧含义"污染
-            desc = await self._call_vision(segment, conversation_context, group_image_urls)
+            vision_result = await self._call_vision(
+                segment, conversation_context, group_image_urls
+            )
         else:
             cached = self._cache_get(self._image_desc_cache, image_ref, self.image_cache_ttl)
             if cached is None:
                 cached = await self._call_vision(segment, conversation_context)
                 if cached:
                     self._cache_put(self._image_desc_cache, image_ref, cached)
-            desc = cached
+            vision_result = cached
 
-        if not desc:
+        if not vision_result or not vision_result.description.strip():
             return False
-        if desc == SENSITIVE_IMAGE_NOTE:
-            segment.summary = describe_media_in_words(segment.type, "爱丽丝不想看")
-            return True
+        desc = vision_result.description.strip()
         metadata = getattr(segment, "data", None)
         if isinstance(metadata, dict):
             # 表情库使用这一份不带群聊语境的描述；segment.summary 仍保留给
             # 普通回复链路使用，避免把“图片是什么”和“当时在回应谁”混成一个字段。
             metadata["objective_summary"] = desc[:240]
-        segment.summary = describe_media_in_words(segment.type, desc[:100])
+            metadata["vision_confidence"] = vision_result.confidence
+            metadata["vision_uncertain"] = vision_result.uncertain
+        if desc == SENSITIVE_IMAGE_NOTE:
+            segment.summary = describe_media_in_words(segment.type, "爱丽丝不想看")
+            return True
+        summary = describe_media_in_words(segment.type, desc[:100])
+        if vision_result.uncertain:
+            summary = summary.rstrip("。") + "（视觉识别不确定）。"
+        segment.summary = summary
         return True
 
     async def _call_vision(
@@ -436,7 +467,7 @@ class RichMediaEnricher:
         segment: MessageSegment,
         conversation_context: str = "",
         group_image_urls: list[dict] | None = None,
-    ) -> str:
+    ) -> VisionResult | None:
         """三级回退识别图片：
 
         1. 直传图床 URL（当前图 + 组图）。MiniMax 等兼容端点抓取多张远程 URL 时，
@@ -449,7 +480,7 @@ class RichMediaEnricher:
         """
         if self.vision_provider is None:
             logger.info("[图片] 未配置视觉模型，跳过识别")
-            return ""
+            return None
 
         prompt = self._build_image_prompt(segment, conversation_context, group_image_urls)
         url = segment.url
@@ -470,14 +501,16 @@ class RichMediaEnricher:
         url = segment.url
         if url:
             try:
-                text = await self._vision_chat(prompt, [url, *(g["url"] for g in group_items)])
-                if text:
-                    return text
+                result = await self._vision_chat(
+                    prompt, [url, *(g["url"] for g in group_items)]
+                )
+                if result:
+                    return result
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if _is_sensitive_rejection(exc):
-                    return SENSITIVE_IMAGE_NOTE
+                    return VisionResult(SENSITIVE_IMAGE_NOTE, confidence=1.0, uncertain=False)
                 logger.debug(
                     "通过图片地址调用视觉模型失败（%s，组图 %d 张），改用 Base64 编码：%s",
                     url, len(group_items), exc,
@@ -489,7 +522,7 @@ class RichMediaEnricher:
             logger.warning(
                 "图片下载失败，无法识别：地址=%s，文件=%s", url, segment.file or segment.file_id
             )
-            return ""
+            return None
         group_b64s: list[str] = []
         if group_items:
             raw = await asyncio.gather(
@@ -500,26 +533,26 @@ class RichMediaEnricher:
         try:
             if group_b64s:
                 try:
-                    text = await self._vision_chat(prompt, [current_b64, *group_b64s])
-                    if text:
-                        return text
+                    result = await self._vision_chat(prompt, [current_b64, *group_b64s])
+                    if result:
+                        return result
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     if _is_sensitive_rejection(exc):
-                        return SENSITIVE_IMAGE_NOTE
+                        return VisionResult(SENSITIVE_IMAGE_NOTE, confidence=1.0, uncertain=False)
                     logger.warning("组图 Base64 编码识别失败，降级为单图：%s", exc)
-            text = await self._vision_chat(prompt, [current_b64])
-            if text:
-                return text
+            result = await self._vision_chat(prompt, [current_b64])
+            if result:
+                return result
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             if _is_sensitive_rejection(exc):
-                return SENSITIVE_IMAGE_NOTE
+                return VisionResult(SENSITIVE_IMAGE_NOTE, confidence=1.0, uncertain=False)
             self._stats["failures"] += 1
             logger.warning("视觉识别失败：%s", exc)
-        return ""
+        return None
 
     async def _download_group_image_base64(self, item: dict) -> str:
         """尽力把一张组图转成 base64 data URL；失败返回空串（由调用方丢弃）。
@@ -570,9 +603,66 @@ class RichMediaEnricher:
                 f"前文对话仅用于确认图片边界：\n{conversation_context}\n"
                 "不要把前文人物、事件、评价或原话写进图片描述；不要加引号复述群友说过的句子。"
             )
+        parts.append(
+            "只输出 JSON，不要输出解释，格式如："
+            '{"description":"画面中可直接看到的事实",'
+            '"confidence":0.85,"uncertain":false}。'
+            "无法确认的内容不要猜，confidence 低于0.65时 uncertain 必须为 true。"
+        )
         return "\n".join(parts)
 
-    async def _vision_chat(self, prompt: str, image_urls: list[str]) -> str:
+    @staticmethod
+    def _parse_vision_result(text: str) -> VisionResult | None:
+        """解析视觉模型结果；兼容旧模型的纯文本输出，但标记为不确定。"""
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+
+        payload: dict[str, Any] | None = None
+        candidates = [raw]
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if match and match.group(0) not in candidates:
+            candidates.append(match.group(0))
+        for candidate in candidates:
+            candidate = re.sub(
+                r"^```(?:json)?\s*|\s*```$", "", candidate.strip(), flags=re.I
+            )
+            try:
+                value = json.loads(candidate)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                payload = value
+                break
+
+        if payload is None:
+            return VisionResult(raw[:240], confidence=0.45, uncertain=True)
+
+        description = str(
+            payload.get("description")
+            or payload.get("summary")
+            or payload.get("content")
+            or ""
+        ).strip()
+        if not description:
+            return None
+        try:
+            confidence = float(payload.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        confidence = max(0.0, min(1.0, confidence))
+        uncertain_value = payload.get("uncertain", confidence < 0.65)
+        if isinstance(uncertain_value, str):
+            uncertain = uncertain_value.strip().lower() in {
+                "1", "true", "yes", "是", "不确定"
+            }
+        else:
+            uncertain = bool(uncertain_value)
+        if confidence < 0.65:
+            uncertain = True
+        return VisionResult(description[:240], confidence=confidence, uncertain=uncertain)
+
+    async def _vision_chat(self, prompt: str, image_urls: list[str]) -> VisionResult | None:
         from modules.llm.base import ChatMessage, ChatRequest
 
         # 必须显式指定视觉模型：ChatRequest.model 默认 "gpt-4o"，会覆盖 provider 配置的模型。
@@ -592,8 +682,7 @@ class RichMediaEnricher:
             self.vision_provider.chat(request),
             timeout=self.image_to_text_timeout,
         )
-        text = (response.content or "").strip()
-        return text[:300]
+        return self._parse_vision_result(response.content or "")
 
     async def _download_image_data_url(self, segment: MessageSegment) -> str:
         """下载当前图片转 base64 data URL。
