@@ -882,7 +882,9 @@ class ReplyGenerator:
             meme_capability = (
                 "发送能力：普通情况下发送纯文字；如果真的适合，可以调用 send_meme 工具"
                 "（category 选分类、meme_id 精确选图、random 随便来一张）让系统替你发一张表情包。"
-                "可以只发图不发文字，也可以文字+图并存；调用即代表真的要让 bot 发图，不要用文字描述「想发图」。"
+                "如果表情包本身已经完整表达你想说的反应、态度或吐槽，优先只调用 send_meme、把文字留空，"
+                "不要再生成同义解释；只有图片表达不完整时才文字+图并存。调用即代表真的要让 bot 发图，"
+                "不要为了凑频率发图，也不要用文字描述「想发图」。"
             )
         elif self.meme_manager:
             meme_capability = (
