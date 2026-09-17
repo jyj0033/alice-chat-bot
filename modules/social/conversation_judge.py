@@ -11,6 +11,7 @@
 硬规则：同一发言者刚在明确对别人说话、当前又没有 @/引用 Bot 时，不允许
 因为出现「你」或问号就改判为对 Bot；对 Bot 的引用目标只能是当前消息。
 面向全群的打招呼、开放提问和闲聊吐槽允许参与；互聊仍保持沉默。
+明确把 Alice 拉进玩笑或行动的点名允许短反应，普通第三人称提及仍按上下文判断。
 模型没点头时，group/unknown 还可以交给低概率随机插话，other 不行。
 """
 
@@ -189,10 +190,12 @@ class ConversationJudge:
             "不要因为出现问号、昵称或关键词就机械判定为问 Alice。"
             "也不要因为 Alice 刚回复过某人就默认下一句仍然是对 Alice 说。\n"
             "【应当 should_reply=true】"
-            "target=bot：明确@/回复/叫「爱丽丝」「小艾」在对她说话或提问；"
+            "target=bot：明确@/回复/叫「爱丽丝」「小艾」「小爱」在对她说话或提问；"
             "target=group：面向全群的打招呼（早、早上好、孩子们）、"
             "开放提问（有无人、有无、谁来、找人聊天）、"
-            "随口分享后适合接一句的闲聊吐槽。"
+            "随口分享后适合接一句的闲聊吐槽，或明确把 Alice 拉进玩笑、惩罚或行动"
+            "（如‘连带着爱丽丝一起处刑’、‘把小艾也算上’）；此类场景允许一条短反应，"
+            "即使它同时承接了对其他群友的话。单纯第三人称提到 Alice 不算拉她参与。"
             "面向全群时 intent 用 acknowledge/react/answer/add_info，"
             "不要因为没@Alice 就改成 silent 或 should_reply=false。\n"
             "【应当 should_reply=false】"
@@ -752,7 +755,51 @@ class ConversationJudge:
                 current_id or "no-id",
                 other_id or continuity.get("judged") or "other",
             )
+
+        if self._is_playful_bot_inclusion(current_message):
+            result.evidence["playful_bot_inclusion"] = True
+            result.evidence["model_target"] = result.target
+            result.target = "group"
+            result.intent = "react"
+            result.should_reply = True
+            result.confidence = max(result.confidence, 0.72)
+            result.target_user_id = ""
+            if current_id:
+                result.reference_message_id = current_id
+            result.reason = "群友把爱丽丝拉进玩笑，适合短接一句"
+            logger.info(
+                "[目标判断] 玩笑点名拉入群聊 %s，允许短反应",
+                current_id or "no-id",
+            )
         return result
+
+    def _is_playful_bot_inclusion(self, message: Any) -> bool:
+        """识别明确把 Bot 拉进玩笑/行动的短句，避免只按普通第三人称提及处理。"""
+        if bool(getattr(message, "rich_only", False)):
+            return False
+        text = str(
+            getattr(message, "outer_text", "")
+            or getattr(message, "content", "")
+            or ""
+        )
+        if not text:
+            return False
+
+        names = {
+            str(name or "").strip()
+            for name in (self.bot_name, "爱丽丝", "小艾", "小爱")
+            if str(name or "").strip()
+        }
+        if not names:
+            return False
+        name_pattern = "(?:" + "|".join(
+            re.escape(name) for name in sorted(names, key=len, reverse=True)
+        ) + ")"
+        inclusion_pattern = re.compile(
+            rf"(?:连带(?:着)?|算上|加上|带上|拉上|拖上|捎上).{{0,8}}{name_pattern}"
+            rf"|{name_pattern}.{{0,8}}(?:也)?(?:一起|算上|加上|带上|拉上|拖上|捎上|挨罚|被罚|遭殃|处刑|上名单)"
+        )
+        return bool(inclusion_pattern.search(text))
 
     def _current_points_to_bot(
         self,

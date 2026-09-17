@@ -1092,7 +1092,7 @@ class ReplyGenerator:
             "react": "短反应",
             "silent": "保持沉默",
         }.get(intent, intent)
-        return (
+        guide = (
             f"动态对话判断：当前消息{target_text}；推荐行为={intent_text}。"
             "把它当作本轮方向参考，结合上下文自然回应，不必重新总结历史。"
             "优先接住当前还没被回应的内容，也不要把判断结果说给群友听。"
@@ -1102,6 +1102,12 @@ class ReplyGenerator:
                 else "本轮已经决定不参与；如仍进入生成流程，只输出 <silent>。"
             )
         )
+        if (judgement.get("evidence") or {}).get("playful_bot_inclusion"):
+            guide += (
+                "群友把你拉进了玩笑；用一句短的自嘲或接梗回应，"
+                "别解释背景，也别把玩笑当真。"
+            )
+        return guide
 
     @staticmethod
     def _build_glossary_guide(glossary: list) -> str:

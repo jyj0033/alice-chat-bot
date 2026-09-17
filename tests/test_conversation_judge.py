@@ -78,6 +78,50 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("回复=m1/u1", prompt)
         self.assertIn("@=u1", prompt)
 
+    async def test_playful_inclusion_of_alice_allows_a_short_reaction(self):
+        provider = _FakeProvider(
+            '{"target":"other","intent":"silent",'
+            '"should_reply":false,"confidence":0.9,"reason":"在接别人话"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot", bot_name="爱丽丝")
+        current = self._message(
+            message_id="m3",
+            content="应该连带着爱丽丝一起处刑~",
+            mentioned_user_ids=[],
+            reply_to_id=None,
+            reply_to_qq=None,
+        )
+
+        result = await judge.judge(current, [])
+
+        self.assertTrue(result.should_reply)
+        self.assertEqual(result.target, "group")
+        self.assertEqual(result.intent, "react")
+        self.assertTrue(result.evidence["playful_bot_inclusion"])
+        self.assertEqual(result.reference_message_id, "m3")
+        prompt = provider.requests[0].messages[-1].content
+        self.assertIn("连带着爱丽丝一起处刑", prompt)
+
+    async def test_plain_third_person_bot_mention_stays_silent(self):
+        provider = _FakeProvider(
+            '{"target":"other","intent":"silent",'
+            '"should_reply":false,"confidence":0.9,"reason":"群友之间的对话"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot", bot_name="爱丽丝")
+        current = self._message(
+            message_id="m3",
+            content="宫园薰说爱丽丝今天不在线。",
+            mentioned_user_ids=[],
+            reply_to_id=None,
+            reply_to_qq=None,
+        )
+
+        result = await judge.judge(current, [])
+
+        self.assertFalse(result.should_reply)
+        self.assertEqual(result.target, "other")
+        self.assertNotIn("playful_bot_inclusion", result.evidence)
+
     async def test_invalid_judge_output_falls_back_as_unavailable(self):
         provider = _FakeProvider("这不是 JSON，也没有结构化结果")
         judge = ConversationJudge(provider, bot_id="bot")

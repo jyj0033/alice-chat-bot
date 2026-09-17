@@ -67,6 +67,20 @@ class ReplySituationTests(unittest.TestCase):
         )
         self.assertFalse(ReplyGenerator.looks_like_prompt_echo("困得理直气壮"))
 
+    def test_judgement_guide_uses_self_deprecating_banter_for_playful_inclusion(self):
+        guide = ReplyGenerator._build_judgement_guide(
+            {
+                "available": True,
+                "target": "group",
+                "intent": "react",
+                "should_reply": True,
+                "evidence": {"playful_bot_inclusion": True},
+            }
+        )
+
+        self.assertIn("短的自嘲或接梗", guide)
+        self.assertIn("别把玩笑当真", guide)
+
     def test_confused_short_probe_does_not_include_yes_or_come(self):
         self.assertTrue(ReplyGenerator._is_confused_short_probe("啥？"))
         self.assertFalse(ReplyGenerator._is_confused_short_probe("是"))

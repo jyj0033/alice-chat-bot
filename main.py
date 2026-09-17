@@ -911,6 +911,11 @@ class GroupChatBot:
             logger.debug("群 %s 已在 Web 配置中停用", message.group_id)
             return
 
+        # 普通插话只对触发它的那一轮有效。新群消息一到就撤掉仍在等待或
+        # 生成中的非定向草稿，让新消息自己的目标判断决定要不要说话；否则
+        # 旧草稿可能把新消息当成目标，尤其在两轮目标判断结果不一致时。
+        self._cancel_pending_group_interjection(message)
+
         # 富媒体增强只依据最外层文字和结构化指向判断。转发/卡片内部即使含有
         # bot 昵称、@ 或问题，也不能把一条普通分享误判为“对 bot 说”。
         is_reply_to_bot = self._is_reply_to_bot(message)
@@ -2045,6 +2050,25 @@ class GroupChatBot:
                 return self._context_marker(item)
         return None
 
+    def _cancel_pending_group_interjection(self, message: Message) -> bool:
+        """新群消息到达时取消尚未发送的普通插话，避免旧候选接错新话题。"""
+        if message.message_type != "group":
+            return False
+        session_id = message.session_id
+        task = self._reply_tasks.get(session_id)
+        if task is None or task.done():
+            return False
+        decision = self._reply_task_decisions.get(session_id) or {}
+        if decision.get("explicit_directed") or decision.get("sending_started"):
+            return False
+
+        task.cancel()
+        logger.info(
+            "[发送复核] 新群消息到达，取消未完成的普通插话：%s",
+            message.message_id or message.sender_id or session_id,
+        )
+        return True
+
     def _context_marker_for_message(self, session_id: str, message: Message):
         """返回某条入站消息在窗口中的标记，而不是调用时刻的 latest 标记。"""
         item = self._context_item_for_message(session_id, message)
@@ -2850,6 +2874,9 @@ class GroupChatBot:
             first_sent_message_id = ""
             meme_sent = False
             meme_item = None
+            # 已通过发送前复核并开始调用平台发送接口；新消息不再取消这条
+            # 已经出站的回复，避免分段回复被截成半句。
+            decision["sending_started"] = True
             try:
                 for i, seg in enumerate(segments):
                     if i > 0 and action_plan:
