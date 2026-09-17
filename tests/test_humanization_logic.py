@@ -969,8 +969,33 @@ class HumanizationLogicTests(unittest.TestCase):
         system_text = "\n".join(
             message.content for message in request.messages if message.role == "system"
         )
-        self.assertIn("语义复核提示", system_text)
+        self.assertIn("语义复核后的回复修正要求", system_text)
         self.assertIn("未知图片内容", system_text)
+        self.assertIn("不要复述或解释这些要求", system_text)
+        self.assertIn("只输出最终发给群友的话", system_text)
+        self.assertIn("不要描述分析、整理、核实", system_text)
+
+    def test_review_guidance_uses_final_reply_constraints_not_checker_reason(self):
+        hint = ReplyGenerator._build_reply_review_hint({
+            "unsupported_assumption": True,
+            "needs_clarification": True,
+        })
+        self.assertIn("不要断定上下文没有证实的事实", hint)
+        self.assertIn("直接向相关群友问一个具体问题", hint)
+        self.assertNotIn("先澄清", hint)
+        self.assertNotIn("内部检查意见", hint)
+
+    def test_reply_quality_detects_internal_process_sentence(self):
+        draft = '先把"今天又老了一岁"和生日这事理'
+        self.assertTrue(ReplyGenerator.looks_like_meta_commentary(draft))
+        self.assertTrue(
+            ReplyGenerator.needs_reply_quality_review(
+                draft,
+                "猫姐今天生日吗？",
+                [],
+                direction="group",
+            )
+        )
 
     # === 省略号与笑声频率 ===
 

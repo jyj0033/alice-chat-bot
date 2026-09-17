@@ -935,10 +935,10 @@ class ReplyGenerator:
             review_hint = re.sub(r"\s+", " ", str(reply_review_hint)).strip()[:180]
             if review_hint:
                 request.add_system(
-                    "语义复核提示：上一版草稿存在证据不足或指代不清的问题。"
-                    f"内部检查意见：{review_hint}。"
-                    "本轮不要把群友的猜测、转述或图片占位符当成已确认事实；"
-                    "如果仍无法确认指向或画面内容，先用一句话澄清，或者输出 <silent>。"
+                    "语义复核后的回复修正要求（不要复述或解释这些要求）："
+                    f"{review_hint}。"
+                    "只输出最终发给群友的话，不要描述分析、整理、核实或决定如何回复的过程；"
+                    "事实不确定时直接问一个简短的具体问题，或只输出 <silent>。"
                 )
 
         request.add_system(
@@ -1144,6 +1144,25 @@ class ReplyGenerator:
             + "\n当前情境明显合适时，最多自然借鉴其中一种表达方式；"
             "不合适就忽略，不要逐字复述例句，也不要模仿某个具体群友的身份或口吻。"
         )
+
+    @staticmethod
+    def _build_reply_review_hint(evidence: dict) -> str:
+        """把复核结果转成面向最终回复的约束，不把复核员的分析原文塞回提示词。"""
+        evidence = evidence or {}
+        hints = []
+        if evidence.get("unsupported_assumption") or evidence.get("needs_clarification"):
+            hints.append(
+                "不要断定上下文没有证实的事实；确有必要时直接向相关群友问一个具体问题，或保持沉默"
+            )
+        if evidence.get("incomplete"):
+            hints.append("只输出语意完整的一句话，无法完整表达时保持沉默")
+        if evidence.get("meta_commentary"):
+            hints.append("不要描述分析、整理上下文、核实事实或决定怎么回复，直接面向群友说话")
+        if evidence.get("is_paraphrase") and not evidence.get("adds_information"):
+            hints.append("不要复述前文，直接回应当前消息或补充真正有用的新内容")
+        if evidence.get("on_topic") is False:
+            hints.append("只回应当前消息，不要转去概括旁边的聊天")
+        return "；".join(hints) or "直接回应当前消息；没有自然、准确的内容就保持沉默"
 
     def _matches_taboo(self, text: str) -> bool:
         """判断当前消息是否触及配置的禁忌话题。"""
@@ -1669,6 +1688,10 @@ class ReplyGenerator:
         "我不参与", "我不插话", "我该不该说", "我该不该参与",
         "我刚说", "我刚才说", "我刚才回复", "我应该说什么",
     )
+    _META_PROCESS_RE = re.compile(
+        r"^先把.{0,60}(?:这事|这件事|这个问题).{0,12}"
+        r"(?:理|捋|梳理|确认|核实|弄清|搞清)(?:清|楚|一下|再说)?[。！？!?…]*$"
+    )
 
     @classmethod
     def has_media_context(cls, current_message: str, source_texts: list) -> bool:
@@ -1692,7 +1715,12 @@ class ReplyGenerator:
     def looks_like_meta_commentary(cls, reply: str) -> bool:
         """筛出解释自己是否插话的草稿，交给语义复核器最终判断。"""
         text = str(reply or "").strip()
-        return bool(text) and any(marker in text for marker in cls._META_COMMENTARY_MARKERS)
+        if not text:
+            return False
+        return (
+            any(marker in text for marker in cls._META_COMMENTARY_MARKERS)
+            or bool(cls._META_PROCESS_RE.match(text))
+        )
 
     @classmethod
     def needs_reply_quality_review(

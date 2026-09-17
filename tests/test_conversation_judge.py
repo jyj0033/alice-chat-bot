@@ -206,6 +206,8 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.should_reply)
         self.assertTrue(result.evidence["incomplete"])
         self.assertTrue(result.evidence["meta_commentary"])
+        prompt = provider.requests[0].messages[-1].content
+        self.assertIn("先把这事理清再说", prompt)
 
     async def test_review_payload_without_quality_fields_is_unavailable(self):
         provider = _FakeProvider('{"replacement_hint":"看起来还行"}')

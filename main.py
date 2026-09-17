@@ -2117,6 +2117,27 @@ class GroupChatBot:
             marker = latest
             logger.debug("[发言收尾] 检测到新群消息，继续等待 %.1fs", idle_seconds)
 
+    @staticmethod
+    async def _validate_retried_reply(
+        judge,
+        message: Message,
+        recent_messages: list,
+        reply: str,
+        direction: str,
+    ) -> tuple[bool, str]:
+        """重生成稿必须再通过一次质量复核；复核不可用时按未通过处理。"""
+        review = await judge.review_reply(
+            message,
+            recent_messages,
+            reply,
+            direction=direction,
+        )
+        if not review.available:
+            return False, "重答复核不可用"
+        if review.should_reply:
+            return True, ""
+        return False, str(review.reason or "重答仍未通过语义复核")
+
     async def _compose_and_send(self, message: Message, decision: dict) -> None:
         """慢路径：思考延迟 → 用最新上下文生成回复 → 发送"""
         session_id = message.session_id
@@ -2551,23 +2572,16 @@ class GroupChatBot:
                         review_label = "元话语"
                     else:
                         review_label = "偏离当前话题"
-                    review_hint = str(review.reason or "").strip()
-                    if unsupported_issue:
-                        review_hint = (
-                            f"{review_hint}；" if review_hint else ""
-                        ) + "不要把猜测或未知图片内容当成事实"
-                    elif clarification_issue and not review_hint:
-                        review_hint = "当前指代不清，先澄清对象或保持沉默"
-                    elif incomplete_issue and not review_hint:
-                        review_hint = "把句子说完整，或直接保持沉默"
-                    elif meta_commentary_issue and not review_hint:
-                        review_hint = "不要解释自己是否插话，直接回应当前消息或保持沉默"
-                    elif off_topic_issue and not review_hint:
-                        review_hint = "只回应当前消息，不要转去概括旁边的对话"
+                    # 检查器给出的自然语言理由只写日志，不回灌给生成模型，
+                    # 避免“先澄清/先整理”被模型当作要发给群友的话。
+                    review_reason = str(review.reason or "").strip()
+                    review_hint = self.reply_generator._build_reply_review_hint(
+                        review_evidence
+                    )
                     logger.info(
                         "[语义复核] 草稿被判定为%s，要求重新生成：%s",
                         review_label,
-                        review_hint or "未通过语义复核",
+                        review_reason or review_hint,
                     )
                     retry_reply = await self.reply_generator.generate(
                         context_prompt=context_prompt,
@@ -2612,6 +2626,51 @@ class GroupChatBot:
                     tool_meme_category = retry_meme_category
                     tool_meme_id = retry_meme_id
                     tool_meme_called = retry_meme_called
+
+                    retry_review_text = reply
+                    if self.meme_manager:
+                        retry_review_text, _ = self.meme_manager.strip_directives(
+                            retry_review_text
+                        )
+                    if retry_review_text.strip():
+                        retry_failure = ""
+                        if self.reply_generator.looks_like_meta_commentary(
+                            retry_review_text
+                        ):
+                            retry_failure = "重答仍是回复过程说明"
+                        elif self.reply_generator.looks_like_incomplete(
+                            retry_review_text
+                        ):
+                            retry_failure = "重答仍是残句"
+                        else:
+                            retry_accepted, retry_failure = (
+                                await self._validate_retried_reply(
+                                    judge,
+                                    effective_message,
+                                    recent_context_for_review,
+                                    retry_review_text,
+                                    direction,
+                                )
+                            )
+                            if retry_accepted:
+                                retry_failure = ""
+
+                        if retry_failure:
+                            if direction == "to_bot":
+                                logger.info(
+                                    "[语义复核] 重答未通过（%s），改用安全澄清句",
+                                    retry_failure,
+                                )
+                                reply = "这件事我不太确定，你能再具体说一点吗？"
+                                tool_meme_category = None
+                                tool_meme_id = ""
+                                tool_meme_called = False
+                            else:
+                                logger.info(
+                                    "[语义复核] 重答未通过（%s），放弃群聊插话",
+                                    retry_failure,
+                                )
+                                return
 
             # 表情包选择标记只在内部流转，不能进入群聊文本、记忆或日报。
             meme_category = None
