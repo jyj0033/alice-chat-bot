@@ -539,7 +539,8 @@ async def get_memories(
 
     ``limit`` 保留给旧版前端兼容；新版使用 ``page/page_size``。筛选、排序、
     总数统计都在 SQLite 层完成，避免每次打开页面都把整个记忆库读入内存。
-    type: all=长期记忆+群聊纪要, memory=仅长期记忆, digest=仅群聊纪要
+    type: all=长期记忆+群聊纪要+表达习惯, memory=仅长期记忆,
+    digest=仅群聊纪要, expressions=仅学到的表达习惯
     """
     page = max(1, int(page))
     if limit > 0:
@@ -559,10 +560,14 @@ async def get_memories(
     try:
         if type == "digest":
             allowed_types = {"session_summary"}
+        elif type == "expressions":
+            allowed_types = {"expression_pattern"}
         elif type == "memory":
             allowed_types = {"episodic", "semantic"}
         else:
-            allowed_types = {"episodic", "semantic", "session_summary"}
+            allowed_types = {
+                "episodic", "semantic", "session_summary", "expression_pattern"
+            }
         decay_presets = getattr(bot_instance, "memory_decay_presets", {}) or {}
         half_life_days = getattr(bot_instance, "memory_half_life_days", 30)
         memories, total = await bot_instance.memory_storage.get_memories_page(
@@ -598,6 +603,7 @@ async def get_memories(
             "last_accessed": m.last_accessed.isoformat(),
             "source_session": m.source_session,
             "sender_name": (m.metadata or {}).get("sender_name", ""),
+            "evidence_count": int((m.metadata or {}).get("evidence_count", 0) or 0),
         })
 
     total_pages = (total + page_size - 1) // page_size if total else 0
@@ -1000,6 +1006,22 @@ async def extract_slang_now():
         return {"success": True, **result}
     except Exception as e:
         logger.error(f"手动提取黑话失败：{e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/expression-patterns/extract")
+async def extract_expression_patterns_now():
+    """立即从近期群聊提取可复用的情境表达习惯。"""
+    if not bot_instance:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        config = getattr(bot_instance, "_expression_learning_config", {}) or {}
+        result = await bot_instance.extract_expressions_all(
+            hours=int(config.get("lookback_hours", 48))
+        )
+        return {"success": not result["errors"], **result}
+    except Exception as e:
+        logger.error("手动提取表达习惯失败：%s", e, exc_info=True)
         return {"success": False, "error": str(e)}
 
 

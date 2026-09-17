@@ -4,6 +4,7 @@
 """
 import asyncio
 from dataclasses import replace
+import json
 import logging
 import random
 import re
@@ -150,6 +151,9 @@ class GroupChatBot:
         # 同一会话的入站版本号。目标判断可能排队数秒，版本号用来在真正
         # 调模型前丢弃已经被后续群消息覆盖的普通候选，减少过期判断和费用。
         self._session_message_versions: dict[str, int] = {}
+        # 普通群聊先短暂合并同一会话里的连续消息，再对最新消息做一次目标判断。
+        # 批次有最长等待时间，避免消息持续到来时一直等不到判断。
+        self._conversation_judge_batch_started_at: dict[str, float] = {}
         self._rich_media_tasks: set[asyncio.Task] = set()
         self._meme_collect_tasks: set[asyncio.Task] = set()
         # 用户消息、Bot 回复等轻量记忆写入任务。单独跟踪，停止时等待/取消，
@@ -175,6 +179,9 @@ class GroupChatBot:
         self._profile_distill_guard = threading.Lock()
         # 黑话自动清理的上次执行时间（进程内首次启动时立即检查）
         self._last_slang_cleanup: float = 0.0
+        # 群聊表达习惯自动提取，手动触发与定时任务共用非阻塞锁。
+        self._last_expression_learn: float = 0.0
+        self._expression_learning_guard = threading.Lock()
 
     @property
     def _image_group_config(self) -> dict:
@@ -361,6 +368,7 @@ class GroupChatBot:
             "semantic": {"half_life_days": 90, "max_age_days": 365},
             "session_summary": {"half_life_days": 45, "max_age_days": 180},
             "episodic": {"half_life_days": 14, "max_age_days": 90},
+            "expression_pattern": {"half_life_days": 90, "max_age_days": 365},
         }
         # 衰减清理任务的上次执行时间（初始为"从未"）
         self._last_decay_run: float = 0.0
@@ -466,6 +474,21 @@ class GroupChatBot:
             f"每{self._slang_config['interval_hours']}小时提取一次；"
             f"自动清理={self._slang_config['cleanup']['enabled']}，"
             f"每{self._slang_config['cleanup']['interval_hours']}小时检查一次"
+        )
+
+        expression_cfg = memory_config.get("expression_learning", {}) or {}
+        self._expression_learning_config = {
+            "enabled": bool(expression_cfg.get("enabled", True)),
+            "interval_hours": max(1, int(expression_cfg.get("interval_hours", 24))),
+            "lookback_hours": max(6, int(expression_cfg.get("lookback_hours", 48))),
+            "min_messages": max(6, int(expression_cfg.get("min_messages", 10))),
+            "max_inject": max(1, min(3, int(expression_cfg.get("max_inject", 3)))),
+        }
+        logger.info(
+            "✓ 群聊表达习惯：启用=%s，每%s小时学习一次，回看%s小时",
+            self._expression_learning_config["enabled"],
+            self._expression_learning_config["interval_hours"],
+            self._expression_learning_config["lookback_hours"],
         )
 
     def _init_meme_manager(self) -> None:
@@ -1006,6 +1029,37 @@ class GroupChatBot:
             # 才能继续进入上下文，供收尾窗口观察。
             ingest_lock.release()
 
+        # 普通群聊做短暂合并，只判断批次里的最新消息；前面的消息已经留在
+        # recent_context 中供判断器理解。明确对 bot 的消息和强触发不等待。
+        judge = getattr(self, "conversation_judge", None)
+        judge_enabled = bool(
+            getattr(judge, "enabled", False) and getattr(judge, "provider", None)
+        )
+        bypass_judge_batch = (
+            message.message_type != "group"
+            or message.mentioned_me
+            or is_reply_to_bot
+            or continuing
+            or bool(rich_trigger.get("forced_trigger", False))
+        )
+        if judge_enabled and not bypass_judge_batch:
+            batch_ready = await self._wait_for_conversation_judge_batch(
+                session_id, message_version
+            )
+            if batch_ready:
+                # 等待期间新消息也已立即写入上下文；刷新快照后再交给模型，
+                # 避免只看见批次第一条消息。
+                recent_context_for_judgement = self.context_manager.get_window(
+                    session_id
+                ).get_recent(30)
+            else:
+                logger.debug(
+                    "[目标判断] 消息已并入更新的群聊批次，跳过旧消息：%s",
+                    message.message_id or message.sender_id,
+                )
+        else:
+            self._conversation_judge_batch_started_at.pop(session_id, None)
+
         # 目标和接话意图由独立的轻量模型动态判断。它只返回结构化结果，
         # 不生成回复；失败时由 _decide_reply 使用保守的旧逻辑回退。
         judge_lock = self._conversation_judge_locks.setdefault(
@@ -1135,6 +1189,47 @@ class GroupChatBot:
             )
             self._reply_tasks[session_id] = task
             self._reply_task_decisions[session_id] = decision
+
+    async def _wait_for_conversation_judge_batch(
+        self,
+        session_id: str,
+        message_version: int,
+    ) -> bool:
+        """短暂合并普通群聊消息，并确保批次不会无限等待。
+
+        每条消息仍会立即写入上下文。若等待期间有更新的消息到达，旧任务
+        返回 False；最新任务沿用批次起始时间，安静一小段时间后判断最新消息。
+        到达最长等待时间时则提前刷新，避免活跃群聊持续饿死判断器。
+        """
+        judge_config = self.config.get("conversation_judge", {}) or {}
+        try:
+            batch_window = float(judge_config.get("batch_window_seconds", 0.35))
+        except (TypeError, ValueError):
+            batch_window = 0.35
+        try:
+            max_batch_wait = float(judge_config.get("max_batch_wait_seconds", 1.5))
+        except (TypeError, ValueError):
+            max_batch_wait = 1.5
+
+        # Web 配置可能手工编辑；限制上界，避免一次错误配置挂住收件任务。
+        batch_window = max(0.0, min(batch_window, 3.0))
+        max_batch_wait = max(batch_window, min(max_batch_wait, 5.0))
+
+        now = time.monotonic()
+        batch_started_at = self._conversation_judge_batch_started_at.get(session_id)
+        if batch_started_at is None:
+            batch_started_at = now
+            self._conversation_judge_batch_started_at[session_id] = now
+        elapsed = max(0.0, now - batch_started_at)
+        delay = min(batch_window, max(0.0, max_batch_wait - elapsed))
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        if self._session_message_versions.get(session_id) != message_version:
+            return False
+
+        self._conversation_judge_batch_started_at.pop(session_id, None)
+        return True
 
     async def _collect_meme_after_enrichment(
         self,
@@ -2212,10 +2307,12 @@ class GroupChatBot:
                 return
 
             # 记忆查询按最终候选消息执行，避免等待后换了目标但仍召回旧问题。
+            target_user_ids = self._profile_target_ids(effective_message)
             memories = await self._retrieve_memories(
                 generation_message,
                 session_id,
                 exclude_id=effective_message_id or message.message_id,
+                target_user_ids=target_user_ids,
             )
 
             # === 构建提示词（此刻的上下文 = 思考期间的最新消息，不会回旧话题） ===
@@ -2230,9 +2327,25 @@ class GroupChatBot:
                 max_messages=self.context_manager.max_messages,
             )
 
-            # === 注入最近群日报摘要：让 bot 知道"昨天/今天群里聊过啥，群友标签是啥" ===
+            # 群日报只补充当前发言者/@对象/被回复对象的标签，不把整份名单塞进来。
+            target_names = set()
+            target_set = set(target_user_ids)
+            for item in self.context_manager.get_window(session_id).get_recent(40):
+                if str(getattr(item, "sender_id", "") or "") in target_set:
+                    name = str(getattr(item, "sender_name", "") or "").strip()
+                    if name:
+                        target_names.add(name)
+            for memory in memories:
+                meta = memory.metadata or {}
+                if str(meta.get("sender_id") or "") in target_set:
+                    name = str(meta.get("sender_name") or "").strip()
+                    if name:
+                        target_names.add(name)
             context_prompt = await self._augment_context_with_group_reports(
-                session_id, context_prompt
+                session_id,
+                context_prompt,
+                target_user_ids=target_user_ids,
+                target_names=sorted(target_names),
             )
 
             # === 命中的群黑话：只注入本轮对话里真正出现的词条 ===
@@ -2258,6 +2371,51 @@ class GroupChatBot:
             except Exception as exc:
                 logger.debug("黑话匹配失败：%s", exc)
 
+            # 表达模式按当前群和附近消息的语境召回；它们是可忽略的风格参考，
+            # 不进入事实记忆，也不会从其他群带入。
+            expression_patterns = []
+            try:
+                expression_cfg = getattr(
+                    self, "_expression_learning_config", {}
+                ) or {}
+                if (
+                    getattr(self, "long_term_memory_enabled", True)
+                    and expression_cfg.get("enabled", True)
+                    and session_id.startswith("group_")
+                ):
+                    recent_expression_context = self.context_manager.get_window(
+                        session_id
+                    ).get_recent(4)
+                    expression_query = "\n".join(
+                        [f"当前消息（优先）：{generation_message}"]
+                        + [item.content for item in recent_expression_context[-3:]]
+                    )[:1000]
+                    matched_patterns = await self.memory_storage.semantic_search(
+                        query=expression_query,
+                        session=session_id,
+                        limit=max(1, min(3, int(expression_cfg.get("max_inject", 3)))),
+                        half_life_days=90,
+                        similarity_weight=self.memory_similarity_weight,
+                        decay_presets=self.memory_decay_presets,
+                        memory_types=["expression_pattern"],
+                        strict_session=True,
+                    )
+                    expression_patterns = [
+                        {
+                            "situation": str((memory.metadata or {}).get("situation") or ""),
+                            "style": str((memory.metadata or {}).get("style") or ""),
+                        }
+                        for memory in matched_patterns
+                        if (memory.metadata or {}).get("situation")
+                        and (memory.metadata or {}).get("style")
+                    ][:3]
+                    if expression_patterns:
+                        await self.memory_storage.update_access_many(
+                            [memory.id for memory in matched_patterns if memory.id]
+                        )
+            except Exception as exc:
+                logger.debug("表达习惯召回失败：%s", exc)
+
             # === 生成回复（direction 控制是否可沉默） ===
             try:
                 gen_result = await self.reply_generator.generate(
@@ -2268,6 +2426,7 @@ class GroupChatBot:
                     action_plan=action_plan.to_dict() if action_plan else None,
                     session_id=session_id,
                     glossary=glossary,
+                    expression_patterns=expression_patterns,
                     conversation_judgement=conversation_judgement,
                     current_message_context=self._reply_situation_fields(
                         session_id,
@@ -2418,6 +2577,7 @@ class GroupChatBot:
                         action_plan=action_plan.to_dict() if action_plan else None,
                         session_id=session_id,
                         glossary=glossary,
+                        expression_patterns=expression_patterns,
                         conversation_judgement=conversation_judgement,
                         current_message_context=self._reply_situation_fields(
                             session_id,
@@ -4990,11 +5150,261 @@ class GroupChatBot:
         if result["error"]:
             logger.warning("[黑话清理] %s", result["error"])
 
+    @staticmethod
+    def _parse_expression_patterns(
+        raw: str,
+        valid_source_ids: set[str],
+        speaker_names: list[str] | None = None,
+        source_texts: list[str] | None = None,
+    ) -> list[dict]:
+        """只接受由多条真人消息支持、且不包含人名或隐私的抽象表达模式。"""
+        text = re.sub(
+            r"^```(?:json)?\s*|\s*```$", "", str(raw or "").strip(), flags=re.I
+        )
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            match = re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", text)
+            if not match:
+                return []
+            try:
+                payload = json.loads(match.group(0))
+            except (TypeError, ValueError):
+                return []
+        if isinstance(payload, dict):
+            payload = payload.get("patterns", [])
+        if not isinstance(payload, list):
+            return []
+
+        names = [
+            str(name).strip().casefold()
+            for name in (speaker_names or [])
+            if len(str(name).strip()) >= 2
+        ]
+        blocked = re.compile(
+            r"https?://|www\.|@|\d{6,}|忽略|提示词|系统(?:提示|指令)|system prompt|"
+            r"developer|assistant|api[_ -]?key|密钥|密码|身份证|手机号|电话号码|"
+            r"读取.{0,10}(?:文件|密钥)|调用.{0,10}(?:工具|接口)|执行命令",
+            re.I,
+        )
+        source_compact = [
+            re.sub(r"[^\w\u3400-\u9fff]+", "", str(value or "").casefold())
+            for value in (source_texts or [])
+        ]
+        seen_situations: set[str] = set()
+        patterns: list[dict] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            situation = " ".join(str(item.get("situation") or "").split()).strip()
+            style = " ".join(str(item.get("style") or "").split()).strip()
+            source_values = item.get("source_ids", item.get("evidence_ids", []))
+            if isinstance(source_values, (str, int)):
+                source_values = [source_values]
+            if not isinstance(source_values, list):
+                continue
+            source_ids = list(dict.fromkeys(
+                str(value).strip()
+                for value in source_values
+                if str(value).strip() in valid_source_ids
+            ))
+            if len(source_ids) < 2 or not situation or not style:
+                continue
+            if len(situation) > 50 or len(style) > 160:
+                continue
+            if blocked.search(situation) or blocked.search(style):
+                continue
+            if re.search(r"[\"'“”‘’「」『』]", situation + style):
+                continue
+            combined = (situation + " " + style).casefold()
+            if any(name in combined for name in names):
+                continue
+            compact_style = re.sub(
+                r"[^\w\u3400-\u9fff]+", "", style.casefold()
+            )
+            if len(compact_style) >= 8 and any(
+                compact_style in original for original in source_compact
+            ):
+                continue
+            key = situation.casefold()
+            if key in seen_situations:
+                continue
+            seen_situations.add(key)
+            patterns.append({
+                "situation": situation,
+                "style": style,
+                "source_ids": source_ids,
+            })
+            if len(patterns) >= 5:
+                break
+        return patterns
+
+    async def _extract_expressions(
+        self,
+        session_id: str,
+        hours: int = 48,
+        episodes: list[Memory] | None = None,
+    ) -> dict:
+        """从单个群近期的重复表达中提炼简短、可迁移的情境习惯。"""
+        result = {"session": session_id, "found": 0, "saved": 0, "error": ""}
+        if not str(session_id).startswith("group_"):
+            result["error"] = "表达习惯只从群聊学习"
+            return result
+        provider = self.get_active_provider()
+        if not provider:
+            result["error"] = "no active provider"
+            return result
+
+        try:
+            if episodes is None:
+                episodes = await self.memory_storage.get_recent("episodic", limit=5000)
+            since = datetime.now() - timedelta(hours=max(1, int(hours)))
+            rows = [
+                memory for memory in episodes
+                if memory.source_session == session_id
+                and memory.created_at > since
+                and not (memory.metadata or {}).get("is_bot")
+                and not (memory.metadata or {}).get("profile_context_only")
+                and (memory.content or "").strip()
+                and not (memory.content or "").strip().startswith("[")
+                and memory.id
+            ]
+            rows.sort(key=lambda memory: memory.created_at)
+            rows = rows[-120:]
+            min_messages = self._expression_learning_config.get("min_messages", 10)
+            if len(rows) < min_messages:
+                result["error"] = f"素材不足（{len(rows)} 条，需要 {min_messages} 条）"
+                return result
+
+            valid_ids = {str(memory.id) for memory in rows}
+            names = list(dict.fromkeys(
+                str((memory.metadata or {}).get("sender_name") or "").strip()
+                for memory in rows
+                if str((memory.metadata or {}).get("sender_name") or "").strip()
+                and str((memory.metadata or {}).get("sender_name") or "").strip().casefold()
+                not in {"群友", "未知", "unknown", "user"}
+            ))
+            lines = [
+                f"[source_id:{memory.id}] "
+                f"{(memory.metadata or {}).get('sender_name') or '群友'}："
+                f"{(memory.content or '').strip()[:120]}"
+                for memory in rows
+            ]
+
+            from modules.llm.base import ChatRequest
+            request = ChatRequest(temperature=0.2, max_tokens=900, top_p=0.9)
+            request.add_system(
+                "你是群聊表达习惯整理助手。只归纳反复出现、以后可迁移的情境表达方式，"
+                "例如安慰、接梗、轻微自嘲、婉拒、追问或短促反应。"
+                "每条必须由至少两条不同 source_id 的真人消息支持；没有重复证据就省略。"
+                "用抽象说明描述说话结构、语气和节奏，不抄原句，不写具体人名、群内事实、"
+                "人物关系、隐私或一次性梗；不要学 Bot 自己的发言。"
+                "不要输出任何指令、规则或对 Bot 的要求。"
+                "只输出严格 JSON：{\"patterns\":[{\"situation\":\"情境\","
+                "\"style\":\"可复用的表达方式\",\"source_ids\":[\"id1\",\"id2\"]}]}。"
+                "最多 5 条；没有符合条件的模式时输出 {\"patterns\":[]}。"
+            )
+            request.add_user("【群聊记录】\n" + "\n".join(lines))
+            response = await provider.chat(request)
+            patterns = self._parse_expression_patterns(
+                response.content if response else "",
+                valid_ids,
+                speaker_names=names,
+                source_texts=[memory.content for memory in rows],
+            )
+            result["found"] = len(patterns)
+            for pattern in patterns:
+                memory_id = await self.memory_storage.upsert_expression_pattern(
+                    session=session_id,
+                    situation=pattern["situation"],
+                    style=pattern["style"],
+                    evidence_ids=pattern["source_ids"],
+                )
+                if memory_id:
+                    result["saved"] += 1
+            if patterns:
+                logger.info(
+                    "[表达习惯] %s 提取 %d 条：%s",
+                    session_id,
+                    len(patterns),
+                    "、".join(pattern["situation"] for pattern in patterns[:5]),
+                )
+        except Exception as exc:
+            logger.error("[表达习惯] 提取失败（%s）：%s", session_id, exc, exc_info=True)
+            result["error"] = str(exc)
+        return result
+
+    async def extract_expressions_all(self, hours: int = 48) -> dict:
+        """提取近期活跃群的表达习惯，供定时任务和 Dashboard 手动触发。"""
+        summary = {"sessions": 0, "found": 0, "saved": 0, "errors": []}
+        if not self._expression_learning_guard.acquire(blocking=False):
+            summary["errors"].append("表达学习任务正在运行")
+            return summary
+        try:
+            episodes = await self.memory_storage.get_recent("episodic", limit=5000)
+            since = datetime.now() - timedelta(hours=max(1, int(hours)))
+            sessions = {
+                memory.source_session for memory in episodes
+                if memory.source_session
+                and str(memory.source_session).startswith("group_")
+                and memory.created_at > since
+            }
+            sessions.update(
+                session for session in self.context_manager._windows
+                if str(session).startswith("group_")
+            )
+            for session_id in sorted(sessions):
+                result = await self._extract_expressions(
+                    session_id, hours=hours, episodes=episodes
+                )
+                summary["sessions"] += 1
+                summary["found"] += result["found"]
+                summary["saved"] += result["saved"]
+                if result["error"] and not result["error"].startswith("素材不足"):
+                    summary["errors"].append(f"{session_id}: {result['error']}")
+            return summary
+        except Exception as exc:
+            logger.error("[表达习惯] 全局提取失败：%s", exc, exc_info=True)
+            summary["errors"].append(str(exc))
+            return summary
+        finally:
+            self._expression_learning_guard.release()
+
+    async def _maybe_learn_expressions(self) -> None:
+        """按配置间隔学习群聊中反复出现的情境表达。"""
+        if (
+            not getattr(self, "long_term_memory_enabled", True)
+            or not getattr(self, "_expression_learning_config", {}).get("enabled", True)
+        ):
+            return
+        interval = max(
+            1, int(self._expression_learning_config.get("interval_hours", 24))
+        )
+        now = time.time()
+        if self._last_expression_learn and now - self._last_expression_learn < interval * 3600:
+            return
+        self._last_expression_learn = now
+        try:
+            result = await self.extract_expressions_all(
+                hours=self._expression_learning_config.get("lookback_hours", 48)
+            )
+        except Exception as exc:
+            logger.error("[表达习惯] 定时提取失败：%s", exc, exc_info=True)
+            return
+        if result["saved"] or result["errors"]:
+            logger.info(
+                "[表达习惯] 检查 %d 个群，发现 %d 条，写入/更新 %d 条%s",
+                result["sessions"], result["found"], result["saved"],
+                f"；错误 {len(result['errors'])} 个" if result["errors"] else "",
+            )
+
     async def _retrieve_memories(self, query: str, session_id: str, limit: int = None,
-                                 exclude_id: str = "") -> list:
+                                 exclude_id: str = "",
+                                 target_user_ids: list[str] | tuple[str, ...] | None = None) -> list:
         """检索相关长期记忆：
-        1. 该会话最近的群聊纪要（始终带上，bot 记得"最近群里聊过什么"，不会隔天失忆）
-        2. 向量语义检索（TF-IDF + 余弦），失败或空时退回该会话最近记忆
+        1. 按当前话题语义检索记忆与群聊纪要
+        2. 检索为空时退回该会话最近消息
+        3. 优先补充当前发言者、@对象和被回复对象的画像
 
         exclude_id：当前消息的 message_id。快路径会先异步把当前消息写入 episodic，
         检索发生在写入之后，若不排除，刚发的这条会把自己的内容召回——等于让 bot
@@ -5004,7 +5414,7 @@ class GroupChatBot:
             return []
 
         limit = limit or self.memory_search_top_k
-        # 略微提高单次召回数，让"近况纪要"和"群友画像"有更多被覆盖到的概率
+        # 略微提高单次召回数，给相关纪要和目标画像留出位置。
         if limit < 8:
             limit = 8
 
@@ -5038,25 +5448,60 @@ class GroupChatBot:
             if excluded:
                 memories = [m for m in memories if m.id not in excluded]
 
-        # 近况纪要：今天 + 昨天各 1 条，让 bot 跨日也记得群里聊过啥
-        try:
-            digests = await self.memory_storage.retrieve_session_recent(
-                session_id, limit=2, memory_type="session_summary"
-            )
-        except Exception as e:
-            logger.debug(f"读取群聊纪要失败，跳过：{e}")
-            digests = []
-        if digests:
-            digest_ids = {d.id for d in digests}
-            memories = (digests + [m for m in memories if m.id not in digest_ids])[:limit]
+        targets = list(dict.fromkeys(
+            str(user_id).strip()
+            for user_id in (target_user_ids or [])
+            if str(user_id).strip() and str(user_id).strip().casefold() != "all"
+        ))
 
-        # 群友画像补充：semantic_search 不一定召回到当前活跃的常驻群友，
-        # 这里再单独拉本会话最近的画像（最多 3 条），保证至少有"谁是谁"的锚点
+        def is_profile(memory) -> bool:
+            meta = memory.metadata or {}
+            tags = meta.get("tags") or memory.tags or []
+            if isinstance(tags, str):
+                tags = [tags]
+            return bool(meta.get("profile") or "用户画像" in tags)
+
+        # 已命中画像若不属于当前说话者/@对象/回复对象，不放进上下文。
+        if targets:
+            target_set = set(targets)
+            memories = [
+                memory for memory in memories
+                if not is_profile(memory)
+                or str((memory.metadata or {}).get("sender_id") or "") in target_set
+            ]
+
+        # 画像检索：有明确对象时按对象优先级精确匹配；无对象时保持旧的
+        # 当前会话近期画像兜底，且绝不跨会话扩散。
         try:
             profile_existing_ids = {m.id for m in memories}
-            profiles = await self.memory_storage.retrieve_session_recent(
-                session_id, limit=12, memory_type="semantic"
-            )
+            if targets and hasattr(self.memory_storage, "get_profiles"):
+                all_profiles = await self.memory_storage.get_profiles()
+                share_profiles = bool(
+                    getattr(self, "memory_share_across_sessions", False)
+                )
+                target_set = set(targets)
+                profiles = [
+                    profile for profile in all_profiles
+                    if (profile.metadata or {}).get("profile")
+                    and not (profile.metadata or {}).get("warnings")
+                    and not (profile.metadata or {}).get("profile_context_only")
+                    and (share_profiles or profile.source_session == session_id)
+                    and not (
+                        session_id.startswith("group_")
+                        and str(profile.source_session or "").startswith("private_")
+                    )
+                    and str((profile.metadata or {}).get("sender_id") or "") in target_set
+                ]
+                target_order = {user_id: index for index, user_id in enumerate(targets)}
+                profiles.sort(key=lambda profile: profile.last_accessed, reverse=True)
+                profiles.sort(key=lambda profile: target_order.get(
+                    str((profile.metadata or {}).get("sender_id") or ""),
+                    len(target_order),
+                ))
+            else:
+                profiles = await self.memory_storage.retrieve_session_recent(
+                    session_id, limit=12, memory_type="semantic"
+                )
             profile_picks: list = []
             seen_senders: set[str] = set()
             for mem in profiles:
@@ -5064,12 +5509,14 @@ class GroupChatBot:
                 tags = meta.get("tags") or []
                 if isinstance(tags, str):
                     tags = [tags]
-                if "用户画像" not in tags:
+                if not (meta.get("profile") or "用户画像" in tags):
                     continue
                 sender_key = str(meta.get("sender_id") or "")
+                if targets and sender_key not in set(targets):
+                    continue
                 if sender_key and sender_key in seen_senders:
                     continue
-                if mem.id in profile_existing_ids:
+                if mem.id in profile_existing_ids and not targets:
                     continue
                 profile_picks.append(mem)
                 if sender_key:
@@ -5077,7 +5524,16 @@ class GroupChatBot:
                 if len(profile_picks) >= 3:
                     break
             if profile_picks:
-                memories = profile_picks + memories
+                picked_ids = {memory.id for memory in profile_picks}
+                if targets:
+                    non_profile_memories = [
+                        memory for memory in memories
+                        if memory.id not in picked_ids and not is_profile(memory)
+                    ]
+                    # 目标画像固定放在普通记忆前；相关非画像记忆仍照常保留。
+                    memories = profile_picks + non_profile_memories
+                else:
+                    memories = profile_picks + memories
         except Exception as e:
             logger.debug(f"读取用户画像失败，跳过：{e}")
 
@@ -5093,6 +5549,30 @@ class GroupChatBot:
                 logger.debug(f"更新用户画像访问记录失败，跳过：{e}")
 
         return memories
+
+    def _profile_target_ids(self, message: Message) -> list[str]:
+        """按当前发言者、引用对象、@对象的顺序收集画像检索目标。"""
+        config = getattr(self, "config", {}) or {}
+        bot_id = str((config.get("qq", {}) or {}).get("self_id", "") or "")
+        values = [
+            getattr(message, "sender_id", ""),
+            getattr(message, "reply_to_qq", ""),
+            *(getattr(message, "mentioned_user_ids", []) or []),
+        ]
+        targets: list[str] = []
+        for value in values:
+            user_id = str(value or "").strip()
+            if (
+                not user_id
+                or user_id.casefold() == "all"
+                or (bot_id and user_id == bot_id)
+                or user_id in targets
+            ):
+                continue
+            targets.append(user_id)
+            if len(targets) >= 5:
+                break
+        return targets
 
     def _reply_situation_fields(
         self,
@@ -5134,12 +5614,16 @@ class GroupChatBot:
         }
 
     async def _augment_context_with_group_reports(
-        self, session_id: str, context_prompt: str
+        self,
+        session_id: str,
+        context_prompt: str,
+        target_user_ids: list[str] | None = None,
+        target_names: list[str] | None = None,
     ) -> str:
-        """把最近两天的群日报里的"话题"和"群友标签"段拼进 context_prompt。
+        """把最近两天群日报中与当前对话对象匹配的群友标签拼进上下文。
 
         bot 跨日不会自动记得群里聊过啥、人是谁，日报里已经有结构化结论，
-        直接复用，避免每次都"群友 X 是谁"猜错。
+        仅在当前目标有对应昵称时复用，避免无关标签进入本轮对话。
         """
         try:
             reports = await self.memory_storage.get_group_analysis_reports(
@@ -5151,9 +5635,19 @@ class GroupChatBot:
         if not reports:
             return context_prompt
 
-        # 只注入群友印象，不注入话题清单——后者会把模型推成播报腔。
+        # 只注入命中目标的群友印象，不注入话题清单——后者会把模型推成播报腔。
         blocks: list[str] = ["\n[你记得的群友印象]（用来认人，不要当新闻播报）："]
         used = False
+        targets = set(str(value) for value in (target_user_ids or []) if str(value))
+        names = {
+            str(value).strip().casefold()
+            for value in (target_names or [])
+            if str(value).strip()
+        }
+        # 旧调用未提供目标时保留兼容；本轮消息路径总会传入目标列表。
+        filter_targets = target_user_ids is not None
+        if filter_targets and (not targets or not names):
+            return context_prompt
         for report in reports:
             meta = report.metadata or {}
             report_date = meta.get("report_date") or "?"
@@ -5161,9 +5655,18 @@ class GroupChatBot:
             profiles_segment = _extract_section(content, "我给几位群友留了个小标签", "我注意到的话题")
             if not profiles_segment:
                 continue
+            profile_lines = []
+            for line in profiles_segment.splitlines():
+                if not line.strip().startswith("-"):
+                    continue
+                display_name = line.strip().lstrip("- ").split("：", 1)[0].strip().casefold()
+                if display_name and display_name in names:
+                    profile_lines.append(line)
+            if filter_targets and not profile_lines:
+                continue
             blocks.append(f"--- {report_date} ---")
             used = True
-            short_profiles = "\n".join(profiles_segment.splitlines()[:5])
+            short_profiles = "\n".join(profile_lines[:5] if filter_targets else profiles_segment.splitlines()[:5])
             blocks.append(short_profiles)
         if not used:
             return context_prompt
@@ -5207,6 +5710,7 @@ class GroupChatBot:
             await self._maybe_decay_memories()
             await self._maybe_distill_profiles()
             await self._maybe_extract_slang()
+            await self._maybe_learn_expressions()
             await self._maybe_cleanup_slang()
             await self._maybe_group_analysis()
             await self._maybe_cleanup_group_analysis()
@@ -5325,6 +5829,7 @@ class GroupChatBot:
         self._message_ingest_locks.clear()
         self._conversation_judge_locks.clear()
         self._session_message_versions.clear()
+        self._conversation_judge_batch_started_at.clear()
         self._rich_media_tasks.clear()
         self._meme_collect_tasks.clear()
         self._digest_tasks.clear()
@@ -5503,6 +6008,8 @@ class GroupChatBot:
                 "timeout": 8.0,
                 "max_tokens": 220,
                 "context_messages": 16,
+                "batch_window_seconds": 0.35,
+                "max_batch_wait_seconds": 1.5,
             },
             "rich_media": {
                 "enabled": True,
@@ -5590,6 +6097,13 @@ class GroupChatBot:
                         "lookback_hours": 168,
                         "max_entries": 40
                     }
+                },
+                "expression_learning": {
+                    "enabled": True,
+                    "interval_hours": 24,
+                    "lookback_hours": 48,
+                    "min_messages": 10,
+                    "max_inject": 3
                 },
                 "profile": {
                     "enabled": True,

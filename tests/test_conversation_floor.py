@@ -436,7 +436,7 @@ class ConversationFloorTests(unittest.TestCase):
         )
 
         self.assertTrue(
-            any("很短的即时反应" in message.content for message in request.messages)
+            any("自然回应眼前这一刻" in message.content for message in request.messages)
         )
         # 按词边界截断：不切进词中间（"确实有点太离谱了"→"确实有点太"）
         cut = generator._limit_action_length("确实有点太离谱了", 6)
@@ -454,10 +454,10 @@ class ConversationFloorTests(unittest.TestCase):
         )
 
         self.assertTrue(
-            any("最近2到4条消息" in message.content for message in request.messages)
+            any("弄清相邻几句在聊什么" in message.content for message in request.messages)
         )
         self.assertTrue(
-            any("不要只抓最新消息" in message.content for message in request.messages)
+            any("别只抓一个数字、名字或表情" in message.content for message in request.messages)
         )
 
     def test_surface_reaction_guard_catches_number_only_comment(self):

@@ -383,22 +383,133 @@ class MemoryStorage:
         return memory.id
 
     @_db_locked
+    def upsert_expression_pattern(
+        self,
+        session: str,
+        situation: str,
+        style: str,
+        evidence_ids: list[str],
+    ) -> tuple[int, bool, str]:
+        """按群和情境合并表达习惯；返回 (id, 内容是否变化, 正文)。"""
+        situation = " ".join(str(situation or "").split()).strip()[:60]
+        style = " ".join(str(style or "").split()).strip()[:180]
+        session = str(session or "").strip()
+        if not session or not situation or not style:
+            return 0, False, ""
+
+        incoming_ids = list(dict.fromkeys(
+            str(item).strip() for item in (evidence_ids or []) if str(item).strip()
+        ))
+        if len(incoming_ids) < 2:
+            return 0, False, ""
+
+        key = situation.casefold()
+        rows = self.conn.execute(
+            "SELECT * FROM memories WHERE memory_type = 'expression_pattern' "
+            "AND source_session = ? ORDER BY last_accessed DESC, id DESC",
+            (session,),
+        ).fetchall()
+        existing = None
+        for row in rows:
+            memory = self._row_to_memory(row)
+            meta = memory.metadata or {}
+            if " ".join(str(meta.get("situation") or "").split()).casefold() == key:
+                existing = memory
+                break
+
+        if existing:
+            metadata = dict(existing.metadata or {})
+            # 保护显式维护的条目；自动提取只补证据，不改人工内容。
+            if metadata.get("source") == "manual":
+                return int(existing.id or 0), False, existing.content
+            previous_ids = list(dict.fromkeys(
+                str(item).strip()
+                for item in (metadata.get("evidence_message_ids") or [])
+                if str(item).strip()
+            ))
+            seen = set(previous_ids)
+            additions = [item for item in incoming_ids if item not in seen]
+            merged_ids = (previous_ids + additions)[-200:]
+            metadata.update({
+                "kind": "expression_pattern",
+                "situation": situation,
+                "style": style,
+                "source": "auto",
+                "evidence_message_ids": merged_ids,
+                "evidence_count": max(
+                    int(metadata.get("evidence_count", 0) or 0), len(previous_ids)
+                ) + len(additions),
+            })
+            new_content = f"情境：{situation}；表达方式：{style}"
+            content_changed = new_content != existing.content
+            if additions or content_changed:
+                now = datetime.now()
+                self.conn.execute(
+                    "UPDATE memories SET content = ?, metadata = ?, last_accessed = ? "
+                    "WHERE id = ?",
+                    (
+                        new_content,
+                        json.dumps(metadata, ensure_ascii=False),
+                        now.isoformat(sep=" "),
+                        existing.id,
+                    ),
+                )
+                self.conn.commit()
+            return int(existing.id or 0), content_changed, new_content
+
+        content = f"情境：{situation}；表达方式：{style}"
+        memory = Memory(
+            content=content,
+            memory_type="expression_pattern",
+            importance=0.58,
+            source_session=session,
+            tags=["表达习惯"],
+            metadata={
+                "kind": "expression_pattern",
+                "situation": situation,
+                "style": style,
+                "source": "auto",
+                "evidence_message_ids": incoming_ids[-200:],
+                "evidence_count": len(incoming_ids),
+            },
+        )
+        return self.store(memory), True, content
+
+    @_db_locked
+    def invalidate_embedding(self, memory_id: int) -> None:
+        """内容改变且无嵌入服务时清除旧向量，避免日后召回过期向量。"""
+        self.conn.execute("UPDATE memories SET embedding = NULL WHERE id = ?", (memory_id,))
+        self.conn.commit()
+        self._embed_cache.pop(memory_id, None)
+
+    @_db_locked
     def retrieve(
         self,
         query: str = "",
         memory_type: Optional[str] = None,
         session: str = "",
-        limit: int = 10
+        limit: int = 10,
+        memory_types: Optional[list[str]] = None,
+        strict_session: bool = False,
     ) -> list[Memory]:
         """检索记忆"""
         conditions = []
         params = []
 
+        if strict_session and not session:
+            return []
+
         if query:
             conditions.append("content LIKE ?")
             params.append(f"%{query}%")
 
-        if memory_type:
+        selected_types = [str(value) for value in (memory_types or []) if str(value)]
+        if selected_types:
+            conditions.append(
+                "memory_type IN (" + ", ".join("?" for _ in selected_types) + ")"
+            )
+            params.extend(selected_types)
+        elif memory_type:
             conditions.append("memory_type = ?")
             params.append(memory_type)
 
@@ -1536,6 +1647,8 @@ class MemoryStorage:
         half_life_days: float = 30.0,
         similarity_weight: float = 0.85,
         decay_presets: Optional[dict] = None,
+        memory_types: Optional[list[str]] = None,
+        strict_session: bool = False,
     ) -> list[Memory]:
         """语义检索：TF-IDF + 余弦相似度，结合时间衰减后的重要性排序。
 
@@ -1547,10 +1660,21 @@ class MemoryStorage:
         """
         if not self._load_deps():
             logger.warning("jieba/numpy 未安装，退回 LIKE 检索")
-            return self.retrieve(query=query, session=session, limit=limit)
+            return self.retrieve(
+                query=query,
+                session=session,
+                limit=limit,
+                memory_types=memory_types,
+                strict_session=strict_session,
+            )
 
         now = datetime.now()
-        candidates = self._get_candidates(session, top_k_candidates)
+        candidates = self._get_candidates(
+            session,
+            top_k_candidates,
+            memory_types=memory_types,
+            strict_session=strict_session,
+        )
         if not candidates:
             return []
 
@@ -1622,31 +1746,51 @@ class MemoryStorage:
         return [m for _, m in hits[:limit]]
 
     @_db_locked
-    def _get_candidates(self, session: str = "", top_k: int = 200) -> list[Memory]:
+    def _get_candidates(
+        self,
+        session: str = "",
+        top_k: int = 200,
+        memory_types: Optional[list[str]] = None,
+        strict_session: bool = False,
+    ) -> list[Memory]:
         """取候选记忆：默认只取当前会话，显式共享时才补其他会话。
 
         默认严格按会话隔离，避免个人信息和群内话题跨边界泄漏。若显式开启
         ``share_across_sessions``，才恢复旧的跨会话共享策略。
         """
-        if session and not self.share_across_sessions:
-            cursor = self.conn.execute("""
+        if strict_session and not session:
+            return []
+
+        selected_types = [str(value) for value in (memory_types or []) if str(value)]
+        if not selected_types:
+            selected_types = ["episodic", "semantic", "session_summary"]
+        type_clause = "memory_type IN (" + ", ".join("?" for _ in selected_types) + ")"
+        type_params = tuple(selected_types)
+
+        if session and (strict_session or not self.share_across_sessions):
+            cursor = self.conn.execute(
+                f"""
                 SELECT * FROM memories
-                WHERE memory_type IN ('episodic', 'semantic', 'session_summary')
-                  AND source_session = ?
+                WHERE {type_clause} AND source_session = ?
                 ORDER BY importance DESC, last_accessed DESC
                 LIMIT ?
-            """, (session, top_k))
+                """,
+                (*type_params, session, top_k),
+            )
             return [
                 memory for memory in (self._row_to_memory(r) for r in cursor.fetchall())
                 if self._is_retrievable_memory(memory)
             ]
 
-        cursor = self.conn.execute("""
+        cursor = self.conn.execute(
+            f"""
             SELECT * FROM memories
-            WHERE memory_type IN ('episodic', 'semantic', 'session_summary')
+            WHERE {type_clause}
             ORDER BY importance DESC, last_accessed DESC
             LIMIT ?
-        """, (top_k,))
+            """,
+            (*type_params, top_k),
+        )
         rows = cursor.fetchall()
         memories = [
             memory for memory in (self._row_to_memory(r) for r in rows)
@@ -1775,6 +1919,38 @@ class AsyncMemoryStorage:
             except Exception as e:
                 logger.debug(f"保存时生成向量失败，已跳过：{e}")
         return mid
+
+    async def upsert_expression_pattern(
+        self,
+        session: str,
+        situation: str,
+        style: str,
+        evidence_ids: list[str],
+    ) -> int:
+        """按群合并情境表达，并在正文变化时刷新嵌入。"""
+        memory_id, content_changed, content = await asyncio.to_thread(
+            self._storage.upsert_expression_pattern,
+            session,
+            situation,
+            style,
+            evidence_ids,
+        )
+        if not memory_id or not content_changed:
+            return memory_id
+
+        await asyncio.to_thread(self._storage.invalidate_embedding, memory_id)
+        service = self._storage._embedding_service
+        if not service or not service.enabled:
+            return memory_id
+        try:
+            vectors = await service.embed([content])
+            if vectors and vectors[0]:
+                await asyncio.to_thread(
+                    self._storage.update_embedding, memory_id, vectors[0]
+                )
+        except Exception as exc:
+            logger.debug("更新表达习惯嵌入失败：%s", exc)
+        return memory_id
 
     async def retrieve(
         self,
@@ -2011,6 +2187,8 @@ class AsyncMemoryStorage:
         half_life_days: float = 30.0,
         similarity_weight: float = 0.85,
         decay_presets: Optional[dict] = None,
+        memory_types: Optional[list[str]] = None,
+        strict_session: bool = False,
     ) -> list[Memory]:
         """两阶段语义检索：
         1. 有嵌入服务：向量召回 top-30 → 重排 → top-N
@@ -2022,6 +2200,7 @@ class AsyncMemoryStorage:
                 result = await self._vector_search(
                     query, session, limit, top_k_candidates,
                     half_life_days, similarity_weight, decay_presets,
+                    memory_types, strict_session,
                 )
                 if result is not None:
                     return result
@@ -2031,6 +2210,7 @@ class AsyncMemoryStorage:
         return await asyncio.to_thread(
             self._storage.semantic_search, query, session, limit,
             top_k_candidates, half_life_days, similarity_weight, decay_presets,
+            memory_types, strict_session,
         )
 
     async def _vector_search(
@@ -2042,6 +2222,8 @@ class AsyncMemoryStorage:
         half_life_days: float,
         similarity_weight: float,
         decay_presets: Optional[dict],
+        memory_types: Optional[list[str]] = None,
+        strict_session: bool = False,
     ) -> Optional[list[Memory]]:
         """向量召回 + 重排。任一环节失败返回 None（调用方回退 TF-IDF）"""
         service = self._storage._embedding_service
@@ -2053,7 +2235,11 @@ class AsyncMemoryStorage:
             similarity_weight = 0.85
 
         candidates = await asyncio.to_thread(
-            self._storage._get_candidates, session, top_k_candidates
+            self._storage._get_candidates,
+            session,
+            top_k_candidates,
+            memory_types,
+            strict_session,
         )
         if not candidates:
             return []
@@ -2094,7 +2280,8 @@ class AsyncMemoryStorage:
                 self._storage.semantic_search, query, session,
                 limit=self.VECTOR_RECALL_K, top_k_candidates=top_k_candidates,
                 half_life_days=half_life_days, similarity_weight=similarity_weight,
-                decay_presets=decay_presets,
+                decay_presets=decay_presets, memory_types=memory_types,
+                strict_session=strict_session,
             )
             for m in lexical:
                 if m.id not in recalled_by_id:

@@ -41,6 +41,8 @@ class DashboardSurfaceTests(unittest.TestCase):
             "judge-timeout",
             "judge-max-tokens",
             "judge-context-messages",
+            "judge-batch-window",
+            "judge-batch-max-wait",
             "rich-enabled",
             "rich-forward-enabled",
             "rich-links-enabled",
@@ -68,6 +70,11 @@ class DashboardSurfaceTests(unittest.TestCase):
             "group-analysis-retention",
             "group-analysis-session",
             "group-analysis-reports",
+            "expression-learning-enabled",
+            "expression-learning-interval",
+            "expression-learning-lookback",
+            "expression-learning-min",
+            "expression-learning-max-inject",
             "style-max-reply",
             "style-direct-max-reply",
             "typing-min-length",
@@ -139,6 +146,13 @@ class DashboardSurfaceTests(unittest.TestCase):
         self.assertIn("/api/group-analysis/run", self.dashboard_source)
         self.assertIn("runGroupAnalysis", self.html)
         self.assertNotIn("/群分析 [天数]", self.html)
+
+    def test_expression_patterns_can_be_learned_viewed_and_deleted(self):
+        self.assertIn("/api/expression-patterns/extract", self.dashboard_source)
+        self.assertIn("/api/memories/{memory_id}", self.dashboard_source)
+        self.assertIn('value="expressions"', self.html)
+        self.assertIn("expression_pattern", self.html)
+        self.assertIn("extractExpressionPatterns", self.html)
 
     def test_session_messages_are_html_escaped(self):
         self.assertIn("escapeHtml(m.sender)", self.html)

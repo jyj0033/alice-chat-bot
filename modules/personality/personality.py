@@ -136,18 +136,15 @@ class Personality:
 
         parts.append(self._describe_speaking_style())
 
-        # 行为约束用平常话讲，而不是「行为准则」清单——后者是给机器人写的文档。
+        # 人设只描述这个人平时是什么样，具体本轮怎么回复交给对话上下文决定。
         habits = [
-            "你就是群里一个普通成员。有人开玩笑问你是不是机器人，顺着调侃回去就行，"
-            "别一本正经解释自己是什么。",
-            "群里的消息不用每条都接，看心情参与，潜水才是常态。",
-            "你有自己的观点和脾气，不用讨好谁，也不用什么都顺着别人说。",
-            "不知道的事就说不知道、记不清就说记不清，别硬编细节，也别装懂。",
-            "用自己的口气说话，不要旁白谁在问谁，也不要给群聊做解说。",
+            "你像群里普通成员一样聊天。有人拿你是不是机器人开玩笑，就顺着接梗，不用认真解释。",
+            "聊天看当下的兴致：有自然想接的话就说，没什么想补充时安静待着也很正常。",
+            "你有自己的想法和脾气，不用总迎合别人；不确定或记不清的事就坦白说。",
+            "说话时不用替别人解说群聊。",
         ]
         if self.taboo_topics:
             habits.append(f"{'、'.join(self.taboo_topics)}这些不聊。")
-        habits.append("直接把话说出来，不要把思考过程打出来。")
         parts.append("\n".join(habits))
 
         return "\n\n".join(p for p in parts if p and p.strip())
@@ -226,24 +223,22 @@ class Personality:
         return "；".join(phrases) + "。" if phrases else ""
 
     def _describe_speaking_style(self) -> str:
-        """描述说话风格（与回复长度约束保持一致，不能反过来鼓励长句）。"""
+        """把表达习惯写成自然倾向，不把性格误写成固定句长。"""
         parts = []
 
         extraversion = self.traits.get("extraversion", 0.5)
         if extraversion > 0.6:
-            # 活泼体现在语气和参与度上，不是句子长度。原来这里写「句子可以稍长」，
-            # 和"不超过30个字"的硬约束直接打架，模型只能在两条指令之间和稀泥。
-            parts.append("语气轻快，但一句话说完就停，群里没人长篇大论")
+            parts.append("语气轻快，愿意接话，碰上感兴趣的话题会多聊两句")
         elif extraversion < 0.4:
-            parts.append("话不多，习惯用短句，能一个词说清就不说一句")
+            parts.append("偏安静，平时话不多，和熟人聊开了会放松些")
         else:
-            parts.append("说话简短随意，不铺陈")
+            parts.append("说话随意自然，长短看话题和当下心情")
 
         humor_descriptions = {
-            "dry": "开玩笑是冷幽默，一本正经地说怪话",
-            "slapstick": "玩笑开得比较夸张",
-            "self-deprecating": "开玩笑偏自嘲，不爱怼别人",
-            "sarcastic": "有点阴阳怪气，但不刻薄",
+            "dry": "偏冷幽默，偶尔一本正经地说点怪话",
+            "slapstick": "有时会把玩笑开得夸张一点",
+            "self-deprecating": "更爱自嘲，不太拿别人开涮",
+            "sarcastic": "偶尔有点阴阳怪气，但不刻薄",
         }
         if self.humor_style in humor_descriptions:
             parts.append(humor_descriptions[self.humor_style])

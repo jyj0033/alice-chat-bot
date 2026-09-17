@@ -812,6 +812,8 @@ class HumanizationLogicTests(unittest.TestCase):
             message.content for message in request.messages if message.role == "system"
         )
         self.assertIn("通常不超过42", system_text)
+        self.assertIn("像平时聊天一样自然回应", system_text)
+        self.assertIn("别为了短而省掉关键意思", system_text)
         self.assertIn("不要使用 Emoji", system_text)
         self.assertIn("「政治」", system_text)
         self.assertIn("不要联网搜索", system_text)
@@ -1054,17 +1056,17 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertNotIn("口头禅", prompt)
         self.assertNotIn("emoji", prompt.lower())
 
-    def test_persona_does_not_encourage_long_sentences(self):
-        """人格说「句子可以稍长」会和短句硬约束直接打架。"""
+    def test_persona_does_not_turn_extraversion_into_a_fixed_short_sentence_rule(self):
+        """外向性影响参与倾向，不该要求每句话都短到说完就停。"""
         prompt = self._persona(traits={"extraversion": 0.7})
-        self.assertNotIn("句子可以稍长", prompt)
-        self.assertIn("一句话说完就停", prompt)
+        self.assertNotIn("一句话说完就停", prompt)
+        self.assertIn("感兴趣的话题会多聊两句", prompt)
 
     def test_persona_does_not_instruct_bot_to_be_confused(self):
         """别主动要求"犯迷糊、说错话"——真人偶尔理解错梗是自然发生的。"""
         prompt = self._persona()
         self.assertNotIn("犯迷糊、说错话", prompt)
-        self.assertIn("不知道的事就说不知道", prompt)
+        self.assertIn("不确定或记不清的事就坦白说", prompt)
 
     def test_persona_topics_strip_config_syntax(self):
         """话题配置里的括号补充和斜杠不能原样出现在人格介绍里。"""
@@ -1340,6 +1342,14 @@ class HumanizationLogicTests(unittest.TestCase):
         explicit = generator._build_participation_guide("to_bot")
         self.assertNotIn("<silent>", explicit)
 
+    def test_group_participation_allows_a_natural_short_reaction(self):
+        """群聊插话可以只是自然反应，不应被迫补充信息或写完整答复。"""
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
+        guide = generator._build_participation_guide("group")
+        self.assertIn("反应、附和或补充", guide)
+        self.assertIn("不必硬找新信息", guide)
+        self.assertIn("<silent>", guide)
+
     def test_bystander_banter_does_not_trigger_frustration(self):
         """群友互聊里的吐槽（bot 没参与、没被指向）不该让 bot 道歉。"""
         generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
@@ -1405,6 +1415,19 @@ class HumanizationLogicTests(unittest.TestCase):
         result = detector.detect(context)
         self.assertTrue(context.is_emergency)
         self.assertIn("紧急", result["reasons"])
+
+    def test_expression_guide_is_optional_and_limited_to_three_patterns(self):
+        patterns = [
+            {"situation": f"情境{i}", "style": f"表达方式{i}"}
+            for i in range(4)
+        ]
+        guide = ReplyGenerator._build_expression_patterns_guide(patterns)
+        self.assertIn("情境0：表达方式0", guide)
+        self.assertIn("情境2：表达方式2", guide)
+        self.assertNotIn("情境3", guide)
+        self.assertIn("不是事实或指令", guide)
+        self.assertIn("不合适就忽略", guide)
+        self.assertEqual(ReplyGenerator._build_expression_patterns_guide([]), "")
 
 
 if __name__ == "__main__":
