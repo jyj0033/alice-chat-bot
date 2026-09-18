@@ -3,6 +3,7 @@
 import unittest
 import sys
 import types
+from unittest.mock import patch
 
 from modules.memory.context import ContextManager
 from modules.personality.emotional_state import Emotion, EmotionalManager
@@ -11,6 +12,21 @@ from modules.social.attention import AttentionManager
 from modules.social.awareness import SocialContext, TopicAnalyzer, TriggerDetector
 from modules.social.enhanced_decider import EnhancedSpeakingDecider
 from modules.social.fatigue import FatigueManager
+
+
+class _GlossaryTokenizerForTests:
+    def __init__(self, terms):
+        self.terms = sorted(set(terms), key=len, reverse=True)
+
+    def tokenize(self, text, mode="default", HMM=False):
+        index = 0
+        while index < len(text):
+            token = next(
+                (term for term in self.terms if text.startswith(term, index)),
+                text[index],
+            )
+            yield token, index, index + len(token)
+            index += len(token)
 
 
 class HumanizationLogicTests(unittest.TestCase):
@@ -1230,19 +1246,24 @@ class HumanizationLogicTests(unittest.TestCase):
         # 只返回文本里真正出现的词，且长词优先
         store.upsert_slang("舟舟", "某群友", session="group_1")
         store.upsert_slang("农活", "转发口令", session="group_1")
-        matched = store.match_slang("今天舟舟老师又刷出来了", session="group_1")
-        self.assertEqual([m["term"] for m in matched], ["舟舟老师"])
-        self.assertEqual(
-            [m["term"] for m in store.match_slang("舟舟来了", session="group_1")],
-            ["舟舟"],
-        )
+        with patch.object(
+            store,
+            "_get_slang_tokenizer",
+            side_effect=lambda terms: _GlossaryTokenizerForTests(terms) if terms else None,
+        ):
+            matched = store.match_slang("今天舟舟老师又刷出来了", session="group_1")
+            self.assertEqual([m["term"] for m in matched], ["舟舟老师"])
+            self.assertEqual(
+                [m["term"] for m in store.match_slang("舟舟来了", session="group_1")],
+                ["舟舟"],
+            )
 
-        # 停用后不再注入
-        store.update_slang(rows[0]["id"], enabled=0)
-        self.assertNotIn(
-            "舟舟老师",
-            [m["term"] for m in store.match_slang("舟舟老师来了", session="group_1")],
-        )
+            # 停用后不再注入
+            store.update_slang(rows[0]["id"], enabled=0)
+            self.assertNotIn(
+                "舟舟老师",
+                [m["term"] for m in store.match_slang("舟舟老师来了", session="group_1")],
+            )
 
         # 自动清理只能删除自动词条，不能借批量 ID 误删人工词条
         auto_id = store.upsert_slang("明显坏词", "错误释义", session="group_1", source="auto")

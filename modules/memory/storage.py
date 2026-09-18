@@ -100,6 +100,11 @@ class Memory:
 class MemoryStorage:
     """记忆存储"""
 
+    _SLANG_TOKENIZER_CACHE = OrderedDict()
+    _SLANG_TOKENIZER_CACHE_LOCK = threading.Lock()
+    _SLANG_JIEBA_MODULE = None
+    _SLANG_TOKENIZER_CACHE_MAX = 8
+
     def __init__(self, db_path: str = "data/memory.db", share_across_sessions: bool = False):
         self.db_path = db_path
         self.share_across_sessions = bool(share_across_sessions)
@@ -185,6 +190,7 @@ class MemoryStorage:
                 example TEXT DEFAULT '',
                 enabled INTEGER DEFAULT 1,
                 source TEXT DEFAULT 'auto',
+                match_mode TEXT NOT NULL DEFAULT 'auto',
                 hit_count INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -200,6 +206,10 @@ class MemoryStorage:
             )
         if "last_seen_at" not in glossary_cols:
             self.conn.execute("ALTER TABLE glossary ADD COLUMN last_seen_at TEXT DEFAULT ''")
+        if "match_mode" not in glossary_cols:
+            self.conn.execute(
+                "ALTER TABLE glossary ADD COLUMN match_mode TEXT NOT NULL DEFAULT 'auto'"
+            )
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_glossary_session
             ON glossary(session, enabled)
@@ -274,6 +284,68 @@ class MemoryStorage:
     @staticmethod
     def _normalize_alias_key(value: str) -> str:
         return " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).casefold()
+
+    @staticmethod
+    def _contains_han(value: str) -> bool:
+        return any(
+            0x3400 <= ord(char) <= 0x4DBF
+            or 0x4E00 <= ord(char) <= 0x9FFF
+            or 0xF900 <= ord(char) <= 0xFAFF
+            or 0x20000 <= ord(char) <= 0x2FA1F
+            for char in value
+        )
+
+    @staticmethod
+    def _is_single_han_term(value: str) -> bool:
+        return len(value) == 1 and MemoryStorage._contains_han(value)
+
+    @staticmethod
+    def _normalize_slang_match_mode(value: str) -> str:
+        mode = str(value or "auto").strip().lower()
+        if mode not in {"auto", "exact", "standalone"}:
+            raise ValueError("匹配方式必须是 auto、exact 或 standalone")
+        return mode
+
+    @classmethod
+    def _get_slang_tokenizer(cls, terms: list[str]):
+        """Return a cached jieba tokenizer with the active glossary terms added."""
+        term_key = tuple(sorted({term for term in terms if term}))
+        if not term_key:
+            return None
+        with cls._SLANG_TOKENIZER_CACHE_LOCK:
+            if cls._SLANG_JIEBA_MODULE is None:
+                try:
+                    import jieba
+                    jieba.setLogLevel(logging.WARNING)
+                    cls._SLANG_JIEBA_MODULE = jieba
+                except ImportError:
+                    cls._SLANG_JIEBA_MODULE = False
+                    logger.warning("jieba 未安装，中文黑话自动匹配将关闭")
+            jieba_module = cls._SLANG_JIEBA_MODULE
+            if not jieba_module:
+                return None
+
+            cached = cls._SLANG_TOKENIZER_CACHE.get(term_key)
+            if cached is not None:
+                cls._SLANG_TOKENIZER_CACHE.move_to_end(term_key)
+                return cached
+
+            try:
+                tokenizer = jieba_module.Tokenizer()
+                tokenizer.initialize()
+                for term in sorted(term_key, key=len, reverse=True):
+                    # A high, length-scaled frequency makes an explicitly curated
+                    # glossary phrase win over a segmentation into shorter words.
+                    tokenizer.add_word(term, freq=1_000_000 * max(1, len(term)))
+            except Exception as exc:
+                logger.warning("创建黑话分词器失败，中文自动匹配将关闭：%s", exc)
+                return None
+
+            cls._SLANG_TOKENIZER_CACHE[term_key] = tokenizer
+            cls._SLANG_TOKENIZER_CACHE.move_to_end(term_key)
+            while len(cls._SLANG_TOKENIZER_CACHE) > cls._SLANG_TOKENIZER_CACHE_MAX:
+                cls._SLANG_TOKENIZER_CACHE.popitem(last=False)
+            return tokenizer
 
     @staticmethod
     def _explicit_qq_ids(meaning: str, example: str = "") -> set[str]:
@@ -370,6 +442,7 @@ class MemoryStorage:
         session: str = "",
         example: str = "",
         source: str = "auto",
+        match_mode: str = "auto",
     ) -> int:
         """新增或更新一条黑话。
 
@@ -378,6 +451,7 @@ class MemoryStorage:
         """
         term = (term or "").strip()
         meaning = (meaning or "").strip()
+        match_mode = self._normalize_slang_match_mode(match_mode)
         if not term or not meaning:
             return 0
         alias_key = self._normalize_alias_key(term)
@@ -396,15 +470,16 @@ class MemoryStorage:
                 return row["id"]
             self.conn.execute(
                 "UPDATE glossary SET meaning = ?, example = COALESCE(NULLIF(?, ''), example),"
-                " source = ?, updated_at = ? WHERE id = ?",
-                (meaning, example, source, now, row["id"]),
+                " source = ?, match_mode = ?, updated_at = ? WHERE id = ?",
+                (meaning, example, source, match_mode, now, row["id"]),
             )
             self.conn.commit()
             return row["id"]
         cursor = self.conn.execute(
-            "INSERT INTO glossary (term, meaning, session, example, source, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (term, meaning, session, example, source, now, now),
+            "INSERT INTO glossary "
+            "(term, meaning, session, example, source, match_mode, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (term, meaning, session, example, source, match_mode, now, now),
         )
         self.conn.commit()
         return cursor.lastrowid
@@ -429,7 +504,7 @@ class MemoryStorage:
     @_db_locked
     def update_slang(self, slang_id: int, **fields) -> bool:
         """更新单条黑话；人工编辑内容后将词条标记为 manual。"""
-        allowed = {"term", "meaning", "example", "enabled"}
+        allowed = {"term", "meaning", "example", "enabled", "match_mode"}
         current = self.conn.execute(
             "SELECT term FROM glossary WHERE id = ?", (slang_id,)
         ).fetchone()
@@ -439,8 +514,12 @@ class MemoryStorage:
         content_edited = False
         for key, value in fields.items():
             if key in allowed and value is not None:
+                if key == "match_mode":
+                    value = self._normalize_slang_match_mode(value)
                 sets.append(f"{key} = ?")
-                params.append(int(value) if key == "enabled" else str(value).strip())
+                params.append(
+                    int(value) if key == "enabled" else str(value).strip()
+                )
                 if key != "enabled":
                     content_edited = True
         if not sets:
@@ -529,18 +608,56 @@ class MemoryStorage:
             row for row in rows
             if row.get("session") or self._normalize_alias_key(row["term"]) not in local_keys
         ]
+        token_terms = {
+            self._normalize_alias_key(row["term"])
+            for row in rows
+            if self._normalize_slang_match_mode(row.get("match_mode", "auto")) == "auto"
+            and self._contains_han(self._normalize_alias_key(row["term"]))
+            and not self._is_single_han_term(self._normalize_alias_key(row["term"]))
+            and " " not in self._normalize_alias_key(row["term"])
+        }
+        tokenizer = self._get_slang_tokenizer(sorted(token_terms))
+        token_spans = {}
+        if tokenizer is not None:
+            try:
+                for token, start, end in tokenizer.tokenize(
+                    normalized_text, mode="default", HMM=False
+                ):
+                    token_spans.setdefault(token.casefold(), []).append((start, end))
+            except Exception as exc:
+                # No substring fallback: a tokenizer failure must not reintroduce
+                # the false positives this matching mode is designed to prevent.
+                logger.warning("中文黑话分词失败，本条消息跳过中文自动匹配：%s", exc)
+                token_spans = {}
+
         candidates = []
         for row in rows:
             term_key = self._normalize_alias_key(row["term"])
             if not term_key:
                 continue
-            pattern_text = re.escape(term_key)
-            if re.search(r"[a-z0-9]", term_key):
-                if re.match(r"[a-z0-9]", term_key):
-                    pattern_text = r"(?<![a-z0-9])" + pattern_text
-                if re.search(r"[a-z0-9]$", term_key):
-                    pattern_text += r"(?![a-z0-9])"
-            spans = [match.span() for match in re.finditer(pattern_text, normalized_text)]
+            match_mode = self._normalize_slang_match_mode(row.get("match_mode", "auto"))
+            if match_mode == "exact":
+                spans = [(0, len(normalized_text))] if normalized_text == term_key else []
+            elif match_mode == "standalone":
+                pattern_text = r"(?<!\w)" + re.escape(term_key) + r"(?!\w)"
+                spans = [match.span() for match in re.finditer(pattern_text, normalized_text)]
+            elif self._contains_han(term_key):
+                if self._is_single_han_term(term_key):
+                    spans = []
+                elif " " in term_key:
+                    # Explicit multi-part phrases use punctuation/space boundaries.
+                    pattern_text = r"(?<!\w)" + re.escape(term_key) + r"(?!\w)"
+                    spans = [match.span() for match in re.finditer(pattern_text, normalized_text)]
+                else:
+                    spans = token_spans.get(term_key, [])
+            else:
+                pattern_text = re.escape(term_key)
+                if re.search(r"[a-z0-9]", term_key):
+                    if re.match(r"[a-z0-9]", term_key):
+                        pattern_text = r"(?<![a-z0-9])" + pattern_text
+                    if re.search(r"[a-z0-9]$", term_key):
+                        pattern_text += r"(?![a-z0-9])"
+                spans = [match.span() for match in re.finditer(pattern_text, normalized_text)]
             if spans:
                 candidates.append((len(term_key), row, spans))
 
@@ -2782,9 +2899,10 @@ class AsyncMemoryStorage:
     # === 群聊黑话（异步包装） ===
 
     async def upsert_slang(self, term: str, meaning: str, session: str = "",
-                           example: str = "", source: str = "auto") -> int:
+                           example: str = "", source: str = "auto",
+                           match_mode: str = "auto") -> int:
         return await asyncio.to_thread(
-            self._storage.upsert_slang, term, meaning, session, example, source
+            self._storage.upsert_slang, term, meaning, session, example, source, match_mode
         )
 
     async def list_slang(self, session: str = "", enabled_only: bool = False) -> list:

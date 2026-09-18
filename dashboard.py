@@ -990,6 +990,7 @@ async def create_slang(request: Request):
             session=(data.get("session") or "").strip(),
             example=(data.get("example") or "").strip(),
             source="manual",
+            match_mode=data.get("match_mode", "auto"),
         )
         return {"success": bool(slang_id), "id": slang_id}
     except Exception as e:
@@ -1010,6 +1011,7 @@ async def edit_slang(slang_id: int, request: Request):
             meaning=data.get("meaning"),
             example=data.get("example"),
             enabled=data.get("enabled"),
+            match_mode=data.get("match_mode"),
         )
         return {"success": ok}
     except Exception as e:

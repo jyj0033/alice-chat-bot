@@ -791,7 +791,7 @@
         .mbti-low { opacity: .5; }
         /* ============ 群聊黑话 ============ */
         .slang-add { display: flex; gap: 10px; padding: 16px 20px; flex-wrap: wrap; }
-        .slang-add input { flex: 1; min-width: 160px; }
+        .slang-add input, .slang-add select { flex: 1; min-width: 160px; }
         .slang-row {
             display: flex; align-items: center; gap: 12px;
             padding: 12px 20px; border-bottom: 1px solid var(--border);
@@ -821,9 +821,10 @@
             padding: 2px 8px; border-radius: 999px; font-size: 10.5px;
             background: #f1f5f9; color: #475569; font-family: var(--font-mono);
         }
-        .slang-row input {
+        .slang-row input, .slang-row select {
             font-size: 13px; padding: 6px 10px;
         }
+        .slang-row select { min-width: 190px; max-width: 250px; }
         .person-alias-row {
             display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
             padding: 11px 20px; border-bottom: 1px solid var(--border);
@@ -2380,7 +2381,15 @@
                         <input type="text" id="slang-term" placeholder="黑话（如 舟舟老师）" maxlength="20">
                         <input type="text" id="slang-meaning" placeholder="在这个群里实际指什么" maxlength="120">
                         <input type="text" id="slang-session" placeholder="限定会话（留空=全部群）" maxlength="40">
+                        <select id="slang-match-mode" aria-label="匹配方式" title="选择词条如何匹配">
+                            <option value="auto">自动（中文分词）</option>
+                            <option value="exact">整句精确</option>
+                            <option value="standalone">独立词</option>
+                        </select>
                         <button class="btn btn-primary" onclick="addSlang()">添加</button>
+                    </div>
+                    <div class="hint" style="padding: 0 20px 14px">
+                        自动：中文按分词完整命中，单字中文不自动触发；英文按单词边界匹配。整句精确：整条消息必须等于词条。独立词：两侧需为空或标点、空白，不能紧贴中英文、数字或下划线。
                     </div>
                 </div>
 
@@ -4144,8 +4153,10 @@
             }
             list.innerHTML = rows.map(r => {
                 const scope = r.session ? escapeHtml(r.session.replace('group_', '群 ')) : '全部群';
+                const matchMode = ['auto', 'exact', 'standalone'].includes(r.match_mode) ? r.match_mode : 'auto';
+                const matchModeLabel = { auto: '自动', exact: '整句精确', standalone: '独立词' }[matchMode];
                 return `
-                <div class="slang-row ${r.enabled ? '' : 'off'}" data-id="${r.id}">
+                <div class="slang-row ${r.enabled ? '' : 'off'}" data-id="${r.id}" data-match-mode="${matchMode}">
                     <div class="slang-term">${escapeHtml(r.term)}</div>
                     <div class="slang-meaning">${escapeHtml(r.meaning)}</div>
                     <div class="slang-example" title="${escapeHtml(r.example || '')}">${escapeHtml(r.example || '')}</div>
@@ -4153,6 +4164,7 @@
                         <span class="${r.source === 'manual' ? 'badge-manual' : 'badge-auto'}">${r.source === 'manual' ? '人工' : '自动'}</span>
                         <span class="badge-hits" title="出现过该词的消息数">出现 ${r.occurrence_count || 0} 条消息</span>
                         <span class="badge-hits" title="被注入回复提示的次数">注入 ${r.prompt_inject_count || r.hit_count || 0}</span>
+                        <span class="badge-hits" title="词条匹配规则">匹配 ${matchModeLabel}</span>
                         <span class="hint" style="font-size:11px">${scope}</span>
                     </div>
                     <div class="slang-acts">
@@ -4168,15 +4180,17 @@
             const term = document.getElementById('slang-term').value.trim();
             const meaning = document.getElementById('slang-meaning').value.trim();
             const session = document.getElementById('slang-session').value.trim();
+            const match_mode = document.getElementById('slang-match-mode').value;
             if (!term || !meaning) { showToast('词和含义都要填', 'error'); return; }
             const res = await fetch(API + '/slang', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ term, meaning, session })
+                body: JSON.stringify({ term, meaning, session, match_mode })
             }).then(r => r.json());
             if (res.success) {
                 showToast('已添加', 'success');
                 document.getElementById('slang-term').value = '';
                 document.getElementById('slang-meaning').value = '';
+                document.getElementById('slang-match-mode').value = 'auto';
                 loadSlang();
             } else showToast('添加失败：' + (res.error || ''), 'error');
         }
@@ -4187,8 +4201,16 @@
             row.dataset.editing = '1';
             const term = row.querySelector('.slang-term').textContent;
             const meaning = row.querySelector('.slang-meaning').textContent;
+            const matchMode = ['auto', 'exact', 'standalone'].includes(row.dataset.matchMode)
+                ? row.dataset.matchMode : 'auto';
             row.querySelector('.slang-term').innerHTML = `<input type="text" value="${escapeHtml(term)}" style="width:100%">`;
             row.querySelector('.slang-meaning').innerHTML = `<input type="text" value="${escapeHtml(meaning)}" style="width:100%">`;
+            row.querySelector('.slang-tags').innerHTML =
+                `<select class="slang-match-mode-select" aria-label="匹配方式">
+                    <option value="auto" ${matchMode === 'auto' ? 'selected' : ''}>自动（中文分词）</option>
+                    <option value="exact" ${matchMode === 'exact' ? 'selected' : ''}>整句精确</option>
+                    <option value="standalone" ${matchMode === 'standalone' ? 'selected' : ''}>独立词</option>
+                </select>`;
             row.querySelector('.slang-acts').innerHTML =
                 `<button class="btn btn-primary btn-sm" onclick="saveSlangRow(${id})">保存</button>
                  <button class="btn btn-secondary btn-sm" onclick="loadSlang()">取消</button>`;
@@ -4198,10 +4220,11 @@
             const row = document.querySelector(`.slang-row[data-id="${id}"]`);
             const term = row.querySelector('.slang-term input').value.trim();
             const meaning = row.querySelector('.slang-meaning input').value.trim();
+            const match_mode = row.querySelector('.slang-match-mode-select').value;
             if (!term || !meaning) { showToast('词和含义都要填', 'error'); return; }
             const res = await fetch(API + '/slang/' + id, {
                 method: 'PUT', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ term, meaning })
+                body: JSON.stringify({ term, meaning, match_mode })
             }).then(r => r.json());
             showToast(res.success ? '已保存' : '保存失败', res.success ? 'success' : 'error');
             loadSlang();
