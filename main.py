@@ -2432,10 +2432,18 @@ class GroupChatBot:
                     getattr(self, "long_term_memory_enabled", True)
                     and self._slang_config.get("enabled", True)
                 ):
+                    target_ids = self._profile_target_ids(effective_message)
+                    matched_aliases = (
+                        await self.memory_storage.match_person_aliases(target_ids)
+                        if target_ids else []
+                    )
                     glossary = await self.memory_storage.match_slang(
                         generation_message,
                         session=session_id,
                         limit=self._slang_config.get("max_inject", 8),
+                        exclude_terms=[
+                            alias.get("alias", "") for alias in matched_aliases
+                        ],
                     )
                     if glossary:
                         await self.memory_storage.bump_slang_hits(
@@ -2445,11 +2453,7 @@ class GroupChatBot:
                             "[黑话] 本轮注入 %d 条：%s",
                             len(glossary), "、".join(g["term"] for g in glossary),
                         )
-                    target_ids = self._profile_target_ids(effective_message)
-                    if target_ids:
-                        matched_aliases = await self.memory_storage.match_person_aliases(
-                            target_ids
-                        )
+                    if matched_aliases:
                         sender_id = str(effective_message.sender_id or "")
                         reply_to_qq = str(effective_message.reply_to_qq or "")
                         mentioned_ids = {

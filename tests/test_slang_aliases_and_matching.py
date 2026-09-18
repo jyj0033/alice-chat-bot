@@ -30,15 +30,23 @@ class SlangAliasesAndMatchingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "已绑定其他 QQ 号"):
             self.store.upsert_person_alias("猫姐", "987654321")
 
-    def test_person_alias_disables_same_named_group_slang(self):
+    def test_person_alias_preserves_same_named_unmapped_group_slang(self):
         slang_id = self.store.upsert_slang(
             "猫姐", "群级文本释义", session="group_1", source="manual"
         )
         self.store.upsert_person_alias("猫姐", "123456789")
         rows = self.store.list_slang(session="group_1", enabled_only=True)
-        self.assertNotIn(slang_id, [row["id"] for row in rows])
-        self.assertFalse(self.store.update_slang(slang_id, enabled=1))
-        self.assertEqual(self.store.match_slang("猫姐来了", "group_1"), [])
+        self.assertIn(slang_id, [row["id"] for row in rows])
+        self.assertEqual(
+            [row["id"] for row in self.store.match_slang("猫姐来了", "group_1")],
+            [slang_id],
+        )
+        self.assertEqual(
+            self.store.match_slang(
+                "猫姐来了", "group_1", exclude_terms=["猫姐"]
+            ),
+            [],
+        )
         self.assertEqual(
             self.store.upsert_slang("猫姐", "自动重新提取", session="group_2"), 0
         )
@@ -109,6 +117,7 @@ class SlangAliasesAndMatchingTests(unittest.TestCase):
             "INSERT INTO glossary (term, meaning, session, source) VALUES (?, ?, ?, 'manual')",
             [
                 ("水母", "QQ号：123456789", "group_1"),
+                ("水母", "同名但未映射的群级用法", "group_2"),
                 ("数字词", "版本 123456789", "group_1"),
                 ("冲突称呼", "QQ 123456789", "group_1"),
                 ("冲突称呼", "QQ 987654321", "group_2"),
@@ -126,6 +135,12 @@ class SlangAliasesAndMatchingTests(unittest.TestCase):
             )
             self.assertEqual(
                 len(legacy_store.list_slang(session="group_1", enabled_only=True)), 2
+            )
+            self.assertEqual(
+                [row["term"] for row in legacy_store.list_slang(
+                    session="group_2", enabled_only=True
+                )].count("水母"),
+                1,
             )
             alias_id = aliases[0]["id"]
             self.assertTrue(legacy_store.delete_person_alias(alias_id))

@@ -275,39 +275,67 @@ class MemoryStorage:
     def _normalize_alias_key(value: str) -> str:
         return " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).casefold()
 
+    @staticmethod
+    def _explicit_qq_ids(meaning: str, example: str = "") -> set[str]:
+        return set(re.findall(
+            r"(?i)\bQQ(?:\s*(?:号|号码|ID))?\s*[:：#]?\s*([0-9]{5,20})\b",
+            f"{meaning or ''} {example or ''}",
+        ))
+
+    @_db_locked
+    def _disable_explicit_alias_glossary_row(
+        self, row: dict, alias_key: str, qq_id: str, now: str
+    ) -> None:
+        """Only retire a glossary row that itself explicitly names the same QQ ID."""
+        self.conn.execute(
+            "UPDATE glossary SET enabled = 0, updated_at = ? WHERE id = ?",
+            (now, row["id"]),
+        )
+        if row["source"] == "manual":
+            self.conn.execute(
+                "INSERT OR IGNORE INTO person_alias_migrations "
+                "(glossary_id, alias_key, qq_id, migrated_at) VALUES (?, ?, ?, ?)",
+                (row["id"], alias_key, qq_id, now),
+            )
+
     @_db_locked
     def _migrate_explicit_qq_aliases(self) -> int:
         """迁移释义中明确写有唯一 QQ 号的人工称呼；不从昵称或群名推断身份。"""
-        rows = self.conn.execute(
-            "SELECT id, term, meaning, example, source FROM glossary "
-            "WHERE source = 'manual' AND id NOT IN "
-            "(SELECT glossary_id FROM person_alias_migrations)"
+        all_rows = self.conn.execute(
+            "SELECT id, term, meaning, example, source FROM glossary"
         ).fetchall()
+        migrated_ids = {
+            row[0] for row in self.conn.execute(
+                "SELECT glossary_id FROM person_alias_migrations"
+            ).fetchall()
+        }
+        rows = [
+            row for row in all_rows
+            if row["source"] == "manual" and row["id"] not in migrated_ids
+        ]
         references_by_alias: dict[str, set[str]] = {}
         representatives: dict[str, dict] = {}
+        ambiguous_aliases = set()
         for row in rows:
             alias = str(row["term"] or "").strip()
             alias_key = self._normalize_alias_key(alias)
             if not alias_key:
                 continue
-            references = set(
-                re.findall(
-                    r"(?i)\bQQ(?:\s*(?:号|号码|ID))?\s*[:：#]?\s*([0-9]{5,20})\b",
-                    f"{row['meaning'] or ''} {row['example'] or ''}",
-                )
-            )
+            references = self._explicit_qq_ids(row["meaning"], row["example"])
+            if len(references) > 1:
+                ambiguous_aliases.add(alias_key)
+                continue
             if len(references) != 1:
                 continue
             qq_id = next(iter(references))
             references_by_alias.setdefault(alias_key, set()).add(qq_id)
             representatives.setdefault(alias_key, row)
 
-        migrated_keys = set()
         migrated = 0
         now = datetime.now().isoformat(sep=" ")
         for alias_key, references in references_by_alias.items():
             # 同一称呼对应多个 QQ 号时不迁移，留给管理员消歧。
-            if len(references) != 1:
+            if len(references) != 1 or alias_key in ambiguous_aliases:
                 continue
             qq_id = next(iter(references))
             row = representatives[alias_key]
@@ -324,26 +352,13 @@ class MemoryStorage:
                 "VALUES (?, ?, ?, ?, 'legacy_migration', ?, ?)",
                 (alias, alias_key, qq_id, description, now, now),
             )
-            migrated_keys.add(alias_key)
-            migrated += 1
-
-        if migrated_keys:
-            all_rows = self.conn.execute("SELECT id, term FROM glossary").fetchall()
             for row in all_rows:
-                if self._normalize_alias_key(row["term"]) in migrated_keys:
-                    self.conn.execute(
-                        "UPDATE glossary SET enabled = 0, updated_at = ? WHERE id = ?",
-                        (now, row["id"]),
-                    )
-            for row in rows:
-                alias_key = self._normalize_alias_key(row["term"])
-                if alias_key in migrated_keys:
-                    qq_id = next(iter(references_by_alias[alias_key]))
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO person_alias_migrations "
-                        "(glossary_id, alias_key, qq_id, migrated_at) VALUES (?, ?, ?, ?)",
-                        (row["id"], alias_key, qq_id, now),
-                    )
+                if (
+                    self._normalize_alias_key(row["term"]) == alias_key
+                    and self._explicit_qq_ids(row["meaning"], row["example"]) == {qq_id}
+                ):
+                    self._disable_explicit_alias_glossary_row(row, alias_key, qq_id, now)
+                    migrated += 1
         self.conn.commit()
         return migrated
 
@@ -366,7 +381,7 @@ class MemoryStorage:
         if not term or not meaning:
             return 0
         alias_key = self._normalize_alias_key(term)
-        if self.conn.execute(
+        if source == "auto" and self.conn.execute(
             "SELECT 1 FROM person_aliases WHERE alias_key = ? AND enabled = 1",
             (alias_key,),
         ).fetchone():
@@ -419,16 +434,6 @@ class MemoryStorage:
             "SELECT term FROM glossary WHERE id = ?", (slang_id,)
         ).fetchone()
         if not current:
-            return False
-        effective_term = str(fields.get("term") or current["term"] or "").strip()
-        try:
-            requested_enabled = bool(int(fields.get("enabled") or 0))
-        except (TypeError, ValueError):
-            requested_enabled = False
-        if requested_enabled and self.conn.execute(
-            "SELECT 1 FROM person_aliases WHERE alias_key = ? AND enabled = 1",
-            (self._normalize_alias_key(effective_term),),
-        ).fetchone():
             return False
         sets, params = [], []
         content_edited = False
@@ -487,7 +492,13 @@ class MemoryStorage:
         return cursor.rowcount
 
     @_db_locked
-    def match_slang(self, text: str, session: str = "", limit: int = 12) -> list[dict]:
+    def match_slang(
+        self,
+        text: str,
+        session: str = "",
+        limit: int = 12,
+        exclude_terms: list[str] | None = None,
+    ) -> list[dict]:
         """挑出文本里出现过的黑话。
 
         只注入命中的词条，不是把整张词表塞进提示词——词表会越来越大，
@@ -500,11 +511,14 @@ class MemoryStorage:
             return []
 
         rows = self.list_slang(session=session, enabled_only=True)
-        active_alias_keys = {
-            row["alias_key"] for row in self.conn.execute(
-                "SELECT alias_key FROM person_aliases WHERE enabled = 1"
-            ).fetchall()
+        excluded_keys = {
+            self._normalize_alias_key(term) for term in (exclude_terms or [])
         }
+        if excluded_keys:
+            rows = [
+                row for row in rows
+                if self._normalize_alias_key(row["term"]) not in excluded_keys
+            ]
         local_keys = {
             self._normalize_alias_key(row["term"])
             for row in rows
@@ -513,8 +527,7 @@ class MemoryStorage:
         # 群级词条覆盖同名全局词条，避免一个词注入两份互相矛盾的解释。
         rows = [
             row for row in rows
-            if self._normalize_alias_key(row["term"]) not in active_alias_keys
-            and (row.get("session") or self._normalize_alias_key(row["term"]) not in local_keys)
+            if row.get("session") or self._normalize_alias_key(row["term"]) not in local_keys
         ]
         candidates = []
         for row in rows:
@@ -620,13 +633,15 @@ class MemoryStorage:
             )
             alias_id = int(cursor.lastrowid)
 
-        # 旧词表里的同名项停用，避免仍按文本命中、在其他群里带出错误身份。
-        for row in self.conn.execute("SELECT id, term FROM glossary").fetchall():
-            if self._normalize_alias_key(row["term"]) == alias_key:
-                self.conn.execute(
-                    "UPDATE glossary SET enabled = 0, updated_at = ? WHERE id = ?",
-                    (now, row["id"]),
-                )
+        # 只停用自身明确绑定此 QQ 号的旧词条；同名但未绑定/冲突的群级释义保留。
+        for row in self.conn.execute(
+            "SELECT id, term, meaning, example, source FROM glossary"
+        ).fetchall():
+            if (
+                self._normalize_alias_key(row["term"]) == alias_key
+                and self._explicit_qq_ids(row["meaning"], row["example"]) == {qq_id}
+            ):
+                self._disable_explicit_alias_glossary_row(row, alias_key, qq_id, now)
         self.conn.commit()
         return alias_id
 
@@ -685,11 +700,16 @@ class MemoryStorage:
             (alias, alias_key, qq_id, description, enabled, now, int(alias_id)),
         )
         if enabled:
-            for row in self.conn.execute("SELECT id, term FROM glossary").fetchall():
-                if self._normalize_alias_key(row["term"]) == alias_key:
-                    self.conn.execute(
-                        "UPDATE glossary SET enabled = 0, updated_at = ? WHERE id = ?",
-                        (now, row["id"]),
+            for row in self.conn.execute(
+                "SELECT id, term, meaning, example, source FROM glossary"
+            ).fetchall():
+                if (
+                    self._normalize_alias_key(row["term"]) == alias_key
+                    and self._explicit_qq_ids(row["meaning"], row["example"])
+                    == {qq_id}
+                ):
+                    self._disable_explicit_alias_glossary_row(
+                        row, alias_key, qq_id, now
                     )
         self.conn.commit()
         return True
@@ -2781,8 +2801,16 @@ class AsyncMemoryStorage:
     async def delete_auto_slang(self, slang_ids: list[int]) -> int:
         return await asyncio.to_thread(self._storage.delete_auto_slang, slang_ids)
 
-    async def match_slang(self, text: str, session: str = "", limit: int = 12) -> list:
-        return await asyncio.to_thread(self._storage.match_slang, text, session, limit)
+    async def match_slang(
+        self,
+        text: str,
+        session: str = "",
+        limit: int = 12,
+        exclude_terms: list[str] | None = None,
+    ) -> list:
+        return await asyncio.to_thread(
+            self._storage.match_slang, text, session, limit, exclude_terms
+        )
 
     async def bump_slang_hits(self, slang_ids: list) -> int:
         return await asyncio.to_thread(self._storage.bump_slang_hits, slang_ids)

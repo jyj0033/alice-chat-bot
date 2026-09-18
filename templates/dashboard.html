@@ -2344,7 +2344,7 @@
                 <div class="header">
                     <div class="header-text">
                         <h2>群聊黑话</h2>
-                        <div class="subtitle">群里特有的梗、外号和缩写。Bot 回复时只会带上当前对话里出现的词，避免按字面理解错</div>
+                        <div class="subtitle">群内梗和缩写按当前消息匹配；成员称呼按 QQ 号绑定到对应的人</div>
                     </div>
                     <div class="header-status" style="display: flex; align-items: center; gap: 8px;">
                         <span class="hint" id="slang-meta"></span>
@@ -4151,7 +4151,7 @@
                     <div class="slang-example" title="${escapeHtml(r.example || '')}">${escapeHtml(r.example || '')}</div>
                     <div class="slang-tags">
                         <span class="${r.source === 'manual' ? 'badge-manual' : 'badge-auto'}">${r.source === 'manual' ? '人工' : '自动'}</span>
-                        <span class="badge-hits" title="当前消息里出现次数">出现 ${r.occurrence_count || 0}</span>
+                        <span class="badge-hits" title="出现过该词的消息数">出现 ${r.occurrence_count || 0} 条消息</span>
                         <span class="badge-hits" title="被注入回复提示的次数">注入 ${r.prompt_inject_count || r.hit_count || 0}</span>
                         <span class="hint" style="font-size:11px">${scope}</span>
                     </div>
