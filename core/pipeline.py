@@ -1,6 +1,8 @@
-"""
-Pipeline 调度器 - 多阶段消息处理
-参考 AstrBot 的 Pipeline 架构
+"""通用异步 Pipeline 原型。
+
+当前 GroupChatBot 的运行时消息流程没有接入此通用调度器；实际群聊流程在
+``main.py`` 中按快速入库、参与决策和后台回复调度三个阶段编排，以保留
+会话级取消、批处理和过期消息检查。
 """
 import asyncio
 import logging

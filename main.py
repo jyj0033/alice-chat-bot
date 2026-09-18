@@ -3,7 +3,7 @@
 基于 AstrBot 设计的增强版主入口
 """
 import asyncio
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import json
 import logging
 import random
@@ -22,7 +22,6 @@ import yaml
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
 
-from core.event_bus import EventBus, Event, EventType
 from core.adapter.qq_adapter import QQAdapter
 from core.adapter.base import Message
 from core.adapter.rich_media import RichMediaEnricher
@@ -87,6 +86,18 @@ PERSONAL_KEYWORDS = [
 ] + ["记得我", "我叫什么"]
 
 
+@dataclass
+class _MessageFlowState:
+    session_id: str
+    is_reply_to_bot: bool
+    continuing: bool
+    rich_trigger: dict[str, Any]
+    rich_reasons: list[str]
+    rich_directed: bool
+    recent_context_for_judgement: list[Any]
+    message_version: int | None
+
+
 class GroupChatBot:
     """
     爱丽丝 (Alice) - 群聊AI伙伴
@@ -105,7 +116,6 @@ class GroupChatBot:
         self.personality = None
 
         # 核心组件
-        self.event_bus: Optional[EventBus] = None
         self.llm_providers: dict[str, LLMProvider] = {}  # 多 provider 支持
         self.active_provider_id: str = "primary"  # 当前激活的 provider
         self.qq_adapter: Optional[QQAdapter] = None
@@ -196,36 +206,31 @@ class GroupChatBot:
         self._load_config()
         logger.info("✓ 配置已加载")
 
-        # 2. 初始化事件总线
-        self.event_bus = EventBus()
-        self._tasks.append(asyncio.create_task(self.event_bus.start()))
-        logger.info("✓ 事件总线已初始化")
-
-        # 3. 初始化 LLM
+        # 2. 初始化 LLM
         self._init_llm()
         logger.info("✓ 语言模型提供商已初始化")
 
-        # 4. 初始化记忆系统
+        # 3. 初始化记忆系统
         self._init_memory()
         logger.info("✓ 记忆系统已初始化")
 
-        # 4.5 初始化本地表情库；素材不进入普通记忆和 LLM 召回。
+        # 3.5 初始化本地表情库；素材不进入普通记忆和 LLM 召回。
         self._init_meme_manager()
         logger.info("✓ 表情库已初始化")
 
-        # 5. 初始化人格系统
+        # 4. 初始化人格系统
         self._init_personality()
         logger.info("✓ 人格系统已初始化")
 
-        # 6. 初始化社交感知
+        # 5. 初始化社交感知
         self._init_social()
         logger.info("✓ 社交感知系统已初始化")
 
-        # 7. 初始化回复生成
+        # 6. 初始化回复生成
         self._init_reply_generator()
         logger.info("✓ 回复生成器已初始化")
 
-        # 8. 初始化 QQ 适配器
+        # 7. 初始化 QQ 适配器
         self._init_qq_adapter()
         logger.info("✓ QQ 适配器已初始化")
 
@@ -895,12 +900,22 @@ class GroupChatBot:
         logger.info("✓ Web 配置已热更新（正在进行的请求继续使用旧实例）")
 
     async def _handle_message(self, message: Message) -> None:
-        """处理接收到的消息
+        """按顺序编排消息入库、参与决策和后台回复调度。"""
+        state = await self._ingest_message(message)
+        if state is None:
+            return
 
-        拆成两条路径，避免"思考期间看不到新消息"的失真：
-        - 快速路径（立即执行）：状态更新 + 消息写入上下文 + 发言决策，不阻塞接收循环
-        - 慢路径（后台任务）：思考延迟 + 群聊收尾窗口 + LLM 生成 + 发送，期间新消息仍会进入上下文
-        """
+        decision = await self._decide_incoming_message(message, state)
+        if decision is None:
+            return
+
+        self._schedule_reply_task(message, decision)
+
+    async def _ingest_message(
+        self, message: Message
+    ) -> _MessageFlowState | None:
+        """准备消息并立即写入会话上下文，供后续判断和生成使用。"""
+
         session_id = message.session_id
         group_config = (
             self.config.get("groups", {}).get(str(message.group_id), {})
@@ -937,21 +952,6 @@ class GroupChatBot:
             or is_reply_to_bot
         )
         logger.info(f"[{message.group_id or '私聊'}] {message.sender_name}：{message.content[:50]}……")
-
-        # 创建事件
-        event = Event(
-            type=EventType.GROUP_MESSAGE if message.message_type == "group" else EventType.PRIVATE_MESSAGE,
-            data={
-                "message": message,
-                "group_id": message.group_id,
-                "session_id": message.session_id,
-                "sender_id": message.sender_id,
-                "sender_name": message.sender_name,
-            }
-        )
-
-        # 发布事件（入队即可，不等待处理）
-        await self.event_bus.publish(event)
 
         # === 1. 快速路径：状态更新 + 上下文记录（立即执行，bot 实时"看到"消息） ===
         # 私聊天然是对 bot 说；群聊则结合 @、引用/称呼和最近实际回复判断。
@@ -1034,6 +1034,29 @@ class GroupChatBot:
             # 才能继续进入上下文，供收尾窗口观察。
             ingest_lock.release()
 
+        return _MessageFlowState(
+            session_id=session_id,
+            is_reply_to_bot=is_reply_to_bot,
+            continuing=continuing,
+            rich_trigger=rich_trigger,
+            rich_reasons=rich_reasons,
+            rich_directed=rich_directed,
+            recent_context_for_judgement=recent_context_for_judgement,
+            message_version=message_version,
+        )
+
+    async def _decide_incoming_message(
+        self, message: Message, state: _MessageFlowState
+    ) -> dict | None:
+        """等待必要的合并窗口，判断消息目标并生成回复决策。"""
+        session_id = state.session_id
+        is_reply_to_bot = state.is_reply_to_bot
+        continuing = state.continuing
+        rich_trigger = state.rich_trigger
+        rich_reasons = state.rich_reasons
+        rich_directed = state.rich_directed
+        recent_context_for_judgement = state.recent_context_for_judgement
+        message_version = state.message_version
         # 普通群聊做短暂合并，只判断批次里的最新消息；前面的消息已经留在
         # recent_context 中供判断器理解。明确对 bot 的消息和强触发不等待。
         judge = getattr(self, "conversation_judge", None)
@@ -1165,6 +1188,13 @@ class GroupChatBot:
             or is_reply_to_bot
         )
 
+        return decision
+
+    def _schedule_reply_task(
+        self, message: Message, decision: dict
+    ) -> None:
+        """按会话仲裁已有回复任务，再启动新的后台生成任务。"""
+        session_id = message.session_id
         # === 3. 调度回复生成（后台任务，避免阻塞接收循环） ===
         current = self._reply_tasks.get(session_id)
         if current and not current.done():
@@ -5921,10 +5951,6 @@ class GroupChatBot:
         self._digest_tasks.clear()
         self._group_analysis_tasks.clear()
         self._memory_tasks.clear()
-
-        # 停止事件总线
-        if self.event_bus:
-            self.event_bus.stop()
 
         # 断开 QQ 连接
         if self.qq_adapter:
