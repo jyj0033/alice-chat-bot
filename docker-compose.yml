@@ -8,11 +8,13 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
     ports:
-      - "127.0.0.1:30080:30080"
+      - "127.0.0.1:30081:30080"
       - "3001:3001"
     environment:
-      - PYTHONUNBUFFERED=1
-      - TZ=Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Shanghai
+      ALICE_DASHBOARD_USERNAME: ${ALICE_DASHBOARD_USERNAME:-admin}
+      ALICE_DASHBOARD_PASSWORD: ${ALICE_DASHBOARD_PASSWORD:-}
     networks:
       - bot-network
 

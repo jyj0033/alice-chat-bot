@@ -3,11 +3,14 @@
 """
 import asyncio
 import logging
+import os
+import secrets
 from collections import deque
 from pathlib import Path
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import Depends, FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, Response
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import uvicorn
 from core.config_store import load_config as load_config_file, mask_secrets, save_config as save_config_file
 
@@ -16,7 +19,38 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "config" / "config.yaml"
 
-app = FastAPI(title="爱丽丝 - Alice")
+_dashboard_basic_auth = HTTPBasic(auto_error=False)
+
+
+async def require_dashboard_auth(
+    credentials: HTTPBasicCredentials | None = Depends(_dashboard_basic_auth),
+) -> None:
+    username = os.environ.get("ALICE_DASHBOARD_USERNAME", "admin")
+    password = os.environ.get("ALICE_DASHBOARD_PASSWORD", "")
+    if not password:
+        raise HTTPException(status_code=503, detail="Dashboard password is not configured")
+
+    challenge = {"WWW-Authenticate": 'Basic realm="Alice dashboard"'}
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Authentication required", headers=challenge)
+
+    username_ok = secrets.compare_digest(
+        credentials.username.encode("utf-8"), username.encode("utf-8")
+    )
+    password_ok = secrets.compare_digest(
+        credentials.password.encode("utf-8"), password.encode("utf-8")
+    )
+    if not (username_ok and password_ok):
+        raise HTTPException(status_code=401, detail="Invalid credentials", headers=challenge)
+
+
+app = FastAPI(
+    title="爱丽丝 - Alice",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+    dependencies=[Depends(require_dashboard_auth)],
+)
 bot_instance = None
 LOG_BUFFER = deque(maxlen=1000)
 

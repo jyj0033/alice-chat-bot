@@ -38,13 +38,19 @@ cp config/config.example.yaml config/config.yaml
 
 3. 配置 NapCat（OneBot v11）并确保 WebSocket 可访问
 
+4. 为管理面板设置 Basic Auth 凭据，在项目根目录创建未提交的 `.env`：
+```dotenv
+ALICE_DASHBOARD_USERNAME=admin
+ALICE_DASHBOARD_PASSWORD=替换为足够长的随机密码
+```
+
 ### 启动
 
 ```bash
 docker-compose up -d
 ```
 
-访问管理面板：http://localhost:30080
+访问管理面板：本机 Docker 调试使用 `http://localhost:30081`；公网服务器使用 `https://服务器公网IP:30080`，浏览器会提示输入上面的凭据。
 
 ## 项目结构
 

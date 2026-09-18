@@ -31,6 +31,15 @@ speaking:
 
 ### 2. 构建并启动
 
+在项目根目录创建 `.env`，设置管理面板账号和密码：
+
+```dotenv
+ALICE_DASHBOARD_USERNAME=admin
+ALICE_DASHBOARD_PASSWORD=替换为足够长的随机密码
+```
+
+密码未配置时，管理面板会拒绝请求。
+
 ```bash
 # 启动（仅Bot + Dashboard）
 docker-compose up -d
@@ -45,7 +54,31 @@ docker-compose down
 ### 3. 访问 Dashboard
 
 ```
-http://localhost:30080
+https://<服务器公网IP>:30080
+```
+
+浏览器会弹出 Basic Auth 凭据框。公网 Nginx 使用 IP 地址 TLS 证书并代理到 Alice 本机端口；仅在本机 Docker 调试时使用 `http://localhost:30081`。
+
+首次部署公网入口时，先开放 TCP/80 和 TCP/30080，然后安装 IP 证书。Let’s Encrypt 的 IP 证书是 6 天短期证书；acme.sh 每日自动续期，成功后重载 Nginx。
+
+```bash
+sudo mkdir -p /var/www/acme/.well-known/acme-challenge /etc/nginx/ssl/alice-dashboard
+sudo cp deploy/nginx/alice-ip-acme.conf /etc/nginx/sites-available/alice-ip-acme
+sudo ln -s /etc/nginx/sites-available/alice-ip-acme /etc/nginx/sites-enabled/alice-ip-acme
+sudo nginx -t && sudo systemctl reload nginx
+
+# 以 root 安装 acme.sh；然后申请并安装 IP 证书。
+sudo -i
+SERVER_IP=101.43.221.18
+curl -fsSL https://get.acme.sh | sh
+/root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+/root/.acme.sh/acme.sh --issue --server letsencrypt -d "$SERVER_IP" --webroot /var/www/acme --certificate-profile shortlived --days 3
+/root/.acme.sh/acme.sh --install-cert -d "$SERVER_IP" --fullchain-file /etc/nginx/ssl/alice-dashboard/fullchain.pem --key-file /etc/nginx/ssl/alice-dashboard/key.pem --reloadcmd "systemctl reload nginx"
+exit
+
+sudo cp deploy/nginx/alice-dashboard-ip.conf /etc/nginx/sites-available/alice-dashboard-ip
+sudo ln -s /etc/nginx/sites-available/alice-dashboard-ip /etc/nginx/sites-enabled/alice-dashboard-ip
+sudo nginx -t && sudo systemctl reload nginx
 ```
 
 ---
@@ -82,7 +115,8 @@ docker-compose restart bot
 
 | 端口 | 服务 | 说明 |
 |------|------|------|
-| 30080 | Web Dashboard | 浏览器访问 |
+| 30080 | HTTPS Dashboard | Nginx 公网入口 |
+| 30081 | Web Dashboard | 仅本机 Nginx 上游 |
 | 3001 | OneBot WebSocket | NapCat 反向 WebSocket 连接地址 |
 
 NapCat 在另一台机器时，把反向 WebSocket 地址设置为
@@ -93,10 +127,12 @@ NapCat 在另一台机器时，把反向 WebSocket 地址设置为
 ```bash
 # Ubuntu/Debian
 sudo ufw allow 30080
+sudo ufw allow 80
 sudo ufw allow 3001
 
 # CentOS/RHEL
 sudo firewall-cmd --permanent --add-port=30080/tcp
+sudo firewall-cmd --permanent --add-port=80/tcp
 sudo firewall-cmd --permanent --add-port=3001/tcp
 sudo firewall-cmd --reload
 ```
