@@ -1008,6 +1008,7 @@ class GroupChatBot:
                 mentioned_user_ids=message.mentioned_user_ids,
                 directed_to_bot=directed_to_bot,
             )
+            self._record_slang_occurrences_for_message(message, session_id)
             recent_context_for_judgement = self.context_manager.get_window(
                 session_id
             ).get_recent(30)
@@ -2425,13 +2426,14 @@ class GroupChatBot:
 
             # === 命中的群黑话：只注入本轮对话里真正出现的词条 ===
             glossary = []
+            person_aliases = []
             try:
                 if (
                     getattr(self, "long_term_memory_enabled", True)
                     and self._slang_config.get("enabled", True)
                 ):
                     glossary = await self.memory_storage.match_slang(
-                        f"{context_prompt}\n{generation_message}",
+                        generation_message,
                         session=session_id,
                         limit=self._slang_config.get("max_inject", 8),
                     )
@@ -2443,6 +2445,27 @@ class GroupChatBot:
                             "[黑话] 本轮注入 %d 条：%s",
                             len(glossary), "、".join(g["term"] for g in glossary),
                         )
+                    target_ids = self._profile_target_ids(effective_message)
+                    if target_ids:
+                        matched_aliases = await self.memory_storage.match_person_aliases(
+                            target_ids
+                        )
+                        sender_id = str(effective_message.sender_id or "")
+                        reply_to_qq = str(effective_message.reply_to_qq or "")
+                        mentioned_ids = {
+                            str(value) for value in (effective_message.mentioned_user_ids or [])
+                        }
+                        for alias in matched_aliases:
+                            qq_id = str(alias.get("qq_id") or "")
+                            roles = []
+                            if qq_id == sender_id:
+                                roles.append("当前发言者")
+                            if qq_id == reply_to_qq:
+                                roles.append("引用对象")
+                            if qq_id in mentioned_ids:
+                                roles.append("@对象")
+                            alias["roles"] = roles or ["相关成员"]
+                        person_aliases = matched_aliases[:8]
             except Exception as exc:
                 logger.debug("黑话匹配失败：%s", exc)
 
@@ -2501,6 +2524,7 @@ class GroupChatBot:
                     action_plan=action_plan.to_dict() if action_plan else None,
                     session_id=session_id,
                     glossary=glossary,
+                    person_aliases=person_aliases,
                     expression_patterns=expression_patterns,
                     conversation_judgement=conversation_judgement,
                     current_message_context=self._reply_situation_fields(
@@ -2645,6 +2669,7 @@ class GroupChatBot:
                         action_plan=action_plan.to_dict() if action_plan else None,
                         session_id=session_id,
                         glossary=glossary,
+                        person_aliases=person_aliases,
                         expression_patterns=expression_patterns,
                         conversation_judgement=conversation_judgement,
                         current_message_context=self._reply_situation_fields(
@@ -3953,6 +3978,37 @@ class GroupChatBot:
         # 不阻塞消息处理主流程
         self._track_memory_task(_save())
 
+    def _record_slang_occurrences_for_message(
+        self, message: Message, session_id: str
+    ) -> None:
+        """Count glossary mentions from this incoming message, independent of reply generation."""
+        if (
+            not getattr(self, "long_term_memory_enabled", True)
+            or not (getattr(self, "_slang_config", {}) or {}).get("enabled", True)
+            or not getattr(message, "message_id", "")
+            or not str(getattr(message, "content", "") or "").strip()
+        ):
+            return
+        self._track_memory_task(
+            self._record_slang_occurrence_task(
+                str(message.content), session_id, str(message.message_id)
+            )
+        )
+
+    async def _record_slang_occurrence_task(
+        self, content: str, session_id: str, message_id: str
+    ) -> None:
+        try:
+            matches = await self.memory_storage.match_slang(
+                content, session=session_id, limit=0
+            )
+            if matches:
+                await self.memory_storage.record_slang_occurrences(
+                    [row["id"] for row in matches], session_id, message_id
+                )
+        except Exception as exc:
+            logger.debug("记录黑话出现次数失败：%s", exc)
+
     def _track_memory_task(self, coroutine) -> asyncio.Task:
         """创建并跟踪轻量记忆后台任务。"""
         task = asyncio.create_task(coroutine)
@@ -4883,76 +4939,51 @@ class GroupChatBot:
 
     @classmethod
     def _parse_slang_cleanup_ids(cls, content: str, valid_ids) -> list[int]:
-        """解析黑话审核结果，只接受明确标记为删除的词条 ID。"""
+        """只解析完整且符合约定 schema 的 JSON 清理结果；其他内容一律不删除。"""
         import json as _json
-        import re as _re
 
         allowed = set()
         for value in valid_ids or []:
-            try:
+            if isinstance(value, int) and not isinstance(value, bool):
+                allowed.add(value)
+            elif isinstance(value, str) and value.isdecimal():
                 allowed.add(int(value))
-            except (TypeError, ValueError):
-                continue
         if not allowed:
             return []
 
-        text = _re.sub(r"<think>.*?</think>", "", content or "", flags=_re.DOTALL)
-        deleted = set()
+        if not isinstance(content, str) or not content.strip():
+            return []
 
-        def add(value) -> None:
-            try:
-                value = int(value)
-            except (TypeError, ValueError):
-                return
-            if value in allowed:
-                deleted.add(value)
+        def reject_duplicate_keys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON key")
+                result[key] = value
+            return result
 
-        # 兼容模型偶尔返回的 JSON：{"delete_ids": [1, 2]} 或
-        # [{"id": 1, "action": "delete"}]。
-        def collect_json(value) -> None:
-            if isinstance(value, dict):
-                for key in ("delete_ids", "remove_ids", "删除", "移除"):
-                    values = value.get(key)
-                    if isinstance(values, (list, tuple)):
-                        for item in values:
-                            add(item)
-                action = str(
-                    value.get("action") or value.get("status")
-                    or value.get("decision") or ""
-                ).lower()
-                if value.get("id") is not None and any(
-                    word in action for word in ("delete", "remove", "invalid", "删除", "移除")
-                ):
-                    add(value.get("id"))
-                for nested in value.values():
-                    if isinstance(nested, (dict, list, tuple)):
-                        collect_json(nested)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, (dict, list, tuple)):
-                        collect_json(item)
+        try:
+            result = _json.loads(content, object_pairs_hook=reject_duplicate_keys)
+        except (TypeError, ValueError):
+            return []
 
-        for block in _re.findall(r"```(?:json)?\s*(.*?)```", text, flags=_re.I | _re.S):
-            try:
-                collect_json(_json.loads(block.strip()))
-            except (TypeError, ValueError, _json.JSONDecodeError):
-                pass
-
-        # 约定格式：`删除 12 | 原因`。只解析包含删除动作的行，避免把原因里的
-        # 普通数字误当成词条 ID。
-        for line in text.splitlines():
-            if not _re.search(r"删除|移除|清理|delete|remove|invalid|wrong", line, _re.I):
-                continue
-            match = _re.search(
-                r"(?:删除|移除|清理|delete|remove|invalid|wrong)"
-                r"[^0-9]{0,20}(\d+)",
-                line,
-                flags=_re.I,
-            )
-            if match:
-                add(match.group(1))
-
-        return sorted(deleted)
+        # Exact envelope and action prevent free-form, negated, or ambiguous
+        # responses from being interpreted as deletion instructions.
+        if type(result) is not dict or set(result) != {"action", "delete_ids"}:
+            return []
+        action = result["action"]
+        ids = result["delete_ids"]
+        if type(action) is not str or action not in {"delete", "keep"}:
+            return []
+        if type(ids) is not list:
+            return []
+        if action == "keep":
+            return []
+        if not ids or any(type(value) is not int for value in ids):
+            return []
+        if len(set(ids)) != len(ids) or any(value not in allowed for value in ids):
+            return []
+        return sorted(ids)
 
     @classmethod
     def _is_obviously_invalid_slang(cls, row: dict) -> bool:
@@ -4991,7 +5022,11 @@ class GroupChatBot:
             "只有在以下情况明确成立时才删除：词条在记录中没有依据、含义与实际用法明显不符、"
             "它只是普通词/全网通用网络用语/游戏官方名词，或明显是模型臆造。\n"
             "证据不足时保留，不要因为近期没出现就删除；不要修改含义。人工词条不会出现在本批。\n"
-            "只输出需要删除的行，格式严格为：删除 <ID> | 原因。没有需要删除的就输出：无。"
+            "只输出一个 JSON 对象，不要解释、Markdown、代码围栏或其他文字。"
+            '格式只能是 {"action":"delete","delete_ids":[102]} 或 '
+            '{"action":"keep","delete_ids":[]}。\n'
+            "delete_ids 必须是本批待审核词条中的整数 ID；只要没有明确需要删除的词条，"
+            '就输出 {"action":"keep","delete_ids":[]}。不得输出其他字段。'
         )
         entry_text = "\n".join(
             f"ID={row['id']} | 词={row.get('term', '')} | 含义={row.get('meaning', '')}"

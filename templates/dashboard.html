@@ -824,6 +824,16 @@
         .slang-row input {
             font-size: 13px; padding: 6px 10px;
         }
+        .person-alias-row {
+            display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+            padding: 11px 20px; border-bottom: 1px solid var(--border);
+        }
+        .person-alias-row:last-child { border-bottom: none; }
+        .person-alias-row.off { opacity: .5; }
+        .person-alias-name { min-width: 110px; font-weight: 700; }
+        .person-alias-qq { min-width: 120px; font: 12px var(--font-mono); color: var(--text-secondary); }
+        .person-alias-desc { flex: 1; min-width: 160px; color: var(--muted); font-size: 12px; }
+        .person-alias-actions { display: flex; gap: 6px; }
 
         /* ============ 会话聊天 ============ */
         .chat-container {
@@ -2342,6 +2352,24 @@
                         <button class="btn btn-secondary" onclick="cleanupSlang()"><svg class="icon-sm"><use href="#i-trash"/></svg>清理错误</button>
                         <button class="btn btn-secondary" onclick="loadSlang()"><svg class="icon-sm"><use href="#i-refresh"/></svg>刷新</button>
                     </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title"><span class="card-ico"><svg class="icon-sm"><use href="#i-user"/></svg></span>全局称呼映射
+                            <span class="hint" id="person-alias-count" style="margin-left:6px"></span>
+                        </div>
+                    </div>
+                    <div class="hint" style="padding: 0 20px 10px">
+                        按 QQ 号匹配当前发言者、引用对象和 @ 对象；称呼全局唯一，不根据相似昵称猜身份。
+                    </div>
+                    <div class="slang-add">
+                        <input type="text" id="person-alias-name" placeholder="称呼（如 水母）" maxlength="32">
+                        <input type="text" id="person-alias-qq" placeholder="QQ 号" inputmode="numeric" maxlength="20">
+                        <input type="text" id="person-alias-description" placeholder="备注（可选）" maxlength="240">
+                        <button class="btn btn-primary" onclick="addPersonAlias()">添加称呼</button>
+                    </div>
+                    <div id="person-alias-list"><div class="hint" style="padding: 14px">加载中...</div></div>
                 </div>
 
                 <div class="card">
@@ -4020,7 +4048,86 @@
             }
         }
 
+        async function loadPersonAliases() {
+            const list = document.getElementById('person-alias-list');
+            try {
+                const data = await fetch(API + '/person-aliases').then(r => r.json());
+                const rows = data.aliases || [];
+                document.getElementById('person-alias-count').textContent = `共 ${rows.length} 条`;
+                if (!rows.length) {
+                    list.innerHTML = `<div class="hint" style="padding:14px 20px">还没有称呼映射。只有明确绑定 QQ 号后，Alice 才会把该称呼用于对应成员。</div>`;
+                    return;
+                }
+                list.innerHTML = rows.map(r => `
+                    <div class="person-alias-row ${r.enabled ? '' : 'off'}" data-id="${r.id}">
+                        <span class="person-alias-name">${escapeHtml(r.alias)}</span>
+                        <span class="person-alias-qq">QQ ${escapeHtml(r.qq_id)}</span>
+                        <span class="person-alias-desc">${escapeHtml(r.description || '')}</span>
+                        <div class="person-alias-actions">
+                            <button class="btn btn-secondary btn-sm" onclick="editPersonAlias(${r.id})">编辑</button>
+                            <button class="btn btn-secondary btn-sm" onclick="togglePersonAlias(${r.id}, ${r.enabled ? 0 : 1})">${r.enabled ? '停用' : '启用'}</button>
+                            <button class="btn btn-danger btn-sm" onclick="deletePersonAlias(${r.id})">删除</button>
+                        </div>
+                    </div>`).join('');
+            } catch (e) {
+                list.innerHTML = `<div class="hint" style="padding:14px 20px">加载称呼映射失败：${escapeHtml(e)}</div>`;
+            }
+        }
+
+        async function addPersonAlias() {
+            const alias = document.getElementById('person-alias-name').value.trim();
+            const qq_id = document.getElementById('person-alias-qq').value.trim();
+            const description = document.getElementById('person-alias-description').value.trim();
+            if (!alias || !qq_id) { showToast('称呼和 QQ 号都要填', 'error'); return; }
+            const res = await fetch(API + '/person-aliases', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ alias, qq_id, description })
+            }).then(r => r.json());
+            if (res.success) {
+                showToast('称呼已绑定', 'success');
+                document.getElementById('person-alias-name').value = '';
+                document.getElementById('person-alias-qq').value = '';
+                document.getElementById('person-alias-description').value = '';
+                loadPersonAliases();
+                loadSlang();
+            } else showToast('绑定失败：' + (res.error || ''), 'error');
+        }
+
+        async function editPersonAlias(id) {
+            const row = document.querySelector(`.person-alias-row[data-id="${id}"]`);
+            if (!row) return;
+            const alias = prompt('称呼', row.querySelector('.person-alias-name').textContent);
+            if (alias === null) return;
+            const qq_id = prompt('QQ 号', row.querySelector('.person-alias-qq').textContent.replace(/^QQ\s*/, ''));
+            if (qq_id === null) return;
+            const description = prompt('备注（可留空）', row.querySelector('.person-alias-desc').textContent);
+            if (description === null) return;
+            const res = await fetch(API + '/person-aliases/' + id, {
+                method: 'PUT', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ alias: alias.trim(), qq_id: qq_id.trim(), description: description.trim() })
+            }).then(r => r.json());
+            if (res.success) { showToast('已保存', 'success'); loadPersonAliases(); }
+            else showToast('保存失败：' + (res.error || ''), 'error');
+        }
+
+        async function togglePersonAlias(id, enabled) {
+            const res = await fetch(API + '/person-aliases/' + id, {
+                method: 'PUT', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ enabled })
+            }).then(r => r.json());
+            if (res.success) loadPersonAliases();
+            else showToast('操作失败：' + (res.error || ''), 'error');
+        }
+
+        async function deletePersonAlias(id) {
+            if (!confirm('删除这个全局称呼映射？')) return;
+            const res = await fetch(API + '/person-aliases/' + id, { method: 'DELETE' }).then(r => r.json());
+            if (res.success) { showToast('已删除', 'success'); loadPersonAliases(); }
+            else showToast('删除失败：' + (res.error || res.message || ''), 'error');
+        }
+
         async function loadSlang() {
+            loadPersonAliases();
             const data = await fetch(API + '/slang').then(r => r.json());
             const list = document.getElementById('slang-list');
             const rows = data.slang || [];
@@ -4044,7 +4151,8 @@
                     <div class="slang-example" title="${escapeHtml(r.example || '')}">${escapeHtml(r.example || '')}</div>
                     <div class="slang-tags">
                         <span class="${r.source === 'manual' ? 'badge-manual' : 'badge-auto'}">${r.source === 'manual' ? '人工' : '自动'}</span>
-                        <span class="badge-hits" title="被注入回复的次数">${r.hit_count || 0} 次</span>
+                        <span class="badge-hits" title="当前消息里出现次数">出现 ${r.occurrence_count || 0}</span>
+                        <span class="badge-hits" title="被注入回复提示的次数">注入 ${r.prompt_inject_count || r.hit_count || 0}</span>
                         <span class="hint" style="font-size:11px">${scope}</span>
                     </div>
                     <div class="slang-acts">

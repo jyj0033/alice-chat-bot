@@ -1193,12 +1193,7 @@ class HumanizationLogicTests(unittest.TestCase):
     def test_slang_cleanup_only_accepts_explicit_delete_ids(self):
         from main import GroupChatBot
 
-        raw = (
-            "<think>审核中</think>\n"
-            "保留 101：近期证据不足\n"
-            "删除 102 | 含义与聊天记录不符\n"
-            "删除 999 | 不在本批词条中"
-        )
+        raw = '{"action":"delete","delete_ids":[102]}'
         self.assertEqual(
             GroupChatBot._parse_slang_cleanup_ids(raw, [101, 102]),
             [102],
@@ -1236,7 +1231,11 @@ class HumanizationLogicTests(unittest.TestCase):
         store.upsert_slang("舟舟", "某群友", session="group_1")
         store.upsert_slang("农活", "转发口令", session="group_1")
         matched = store.match_slang("今天舟舟老师又刷出来了", session="group_1")
-        self.assertEqual([m["term"] for m in matched], ["舟舟老师", "舟舟"])
+        self.assertEqual([m["term"] for m in matched], ["舟舟老师"])
+        self.assertEqual(
+            [m["term"] for m in store.match_slang("舟舟来了", session="group_1")],
+            ["舟舟"],
+        )
 
         # 停用后不再注入
         store.update_slang(rows[0]["id"], enabled=0)

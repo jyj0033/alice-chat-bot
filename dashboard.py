@@ -995,6 +995,67 @@ async def remove_slang(slang_id: int):
         return {"success": False, "error": str(e)}
 
 
+@app.get("/api/person-aliases")
+async def get_person_aliases():
+    """全局 QQ 称呼映射，后台管理用。"""
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"aliases": [], "total": 0}
+    try:
+        rows = await bot_instance.memory_storage.list_person_aliases()
+        return {"aliases": rows, "total": len(rows)}
+    except Exception as exc:
+        logger.error("加载 QQ 称呼映射失败：%s", exc)
+        return {"aliases": [], "total": 0, "error": str(exc)}
+
+
+@app.post("/api/person-aliases")
+async def create_person_alias(request: Request):
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        data = await request.json()
+        alias_id = await bot_instance.memory_storage.upsert_person_alias(
+            alias=data.get("alias", ""),
+            qq_id=data.get("qq_id", ""),
+            description=data.get("description", ""),
+            source="manual",
+        )
+        return {"success": bool(alias_id), "id": alias_id}
+    except Exception as exc:
+        logger.error("新增 QQ 称呼映射失败：%s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+@app.put("/api/person-aliases/{alias_id}")
+async def edit_person_alias(alias_id: int, request: Request):
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        data = await request.json()
+        ok = await bot_instance.memory_storage.update_person_alias(
+            alias_id,
+            alias=data.get("alias"),
+            qq_id=data.get("qq_id"),
+            description=data.get("description"),
+            enabled=data.get("enabled"),
+        )
+        return {"success": ok}
+    except Exception as exc:
+        logger.error("更新 QQ 称呼映射失败：%s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+@app.delete("/api/person-aliases/{alias_id}")
+async def remove_person_alias(alias_id: int):
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        ok = await bot_instance.memory_storage.delete_person_alias(alias_id)
+        return {"success": ok, "message": "已删除" if ok else "映射不存在"}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
 @app.post("/api/slang/extract")
 async def extract_slang_now():
     """立即从最近聊天记录提取黑话"""

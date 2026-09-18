@@ -9,6 +9,7 @@ import math
 import re
 import sqlite3
 import threading
+import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -190,10 +191,57 @@ class MemoryStorage:
                 UNIQUE(term, session)
             )
         """)
+        glossary_cols = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(glossary)")
+        }
+        if "occurrence_count" not in glossary_cols:
+            self.conn.execute(
+                "ALTER TABLE glossary ADD COLUMN occurrence_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_seen_at" not in glossary_cols:
+            self.conn.execute("ALTER TABLE glossary ADD COLUMN last_seen_at TEXT DEFAULT ''")
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_glossary_session
             ON glossary(session, enabled)
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS glossary_occurrences (
+                glossary_id INTEGER NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                message_id TEXT NOT NULL,
+                seen_at TEXT NOT NULL,
+                PRIMARY KEY(glossary_id, session, message_id)
+            )
+        """)
+
+        # 人名/称呼使用全局唯一别名表，按 QQ 号查找；不再把称呼作为群级黑话
+        # 通过文本子串匹配。alias_key 采用 NFKC + casefold，避免大小写/全角变体重复。
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS person_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alias TEXT NOT NULL,
+                alias_key TEXT NOT NULL UNIQUE,
+                qq_id TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                source TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_person_aliases_qq_id
+            ON person_aliases(qq_id, enabled)
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS person_alias_migrations (
+                glossary_id INTEGER PRIMARY KEY,
+                alias_key TEXT NOT NULL,
+                qq_id TEXT NOT NULL,
+                migrated_at TEXT NOT NULL
+            )
+        """)
+        self._migrate_explicit_qq_aliases()
 
         # 删除画像时保留一个"从何时起不再自动重建"的标记；新素材出现后才允许
         # 重新生成，避免用户刚删掉的旧画像在下一轮提炼中立刻复活。
@@ -223,6 +271,82 @@ class MemoryStorage:
 
     # === 群聊黑话（glossary） ===
 
+    @staticmethod
+    def _normalize_alias_key(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).casefold()
+
+    @_db_locked
+    def _migrate_explicit_qq_aliases(self) -> int:
+        """迁移释义中明确写有唯一 QQ 号的人工称呼；不从昵称或群名推断身份。"""
+        rows = self.conn.execute(
+            "SELECT id, term, meaning, example, source FROM glossary "
+            "WHERE source = 'manual' AND id NOT IN "
+            "(SELECT glossary_id FROM person_alias_migrations)"
+        ).fetchall()
+        references_by_alias: dict[str, set[str]] = {}
+        representatives: dict[str, dict] = {}
+        for row in rows:
+            alias = str(row["term"] or "").strip()
+            alias_key = self._normalize_alias_key(alias)
+            if not alias_key:
+                continue
+            references = set(
+                re.findall(
+                    r"(?i)\bQQ(?:\s*(?:号|号码|ID))?\s*[:：#]?\s*([0-9]{5,20})\b",
+                    f"{row['meaning'] or ''} {row['example'] or ''}",
+                )
+            )
+            if len(references) != 1:
+                continue
+            qq_id = next(iter(references))
+            references_by_alias.setdefault(alias_key, set()).add(qq_id)
+            representatives.setdefault(alias_key, row)
+
+        migrated_keys = set()
+        migrated = 0
+        now = datetime.now().isoformat(sep=" ")
+        for alias_key, references in references_by_alias.items():
+            # 同一称呼对应多个 QQ 号时不迁移，留给管理员消歧。
+            if len(references) != 1:
+                continue
+            qq_id = next(iter(references))
+            row = representatives[alias_key]
+            alias = str(row["term"] or "").strip()
+            description = str(row["meaning"] or "")
+            existing = self.conn.execute(
+                "SELECT qq_id FROM person_aliases WHERE alias_key = ?", (alias_key,)
+            ).fetchone()
+            if existing and str(existing["qq_id"]) != qq_id:
+                continue
+            self.conn.execute(
+                "INSERT OR IGNORE INTO person_aliases "
+                "(alias, alias_key, qq_id, description, source, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'legacy_migration', ?, ?)",
+                (alias, alias_key, qq_id, description, now, now),
+            )
+            migrated_keys.add(alias_key)
+            migrated += 1
+
+        if migrated_keys:
+            all_rows = self.conn.execute("SELECT id, term FROM glossary").fetchall()
+            for row in all_rows:
+                if self._normalize_alias_key(row["term"]) in migrated_keys:
+                    self.conn.execute(
+                        "UPDATE glossary SET enabled = 0, updated_at = ? WHERE id = ?",
+                        (now, row["id"]),
+                    )
+            for row in rows:
+                alias_key = self._normalize_alias_key(row["term"])
+                if alias_key in migrated_keys:
+                    qq_id = next(iter(references_by_alias[alias_key]))
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO person_alias_migrations "
+                        "(glossary_id, alias_key, qq_id, migrated_at) VALUES (?, ?, ?, ?)",
+                        (row["id"], alias_key, qq_id, now),
+                    )
+        self.conn.commit()
+        return migrated
+
     @_db_locked
     def upsert_slang(
         self,
@@ -240,6 +364,12 @@ class MemoryStorage:
         term = (term or "").strip()
         meaning = (meaning or "").strip()
         if not term or not meaning:
+            return 0
+        alias_key = self._normalize_alias_key(term)
+        if self.conn.execute(
+            "SELECT 1 FROM person_aliases WHERE alias_key = ? AND enabled = 1",
+            (alias_key,),
+        ).fetchone():
             return 0
         now = datetime.now().isoformat(sep=' ')
         row = self.conn.execute(
@@ -275,7 +405,8 @@ class MemoryStorage:
             clauses.append("enabled = 1")
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = self.conn.execute(
-            f"SELECT * FROM glossary {where} ORDER BY hit_count DESC, updated_at DESC",
+            f"SELECT *, hit_count AS prompt_inject_count FROM glossary {where} "
+            "ORDER BY occurrence_count DESC, hit_count DESC, updated_at DESC",
             params,
         ).fetchall()
         return [dict(r) for r in rows]
@@ -284,6 +415,21 @@ class MemoryStorage:
     def update_slang(self, slang_id: int, **fields) -> bool:
         """更新单条黑话；人工编辑内容后将词条标记为 manual。"""
         allowed = {"term", "meaning", "example", "enabled"}
+        current = self.conn.execute(
+            "SELECT term FROM glossary WHERE id = ?", (slang_id,)
+        ).fetchone()
+        if not current:
+            return False
+        effective_term = str(fields.get("term") or current["term"] or "").strip()
+        try:
+            requested_enabled = bool(int(fields.get("enabled") or 0))
+        except (TypeError, ValueError):
+            requested_enabled = False
+        if requested_enabled and self.conn.execute(
+            "SELECT 1 FROM person_aliases WHERE alias_key = ? AND enabled = 1",
+            (self._normalize_alias_key(effective_term),),
+        ).fetchone():
+            return False
         sets, params = [], []
         content_edited = False
         for key, value in fields.items():
@@ -308,6 +454,9 @@ class MemoryStorage:
 
     @_db_locked
     def delete_slang(self, slang_id: int) -> bool:
+        self.conn.execute(
+            "DELETE FROM glossary_occurrences WHERE glossary_id = ?", (slang_id,)
+        )
         cursor = self.conn.execute("DELETE FROM glossary WHERE id = ?", (slang_id,))
         self.conn.commit()
         return cursor.rowcount > 0
@@ -324,6 +473,12 @@ class MemoryStorage:
         if not ids:
             return 0
         placeholders = ", ".join("?" for _ in ids)
+        self.conn.execute(
+            "DELETE FROM glossary_occurrences WHERE glossary_id IN ("
+            "SELECT id FROM glossary WHERE source = 'auto' AND id IN ("
+            f"{placeholders}))",
+            tuple(sorted(ids)),
+        )
         cursor = self.conn.execute(
             f"DELETE FROM glossary WHERE source = 'auto' AND id IN ({placeholders})",
             tuple(sorted(ids)),
@@ -340,17 +495,216 @@ class MemoryStorage:
         """
         if not text:
             return []
-        matched = []
-        for row in self.list_slang(session=session, enabled_only=True):
-            if row["term"] and row["term"] in text:
-                matched.append(row)
-        # 长词优先：命中「舟舟老师」时不必再解释「舟舟」
-        matched.sort(key=lambda r: len(r["term"]), reverse=True)
-        return matched[:limit]
+        normalized_text = self._normalize_alias_key(text)
+        if not normalized_text:
+            return []
+
+        rows = self.list_slang(session=session, enabled_only=True)
+        active_alias_keys = {
+            row["alias_key"] for row in self.conn.execute(
+                "SELECT alias_key FROM person_aliases WHERE enabled = 1"
+            ).fetchall()
+        }
+        local_keys = {
+            self._normalize_alias_key(row["term"])
+            for row in rows
+            if session and row.get("session") == session
+        }
+        # 群级词条覆盖同名全局词条，避免一个词注入两份互相矛盾的解释。
+        rows = [
+            row for row in rows
+            if self._normalize_alias_key(row["term"]) not in active_alias_keys
+            and (row.get("session") or self._normalize_alias_key(row["term"]) not in local_keys)
+        ]
+        candidates = []
+        for row in rows:
+            term_key = self._normalize_alias_key(row["term"])
+            if not term_key:
+                continue
+            pattern_text = re.escape(term_key)
+            if re.search(r"[a-z0-9]", term_key):
+                if re.match(r"[a-z0-9]", term_key):
+                    pattern_text = r"(?<![a-z0-9])" + pattern_text
+                if re.search(r"[a-z0-9]$", term_key):
+                    pattern_text += r"(?![a-z0-9])"
+            spans = [match.span() for match in re.finditer(pattern_text, normalized_text)]
+            if spans:
+                candidates.append((len(term_key), row, spans))
+
+        # 优先选择长词；被长词覆盖的短词不注入，未重叠的独立出现仍可命中。
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        occupied: list[tuple[int, int]] = []
+        found = []
+        for term_len, row, spans in candidates:
+            accepted = []
+            for start, end in spans:
+                if any(start < used_end and end > used_start for used_start, used_end in occupied):
+                    continue
+                accepted.append((start, end))
+                occupied.append((start, end))
+            if accepted:
+                found.append((min(start for start, _ in accepted), -term_len, row))
+        found.sort(key=lambda item: (item[0], item[1]))
+        matched = [row for _, _, row in found]
+        return matched[:limit] if limit and limit > 0 else matched
+
+    @_db_locked
+    def record_slang_occurrences(
+        self, slang_ids: list, session: str, message_id: str
+    ) -> int:
+        """按 (词条, 会话, 消息 ID) 去重，统计消息正文里的真实出现次数。"""
+        session = str(session or "")
+        message_id = str(message_id or "").strip()
+        if not message_id:
+            return 0
+        ids = sorted({int(value) for value in (slang_ids or []) if str(value).isdigit()})
+        if not ids:
+            return 0
+        now = datetime.now().isoformat(sep=" ")
+        recorded = 0
+        for slang_id in ids:
+            cursor = self.conn.execute(
+                "INSERT OR IGNORE INTO glossary_occurrences "
+                "(glossary_id, session, message_id, seen_at) VALUES (?, ?, ?, ?)",
+                (slang_id, session, message_id, now),
+            )
+            if cursor.rowcount:
+                self.conn.execute(
+                    "UPDATE glossary SET occurrence_count = occurrence_count + 1, "
+                    "last_seen_at = ? WHERE id = ?",
+                    (now, slang_id),
+                )
+                recorded += 1
+        self.conn.commit()
+        return recorded
+
+    @_db_locked
+    def upsert_person_alias(
+        self,
+        alias: str,
+        qq_id: str,
+        description: str = "",
+        source: str = "manual",
+    ) -> int:
+        """新增全局 QQ 称呼；别名不能映射到两个账号。"""
+        alias = " ".join(str(alias or "").split()).strip()
+        alias_key = self._normalize_alias_key(alias)
+        qq_id = str(qq_id or "").strip()
+        description = str(description or "").strip()
+        if not alias_key or len(alias) > 32:
+            raise ValueError("称呼不能为空且不能超过 32 个字符")
+        if not re.fullmatch(r"[0-9]{5,20}", qq_id):
+            raise ValueError("QQ 号必须是 5 到 20 位数字")
+        if len(description) > 240:
+            raise ValueError("说明不能超过 240 个字符")
+
+        existing = self.conn.execute(
+            "SELECT id, qq_id FROM person_aliases WHERE alias_key = ?", (alias_key,)
+        ).fetchone()
+        now = datetime.now().isoformat(sep=" ")
+        if existing:
+            if str(existing["qq_id"]) != qq_id:
+                raise ValueError("这个称呼已绑定其他 QQ 号；请编辑原映射后再保存")
+            self.conn.execute(
+                "UPDATE person_aliases SET alias = ?, description = ?, enabled = 1, "
+                "source = ?, updated_at = ? WHERE id = ?",
+                (alias, description, source, now, existing["id"]),
+            )
+            alias_id = int(existing["id"])
+        else:
+            cursor = self.conn.execute(
+                "INSERT INTO person_aliases "
+                "(alias, alias_key, qq_id, description, source, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (alias, alias_key, qq_id, description, source, now, now),
+            )
+            alias_id = int(cursor.lastrowid)
+
+        # 旧词表里的同名项停用，避免仍按文本命中、在其他群里带出错误身份。
+        for row in self.conn.execute("SELECT id, term FROM glossary").fetchall():
+            if self._normalize_alias_key(row["term"]) == alias_key:
+                self.conn.execute(
+                    "UPDATE glossary SET enabled = 0, updated_at = ? WHERE id = ?",
+                    (now, row["id"]),
+                )
+        self.conn.commit()
+        return alias_id
+
+    @_db_locked
+    def list_person_aliases(self, enabled_only: bool = False) -> list[dict]:
+        where = "WHERE enabled = 1" if enabled_only else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM person_aliases {where} ORDER BY alias_key ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_db_locked
+    def match_person_aliases(self, qq_ids: list) -> list[dict]:
+        ids = list(dict.fromkeys(
+            str(value or "").strip() for value in (qq_ids or [])
+            if re.fullmatch(r"[0-9]{5,20}", str(value or "").strip())
+        ))
+        if not ids:
+            return []
+        placeholders = ", ".join("?" for _ in ids)
+        rows = self.conn.execute(
+            "SELECT * FROM person_aliases WHERE enabled = 1 "
+            f"AND qq_id IN ({placeholders}) ORDER BY alias_key ASC",
+            tuple(ids),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_db_locked
+    def update_person_alias(self, alias_id: int, **fields) -> bool:
+        allowed = {"alias", "qq_id", "description", "enabled"}
+        current = self.conn.execute(
+            "SELECT * FROM person_aliases WHERE id = ?", (int(alias_id),)
+        ).fetchone()
+        if not current:
+            return False
+        values = {key: current[key] for key in allowed}
+        for key in allowed:
+            if key in fields and fields[key] is not None:
+                values[key] = fields[key]
+
+        alias = " ".join(str(values["alias"] or "").split()).strip()
+        alias_key = self._normalize_alias_key(alias)
+        qq_id = str(values["qq_id"] or "").strip()
+        description = str(values["description"] or "").strip()
+        if not alias_key or len(alias) > 32:
+            raise ValueError("称呼不能为空且不能超过 32 个字符")
+        if not re.fullmatch(r"[0-9]{5,20}", qq_id):
+            raise ValueError("QQ 号必须是 5 到 20 位数字")
+        if len(description) > 240:
+            raise ValueError("说明不能超过 240 个字符")
+        enabled = int(bool(values["enabled"]))
+        now = datetime.now().isoformat(sep=" ")
+        self.conn.execute(
+            "UPDATE person_aliases SET alias = ?, alias_key = ?, qq_id = ?, "
+            "description = ?, enabled = ?, updated_at = ? WHERE id = ?",
+            (alias, alias_key, qq_id, description, enabled, now, int(alias_id)),
+        )
+        if enabled:
+            for row in self.conn.execute("SELECT id, term FROM glossary").fetchall():
+                if self._normalize_alias_key(row["term"]) == alias_key:
+                    self.conn.execute(
+                        "UPDATE glossary SET enabled = 0, updated_at = ? WHERE id = ?",
+                        (now, row["id"]),
+                    )
+        self.conn.commit()
+        return True
+
+    @_db_locked
+    def delete_person_alias(self, alias_id: int) -> bool:
+        cursor = self.conn.execute(
+            "DELETE FROM person_aliases WHERE id = ?", (int(alias_id),)
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     @_db_locked
     def bump_slang_hits(self, slang_ids: list) -> int:
-        """记录命中次数，Web 端据此排序，也能看出哪些词是活的。"""
+        """记录词条实际注入回复提示的次数；正文出现次数另由 record_slang_occurrences 统计。"""
         ids = [i for i in (slang_ids or []) if i]
         if not ids:
             return 0
@@ -2432,3 +2786,31 @@ class AsyncMemoryStorage:
 
     async def bump_slang_hits(self, slang_ids: list) -> int:
         return await asyncio.to_thread(self._storage.bump_slang_hits, slang_ids)
+
+    async def record_slang_occurrences(
+        self, slang_ids: list, session: str, message_id: str
+    ) -> int:
+        return await asyncio.to_thread(
+            self._storage.record_slang_occurrences, slang_ids, session, message_id
+        )
+
+    async def upsert_person_alias(
+        self, alias: str, qq_id: str, description: str = "", source: str = "manual"
+    ) -> int:
+        return await asyncio.to_thread(
+            self._storage.upsert_person_alias, alias, qq_id, description, source
+        )
+
+    async def list_person_aliases(self, enabled_only: bool = False) -> list[dict]:
+        return await asyncio.to_thread(self._storage.list_person_aliases, enabled_only)
+
+    async def match_person_aliases(self, qq_ids: list) -> list[dict]:
+        return await asyncio.to_thread(self._storage.match_person_aliases, qq_ids)
+
+    async def update_person_alias(self, alias_id: int, **fields) -> bool:
+        return await asyncio.to_thread(
+            lambda: self._storage.update_person_alias(alias_id, **fields)
+        )
+
+    async def delete_person_alias(self, alias_id: int) -> bool:
+        return await asyncio.to_thread(self._storage.delete_person_alias, alias_id)

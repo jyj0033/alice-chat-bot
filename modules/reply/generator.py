@@ -236,6 +236,7 @@ class ReplyGenerator:
         avoid_paraphrase: bool = False,
         reply_review_hint: str = "",
         expression_patterns: list = None,
+        person_aliases: list = None,
     ) -> Optional[dict]:
         """
         生成回复
@@ -274,6 +275,7 @@ class ReplyGenerator:
             temperature_override=temperature,
             reply_review_hint=reply_review_hint,
             expression_patterns=expression_patterns,
+            person_aliases=person_aliases,
         )
 
         # 2. 联网搜索：先让 LLM 判断这条回复是否需要联网（关键词太局限且易误判，
@@ -810,6 +812,7 @@ class ReplyGenerator:
         temperature_override: float | None = None,
         reply_review_hint: str = "",
         expression_patterns: list = None,
+        person_aliases: list = None,
     ) -> ChatRequest:
         """构建 LLM 请求"""
 
@@ -961,6 +964,10 @@ class ReplyGenerator:
         glossary_guide = self._build_glossary_guide(glossary)
         if glossary_guide:
             request.add_system(glossary_guide)
+
+        alias_guide = self._build_person_alias_guide(person_aliases)
+        if alias_guide:
+            request.add_system(alias_guide)
 
         expression_guide = self._build_expression_patterns_guide(expression_patterns)
         if expression_guide:
@@ -1128,6 +1135,36 @@ class ReplyGenerator:
             "这个群的黑话（当前对话里出现了这些词，按这里的意思理解，不要按字面理解）：\n"
             + "；".join(entries)
             + "。\n知道意思就行，回复时不用刻意去用这些词，也不要解释它们。"
+        )
+
+    @staticmethod
+    def _build_person_alias_guide(person_aliases: list) -> str:
+        """只提供当前说话者/被回复者/被 @ 者的 QQ 绑定称呼，不注入整张名册。"""
+        entries = []
+        seen = set()
+        for item in (person_aliases or [])[:8]:
+            if not isinstance(item, dict):
+                continue
+            alias = " ".join(str(item.get("alias") or "").split()).strip()
+            if not alias:
+                continue
+            roles = [
+                str(role).strip()
+                for role in (item.get("roles") or [])
+                if str(role).strip()
+            ]
+            key = (alias.casefold(), tuple(roles))
+            if key in seen:
+                continue
+            seen.add(key)
+            label = "/".join(roles) or "相关成员"
+            entries.append(f"{label}的称呼是「{alias}」")
+        if not entries:
+            return ""
+        return (
+            "已核实的成员称呼（由平台 QQ 号匹配，只对当前对话涉及的成员有效）：\n"
+            + "；".join(entries)
+            + "。可以自然称呼对应成员；不要向聊天内容复述 QQ 号，也不要根据相似昵称推断身份。"
         )
 
     @staticmethod
