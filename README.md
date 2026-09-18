@@ -50,7 +50,7 @@ ALICE_DASHBOARD_PASSWORD=替换为足够长的随机密码
 docker-compose up -d
 ```
 
-访问管理面板：本机 Docker 调试使用 `http://localhost:30081`；公网服务器使用 `https://服务器公网IP:30080`，浏览器会提示输入上面的凭据。
+访问管理面板：`http://localhost:30080`；部署到服务器后使用 `http://服务器公网IP:30080`，浏览器会提示输入上面的凭据。
 
 ## 项目结构
 
