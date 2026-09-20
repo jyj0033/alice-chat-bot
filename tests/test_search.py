@@ -151,7 +151,7 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_llm = MagicMock()
         tool_llm.chat = AsyncMock(side_effect=[
             ChatResponse(content="YES", model="test"),          # 判断
-            ChatResponse(content="今天的新闻是xxx", model="test"),  # 带资料生成
+            ChatResponse(content="<say>今天的新闻是xxx</say>", model="test"),  # 带资料生成
         ])
         search_client = MagicMock()
         search_client.available = True
@@ -181,7 +181,7 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_llm = MagicMock()
         tool_llm.chat = AsyncMock(return_value=ChatResponse(content="YES", model="test"))
         main_llm = MagicMock()
-        main_llm.chat = AsyncMock(return_value=ChatResponse(content="没搜到，正常回答", model="test"))
+        main_llm.chat = AsyncMock(return_value=ChatResponse(content="<say>没搜到，正常回答</say>", model="test"))
         search_client = MagicMock()
         search_client.available = True
         search_client.is_time_sensitive = lambda q: True
@@ -206,7 +206,7 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_llm = MagicMock()
         tool_llm.chat = AsyncMock(return_value=ChatResponse(content="NO", model="test"))
         main_llm = MagicMock()
-        main_llm.chat = AsyncMock(return_value=ChatResponse(content="随便吃点", model="test"))
+        main_llm.chat = AsyncMock(return_value=ChatResponse(content="<say>随便吃点</say>", model="test"))
         search_client = MagicMock()
         search_client.available = True
         search_client.search = AsyncMock(return_value=[])
@@ -238,7 +238,7 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         ])
         main_llm = MagicMock()
         main_llm.chat = AsyncMock(return_value=ChatResponse(
-            content="崩铁现在up的是流萤。", model="test"))
+            content="<say>崩铁现在up的是流萤。</say>", model="test"))
         search_client = MagicMock()
         search_client.available = True
         search_client.is_time_sensitive = lambda q: True
@@ -270,7 +270,7 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         ])
         main_llm = MagicMock()
         main_llm.chat = AsyncMock(return_value=ChatResponse(
-            content="今天是晴天。", model="test"))
+            content="<say>今天是晴天。</say>", model="test"))
         search_client = MagicMock()
         search_client.available = True
         search_client.is_time_sensitive = lambda q: True

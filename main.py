@@ -2591,27 +2591,7 @@ class GroupChatBot:
             recent_texts = [
                 m.content for m in recent_context_for_review if not m.is_bot
             ]
-            paraphrase_candidate = (
-                self.reply_generator.looks_like_paraphrase_candidate(
-                    review_text, recent_texts
-                )
-            )
-            evidence_candidate = self.reply_generator.needs_semantic_review(
-                review_text,
-                effective_message.content,
-                recent_texts,
-            )
-            quality_candidate = self.reply_generator.needs_reply_quality_review(
-                review_text,
-                effective_message.content,
-                recent_texts,
-                direction=direction,
-            )
-            if (
-                judge
-                and review_text.strip()
-                and (paraphrase_candidate or evidence_candidate or quality_candidate)
-            ):
+            if judge and review_text.strip():
                 review = await judge.review_reply(
                     effective_message,
                     recent_context_for_review,
@@ -2717,10 +2697,17 @@ class GroupChatBot:
                         )
                     if retry_review_text.strip():
                         retry_failure = ""
-                        if self.reply_generator.looks_like_meta_commentary(
+                        if self.reply_generator.looks_like_leaked_internal(
                             retry_review_text
                         ):
-                            retry_failure = "重答仍是回复过程说明"
+                            retry_failure = "重答仍是内部话术"
+                        elif (
+                            direction == "group"
+                            and self.reply_generator.looks_like_hollow_ping(
+                                retry_review_text
+                            )
+                        ):
+                            retry_failure = "重答仍是空问在场"
                         elif self.reply_generator.looks_like_incomplete(
                             retry_review_text
                         ):
@@ -2741,10 +2728,10 @@ class GroupChatBot:
                         if retry_failure:
                             if direction == "to_bot":
                                 logger.info(
-                                    "[语义复核] 重答未通过（%s），改用安全澄清句",
+                                    "[语义复核] 重答未通过（%s），改用短反应",
                                     retry_failure,
                                 )
-                                reply = "这件事我不太确定，你能再具体说一点吗？"
+                                reply = self.reply_generator.short_direct_fallback()
                                 tool_meme_category = None
                                 tool_meme_id = ""
                                 tool_meme_called = False
@@ -2754,6 +2741,56 @@ class GroupChatBot:
                                     retry_failure,
                                 )
                                 return
+
+            leak_text = reply or ""
+            if self.meme_manager:
+                leak_text, _ = self.meme_manager.strip_directives(leak_text)
+            if leak_text.strip() and (
+                self.reply_generator.looks_like_leaked_internal(leak_text)
+                or (
+                    direction == "group"
+                    and (
+                        self.reply_generator.looks_like_hollow_ping(leak_text)
+                        or self.reply_generator.looks_like_incomplete(leak_text)
+                    )
+                )
+            ):
+                if direction == "to_bot":
+                    logger.info("[语义复核] 内部话术泄漏，改用短反应")
+                    reply = self.reply_generator.short_direct_fallback()
+                    tool_meme_category = None
+                    tool_meme_id = ""
+                    tool_meme_called = False
+                else:
+                    logger.info("[语义复核] 内部话术泄漏，放弃群聊插话")
+                    return
+
+            if direction == "group" and leak_text.strip():
+                now = datetime.now()
+                window = float(ReplyGenerator._SELF_RESTATEMENT_WINDOW)
+                own_in_window = []
+                for item in recent_context_for_review:
+                    if not getattr(item, "is_bot", False):
+                        continue
+                    timestamp = getattr(item, "timestamp", None)
+                    if timestamp is None:
+                        own_in_window.append(item.content)
+                        continue
+                    try:
+                        delta = (now - timestamp).total_seconds()
+                    except Exception:
+                        own_in_window.append(item.content)
+                        continue
+                    if 0 <= delta <= window:
+                        own_in_window.append(item.content)
+                if self.reply_generator.looks_like_self_restatement(
+                    leak_text, own_in_window
+                ):
+                    logger.info(
+                        "[复读] 放弃与自己刚说的话换皮重复：%s",
+                        leak_text[:40],
+                    )
+                    return
 
             # 表情包选择标记只在内部流转，不能进入群聊文本、记忆或日报。
             meme_category = None

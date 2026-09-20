@@ -438,10 +438,9 @@ class ConversationFloorTests(unittest.TestCase):
         self.assertTrue(
             any("自然回应眼前这一刻" in message.content for message in request.messages)
         )
-        # 按词边界截断：不切进词中间（"确实有点太离谱了"→"确实有点太"）
+        # 单句超限时保留完整句，不切成「确实有点太」这种半截话
         cut = generator._limit_action_length("确实有点太离谱了", 6)
-        self.assertLessEqual(len(cut), 6)
-        self.assertEqual(cut, "确实有点太")
+        self.assertEqual(cut, "确实有点太离谱了")
 
     def test_short_reaction_prompt_prioritizes_complete_event(self):
         generator = ReplyGenerator(llm_provider=None)

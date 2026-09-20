@@ -484,7 +484,8 @@ class MemeManagerTests(unittest.TestCase):
             6,
         )
         self.assertTrue(result.endswith("[[表情:编号:abcdef1234]]"))
-        self.assertLessEqual(len(result.removesuffix(" [[表情:编号:abcdef1234]]")), 6)
+        body = result.removesuffix("[[表情:编号:abcdef1234]]").strip()
+        self.assertEqual(body, "这句很长，需要截短")
 
 
 if __name__ == "__main__":

@@ -178,7 +178,7 @@ class SpeakingStyleManager:
 
 
     def _adjust_length(self, text: str, max_reply_length: int = None) -> str:
-        """调整文本长度 - 超长时按句子边界智能截断（兜底）"""
+        """调整文本长度：能留下完整句就留下；单句超限不从中间切断。"""
         max_len = (
             max_reply_length
             if max_reply_length is not None
@@ -187,7 +187,6 @@ class SpeakingStyleManager:
         if not text or len(text) <= max_len:
             return text
 
-        # 按句子边界切分（中文/英文标点）
         sentences = re.split(r'(?<=[。！？!?~…])', text)
         result = ""
         for sent in sentences:
@@ -195,16 +194,11 @@ class SpeakingStyleManager:
                 break
             result += sent
 
-        # 单句就超长时硬截断
-        if not result.strip():
-            result = text[:max_len]
+        if result.strip():
+            return result.strip()
 
-        result = result.strip()
-        # 有内容被截掉时补省略号，读起来像"话说到一半"，更像真人
-        if result != text and not result.endswith(("…", "...")):
-            result = result.rstrip("。，,.!！ ") + "…"
-
-        return result
+        first = (sentences[0] if sentences else text).strip()
+        return first or text
 
     def _remove_banned_words(self, text: str) -> str:
         """移除禁用词"""

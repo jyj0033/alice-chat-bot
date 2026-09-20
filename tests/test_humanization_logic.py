@@ -1013,6 +1013,127 @@ class HumanizationLogicTests(unittest.TestCase):
             )
         )
 
+    def test_only_say_channel_is_sendable(self):
+        kind, content = ReplyGenerator.extract_sendable_reply(
+            '先判断他在问生日，联系上下文\n<say>空巢老人+1</say>'
+        )
+        self.assertEqual(kind, "say")
+        self.assertEqual(content, "空巢老人+1")
+        kind, content = ReplyGenerator.extract_sendable_reply(
+            '水母说"完了"，联系上下文他之前问'
+        )
+        self.assertEqual(kind, "missing")
+        self.assertEqual(content, "")
+        kind, content = ReplyGenerator.extract_sendable_reply(
+            "哈哈这车的话题终于过了"
+        )
+        self.assertEqual(kind, "missing")
+        kind, content = ReplyGenerator.extract_sendable_reply("<silent>")
+        self.assertEqual(kind, "silent")
+        kind, content = ReplyGenerator.extract_sendable_reply(
+            "随便分析一句\n<silent>"
+        )
+        self.assertEqual(kind, "silent")
+
+    def test_unwrapped_group_analysis_is_not_sent(self):
+        import asyncio
+        from modules.llm.base import ChatResponse
+
+        class _Provider:
+            model = "test"
+
+            async def chat(self, request):
+                return ChatResponse(
+                    content='水母说"完了"，联系上下文他之前问',
+                    model=self.model,
+                )
+
+        async def run():
+            generator = ReplyGenerator(llm_provider=_Provider())
+            return await generator.generate(
+                context_prompt="[刚刚] 海蜇妹：完了",
+                current_message="完了",
+                direction="group",
+            )
+
+        self.assertIsNone(asyncio.run(run()))
+
+    def test_leaked_internal_catches_bot_and_caption_pipeline(self):
+        self.assertTrue(ReplyGenerator.looks_like_bot_self_id("没有呢，bot不用休息的"))
+        self.assertTrue(ReplyGenerator.looks_like_caption_leak("江雨衿发的图片是普通市民分享"))
+        self.assertTrue(ReplyGenerator.looks_like_leaked_internal("没有呢，bot不用休息的"))
+        for natural in (
+            "想得美，我钱包比脸还干净",
+            "笑死 真是捡到钱",
+            "水母说完了，他之前好像问过",
+            "哈哈这车的话题终于过了",
+        ):
+            self.assertFalse(
+                ReplyGenerator.looks_like_leaked_internal(natural),
+                natural,
+            )
+
+    def test_self_restatement_catches_same_stance_not_follow_up(self):
+        self.assertTrue(
+            ReplyGenerator.looks_like_self_restatement(
+                "周日躺赢才是真舒服",
+                ["周日闲着的才是真赢家"],
+            )
+        )
+        self.assertTrue(
+            ReplyGenerator.looks_like_self_restatement(
+                "这祝福越来越离谱了哈哈",
+                ["这祝福挺别致的哈哈哈"],
+            )
+        )
+        self.assertFalse(
+            ReplyGenerator.looks_like_self_restatement(
+                "这么便宜啊，真能吃一天？",
+                ["13块能吃一天真假的"],
+            )
+        )
+        self.assertFalse(
+            ReplyGenerator.looks_like_self_restatement(
+                "哦？赛兔子是谁啊 之前没出现过吧",
+                ["哦？展开说说"],
+            )
+        )
+
+    def test_group_hollow_ping_is_quality_issue_but_not_a_phrase_ban(self):
+        self.assertTrue(ReplyGenerator.looks_like_hollow_ping("在吗？"))
+        self.assertTrue(
+            ReplyGenerator.needs_reply_quality_review(
+                "在吗？", "有道理", [], direction="group"
+            )
+        )
+        self.assertFalse(
+            ReplyGenerator.needs_reply_quality_review(
+                "在吗？", "爱丽丝在吗", [], direction="to_bot"
+            )
+        )
+
+    def test_length_limit_keeps_complete_sentence(self):
+        self.assertEqual(
+            ReplyGenerator._limit_action_length("一百四十七天，比上次还惨", 10),
+            "一百四十七天，比上次还惨",
+        )
+
+    def test_persona_forbids_admitting_to_being_a_bot(self):
+        prompt = self._persona()
+        self.assertIn("不要一本正经承认自己是机器人", prompt)
+
+    def test_output_boundary_prompt_forbids_internal_voice(self):
+        request = ReplyGenerator(llm_provider=None)._build_request(
+            context_prompt="",
+            current_message="爱丽丝有休息吗？",
+        )
+        system_text = "\n".join(
+            message.content for message in request.messages if message.role == "system"
+        )
+        self.assertIn("不要说自己是机器人", system_text)
+        self.assertIn("<say>", system_text)
+        self.assertNotIn("要让 bot 发图", system_text)
+
     # === 省略号与笑声频率 ===
 
     def test_ellipsis_not_appended_after_tone_marks(self):

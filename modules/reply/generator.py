@@ -296,6 +296,7 @@ class ReplyGenerator:
         meme_category = None
         meme_id = ""
         meme_called = False
+        trusted_reply = False
         if need_search:
             try:
                 response = await self._generate_with_search(
@@ -320,9 +321,11 @@ class ReplyGenerator:
                     # 群友互聊/推断的延续对话场景 LLM 挂了 → 安静潜水，比说错话好
                     return None
                 reply = self._get_fallback_reply()
+                trusted_reply = True
 
         # 4. 清理思考过程
-        reply = self._clean_thinking_process(reply)
+        if not trusted_reply:
+            reply = self._clean_thinking_process(reply)
         if reply and self.looks_like_prompt_echo(reply):
             logger.info("[格式] 草稿在复述上下文记录，丢弃：%s", reply[:60])
             if direction != "to_bot":
@@ -341,7 +344,7 @@ class ReplyGenerator:
         #     meme_called 是工具实际被调用的旗标，独立于 arguments 是否解析出 category/id
         #     （空 args 想随机抽时 category/id 都是空，但 called=True）。
         has_meme = meme_called
-        if (self._has_tool_markup(reply) or not reply) and not has_meme:
+        if (self._has_tool_markup(reply) or not reply) and not has_meme and not trusted_reply:
             logger.warning("搜索回复不可用（%s），回退主语言模型重新生成", (reply or "")[:40])
             try:
                 resp2 = await self.llm.chat(request)
@@ -358,6 +361,7 @@ class ReplyGenerator:
                     if direction != "to_bot":
                         return None
                     reply = self._get_fallback_reply()
+                    trusted_reply = True
                 elif reply2:
                     reply = reply2
             except Exception as e:
@@ -366,11 +370,30 @@ class ReplyGenerator:
                 if direction != "to_bot":
                     return None
                 reply = self._get_fallback_reply()
+                trusted_reply = True
         elif has_meme and not reply:
             # LLM 选择只发图不发文字：content 为空但 tool_calls 已经把
             # meme_category/meme_id 抓到。让 reply 走一个空字符串，让下游
             # filter/meme 通道正常处理。
             reply = ""
+            trusted_reply = True
+
+        has_meme = meme_called
+        if not trusted_reply:
+            reply = await self._ensure_sendable_text(
+                reply,
+                request,
+                direction=direction,
+                has_meme=has_meme,
+            )
+            if reply is None and not has_meme:
+                if direction != "to_bot":
+                    logger.debug(f"语言模型选择沉默或未给出可发送回复（回复方向={direction}）")
+                    return None
+                logger.warning("明确对机器人的消息没有可发送回复，使用兜底回复")
+                reply = self._get_fallback_reply()
+            if reply is None:
+                reply = ""
 
         # 5. 参与决策：LLM 有权选择沉默（群友互聊/自言自语时）。
         # 明确对 bot 的消息不能被模型偶发输出的 <silent> 吞掉，异常时使用
@@ -485,6 +508,76 @@ class ReplyGenerator:
         if r.startswith("sil") and len(r) <= 8:
             return True
         return False
+
+    _SAY_RE = re.compile(r"<say\s*>(.*?)</say\s*>", re.DOTALL | re.IGNORECASE)
+    _SAY_UNCLOSED_RE = re.compile(r"<say\s*>(.*)\Z", re.DOTALL | re.IGNORECASE)
+    _SILENT_TAG_RE = re.compile(r"<silent\b[^>]*>", re.IGNORECASE)
+
+    @classmethod
+    def extract_sendable_reply(cls, text: str) -> tuple[str, str]:
+        """只取出准备发给群友的话。标签外的分析无论怎么换词都丢掉。
+
+        Returns:
+            ("say", content) | ("silent", "") | ("missing", "")
+        """
+        raw = str(text or "").strip()
+        if not raw:
+            return "missing", ""
+        matches = cls._SAY_RE.findall(raw)
+        if matches:
+            inner = (matches[-1] or "").strip()
+            inner = re.sub(r"</?say\s*>", "", inner, flags=re.IGNORECASE).strip()
+            if not inner or cls._is_silent(inner):
+                return "silent", ""
+            return "say", inner
+        if cls._SILENT_TAG_RE.search(raw) or cls._is_silent(raw):
+            return "silent", ""
+        unclosed = cls._SAY_UNCLOSED_RE.search(raw)
+        if unclosed:
+            inner = (unclosed.group(1) or "").strip()
+            inner = re.sub(r"</?say\s*>", "", inner, flags=re.IGNORECASE).strip()
+            if not inner or cls._is_silent(inner):
+                return "silent", ""
+            return "say", inner
+        return "missing", ""
+
+    async def _ensure_sendable_text(
+        self,
+        text: str,
+        request: ChatRequest,
+        *,
+        direction: str,
+        has_meme: bool,
+    ) -> Optional[str]:
+        """没有 <say> 的模型输出默认不可发送，避免把思考步骤当群聊发出去。"""
+        kind, content = self.extract_sendable_reply(text)
+        if kind == "say":
+            return content
+        if kind == "silent":
+            return "" if has_meme else None
+        if has_meme:
+            return ""
+        logger.info("[格式] 输出未放入 <say>，要求重包：%s", (text or "")[:60])
+        retry_request = copy.deepcopy(request)
+        retry_request.add_user(
+            "上次没有把要发给群友的话放进 <say></say>。"
+            "分析可以写在标签外；标签里只放那句群聊回复。"
+            "没有要说的就输出 <silent>。"
+        )
+        try:
+            response = await self.llm.chat(retry_request)
+            retry_text = self._clean_thinking_process((response.content or "").strip())
+        except Exception as exc:
+            logger.warning("[格式] 重包 <say> 失败：%s", exc)
+            retry_text = ""
+        kind, content = self.extract_sendable_reply(retry_text)
+        if kind == "say":
+            return content
+        if kind == "silent":
+            return None
+        if direction != "to_bot":
+            return None
+        return self._get_fallback_reply()
 
     # === 联网搜索（LLM 判断是否需要搜索） ===
 
@@ -637,7 +730,7 @@ class ReplyGenerator:
                 "不要提「据xxx」「搜索显示」「仅供参考」，不要贴链接。\n"
                 "3. 资料过时或和现在对不上、没有直接答案时，像记不清一样自然带过"
                 "（比如「这我哪记得」「好久没关注了」），绝不要编造版本号或角色名。\n"
-                "4. 直接给出最终回复，不要输出思考过程或英文草稿。"
+                "4. 把要发给群友的话放进 <say></say>，不要把思考过程或英文草稿放进去。"
             ),
         ))
         clean.max_tokens = max(clean.max_tokens, 300)
@@ -889,7 +982,7 @@ class ReplyGenerator:
                 "发送能力：普通情况下发送纯文字；如果真的适合，可以调用 send_meme 工具"
                 "（category 选分类、meme_id 精确选图、random 随便来一张）让系统替你发一张表情包。"
                 "如果表情包本身已经完整表达你想说的反应、态度或吐槽，优先只调用 send_meme、把文字留空，"
-                "不要再生成同义解释；只有图片表达不完整时才文字+图并存。调用即代表真的要让 bot 发图，"
+                "不要再生成同义解释；只有图片表达不完整时才文字+图并存。调用即代表真的要让你发图，"
                 "不要为了凑频率发图，也不要用文字描述「想发图」。"
             )
         elif self.meme_manager:
@@ -919,8 +1012,13 @@ class ReplyGenerator:
         # 参与规则 - 根据消息指向决定「该不该插嘴」
         request.add_system(
             "你是群里的一员，直接用自己的口吻说话。"
-            "只输出实际要发给群友的话；别旁白谁在做什么，也不要把判断理由、时间戳、消息ID或记录标签带进回复。"
-            "如果没有自然想说的内容，可以只输出 <silent>。"
+            "要发给群友的话必须放进 <say>...</say>；标签以外的任何内容都不会发送，"
+            "包括分析、判断、整理上下文、系统规则和给自己的提醒。"
+            "<say> 里只写你会对群友说的那句话，不要写步骤。"
+            "没有自然想说的内容就输出 <silent>，不要写空的 <say>。"
+            "只发图时可以没有 <say>，调用 send_meme 即可。"
+            "不要说自己是机器人、AI、bot 或程序；被拿这个开玩笑就损回去或装傻，不要认真承认。"
+            "不要用主持人口吻追问。"
         )
         request.add_system(self._build_participation_guide(direction))
 
@@ -1065,8 +1163,8 @@ class ReplyGenerator:
             parts.append("你刚刚在本群说过：")
             parts.extend(f"- {item[:60]}" for item in own_recent[-3:])
             parts.append(
-                "不要立刻改口打脸。如果对方在邀请你而你刚拒绝过，要么沿用拒绝，"
-                "要么明确改主意。"
+                "不要立刻改口打脸。上一句已经表达过的态度不要换个说法再发一遍。"
+                "如果对方在邀请你而你刚拒绝过，要么沿用拒绝，要么明确改主意。"
             )
         if metadata.get("asks_about_media") and metadata.get("unseen_media"):
             parts.append(
@@ -1251,7 +1349,11 @@ class ReplyGenerator:
 
     @staticmethod
     def _limit_action_length(text: str, max_chars: int) -> str:
-        """按行为计划限制长度，优先保留完整短句；单句超长时按词边界截断。"""
+        """按行为计划限制长度，只保留完整短句。
+
+        单句超限时发完整句，不从中间切断。半截话比略超字数更不像人；
+        思考过程漏出来也不该靠切短来「看起来像回复」。
+        """
         if not text or max_chars <= 0 or len(text) <= max_chars:
             return text
 
@@ -1279,22 +1381,8 @@ class ReplyGenerator:
         if result.strip():
             return result.strip()
 
-        # 单句超长：按词边界截断（jieba），避免从词中间切断造成不知所云
-        # （如把「这个哈哈648一单走起」切出「这个哈哈648一」）。
-        try:
-            import jieba
-            jieba.setLogLevel(logging.WARNING)
-            words = [w for w in jieba.cut(text) if w.strip()]
-        except Exception:
-            words = []
-        result = ""
-        for w in words:
-            if len(result) + len(w) > max_chars:
-                break
-            result += w
-        if result.strip():
-            return result.strip()
-        return text[:max_chars].rstrip("，,。.!！ ")
+        first = (sentences[0] if sentences else text).strip()
+        return first or text
 
     def _build_participation_guide(self, direction: str) -> str:
         """构建参与规则：告诉 LLM 当前消息是谁对谁说的，以及它有没有权保持沉默"""
@@ -1528,11 +1616,17 @@ class ReplyGenerator:
             "请重新看最近2到4条群聊消息，先判断完整事件：谁先说了什么、后面发生了什么、"
             "是否有反转/打脸/接梗，再用一条自然口语点评这个事件的笑点或反差。"
             "不要把原消息里的数字、等级、人名当成主要内容复述，不要编造看不出的细节；"
-            "如果仍无法确认前后关系，只输出 <silent>。"
+            "点评放进 <say></say>。如果仍无法确认前后关系，只输出 <silent>。"
         )
         try:
             response = await self.llm.chat(retry_request)
-            return self._clean_thinking_process((response.content or "").strip())
+            cleaned = self._clean_thinking_process((response.content or "").strip())
+            kind, content = self.extract_sendable_reply(cleaned)
+            if kind == "say":
+                return content
+            if kind == "silent":
+                return ""
+            return ""
         except Exception as exc:
             logger.warning("[事件理解] 重答失败：%s", exc)
             return ""
@@ -1587,6 +1681,47 @@ class ReplyGenerator:
         if len(core) < cls._PARROT_MIN_CHARS:
             return False
         return any(core in (text or "") for text in recent_texts)
+
+    @classmethod
+    def _bigram_jaccard(cls, left: str, right: str) -> float:
+        if len(left) < 2 or len(right) < 2:
+            return 0.0
+        left_pairs = {left[index:index + 2] for index in range(len(left) - 1)}
+        right_pairs = {right[index:index + 2] for index in range(len(right) - 1)}
+        if not left_pairs or not right_pairs:
+            return 0.0
+        return len(left_pairs & right_pairs) / len(left_pairs | right_pairs)
+
+    @classmethod
+    def _leading_key(cls, core: str) -> str:
+        compact = re.sub(r"[^\w\u4e00-\u9fff]+", "", core or "", flags=re.UNICODE)
+        return compact[:2]
+
+    @classmethod
+    def _stance_core(cls, text: str) -> str:
+        """自我换皮比较用：只剥笑声和句末标点，保留「这/那」等内容词。"""
+        core = re.sub(r"^[哈呵嘿嘻笑死草\s]+", "", (text or "").strip())
+        return re.sub(r"[哈呵嘿嘻笑死草绷…\.\!！\?？~、，,。\s]+$", "", core).strip()
+
+    @classmethod
+    def looks_like_self_restatement(cls, reply: str, own_recent: list) -> bool:
+        """自己刚说过的话换皮再发。只比对自己的话，阈值比对外复读更松。"""
+        reply_core = cls._stance_core(reply)
+        if len(reply_core) < 6:
+            return False
+        reply_key = cls._leading_key(reply_core)
+        for source in own_recent or []:
+            source_core = cls._stance_core(source)
+            if len(source_core) < 6:
+                continue
+            if reply_core in source_core or source_core in reply_core:
+                return True
+            overlap = cls._bigram_jaccard(reply_core, source_core)
+            if overlap >= 0.55:
+                return True
+            if reply_key and reply_key == cls._leading_key(source_core) and overlap >= 0.15:
+                return True
+        return False
 
     @classmethod
     def looks_like_paraphrase_candidate(cls, reply: str, source_texts: list) -> bool:
@@ -1735,6 +1870,22 @@ class ReplyGenerator:
         r"^先把.{0,60}(?:这事|这件事|这个问题).{0,12}"
         r"(?:理|捋|梳理|确认|核实|弄清|搞清)(?:清|楚|一下|再说)?[。！？!?…]*$"
     )
+    _BOT_SELF_ID_RE = re.compile(
+        r"(?:"
+        r"我是\s*(?:机器人|人工智[能障]|语言模型)"
+        r"|我是\s*(?:AI|ai|bot)\b"
+        r"|作为\s*(?:机器人|AI|ai|bot)\b"
+        r"|(?<![A-Za-z])bot\s*(?:不用|没有|不需要)"
+        r")",
+        re.IGNORECASE,
+    )
+    _CAPTION_LEAK_RE = re.compile(
+        r"(发的图片是|图片是.{0,24}(分享|转发|发送)|一张图，画面|"
+        r"视觉识别|看不清画面|无法识别的消息)"
+    )
+    _SELF_RESTATEMENT_WINDOW = 60.0
+    _HOLLOW_PINGS = frozenset({"在吗", "在嘛", "在不在"})
+    _SHORT_DIRECT_FALLBACKS = ("？", "啥", "啊？")
 
     @classmethod
     def has_media_context(cls, current_message: str, source_texts: list) -> bool:
@@ -1766,6 +1917,36 @@ class ReplyGenerator:
         )
 
     @classmethod
+    def looks_like_bot_self_id(cls, reply: str) -> bool:
+        """草稿在一本正经承认自己是机器人/AI。"""
+        return bool(cls._BOT_SELF_ID_RE.search(str(reply or "")))
+
+    @classmethod
+    def looks_like_caption_leak(cls, reply: str) -> bool:
+        """草稿在复述图片识别摘要或内部描述。"""
+        return bool(cls._CAPTION_LEAK_RE.search(str(reply or "")))
+
+    @classmethod
+    def looks_like_hollow_ping(cls, reply: str) -> bool:
+        """整句只是在问对方在不在，群聊插话时不像真人。"""
+        compact = re.sub(r"[\s？?！!。.~～…]+", "", str(reply or "").strip())
+        return compact in cls._HOLLOW_PINGS
+
+    @classmethod
+    def looks_like_leaked_internal(cls, reply: str) -> bool:
+        """管道泄漏：自称 bot，或把图片识别摘要复述成台词。
+
+        分析步骤/系统指令不走词表。那些无论换什么词，都不应进入 <say>；
+        标签外会被丢掉，标签里交给语义复核。
+        """
+        return cls.looks_like_bot_self_id(reply) or cls.looks_like_caption_leak(reply)
+
+    @classmethod
+    def short_direct_fallback(cls) -> str:
+        """被点名但重答仍不可用时的短反应，不当客服澄清。"""
+        return random.choice(cls._SHORT_DIRECT_FALLBACKS)
+
+    @classmethod
     def needs_reply_quality_review(
         cls,
         reply: str,
@@ -1794,7 +1975,9 @@ class ReplyGenerator:
 
         if cls.looks_like_incomplete(reply):
             return True
-        if direction == "group" and cls.looks_like_meta_commentary(reply):
+        if cls.looks_like_leaked_internal(reply) or cls.looks_like_meta_commentary(reply):
+            return True
+        if direction == "group" and cls.looks_like_hollow_ping(reply):
             return True
         return cls.looks_like_paraphrase_candidate(reply, source_texts) or cls.needs_semantic_review(
             reply, current_message, source_texts
