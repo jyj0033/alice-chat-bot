@@ -736,6 +736,7 @@ class GroupChatBot:
             bot_name=self.personality.name,
             taboo_topics=self.personality.taboo_topics,
             meme_manager=self.meme_manager,
+            knowledge_store=self.memory_storage,
         )
 
     def _init_search(self):

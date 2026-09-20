@@ -1081,6 +1081,74 @@ async def edit_person_alias(alias_id: int, request: Request):
         return {"success": False, "error": str(exc)}
 
 
+@app.get("/api/knowledge")
+async def get_knowledge():
+    """全局热梗/游戏资料库，不按群隔离。"""
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"knowledge": [], "total": 0}
+    try:
+        rows = await bot_instance.memory_storage.list_knowledge()
+        return {"knowledge": rows, "total": len(rows)}
+    except Exception as exc:
+        logger.error("加载资料库失败：%s", exc)
+        return {"knowledge": [], "total": 0, "error": str(exc)}
+
+
+@app.post("/api/knowledge")
+async def create_knowledge(request: Request):
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        data = await request.json()
+        entry_id = await bot_instance.memory_storage.upsert_knowledge(
+            name=data.get("name", ""),
+            summary=data.get("summary", ""),
+            aliases=data.get("aliases"),
+            subject=data.get("subject", ""),
+            source=data.get("source", ""),
+            version=data.get("version", ""),
+        )
+        if not entry_id:
+            return {"success": False, "error": "名称和解释都不能为空"}
+        return {"success": True, "id": entry_id}
+    except Exception as exc:
+        logger.error("新增资料失败：%s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+@app.put("/api/knowledge/{entry_id}")
+async def edit_knowledge(entry_id: int, request: Request):
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        data = await request.json()
+        ok = await bot_instance.memory_storage.update_knowledge(
+            entry_id,
+            name=data.get("name"),
+            summary=data.get("summary"),
+            aliases=data.get("aliases"),
+            subject=data.get("subject"),
+            source=data.get("source"),
+            version=data.get("version"),
+            enabled=data.get("enabled"),
+        )
+        return {"success": ok}
+    except Exception as exc:
+        logger.error("更新资料失败：%s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+@app.delete("/api/knowledge/{entry_id}")
+async def remove_knowledge(entry_id: int):
+    if not bot_instance or not bot_instance.memory_storage:
+        return {"success": False, "error": "Bot not initialized"}
+    try:
+        ok = await bot_instance.memory_storage.delete_knowledge(entry_id)
+        return {"success": ok, "message": "已删除" if ok else "资料不存在"}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
 @app.delete("/api/person-aliases/{alias_id}")
 async def remove_person_alias(alias_id: int):
     if not bot_instance or not bot_instance.memory_storage:

@@ -112,6 +112,8 @@ class MemoryStorage:
         self._ensure_dir()
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._knowledge_count: Optional[int] = None
+        self._knowledge_fts_available = False
         self._init_tables()
         # 嵌入服务（可选，未配置时语义检索回退 TF-IDF）
         self._embedding_service = None
@@ -252,6 +254,7 @@ class MemoryStorage:
             )
         """)
         self._migrate_explicit_qq_aliases()
+        self._init_knowledge_tables()
 
         # 删除画像时保留一个"从何时起不再自动重建"的标记；新素材出现后才允许
         # 重新生成，避免用户刚删掉的旧画像在下一轮提炼中立刻复活。
@@ -433,6 +436,425 @@ class MemoryStorage:
                     migrated += 1
         self.conn.commit()
         return migrated
+
+    # === 全局资料库（热梗 / 游戏设定，不按群隔离） ===
+
+    _WEAK_KNOWLEDGE_KEYS = {
+        "角色", "梗", "游戏", "名词", "这个", "那个", "什么", "是谁",
+        "版本", "卡池", "设定", "出处",
+    }
+
+    def _init_knowledge_tables(self) -> None:
+        """全局热梗和游戏资料：和群黑话、聊天向量记忆分开。"""
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS knowledge_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                aliases TEXT NOT NULL DEFAULT '[]',
+                summary TEXT NOT NULL,
+                subject TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                version TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(name, subject)
+            )
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_knowledge_enabled
+            ON knowledge_entries(enabled, updated_at DESC)
+        """)
+        self._knowledge_fts_available = False
+        try:
+            self.conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+                    name,
+                    aliases,
+                    summary,
+                    subject,
+                    tokenize='unicode61 remove_diacritics 2'
+                )
+            """)
+            self._knowledge_fts_available = True
+            self._rebuild_knowledge_fts_if_needed()
+        except sqlite3.OperationalError as exc:
+            logger.warning("资料库 FTS 不可用，回退别名匹配：%s", exc)
+            self._knowledge_fts_available = False
+        self._knowledge_count = None
+
+    def _rebuild_knowledge_fts_if_needed(self) -> None:
+        if not self._knowledge_fts_available:
+            return
+        try:
+            entry_n = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM knowledge_entries"
+            ).fetchone()["n"]
+            fts_n = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM knowledge_fts"
+            ).fetchone()["n"]
+            if not entry_n or fts_n == entry_n:
+                return
+            self.conn.execute("DELETE FROM knowledge_fts")
+            for row in self.conn.execute("SELECT * FROM knowledge_entries").fetchall():
+                item = self._knowledge_row_to_dict(row)
+                if not item["enabled"]:
+                    continue
+                self.conn.execute(
+                    "INSERT INTO knowledge_fts(rowid, name, aliases, summary, subject) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        item["id"],
+                        item["name"],
+                        " ".join(item["aliases"]),
+                        item["summary"],
+                        item["subject"],
+                    ),
+                )
+        except sqlite3.OperationalError as exc:
+            logger.debug("资料库 FTS 重建失败：%s", exc)
+            self._knowledge_fts_available = False
+
+    @staticmethod
+    def _parse_knowledge_aliases(value) -> list[str]:
+        if isinstance(value, list):
+            raw = value
+        elif not value:
+            raw = []
+        else:
+            text = str(value).strip()
+            if text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                    raw = parsed if isinstance(parsed, list) else [text]
+                except json.JSONDecodeError:
+                    raw = re.split(r"[,，、;；|/]+", text)
+            else:
+                raw = re.split(r"[,，、;；|/]+", text)
+        aliases = []
+        seen = set()
+        for item in raw:
+            alias = " ".join(str(item or "").split()).strip()
+            if not alias:
+                continue
+            key = MemoryStorage._normalize_alias_key(alias)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            aliases.append(alias)
+        return aliases
+
+    @staticmethod
+    def _knowledge_row_to_dict(row) -> dict:
+        data = dict(row)
+        data["aliases"] = MemoryStorage._parse_knowledge_aliases(data.get("aliases"))
+        data["enabled"] = int(data.get("enabled") or 0)
+        return data
+
+    def _invalidate_knowledge_count(self) -> None:
+        self._knowledge_count = None
+
+    def _sync_knowledge_fts(
+        self,
+        entry_id: int,
+        name: str,
+        aliases: list[str],
+        summary: str,
+        subject: str,
+        *,
+        delete_only: bool = False,
+    ) -> None:
+        if not self._knowledge_fts_available:
+            return
+        try:
+            self.conn.execute("DELETE FROM knowledge_fts WHERE rowid = ?", (entry_id,))
+            if delete_only:
+                return
+            self.conn.execute(
+                "INSERT INTO knowledge_fts(rowid, name, aliases, summary, subject) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (entry_id, name, " ".join(aliases), summary, subject),
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug("资料库 FTS 同步失败：%s", exc)
+            self._knowledge_fts_available = False
+
+    @classmethod
+    def _fts_match_query(cls, query: str) -> str:
+        cleaned = re.sub(r"[^\w\u3400-\u9fff]+", " ", query or "", flags=re.UNICODE).strip()
+        if not cleaned:
+            return ""
+        tokens = []
+        for tok in cleaned.split():
+            tok = tok.replace('"', "")
+            if not tok:
+                continue
+            if cls._contains_han(tok) and " " not in tok and 2 <= len(tok) <= 16:
+                tokens.extend(f'"{ch}"' for ch in tok)
+            else:
+                tokens.append(f'"{tok}"')
+        return " AND ".join(tokens[:12])
+
+    @_db_locked
+    def knowledge_count(self, enabled_only: bool = True) -> int:
+        if enabled_only and self._knowledge_count is not None:
+            return self._knowledge_count
+        where = "WHERE enabled = 1" if enabled_only else ""
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM knowledge_entries {where}"
+        ).fetchone()
+        count = int(row["n"] if row else 0)
+        if enabled_only:
+            self._knowledge_count = count
+        return count
+
+    @_db_locked
+    def upsert_knowledge(
+        self,
+        name: str,
+        summary: str,
+        aliases=None,
+        subject: str = "",
+        source: str = "",
+        version: str = "",
+        enabled: bool = True,
+    ) -> int:
+        """新增或更新一条全局资料。同名且同一所属对象视为同一条。"""
+        name = " ".join(str(name or "").split()).strip()
+        summary = str(summary or "").strip()
+        subject = " ".join(str(subject or "").split()).strip()
+        source = str(source or "").strip()
+        version = str(version or "").strip()
+        aliases = self._parse_knowledge_aliases(aliases)
+        aliases = [
+            alias for alias in aliases
+            if self._normalize_alias_key(alias) != self._normalize_alias_key(name)
+        ]
+        if not name or not summary:
+            return 0
+        now = datetime.now().isoformat(sep=" ")
+        row = self.conn.execute(
+            "SELECT id FROM knowledge_entries WHERE name = ? AND subject = ?",
+            (name, subject),
+        ).fetchone()
+        alias_json = json.dumps(aliases, ensure_ascii=False)
+        if row:
+            entry_id = int(row["id"])
+            self.conn.execute(
+                "UPDATE knowledge_entries SET aliases = ?, summary = ?, source = ?, "
+                "version = ?, enabled = ?, updated_at = ? WHERE id = ?",
+                (alias_json, summary, source, version, 1 if enabled else 0, now, entry_id),
+            )
+        else:
+            cursor = self.conn.execute(
+                "INSERT INTO knowledge_entries "
+                "(name, aliases, summary, subject, source, version, enabled, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    name, alias_json, summary, subject, source, version,
+                    1 if enabled else 0, now, now,
+                ),
+            )
+            entry_id = int(cursor.lastrowid)
+        self._sync_knowledge_fts(entry_id, name, aliases, summary, subject)
+        self.conn.commit()
+        self._invalidate_knowledge_count()
+        return entry_id
+
+    @_db_locked
+    def list_knowledge(self, enabled_only: bool = False) -> list[dict]:
+        where = "WHERE enabled = 1" if enabled_only else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM knowledge_entries {where} ORDER BY updated_at DESC, id DESC"
+        ).fetchall()
+        return [self._knowledge_row_to_dict(row) for row in rows]
+
+    @_db_locked
+    def get_knowledge(self, entry_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM knowledge_entries WHERE id = ?", (entry_id,)
+        ).fetchone()
+        return self._knowledge_row_to_dict(row) if row else None
+
+    @_db_locked
+    def update_knowledge(self, entry_id: int, **fields) -> bool:
+        allowed = {
+            "name", "aliases", "summary", "subject", "source", "version", "enabled",
+        }
+        current = self.conn.execute(
+            "SELECT * FROM knowledge_entries WHERE id = ?", (entry_id,)
+        ).fetchone()
+        if not current:
+            return False
+        updates = {}
+        for key, value in fields.items():
+            if key not in allowed or value is None:
+                continue
+            if key == "aliases":
+                updates[key] = json.dumps(
+                    self._parse_knowledge_aliases(value), ensure_ascii=False
+                )
+            elif key == "enabled":
+                updates[key] = 1 if value else 0
+            else:
+                updates[key] = str(value).strip() if key != "summary" else str(value).strip()
+        if "name" in updates and not updates["name"]:
+            return False
+        if "summary" in updates and not updates["summary"]:
+            return False
+        if not updates:
+            return False
+        if "name" in updates or "subject" in updates:
+            new_name = updates.get("name", current["name"])
+            new_subject = updates.get("subject", current["subject"])
+            clash = self.conn.execute(
+                "SELECT id FROM knowledge_entries WHERE name = ? AND subject = ? AND id != ?",
+                (new_name, new_subject, entry_id),
+            ).fetchone()
+            if clash:
+                raise ValueError("已存在同名且同一所属的资料")
+        sets = [f"{key} = ?" for key in updates]
+        params = list(updates.values())
+        sets.append("updated_at = ?")
+        params.append(datetime.now().isoformat(sep=" "))
+        params.append(entry_id)
+        self.conn.execute(
+            f"UPDATE knowledge_entries SET {', '.join(sets)} WHERE id = ?",
+            params,
+        )
+        row = self.conn.execute(
+            "SELECT * FROM knowledge_entries WHERE id = ?", (entry_id,)
+        ).fetchone()
+        item = self._knowledge_row_to_dict(row)
+        if item["enabled"]:
+            self._sync_knowledge_fts(
+                entry_id, item["name"], item["aliases"], item["summary"], item["subject"]
+            )
+        else:
+            self._sync_knowledge_fts(
+                entry_id, item["name"], item["aliases"], item["summary"], item["subject"],
+                delete_only=True,
+            )
+        self.conn.commit()
+        self._invalidate_knowledge_count()
+        return True
+
+    @_db_locked
+    def delete_knowledge(self, entry_id: int) -> bool:
+        cursor = self.conn.execute(
+            "DELETE FROM knowledge_entries WHERE id = ?", (entry_id,)
+        )
+        if cursor.rowcount <= 0:
+            return False
+        self._sync_knowledge_fts(entry_id, "", [], "", "", delete_only=True)
+        self.conn.commit()
+        self._invalidate_knowledge_count()
+        return True
+
+    @_db_locked
+    def search_knowledge(
+        self,
+        query: str,
+        limit: int = 5,
+        exclude_names: list[str] | None = None,
+    ) -> list[dict]:
+        """别名精确匹配优先，FTS 作补充召回。结果带 confidence。"""
+        normalized_query = self._normalize_alias_key(query)
+        if not normalized_query:
+            return []
+        limit = max(1, min(12, int(limit or 5)))
+        excluded = {
+            self._normalize_alias_key(name)
+            for name in (exclude_names or [])
+            if str(name or "").strip()
+        }
+        rows = self.conn.execute(
+            "SELECT * FROM knowledge_entries WHERE enabled = 1"
+        ).fetchall()
+        scored: list[tuple[int, int, dict]] = []
+        seen = set()
+
+        for row in rows:
+            item = self._knowledge_row_to_dict(row)
+            keys = [self._normalize_alias_key(item["name"])]
+            keys.extend(self._normalize_alias_key(alias) for alias in item["aliases"])
+            keys = [key for key in keys if key]
+            if any(key in excluded for key in keys):
+                continue
+            confidence = ""
+            matched = ""
+            for key in sorted(keys, key=len, reverse=True):
+                if normalized_query == key:
+                    confidence, matched = "exact", key
+                    break
+            if not confidence:
+                for key in sorted(keys, key=len, reverse=True):
+                    if (
+                        len(key) >= 2
+                        and key not in self._WEAK_KNOWLEDGE_KEYS
+                        and key in normalized_query
+                    ):
+                        confidence, matched = "exact", key
+                        break
+            if not confidence:
+                for key in sorted(keys, key=len, reverse=True):
+                    if len(normalized_query) >= 2 and normalized_query in key:
+                        confidence, matched = "likely", key
+                        break
+            if not confidence:
+                continue
+            item["confidence"] = confidence
+            item["matched_alias"] = matched
+            scored.append((0 if confidence == "exact" else 1, -len(matched), item))
+            seen.add(item["id"])
+
+        if (
+            self._knowledge_fts_available
+            and sum(1 for item in scored if item[0] == 0) < limit
+        ):
+            fts_query = self._fts_match_query(query)
+            if fts_query:
+                try:
+                    fts_rows = self.conn.execute(
+                        "SELECT rowid FROM knowledge_fts WHERE knowledge_fts MATCH ? LIMIT ?",
+                        (fts_query, limit * 4),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    fts_rows = []
+                for fts_row in fts_rows:
+                    entry_id = int(fts_row[0])
+                    if entry_id in seen:
+                        continue
+                    row = self.conn.execute(
+                        "SELECT * FROM knowledge_entries WHERE id = ? AND enabled = 1",
+                        (entry_id,),
+                    ).fetchone()
+                    if not row:
+                        continue
+                    item = self._knowledge_row_to_dict(row)
+                    keys = [self._normalize_alias_key(item["name"])]
+                    keys.extend(
+                        self._normalize_alias_key(alias) for alias in item["aliases"]
+                    )
+                    if any(key in excluded for key in keys if key):
+                        continue
+                    item["confidence"] = "uncertain"
+                    item["matched_alias"] = item["name"]
+                    scored.append((2, 0, item))
+                    seen.add(item["id"])
+
+        scored.sort(key=lambda item: (item[0], item[1]))
+        hits = [item[2] for item in scored[:limit]]
+        exact_subjects = {
+            str(item.get("subject") or "")
+            for item in hits
+            if item.get("confidence") == "exact"
+        }
+        if len(exact_subjects) > 1:
+            for item in hits:
+                if item.get("confidence") == "exact":
+                    item["confidence"] = "uncertain"
+        return hits
 
     @_db_locked
     def upsert_slang(
@@ -2960,3 +3382,53 @@ class AsyncMemoryStorage:
 
     async def delete_person_alias(self, alias_id: int) -> bool:
         return await asyncio.to_thread(self._storage.delete_person_alias, alias_id)
+
+    # === 全局资料库 ===
+
+    async def knowledge_count(self, enabled_only: bool = True) -> int:
+        return await asyncio.to_thread(self._storage.knowledge_count, enabled_only)
+
+    async def upsert_knowledge(
+        self,
+        name: str,
+        summary: str,
+        aliases=None,
+        subject: str = "",
+        source: str = "",
+        version: str = "",
+        enabled: bool = True,
+    ) -> int:
+        return await asyncio.to_thread(
+            self._storage.upsert_knowledge,
+            name,
+            summary,
+            aliases,
+            subject,
+            source,
+            version,
+            enabled,
+        )
+
+    async def list_knowledge(self, enabled_only: bool = False) -> list[dict]:
+        return await asyncio.to_thread(self._storage.list_knowledge, enabled_only)
+
+    async def get_knowledge(self, entry_id: int) -> Optional[dict]:
+        return await asyncio.to_thread(self._storage.get_knowledge, entry_id)
+
+    async def update_knowledge(self, entry_id: int, **fields) -> bool:
+        return await asyncio.to_thread(
+            lambda: self._storage.update_knowledge(entry_id, **fields)
+        )
+
+    async def delete_knowledge(self, entry_id: int) -> bool:
+        return await asyncio.to_thread(self._storage.delete_knowledge, entry_id)
+
+    async def search_knowledge(
+        self,
+        query: str,
+        limit: int = 5,
+        exclude_names: list[str] | None = None,
+    ) -> list[dict]:
+        return await asyncio.to_thread(
+            self._storage.search_knowledge, query, limit, exclude_names
+        )

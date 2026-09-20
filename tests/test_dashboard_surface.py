@@ -106,6 +106,16 @@ class DashboardSurfaceTests(unittest.TestCase):
             "search-primary",
             "search-bocha-api-key",
             "search-doubao-api-key",
+            "page-knowledge",
+            "knowledge-name",
+            "knowledge-aliases",
+            "knowledge-summary",
+            "knowledge-subject",
+            "knowledge-source",
+            "knowledge-version",
+            "knowledge-list",
+            "knowledge-count",
+            "knowledge-search",
         }
         self.assertTrue(required_ids.issubset(set(self.parser.ids)))
         self.assertNotIn("qq-ws-url", self.parser.ids)
@@ -146,6 +156,12 @@ class DashboardSurfaceTests(unittest.TestCase):
         self.assertIn("/api/group-analysis/run", self.dashboard_source)
         self.assertIn("runGroupAnalysis", self.html)
         self.assertNotIn("/群分析 [天数]", self.html)
+
+    def test_knowledge_library_is_exposed(self):
+        self.assertIn("/api/knowledge", self.dashboard_source)
+        self.assertIn("loadKnowledge", self.html)
+        self.assertIn("addKnowledge", self.html)
+        self.assertIn("全局热梗和游戏设定", self.html)
 
     def test_expression_patterns_can_be_learned_viewed_and_deleted(self):
         self.assertIn("/api/expression-patterns/extract", self.dashboard_source)

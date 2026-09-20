@@ -172,6 +172,7 @@ class ReplyGenerator:
         bot_name: str = "",
         taboo_topics: list[str] = None,
         meme_manager=None,
+        knowledge_store=None,
     ):
         """
         初始化
@@ -186,6 +187,7 @@ class ReplyGenerator:
             bot_name: bot 在对话记录里的显示名（用于识别上下文中自己说的行）
             taboo_topics: 不主动讨论或展开的禁忌话题
             meme_manager: 可选的本地表情包管理器，用于注入内部选图标记
+            knowledge_store: 全局热梗/游戏资料库（与群黑话、聊天向量记忆分开）
         """
         self.llm = llm_provider
         self.personality_prompt = personality_prompt
@@ -203,6 +205,7 @@ class ReplyGenerator:
         self.tool_llm = tool_llm_provider
         self.search_client = search_client
         self.meme_manager = meme_manager
+        self.knowledge_store = knowledge_store
 
         # 统计
         self.replies_generated = 0
@@ -278,17 +281,25 @@ class ReplyGenerator:
             person_aliases=person_aliases,
         )
 
-        # 2. 联网搜索：先让 LLM 判断这条回复是否需要联网（关键词太局限且易误判，
-        #    富媒体描述、玩梗、闲聊都会被误触发），判断需要才确定性预搜索，
-        #    再把资料注入上下文用一次干净调用生成回复。
-        #    （不用 function calling 工具循环：MiniMax 工具协议不稳定——
-        #    内容泄漏、空回复、原生 <invoke> 标记——LLM 判断 + 预搜索 + 注入更可靠。）
-        need_search = await self._judge_need_search(
+        # 2. 检索：先结构化判断「要不要查、查什么」，再查全局资料库；
+        #    稳定事实若本地已命中就不必联网，时效问题或本地不确定时再搜网页。
+        search_decision = await self._judge_need_search(
             current_message,
             context_prompt,
             direction=direction,
             action_plan=action_plan,
         )
+        knowledge_hits = []
+        if search_decision.get("need_search"):
+            knowledge_hits = await self._lookup_knowledge(
+                search_decision.get("query") or current_message,
+                glossary,
+            )
+        has_web = bool(self.search_client and self.search_client.available)
+        use_web = bool(search_decision.get("need_search") and has_web)
+        if knowledge_hits and search_decision.get("freshness") != "current":
+            if any(item.get("confidence") == "exact" for item in knowledge_hits):
+                use_web = False
         # 工具调用：send_meme 是结构化输出，正常路径走原生 tool_use，
         # 异常端点漏成 `<invoke>` 文本时再走 _extract_native_tool_calls 兜底。
         # None 表示本轮没有发图请求；空字符串只表示模型确实调用了
@@ -297,10 +308,15 @@ class ReplyGenerator:
         meme_id = ""
         meme_called = False
         trusted_reply = False
-        if need_search:
+        if search_decision.get("need_search") and (use_web or knowledge_hits):
             try:
                 response = await self._generate_with_search(
-                    request, session_id, current_message
+                    request,
+                    session_id,
+                    current_message,
+                    search_decision=search_decision,
+                    knowledge_hits=knowledge_hits,
+                    use_web=use_web,
                 )
             except Exception as e:
                 logger.error(f"搜索回复生成失败，回退普通回复：{e}", exc_info=True)
@@ -579,7 +595,72 @@ class ReplyGenerator:
             return None
         return self._get_fallback_reply()
 
-    # === 联网搜索（LLM 判断是否需要搜索） ===
+    # === 检索判断（什么时候查、查什么） ===
+
+    _DECISION_RE = re.compile(
+        r"<decision>\s*(.*?)\s*</decision>", re.DOTALL | re.IGNORECASE
+    )
+    _DECISION_JSON_RE = re.compile(
+        r"\{[^{}]*need_search[^{}]*\}", re.DOTALL | re.IGNORECASE
+    )
+    _DEICTIC_QUERIES = {
+        "这是什么梗", "啥梗", "什么梗", "这梗", "那个梗", "这是啥梗",
+        "那角色", "那角色呢", "这个角色", "那是谁", "这谁",
+        "这个", "那个", "这是啥", "这是什么",
+    }
+    _CURRENT_TOPIC_SIGNALS = (
+        "版本", "卡池", "新闻", "天气", "赛程", "价格", "热搜",
+        "兑换码", "礼包码", "开服", "公测",
+    )
+
+    @staticmethod
+    def _no_search_decision() -> Dict[str, Any]:
+        return {
+            "need_search": False,
+            "topic": "",
+            "query": "",
+            "freshness": "stable",
+        }
+
+    async def _has_knowledge(self) -> bool:
+        store = self.knowledge_store
+        if store is None:
+            return False
+        count_fn = getattr(store, "knowledge_count", None)
+        if count_fn is None:
+            return getattr(store, "search_knowledge", None) is not None
+        try:
+            result = count_fn()
+            if asyncio.iscoroutine(result):
+                result = await result
+            return int(result or 0) > 0
+        except Exception:
+            return False
+
+    async def _lookup_knowledge(
+        self,
+        query: str,
+        glossary: list = None,
+    ) -> list[dict]:
+        store = self.knowledge_store
+        if store is None or not str(query or "").strip():
+            return []
+        search = getattr(store, "search_knowledge", None)
+        if search is None:
+            return []
+        exclude = []
+        for item in glossary or []:
+            term = str((item or {}).get("term") or "").strip()
+            if term:
+                exclude.append(term)
+        try:
+            result = search(query, limit=5, exclude_names=exclude)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return [item for item in (result or []) if isinstance(item, dict)]
+        except Exception as exc:
+            logger.warning("资料库检索失败：%s", exc)
+            return []
 
     async def _judge_need_search(
         self,
@@ -587,60 +668,194 @@ class ReplyGenerator:
         context_prompt: str = "",
         direction: str = "",
         action_plan: Dict[str, Any] = None,
-    ) -> bool:
-        """让 LLM 判断这条回复是否需要联网搜索（替代关键词匹配）。
+    ) -> Dict[str, Any]:
+        """判断要不要查资料，以及查什么。
 
-        只有 bot 决策层已经决定要回复的消息才会走到 generate()，所以每次
-        回复多一次轻量判断调用（max_tokens≈8，极简 prompt，约 1s）可接受，
-        换来的是关键词机制没有的上下文理解——「绝区零现在开的谁的池子」能命中，
-        而「猜猜多少钱」这类玩梗、表情包描述不会被误触发。
-
-        返回 False 的情况：媒体描述、判断调用失败/无响应（保守不搜索）、
-        搜索后端不可用、LLM 判定不需要。
+        返回结构化结果，而不是简单的搜/不搜：
+        ``{"need_search", "topic", "query", "freshness"}``。
+        query 应结合最近聊天把「这个」「那角色」还原成具体主题。
         """
-        if not self.tool_llm or not self.search_client or not self.search_client.available:
-            return False
+        judge_llm = self.tool_llm or self.llm
+        has_web = bool(self.search_client and self.search_client.available)
+        if not judge_llm:
+            return self._no_search_decision()
+        has_kb = await self._has_knowledge()
+        if not has_web and not has_kb:
+            return self._no_search_decision()
         # 短反应/明确旁观本身不需要实时资料；尤其是群聊插话，先做一次搜索
         # 判断再让主 LLM 输出 <silent> 会白费一次工具调用和等待时间。
         if direction != "to_bot" and (action_plan or {}).get("action") in {
             "react", "silent"
         }:
-            return False
+            return self._no_search_decision()
         text = (current_message or "").strip()
         if self._matches_taboo(text):
             # 禁忌话题只需要做边界回复，不要为了它额外联网扩展上下文。
-            return False
+            return self._no_search_decision()
         # 富媒体识别描述不判断也不搜索（描述里常带"角色""是什么"等字眼，实为图片内容）
         if text.startswith(self.MEDIA_DESCRIPTION_PREFIXES):
-            return False
+            return self._no_search_decision()
         try:
-            # 上下文取最近几行即可（context_prompt 每行是一条历史消息）
-            context_tail = (context_prompt or "")[-600:]
+            context_tail = (context_prompt or "")[-1200:]
             judge_prompt = (
-                "你是爱丽丝的联网搜索判断器。爱丽丝是普通大学生，群聊里说话随意、选择性参与。\n"
+                "你是爱丽丝的检索判断器。爱丽丝是普通大学生，群聊里说话随意、选择性参与。\n"
                 f"群聊最近对话（节选）：\n{context_tail or '（无）'}\n\n"
                 f"爱丽丝正要回复这条消息：{text}\n\n"
-                "判断：要自然地回复这条消息，是否需要联网搜索实时/精确信息？\n"
-                "需要联网：问现在/今天/最新/天气/温度/价格/比分/新闻/热搜/汇率；"
+                "判断：要自然地回复这条消息，是否需要查资料（本地资料库或联网）。\n"
+                "需要检索：明确问某个梗的意思、出处、来源、怎么来的；"
+                "问游戏名词、角色是谁/什么身份、技能或设定；"
+                "问现在/今天/最新/天气/温度/价格/比分/新闻/热搜/汇率；"
                 "游戏当前卡池、当前版本、开服/公测时间、兑换码/礼包码、赛事赛程；"
                 "未来的具体日程（某游戏明天开服吗、XX号上线吗、发售时间）；"
                 "需要精确事实（人物/作品/名词百科）。\n"
-                "不需要联网：闲聊、玩笑、玩梗、表情包、日常吐槽、问爱丽丝个人看法或喜好、"
-                "情绪回应、续接话题、问不需要外部信息的常识。\n"
-                "最后一行严格输出 <verdict>YES</verdict> 或 <verdict>NO</verdict>，不要输出其他内容。"
+                "不需要检索：闲聊、玩笑、普通接梗（只是用梗说话或玩表情包，并没有问意思）；"
+                "日常吐槽、问爱丽丝个人看法或喜好、情绪回应、续接话题、"
+                "不需要外部信息的常识。\n"
+                "query 必须结合最近聊天，把「这个」「那角色」「这是什么梗」「那是谁」"
+                "还原成具体主题和专有名词，不要只拿当前这句里的指示代词去搜。\n"
+                "freshness：游戏版本、卡池、新闻、天气、赛程、价格等会变的用 current；"
+                "梗出处、角色设定、稳定百科用 stable。\n"
+                "topic 用短标签，如：网络梗解释、游戏角色、游戏版本、新闻、百科。\n"
+                "只输出一行：\n"
+                '<decision>{"need_search":true,"topic":"网络梗解释",'
+                '"query":"补全后的搜索词","freshness":"stable"}</decision>\n'
+                "不需要检索时 need_search 为 false，query 可为空。"
             )
-            resp = await self.tool_llm.chat(ChatRequest(
+            resp = await judge_llm.chat(ChatRequest(
                 messages=[ChatMessage(role="user", content=judge_prompt)],
-                model=getattr(self.tool_llm, "model", None) or "gpt-4o",
+                model=getattr(judge_llm, "model", None) or "gpt-4o",
                 temperature=0.0,
                 max_tokens=512,
             ))
-            verdict = self._parse_search_verdict(resp.content if resp else "")
-            logger.info(f"[搜索判断] 「{text[:40]}」 → {'需要搜索' if verdict else '不搜索'}")
-            return verdict
+            decision = self._parse_search_decision(
+                resp.content if resp else "",
+                fallback_query=text,
+            )
+            if decision.get("need_search"):
+                decision["query"] = self._expand_search_query(
+                    decision.get("query") or "",
+                    text,
+                    context_prompt,
+                )
+            logger.info(
+                "[搜索判断] 「%s」 → %s topic=%s query=%s freshness=%s",
+                text[:40],
+                "需要检索" if decision.get("need_search") else "不检索",
+                decision.get("topic") or "-",
+                (decision.get("query") or "")[:40] or "-",
+                decision.get("freshness") or "stable",
+            )
+            return decision
         except Exception as e:
             logger.error(f"搜索判断失败，按不需搜索处理：{e}", exc_info=True)
-            return False
+            return self._no_search_decision()
+
+    @classmethod
+    def _parse_search_decision(
+        cls,
+        content: str,
+        fallback_query: str = "",
+    ) -> Dict[str, Any]:
+        """解析结构化检索决定；兼容旧的 YES/NO 输出。"""
+        text = re.sub(r"<think>.*?</think>", "", content or "", flags=re.DOTALL)
+        raw = ""
+        tagged = cls._DECISION_RE.search(text)
+        if tagged:
+            raw = (tagged.group(1) or "").strip()
+        if not raw:
+            found = cls._DECISION_JSON_RE.search(text)
+            raw = (found.group(0) if found else "").strip()
+        payload = None
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                try:
+                    payload = json.loads(
+                        raw.replace("True", "true").replace("False", "false")
+                    )
+                except json.JSONDecodeError:
+                    payload = None
+        if isinstance(payload, dict) and "need_search" in payload:
+            return cls._normalize_search_decision(payload, fallback_query)
+        if cls._parse_search_verdict(content):
+            return cls._normalize_search_decision(
+                {"need_search": True, "query": fallback_query},
+                fallback_query,
+            )
+        return cls._no_search_decision()
+
+    @classmethod
+    def _normalize_search_decision(
+        cls,
+        payload: Dict[str, Any],
+        fallback_query: str = "",
+    ) -> Dict[str, Any]:
+        need = payload.get("need_search")
+        if isinstance(need, str):
+            need = need.strip().lower() in {"1", "true", "yes", "y"}
+        else:
+            need = bool(need)
+        query = str(payload.get("query") or "").strip()
+        if need and not query:
+            query = str(fallback_query or "").strip()
+        topic = str(payload.get("topic") or "").strip()
+        freshness = str(payload.get("freshness") or "").strip().lower()
+        if freshness not in {"stable", "current"}:
+            blob = f"{topic} {query}"
+            freshness = (
+                "current"
+                if any(signal in blob for signal in cls._CURRENT_TOPIC_SIGNALS)
+                else "stable"
+            )
+        return {
+            "need_search": need,
+            "topic": topic,
+            "query": query,
+            "freshness": freshness,
+        }
+
+    @classmethod
+    def _expand_search_query(
+        cls,
+        query: str,
+        current_message: str,
+        context_prompt: str,
+    ) -> str:
+        """指示代词查询补上最近一条具体主题。"""
+        filled = (query or current_message or "").strip()
+        compact = re.sub(r"[\s？?！!。.~～、,，]+", "", filled)
+        hint = cls._context_topic_hint(context_prompt, current_message)
+        if not hint:
+            return filled
+        deictic = compact in cls._DEICTIC_QUERIES or compact.endswith("什么梗")
+        if deictic and hint not in filled:
+            return f"{hint} {filled}".strip()
+        return filled
+
+    @classmethod
+    def _context_topic_hint(cls, context_prompt: str, current_message: str) -> str:
+        lines = [
+            line.strip()
+            for line in (context_prompt or "").splitlines()
+            if line.strip()
+        ]
+        current = (current_message or "").strip()
+        for line in reversed(lines):
+            body = line
+            if "：" in body:
+                head, rest = body.split("：", 1)
+                if len(head) <= 40:
+                    body = rest.strip()
+            if not body or body == current:
+                continue
+            if body.startswith(cls.MEDIA_DESCRIPTION_PREFIXES):
+                continue
+            compact = re.sub(r"[\s？?！!。.~～、,，]+", "", body)
+            if compact in cls._DEICTIC_QUERIES or len(body) < 2:
+                continue
+            return body[:40]
+        return ""
 
     @staticmethod
     def _parse_search_verdict(content: str) -> bool:
@@ -660,82 +875,157 @@ class ReplyGenerator:
             return False
         return bool(re.search(r"\byes\b|^是|^对|需要搜索|需要联网|需要查|应该搜|搜索一下|联网查", c))
 
+    @staticmethod
+    def _format_knowledge_hits(hits: list) -> str:
+        if not hits:
+            return ""
+        confidence_label = {
+            "exact": "确定",
+            "likely": "较可能",
+            "uncertain": "不确定",
+        }
+        lines = ["【本地资料库】"]
+        for index, item in enumerate(hits, 1):
+            name = str(item.get("name") or "").strip()
+            subject = str(item.get("subject") or "").strip()
+            aliases = "、".join(
+                str(alias).strip() for alias in (item.get("aliases") or []) if str(alias).strip()
+            )
+            header = f"{index}. {name}"
+            if subject:
+                header += f"（{subject}）"
+            if aliases:
+                header += f" 别名：{aliases}"
+            lines.append(header)
+            summary = str(item.get("summary") or "").strip()
+            if summary:
+                lines.append(f"   解释：{summary}")
+            meta = []
+            source = str(item.get("source") or "").strip()
+            if source:
+                meta.append(f"来源：{source}")
+            updated = str(item.get("updated_at") or "").strip()
+            if updated:
+                meta.append(f"更新：{updated[:10]}")
+            version = str(item.get("version") or "").strip()
+            if version:
+                meta.append(f"适用版本：{version}")
+            meta.append(
+                "匹配：" + confidence_label.get(str(item.get("confidence") or ""), "不确定")
+            )
+            lines.append("   " + " · ".join(meta))
+        return "\n".join(lines)
+
     async def _generate_with_search(
         self,
         request: ChatRequest,
         session_id: str = "",
         current_message: str = "",
+        search_decision: Dict[str, Any] = None,
+        knowledge_hits: list = None,
+        use_web: bool = True,
     ) -> Optional[ChatResponse]:
-        """确定性搜索 + 资料注入上下文，一次干净 LLM 调用生成回复。
+        """资料注入上下文，一次干净 LLM 调用生成回复。
 
         不用 function calling 工具循环：MiniMax 工具协议不稳定（内容泄漏、
         空回复、原生 <invoke> 标记、轮数超限后还要重建请求），
-        预搜索 + 把资料当作普通上下文注入更可靠。关键词已把关，
-        LLM 看到资料后自主决定怎么用。
+        预搜索 + 把资料当作普通上下文注入更可靠。
         """
-        # 1. 搜索词 = 当前消息（去掉对话前缀，取最后一行实质内容）
-        query = (current_message or "").strip()
+        decision = search_decision or {}
+        knowledge_hits = [
+            item for item in (knowledge_hits or []) if isinstance(item, dict)
+        ]
+        query = (decision.get("query") or current_message or "").strip()
         if not query:
             for m in reversed(request.messages):
                 if m.role == "user" and isinstance(m.content, str):
                     query = m.content.strip()
                     break
-        # 富媒体识别描述不搜索（见 _search_enabled 的注释），兜底防绕过。
-        if query.startswith(self.MEDIA_DESCRIPTION_PREFIXES):
-            return None
+        freshness = str(decision.get("freshness") or "stable")
+        prefer_recent = freshness == "current"
 
-        results = await self.search_client.search(query, session_id=session_id)
-        self.search_calls += 1
-
-        # 2. 用户问"现在/当前"，但搜到的全是下版本前瞻（如鸣潮全是3.6预告）：
-        #    自动推断当前版本号，补搜「游戏名+当前版本+卡池」拿正在进行的卡池。
-        if (
-            results
-            and self.search_client.is_time_sensitive(query)
-            and self.search_client.all_future(results)
-        ):
-            cur_ver = self.search_client.infer_current_version(results)
-            game = self.search_client.extract_game_name(query)
-            if cur_ver and game:
-                # 强制豆包+近期时间窗：实测豆包 oneMonth 能命中
-                # 「当前版本在售卡池」的文章（如"鸣潮3.5首期唤取开启"），
-                # 博查对这类查询返回的多是旧版本攻略。
-                followup = await self.search_client.search(
-                    f"{game}{cur_ver}卡池",
+        results = []
+        if use_web and self.search_client and self.search_client.available:
+            # 富媒体识别描述不搜索，兜底防绕过。
+            if query.startswith(self.MEDIA_DESCRIPTION_PREFIXES):
+                if not knowledge_hits:
+                    return None
+            else:
+                results = await self.search_client.search(
+                    query,
                     session_id=session_id,
-                    force_backend="doubao",
-                    prefer_recent=True,
+                    prefer_recent=prefer_recent,
                 )
                 self.search_calls += 1
-                if followup:
-                    results = followup
 
-        if not results:
+                # 用户问"现在/当前"，但搜到的全是下版本前瞻（如鸣潮全是3.6预告）：
+                # 自动推断当前版本号，补搜「游戏名+当前版本+卡池」拿正在进行的卡池。
+                if (
+                    results
+                    and self.search_client.is_time_sensitive(query)
+                    and self.search_client.all_future(results)
+                ):
+                    cur_ver = self.search_client.infer_current_version(results)
+                    game = self.search_client.extract_game_name(query)
+                    if cur_ver and game:
+                        followup = await self.search_client.search(
+                            f"{game}{cur_ver}卡池",
+                            session_id=session_id,
+                            force_backend="doubao",
+                            prefer_recent=True,
+                        )
+                        self.search_calls += 1
+                        if followup:
+                            results = followup
+
+        if not results and not knowledge_hits:
             return None  # 没搜到 → 上层回退主 LLM 正常回答
+
+        knowledge_block = self._format_knowledge_hits(knowledge_hits)
+        web_block = ""
+        if results and self.search_client:
+            web_block = self.search_client.format_results(results)
+        uncertain = any(
+            item.get("confidence") != "exact" for item in knowledge_hits
+        ) if knowledge_hits else False
+        sources = "\n\n".join(part for part in (knowledge_block, web_block) if part)
 
         # 3. 干净请求：在原始请求副本上追加资料（无任何工具），一次生成。
         clean = copy.deepcopy(request)
         import datetime as _dt
         _today = _dt.datetime.now().strftime("%Y年%m月%d日")
+        caution = (
+            "匹配不确定或对不上时，短问一句确认，或谨慎说不太确定，不要把不确定条目当成事实。"
+            if uncertain or not knowledge_hits
+            else "本地资料库命中较确定时优先用它；和联网结果冲突时，时效问题看日期更新的，稳定设定看本地来源。"
+        )
+        current_rule = (
+            "用户问「现在/当前」或资料标记为 current 时，只回答【正在进行】的内容；"
+            if freshness == "current"
+            else "用户问「现在/当前」时，只回答【正在进行】的内容；"
+        )
+        writer = self.tool_llm or self.llm
         clean.messages.append(ChatMessage(
             role="user",
             content=(
-                f"今天是{_today}。以下是爱丽丝查到的资料（每条标注了日期）：\n\n"
-                + self.search_client.format_results(results)
+                f"今天是{_today}。以下是查到的资料（每条标注了来源和日期）。"
+                "这些是通用资料，不是某个群的黑话。\n\n"
+                + sources
                 + "\n\n请基于这些资料回答。要求：\n"
-                "1. 用户问「现在/当前」时，只回答【正在进行】的内容；"
+                f"1. {current_rule}"
                 "标了【前瞻预告】或日期在未来的是还没发生的事，要明确说「X号才开/下个版本才上」，"
                 "不能当成现在。\n"
                 "2. 把资料当作你自己本来就知道的事，用平时跟群友聊天的语气自然说出来；"
-                "不要提「据xxx」「搜索显示」「仅供参考」，不要贴链接。\n"
-                "3. 资料过时或和现在对不上、没有直接答案时，像记不清一样自然带过"
+                "不要提「据xxx」「搜索显示」「资料库」「仅供参考」，不要贴链接。\n"
+                f"3. {caution}"
+                "资料过时或没有直接答案时，像记不清一样自然带过"
                 "（比如「这我哪记得」「好久没关注了」），绝不要编造版本号或角色名。\n"
                 "4. 把要发给群友的话放进 <say></say>，不要把思考过程或英文草稿放进去。"
             ),
         ))
         clean.max_tokens = max(clean.max_tokens, 300)
 
-        resp = await self.tool_llm.chat(clean)
+        resp = await writer.chat(clean) if writer else None
         # 工具 LLM（OpenAI 兼容端点）偶发：空回复 / 只输出 <think> 思考块 /
         # 残留工具标记。一律清理思考后再判定是否可用——若可用内容为空，
         # 改用主 LLM 对同一份资料重答，不浪费已经搜到的结果

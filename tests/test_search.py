@@ -89,6 +89,9 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
             tool_llm.model = "test"
         return gen
 
+    def _needs_search(self, decision):
+        return bool((decision or {}).get("need_search"))
+
     # === LLM 判断是否需要搜索 ===
 
     async def test_judge_yes_when_llm_says_yes(self):
@@ -96,7 +99,9 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_llm.chat = AsyncMock(return_value=ChatResponse(content="YES", model="test"))
         gen = self._make_generator(tool_llm, MagicMock())
         gen.search_client.available = True
-        self.assertTrue(await gen._judge_need_search("绝区零现在开的谁的池子", "[刚刚] 小明：绝区零现在开的谁的池子"))
+        decision = await gen._judge_need_search("绝区零现在开的谁的池子", "[刚刚] 小明：绝区零现在开的谁的池子")
+        self.assertTrue(self._needs_search(decision))
+        self.assertEqual(decision["query"], "绝区零现在开的谁的池子")
         tool_llm.chat.assert_awaited_once()
 
     async def test_judge_no_when_llm_says_no(self):
@@ -104,7 +109,8 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_llm.chat = AsyncMock(return_value=ChatResponse(content="NO", model="test"))
         gen = self._make_generator(tool_llm, MagicMock())
         gen.search_client.available = True
-        self.assertFalse(await gen._judge_need_search("晚饭吃啥", "[刚刚] 小明：晚饭吃啥"))
+        decision = await gen._judge_need_search("晚饭吃啥", "[刚刚] 小明：晚饭吃啥")
+        self.assertFalse(self._needs_search(decision))
 
     async def test_judge_negative_phrase_not_misparsed(self):
         """「不需要」这类否定不能被「需要」误判成要搜索。"""
@@ -112,7 +118,8 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_llm.chat = AsyncMock(return_value=ChatResponse(content="不需要搜索", model="test"))
         gen = self._make_generator(tool_llm, MagicMock())
         gen.search_client.available = True
-        self.assertFalse(await gen._judge_need_search("随便聊聊", "[刚刚] 小明：随便聊聊"))
+        decision = await gen._judge_need_search("随便聊聊", "[刚刚] 小明：随便聊聊")
+        self.assertFalse(self._needs_search(decision))
 
     async def test_judge_media_description_never_searches(self):
         """表情包/图片识别描述不判断（富媒体内容，不是用户问句）。"""
@@ -120,8 +127,9 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_llm.chat = AsyncMock(return_value=ChatResponse(content="YES", model="test"))
         gen = self._make_generator(tool_llm, MagicMock())
         gen.search_client.available = True
-        self.assertFalse(await gen._judge_need_search(
-            "[表情包，内容：白发红瞳的动漫角色闭眼咧嘴笑着…，回复：笑死]", ""))
+        decision = await gen._judge_need_search(
+            "[表情包，内容：白发红瞳的动漫角色闭眼咧嘴笑着…，回复：笑死]", "")
+        self.assertFalse(self._needs_search(decision))
         tool_llm.chat.assert_not_awaited()
 
     async def test_group_short_reaction_skips_search_judge(self):
@@ -130,11 +138,12 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_llm.chat = AsyncMock(return_value=ChatResponse(content="YES", model="test"))
         gen = self._make_generator(tool_llm, MagicMock())
         gen.search_client.available = True
-        self.assertFalse(await gen._judge_need_search(
+        decision = await gen._judge_need_search(
             "现在是什么", "[刚刚] 小明：现在是什么",
             direction="group",
             action_plan={"action": "react"},
-        ))
+        )
+        self.assertFalse(self._needs_search(decision))
         tool_llm.chat.assert_not_awaited()
 
     async def test_judge_failure_conservative_no(self):
@@ -143,7 +152,53 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_llm.chat = AsyncMock(side_effect=RuntimeError("boom"))
         gen = self._make_generator(tool_llm, MagicMock())
         gen.search_client.available = True
-        self.assertFalse(await gen._judge_need_search("今天天气", "[刚刚] 小明：今天天气"))
+        decision = await gen._judge_need_search("今天天气", "[刚刚] 小明：今天天气")
+        self.assertFalse(self._needs_search(decision))
+
+    def test_parse_structured_decision(self):
+        raw = (
+            "<think>先看上下文</think>"
+            '<decision>{"need_search":true,"topic":"网络梗解释",'
+            '"query":"xx梗 出处 意思","freshness":"stable"}</decision>'
+        )
+        decision = ReplyGenerator._parse_search_decision(raw, fallback_query="这是什么梗")
+        self.assertTrue(decision["need_search"])
+        self.assertEqual(decision["topic"], "网络梗解释")
+        self.assertEqual(decision["query"], "xx梗 出处 意思")
+        self.assertEqual(decision["freshness"], "stable")
+
+    def test_parse_decision_defaults_gacha_to_current(self):
+        decision = ReplyGenerator._parse_search_decision(
+            '{"need_search": true, "topic": "游戏版本", "query": "鸣潮当前卡池"}',
+            fallback_query="现在开谁",
+        )
+        self.assertEqual(decision["freshness"], "current")
+
+    def test_expand_deictic_query_from_context(self):
+        filled = ReplyGenerator._expand_search_query(
+            "这是什么梗",
+            "这是什么梗",
+            "[刚刚] 小明：xx这个表情也太烂了\n[刚刚] 小红：这是什么梗",
+        )
+        self.assertIn("xx", filled)
+        self.assertIn("这是什么梗", filled)
+
+    async def test_judge_uses_structured_query_from_context(self):
+        tool_llm = MagicMock()
+        tool_llm.chat = AsyncMock(return_value=ChatResponse(
+            content='<decision>{"need_search":true,"topic":"游戏角色",'
+                    '"query":"崩坏星穹铁道 卡芙卡","freshness":"stable"}</decision>',
+            model="test",
+        ))
+        gen = self._make_generator(tool_llm, MagicMock())
+        gen.search_client.available = True
+        decision = await gen._judge_need_search(
+            "那角色呢",
+            "[刚刚] 小明：崩铁那个卡芙卡也太帅了\n[刚刚] 小红：那角色呢",
+        )
+        self.assertTrue(decision["need_search"])
+        self.assertEqual(decision["query"], "崩坏星穹铁道 卡芙卡")
+        self.assertEqual(decision["freshness"], "stable")
 
     # === 搜索路径（判断 YES） ===
 
@@ -176,6 +231,36 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_llm.chat.call_count, 2)
         last_content = tool_llm.chat.await_args.args[0].messages[-1].content
         self.assertIn("搜索到的资料", last_content)
+        self.assertTrue(search_client.search.await_args.kwargs.get("prefer_recent"))
+
+    async def test_generate_uses_resolved_query_not_current_message(self):
+        tool_llm = MagicMock()
+        tool_llm.chat = AsyncMock(side_effect=[
+            ChatResponse(
+                content='<decision>{"need_search":true,"topic":"网络梗解释",'
+                        '"query":"xx梗 出处 意思","freshness":"stable"}</decision>',
+                model="test",
+            ),
+            ChatResponse(content="<say>就是那个老梗。</say>", model="test"),
+        ])
+        search_client = MagicMock()
+        search_client.available = True
+        search_client.is_time_sensitive = lambda q: False
+        search_client.all_future = lambda r: False
+        search_client.search = AsyncMock(return_value=[
+            SearchResult(title="xx梗", url="https://x.com", snippet="出处"),
+        ])
+        search_client.format_results = lambda r: "搜索到的资料：\n1. xx梗"
+
+        gen = self._make_generator(tool_llm, search_client)
+        await gen.generate(
+            context_prompt="[刚刚] 小明：xx这个也太烂了\n[刚刚] 小红：这是什么梗",
+            current_message="这是什么梗",
+            direction="to_bot",
+            session_id="group_1",
+        )
+        self.assertEqual(search_client.search.await_args.args[0], "xx梗 出处 意思")
+        self.assertFalse(search_client.search.await_args.kwargs.get("prefer_recent"))
 
     async def test_no_results_falls_back_to_main_llm(self):
         tool_llm = MagicMock()
