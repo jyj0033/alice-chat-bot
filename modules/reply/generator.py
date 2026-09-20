@@ -36,6 +36,27 @@ EMOJI_RE = re.compile(
 )
 
 
+# MiniMax-M3 会把内部 tool-call 边界漏进 message.content。
+# 线上实例：`<say>第1580天了，纹丝不动]<]minimax[>[</say>`
+# 参见 MiniMax-M3#31：`]<]minimax[>[` 原样出现在可见文本里。
+_MINIMAX_BOUNDARY_RE = re.compile(r"\]?<\]minimax\[>\[?")
+_TOOL_CALL_TAG_RE = re.compile(r"</?tool_call>")
+_PROTOCOL_STOP_SEQUENCES = ("]<]minimax", "<]minimax")
+
+
+def _merge_protocol_stops(stop) -> list[str]:
+    """在请求里带上 MiniMax 协议边界，减少泄漏进可见文本。"""
+    stops: list[str] = []
+    if isinstance(stop, str) and stop:
+        stops = [stop]
+    elif isinstance(stop, (list, tuple)):
+        stops = [str(item) for item in stop if item]
+    for token in _PROTOCOL_STOP_SEQUENCES:
+        if token not in stops:
+            stops.append(token)
+    return stops
+
+
 def strip_emoji(text: str) -> str:
     """移除文字回复中的 Emoji。
 
@@ -211,6 +232,8 @@ class ReplyGenerator:
         self.replies_generated = 0
         self.replies_filtered = 0
         self.search_calls = 0
+        self.format_invalid = 0
+        self.rewrites = 0
 
         # "被嫌弃"降级按 session 冷却，避免道歉一次后反复道歉
         self._last_frustrated: Dict[str, float] = {}
@@ -361,9 +384,11 @@ class ReplyGenerator:
         #     （空 args 想随机抽时 category/id 都是空，但 called=True）。
         has_meme = meme_called
         if (self._has_tool_markup(reply) or not reply) and not has_meme and not trusted_reply:
-            logger.warning("搜索回复不可用（%s），回退主语言模型重新生成", (reply or "")[:40])
+            reason = "protocol" if self._has_tool_markup(reply) else "empty"
+            self._note_invalid_draft(reason, reply)
+            self._note_rewrite(reason)
             try:
-                resp2 = await self.llm.chat(request)
+                resp2 = await self.llm.chat(self._format_retry_request(request))
                 reply2 = self._clean_thinking_process(resp2.content.strip())
                 # 重答时也要顺手把 send_meme 工具调用捞出来
                 if self.meme_manager and not meme_called:
@@ -374,11 +399,20 @@ class ReplyGenerator:
                     reply2 = self._strip_native_tool_markup(reply2)
                 # 重答也走 tool_use 且没文字 → 别再兜底，否则会无限循环
                 if not reply2 and not meme_called:
+                    self._note_invalid_draft("empty", reply2)
                     if direction != "to_bot":
                         return None
                     reply = self._get_fallback_reply()
                     trusted_reply = True
                 elif reply2:
+                    if self._has_tool_markup(reply2):
+                        self._note_invalid_draft("protocol", reply2)
+                    else:
+                        logger.warning(
+                            "[格式] 第%d次重写完成 reason=%s",
+                            self.rewrites,
+                            reason,
+                        )
                     reply = reply2
             except Exception as e:
                 logger.error(f"语言模型回退调用失败：{e}", exc_info=True)
@@ -488,6 +522,12 @@ class ReplyGenerator:
 
         # 8. 清理文字 Emoji；表情包图片走独立发送通道
         reply = strip_emoji(reply)
+        reply = self._strip_model_protocol_tokens(reply)
+        if self._has_tool_markup(reply):
+            logger.warning("[格式] 发送前仍有模型协议残留，丢弃：%s", reply[:60])
+            if not meme_called:
+                return None
+            reply = ""
 
         # 9. 思考/打字延迟由 GroupChatBot._compose_and_send 统一处理。
         # 这里不再重复等待，避免一次回复串行等待两套延迟。
@@ -536,13 +576,16 @@ class ReplyGenerator:
         Returns:
             ("say", content) | ("silent", "") | ("missing", "")
         """
-        raw = str(text or "").strip()
+        raw = cls._strip_model_protocol_tokens(str(text or "").strip())
         if not raw:
             return "missing", ""
         matches = cls._SAY_RE.findall(raw)
         if matches:
             inner = (matches[-1] or "").strip()
             inner = re.sub(r"</?say\s*>", "", inner, flags=re.IGNORECASE).strip()
+            inner = cls._strip_model_protocol_tokens(inner)
+            if cls._has_tool_markup(inner):
+                return "missing", ""
             if not inner or cls._is_silent(inner):
                 return "silent", ""
             return "say", inner
@@ -552,10 +595,50 @@ class ReplyGenerator:
         if unclosed:
             inner = (unclosed.group(1) or "").strip()
             inner = re.sub(r"</?say\s*>", "", inner, flags=re.IGNORECASE).strip()
+            inner = cls._strip_model_protocol_tokens(inner)
+            if cls._has_tool_markup(inner):
+                return "missing", ""
             if not inner or cls._is_silent(inner):
                 return "silent", ""
             return "say", inner
         return "missing", ""
+
+    _FORMAT_RETRY_HINT = (
+        "上次输出不符合发送格式。"
+        "要发给群友的话必须从 <say> 写到 </say>，一对标签都要有；"
+        "标签里只放那句群聊回复，不要带工具调用、内部标记或协议符号。"
+        "分析可以写在标签外。没有要说的就只输出 <silent>。"
+    )
+    _INVALID_DRAFT_LOG_CHARS = 200
+
+    def _format_retry_request(self, request: ChatRequest) -> ChatRequest:
+        """重写时再强调一次发送格式，避免沿用已泄漏的原请求。"""
+        retry_request = copy.deepcopy(request)
+        retry_request.add_user(self._FORMAT_RETRY_HINT)
+        return retry_request
+
+    def _note_invalid_draft(self, reason: str, draft: str) -> None:
+        """记录不合规草稿：提高级别，带累计次数和原文摘要。"""
+        self.format_invalid += 1
+        snippet = re.sub(r"\s+", " ", str(draft or "")).strip()
+        if len(snippet) > self._INVALID_DRAFT_LOG_CHARS:
+            snippet = snippet[: self._INVALID_DRAFT_LOG_CHARS] + "…"
+        logger.warning(
+            "[格式] 草稿不合规 reason=%s 累计不合规=%d 累计重写=%d：%s",
+            reason,
+            self.format_invalid,
+            self.rewrites,
+            snippet or "（空）",
+        )
+
+    def _note_rewrite(self, reason: str) -> None:
+        self.rewrites += 1
+        logger.warning(
+            "[格式] 开始第%d次重写 reason=%s 累计不合规=%d",
+            self.rewrites,
+            reason,
+            self.format_invalid,
+        )
 
     async def _ensure_sendable_text(
         self,
@@ -573,24 +656,21 @@ class ReplyGenerator:
             return "" if has_meme else None
         if has_meme:
             return ""
-        logger.info("[格式] 输出未放入 <say>，要求重包：%s", (text or "")[:60])
-        retry_request = copy.deepcopy(request)
-        retry_request.add_user(
-            "上次没有把要发给群友的话放进 <say></say>。"
-            "分析可以写在标签外；标签里只放那句群聊回复。"
-            "没有要说的就输出 <silent>。"
-        )
+        self._note_invalid_draft("missing_say", text)
+        self._note_rewrite("missing_say")
         try:
-            response = await self.llm.chat(retry_request)
+            response = await self.llm.chat(self._format_retry_request(request))
             retry_text = self._clean_thinking_process((response.content or "").strip())
         except Exception as exc:
             logger.warning("[格式] 重包 <say> 失败：%s", exc)
             retry_text = ""
         kind, content = self.extract_sendable_reply(retry_text)
         if kind == "say":
+            logger.warning("[格式] 第%d次重写完成 reason=missing_say", self.rewrites)
             return content
         if kind == "silent":
             return None
+        self._note_invalid_draft("missing_say", retry_text)
         if direction != "to_bot":
             return None
         return self._get_fallback_reply()
@@ -1032,22 +1112,29 @@ class ReplyGenerator:
         # （回退无资料的主 LLM 只能凭记忆，搜索等于白做）。
         reply = self._clean_thinking_process(str(resp.content or "")) if resp else ""
         if not reply or self._has_tool_markup(reply):
-            reason = f"finish={getattr(resp, 'finish_reason', '?')!r}" if resp else "无响应"
-            logger.warning(
-                "搜索工具语言模型回复不可用（%r，%s），改用主语言模型带资料重答",
-                reply[:40],
-                reason,
-            )
+            finish = f"finish={getattr(resp, 'finish_reason', '?')!r}" if resp else "无响应"
+            reason = "protocol" if self._has_tool_markup(reply) else "empty"
+            self._note_invalid_draft(reason, reply or finish)
+            self._note_rewrite("search_writer")
             try:
-                resp = await self.llm.chat(clean)
+                resp = await self.llm.chat(self._format_retry_request(clean))
                 reply = self._clean_thinking_process(str(resp.content or "")) if resp else ""
             except Exception as exc:
                 logger.error(f"主语言模型带资料重答失败：{exc}", exc_info=True)
                 resp = None
                 reply = ""
             if not reply or self._has_tool_markup(reply):
+                self._note_invalid_draft(
+                    "protocol" if self._has_tool_markup(reply) else "empty",
+                    reply,
+                )
                 logger.warning("主语言模型带资料重答仍不可用，丢弃搜索结果")
                 resp = None
+            else:
+                logger.warning(
+                    "[格式] 第%d次重写完成 reason=search_writer",
+                    self.rewrites,
+                )
         return resp
 
     @staticmethod
@@ -1056,9 +1143,17 @@ class ReplyGenerator:
         return any(tag in content for tag in ("<tool_call>", "<invoke", "<]minimax", "<parameter"))
 
     @staticmethod
+    def _strip_model_protocol_tokens(text: str) -> str:
+        """去掉模型泄漏到可见文本里的协议边界，保留前后正常句子。"""
+        cleaned = _MINIMAX_BOUNDARY_RE.sub("", str(text or ""))
+        cleaned = _TOOL_CALL_TAG_RE.sub("", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
     def _strip_native_tool_markup(content: str) -> str:
         """移除已经识别的原生工具 XML，保留工具调用前后的正常文字。"""
-        text = str(content or "")
+        text = ReplyGenerator._strip_model_protocol_tokens(content)
         text = re.sub(
             r"<invoke\s*name=[\"'][^\"']+[\"']>[\s\S]*?</invoke>",
             "",
@@ -1241,6 +1336,7 @@ class ReplyGenerator:
             temperature=temp,
             max_tokens=configured_max_tokens,
             top_p=top_p,
+            stop=_merge_protocol_stops(None),
         )
         # 显式带上 provider 的模型：ChatRequest 默认 "gpt-4o" 会对部分严格端点
         # （如 MiniMax OpenAI 兼容端点）报 unknown model，不能让默认值覆盖真实配置。
@@ -2298,7 +2394,6 @@ class ReplyGenerator:
 
     def _clean_thinking_process(self, text: str) -> str:
         """清理思考过程（如 DeepSeek 的 <think>...</think>）"""
-        import re
         # 移除 <think>...</think> 标签
         text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
         # 移除 (思考中...)、【思考】等模式
@@ -2306,6 +2401,7 @@ class ReplyGenerator:
         text = re.sub(r'\(思考中[^)]*\)', '', text)
         # 移除 "让我想想" 等思考前置语
         text = re.sub(r'^(让我想想|等我想想|等等我)[，,]', '', text)
+        text = self._strip_model_protocol_tokens(text)
         # 清理多余空白
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
@@ -2338,6 +2434,8 @@ class ReplyGenerator:
         return {
             "generated": self.replies_generated,
             "filtered": self.replies_filtered,
+            "format_invalid": self.format_invalid,
+            "rewrites": self.rewrites,
             "pass_rate": (
                 (self.replies_generated - self.replies_filtered) / self.replies_generated
                 if self.replies_generated > 0 else 0

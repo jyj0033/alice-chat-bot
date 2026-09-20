@@ -343,8 +343,13 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("流萤", reply)
         # 主 LLM 带同一份资料重答，且不带资料的无资料重答不应发生
         main_llm.chat.assert_awaited_once()
-        last_content = main_llm.chat.await_args.args[0].messages[-1].content
-        self.assertIn("搜索到的资料", last_content)
+        user_text = "\n".join(
+            message.content
+            for message in main_llm.chat.await_args.args[0].messages
+            if message.role == "user"
+        )
+        self.assertIn("搜索到的资料", user_text)
+        self.assertIn("不符合发送格式", user_text)
 
     async def test_tool_llm_empty_content_retries_with_data(self):
         """工具 LLM 返回空 content（resp 非 None 但无内容）→ 同样主 LLM 带资料重答。"""
@@ -374,8 +379,13 @@ class ReplyGeneratorToolLoopTests(unittest.IsolatedAsyncioTestCase):
         reply = gen_result["reply"] if isinstance(gen_result, dict) else gen_result
         self.assertIn("晴天", reply)
         main_llm.chat.assert_awaited_once()
-        last_content = main_llm.chat.await_args.args[0].messages[-1].content
-        self.assertIn("搜索到的资料", last_content)
+        user_text = "\n".join(
+            message.content
+            for message in main_llm.chat.await_args.args[0].messages
+            if message.role == "user"
+        )
+        self.assertIn("搜索到的资料", user_text)
+        self.assertIn("不符合发送格式", user_text)
 
 
 if __name__ == "__main__":

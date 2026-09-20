@@ -1013,6 +1013,149 @@ class HumanizationLogicTests(unittest.TestCase):
             )
         )
 
+    def test_minimax_boundary_token_is_stripped_from_say(self):
+        kind, content = ReplyGenerator.extract_sendable_reply(
+            "<say>第1580天了，纹丝不动]<]minimax[>[</say>"
+        )
+        self.assertEqual(kind, "say")
+        self.assertEqual(content, "第1580天了，纹丝不动")
+        kind, content = ReplyGenerator.extract_sendable_reply(
+            "<say>数着呢，还有1581 1582...]<]minimax[>[]<]minimax[>[</say>"
+        )
+        self.assertEqual(kind, "say")
+        self.assertEqual(content, "数着呢，还有1581 1582...")
+        self.assertNotIn("minimax", content)
+
+    def test_minimax_protocol_tokens_are_not_tool_markup_after_strip(self):
+        leaked = "<say>这么快就拔了？疼不疼]<]minimax[>[</say>"
+        self.assertTrue(ReplyGenerator._has_tool_markup(leaked))
+        cleaned = ReplyGenerator(llm_provider=None)._clean_thinking_process(leaked)
+        self.assertEqual(cleaned, "<say>这么快就拔了？疼不疼</say>")
+        self.assertFalse(ReplyGenerator._has_tool_markup(cleaned))
+        self.assertTrue(
+            ReplyGenerator._has_tool_markup(
+                '<invoke name="web_search"><query>天气</query></invoke>'
+            )
+        )
+
+    def test_minimax_boundary_token_is_not_sent(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from modules.llm.base import ChatResponse
+
+        class _Provider:
+            model = "test"
+
+            async def chat(self, request):
+                return ChatResponse(
+                    content="<say>第1580天了，纹丝不动]<]minimax[>[</say>",
+                    model=self.model,
+                )
+
+        generator = ReplyGenerator(llm_provider=_Provider())
+        generator._judge_need_search = AsyncMock(
+            return_value=ReplyGenerator._no_search_decision()
+        )
+
+        async def run():
+            return await generator.generate(
+                context_prompt="[刚刚] 龍飛月：第147天了",
+                current_message="第147天了",
+                direction="group",
+            )
+
+        with patch("modules.personality.speaking_style.random.random", return_value=1.0):
+            result = asyncio.run(run())
+        self.assertIsNotNone(result)
+        self.assertEqual(result["reply"], "第1580天了，纹丝不动")
+        self.assertNotIn("minimax", result["reply"])
+        self.assertEqual(generator.rewrites, 0)
+        self.assertEqual(generator.format_invalid, 0)
+
+    def test_protocol_retry_reemphasizes_say_format(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from modules.llm.base import ChatResponse
+
+        class _Provider:
+            def __init__(self):
+                self.requests = []
+
+            async def chat(self, request):
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    return ChatResponse(
+                        content=(
+                            "<say>纹丝不动</say>"
+                            '<invoke name="web_search"><query>x</query></invoke>'
+                        ),
+                        model="test",
+                    )
+                return ChatResponse(content="<say>纹丝不动</say>", model="test")
+
+        provider = _Provider()
+        generator = ReplyGenerator(llm_provider=provider)
+        generator._judge_need_search = AsyncMock(
+            return_value=ReplyGenerator._no_search_decision()
+        )
+
+        async def run():
+            return await generator.generate(
+                context_prompt="[刚刚] 龍飛月：第1580天",
+                current_message="第1580天",
+                direction="group",
+            )
+
+        with patch("modules.personality.speaking_style.random.random", return_value=1.0):
+            result = asyncio.run(run())
+        self.assertEqual(result["reply"], "纹丝不动")
+        self.assertEqual(len(provider.requests), 2)
+        retry_user = provider.requests[1].messages[-1].content
+        self.assertIn("不符合发送格式", retry_user)
+        self.assertIn("<say>", retry_user)
+        self.assertIn("</say>", retry_user)
+        self.assertEqual(generator.format_invalid, 1)
+        self.assertEqual(generator.rewrites, 1)
+        stats = generator.get_stats()
+        self.assertEqual(stats["format_invalid"], 1)
+        self.assertEqual(stats["rewrites"], 1)
+
+    def test_missing_say_retry_reemphasizes_format(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from modules.llm.base import ChatResponse
+
+        class _Provider:
+            def __init__(self):
+                self.requests = []
+
+            async def chat(self, request):
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    return ChatResponse(content="先判断他在问什么", model="test")
+                return ChatResponse(content="<say>第1580天了</say>", model="test")
+
+        provider = _Provider()
+        generator = ReplyGenerator(llm_provider=provider)
+        generator._judge_need_search = AsyncMock(
+            return_value=ReplyGenerator._no_search_decision()
+        )
+
+        async def run():
+            return await generator.generate(
+                context_prompt="[刚刚] 龍飛月：第1580天",
+                current_message="第1580天",
+                direction="group",
+            )
+
+        with patch("modules.personality.speaking_style.random.random", return_value=1.0):
+            result = asyncio.run(run())
+        self.assertEqual(result["reply"], "第1580天了")
+        retry_user = provider.requests[1].messages[-1].content
+        self.assertIn("不符合发送格式", retry_user)
+        self.assertEqual(generator.format_invalid, 1)
+        self.assertEqual(generator.rewrites, 1)
+
     def test_only_say_channel_is_sendable(self):
         kind, content = ReplyGenerator.extract_sendable_reply(
             '先判断他在问生日，联系上下文\n<say>空巢老人+1</say>'
