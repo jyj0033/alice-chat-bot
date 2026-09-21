@@ -553,22 +553,40 @@ class ContextManager:
             for m in window.messages:
                 if m.sender_id and not m.is_bot:
                     id_name[m.sender_id] = m.sender_name
-            mem_lines = []
-            for m in memories[:5]:
-                content = m.content
-                meta = m.metadata or {}
+
+            def _memory_line(item) -> str:
+                content = item.content
+                meta = item.metadata or {}
                 sid = meta.get("sender_id")
                 if sid and sid in id_name:
                     old = meta.get("sender_name")
                     new = id_name[sid]
                     if old and old != new and content.startswith(old + "："):
                         content = new + content[len(old):]
-                t = format_message_time(m.created_at, now)
-                mem_lines.append(f"- [{t}] {content}")
-            parts.append(
-                "[你的记忆]（这些是你记得的旧事，[时间]是事情发生的时间，越久远的记忆越模糊）\n"
-                + "\n".join(mem_lines)
-            )
+                t = format_message_time(item.created_at, now)
+                return f"- [{t}] {content}"
+
+            impression_lines = []
+            mem_lines = []
+            for item in memories[:5]:
+                meta = item.metadata or {}
+                tags = meta.get("tags") or getattr(item, "tags", None) or []
+                if isinstance(tags, str):
+                    tags = [tags]
+                if meta.get("profile") or "用户画像" in tags:
+                    impression_lines.append(_memory_line(item))
+                else:
+                    mem_lines.append(_memory_line(item))
+            if impression_lines:
+                parts.append(
+                    "[你对群友的印象]（用第一人称记住的人，不是旁观者档案）\n"
+                    + "\n".join(impression_lines)
+                )
+            if mem_lines:
+                parts.append(
+                    "[你的记忆]（这些是你记得的旧事，[时间]是事情发生的时间，越久远的记忆越模糊）\n"
+                    + "\n".join(mem_lines)
+                )
 
         # 3. 最近对话
         conversation = window.build_conversation_text(

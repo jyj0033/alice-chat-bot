@@ -612,6 +612,35 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertIn("self=\"1\"", prompt)
         self.assertIn("禁止把标签", prompt)
 
+    def test_profile_memories_are_labeled_as_impressions(self):
+        from datetime import datetime
+        from modules.memory.storage import Memory
+
+        manager = ContextManager()
+        prompt = manager.build_context_prompt(
+            "group_g1",
+            bot_name="爱丽丝",
+            memories=[
+                Memory(
+                    content="【用户画像 小明】我记得他常玩原神",
+                    memory_type="semantic",
+                    created_at=datetime.now(),
+                    metadata={"profile": True, "sender_id": "u1", "sender_name": "小明"},
+                    tags=["用户画像"],
+                ),
+                Memory(
+                    content="小明：昨天通宵了",
+                    memory_type="episodic",
+                    created_at=datetime.now(),
+                    metadata={"sender_id": "u1", "sender_name": "小明"},
+                ),
+            ],
+        )
+        self.assertIn("[你对群友的印象]", prompt)
+        self.assertIn("我记得他常玩原神", prompt)
+        self.assertIn("[你的记忆]", prompt)
+        self.assertIn("昨天通宵了", prompt)
+
     def test_current_message_is_separated_from_history_and_relation_is_visible(self):
         """生成阶段要把待回复消息单独标出，避免把整段前文当成复读对象。"""
         manager = ContextManager()
@@ -1633,13 +1662,32 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertTrue(
             GroupChatBot._profile_quality_warnings("此人日常关注游戏话题")
         )
-        # 具体、确定的画像不该被打标
+        self.assertTrue(
+            any("档案口吻" in x for x in GroupChatBot._profile_quality_warnings(
+                "该用户在芜湖做电话催收"
+            ))
+        )
+        self.assertTrue(
+            any("不是第一人称" in x for x in GroupChatBot._profile_quality_warnings(
+                "在芜湖做电话催收，加班多，常聊原神和工作吐槽"
+            ))
+        )
+        # 具体、确定的第一人称印象不该被打标
         self.assertEqual(
             GroupChatBot._profile_quality_warnings(
-                "在芜湖做电话催收，加班多，常聊原神和工作吐槽"
+                "我记得他在芜湖做电话催收，加班多，常聊原神和工作吐槽"
             ),
             [],
         )
+
+    def test_profile_distill_prompt_is_first_person(self):
+        from main import GroupChatBot
+        prompt = GroupChatBot._profile_distill_system_prompt("爱丽丝")
+        self.assertIn("第一人称", prompt)
+        self.assertIn("以「我」来写", prompt)
+        self.assertIn("已有印象", prompt)
+        self.assertNotIn("用第三人称", prompt)
+        self.assertNotIn("你是用户画像提炼助手", prompt)
 
     def test_implicit_direction_allows_silence(self):
         """延续对话推断出的指向（to_bot_implicit）允许 LLM 判断后沉默；
