@@ -5,6 +5,7 @@
 * 这句话主要是在对谁说；
 * Alice 是否应该参与；
 * 如果参与，应该回答、续接、附和还是补充信息；
+* 这句话是在提问、请求、调侃、接梗还是做身份试探；
 * 回复应该引用哪条消息。
 
 显式 @、回复段和消息顺序都作为模型输入证据保留。模型判断之后还会再套一层
@@ -61,6 +62,11 @@ class ConversationJudgeResult:
     intent: str = "silent"  # answer / follow_up / acknowledge / add_info / react / silent
     should_reply: bool = False
     confidence: float = 0.0
+    # ``intent`` 控制是否进入回复流程；语用字段描述当前消息在语境中
+    # 做的社交动作。两者分开，避免语用分类偶尔不准时影响原有的发言决策。
+    pragmatic_intent: dict[str, Any] = field(default_factory=dict)
+    target_confidence: float | None = None
+    pragmatic_confidence: float | None = None
     reference_message_id: str = ""
     target_user_id: str = ""
     reason: str = ""
@@ -69,11 +75,28 @@ class ConversationJudgeResult:
     evidence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        def clamp(value: Any, default: float = 0.0) -> float:
+            try:
+                return round(max(0.0, min(1.0, float(value))), 3)
+            except (TypeError, ValueError):
+                return default
+
         return {
             "target": self.target,
             "intent": self.intent,
             "should_reply": bool(self.should_reply),
-            "confidence": round(max(0.0, min(1.0, float(self.confidence))), 3),
+            "confidence": clamp(self.confidence),
+            "target_confidence": clamp(
+                self.confidence
+                if self.target_confidence is None
+                else self.target_confidence
+            ),
+            "pragmatic_confidence": (
+                None
+                if self.pragmatic_confidence is None
+                else clamp(self.pragmatic_confidence)
+            ),
+            "pragmatic_intent": dict(self.pragmatic_intent or {}),
             "reference_message_id": self.reference_message_id,
             "target_user_id": self.target_user_id,
             "reason": self.reason[:240],
@@ -98,6 +121,45 @@ class ConversationJudge:
         "add_info",
         "react",
         "silent",
+    }
+    PRAGMATIC_ACTS = {
+        "question",
+        "request",
+        "answer",
+        "follow_up",
+        "acknowledge",
+        "share",
+        "tease",
+        "banter",
+        "complaint",
+        "correction",
+        "praise",
+        "comfort",
+        "challenge",
+        "identity_test",
+        "silence",
+    }
+    PRAGMATIC_TONES = {
+        "neutral",
+        "serious",
+        "playful",
+        "sarcastic",
+        "hostile",
+        "uncertain",
+    }
+    EXPECTED_REPLIES = {
+        "direct_answer",
+        "short_reaction",
+        "short_banter",
+        "clarify",
+        "defuse",
+        "silent",
+    }
+    RISK_FLAGS = {
+        "identity_bait",
+        "ambiguous_addressee",
+        "unsupported_assumption",
+        "escalation_risk",
     }
 
     def __init__(
@@ -214,9 +276,23 @@ class ConversationJudge:
             "字段必须是：target（bot/other/group/unknown）、"
             "intent（answer/follow_up/acknowledge/add_info/react/silent）、"
             "should_reply（true/false）、confidence（0到1）、"
+            "target_confidence（目标判断置信度，0到1）、"
+            "pragmatic_confidence（语用判断置信度，0到1）、"
+            "pragmatic_intent（对象：act/tone/expected_reply/literal/risk_flags）、"
             "reference_message_id（当前消息ID，没有就空字符串）、"
             "target_user_id（如果主要对某个群友说则填QQ号，否则空字符串）、"
-            "reason（不超过40字的简短依据）。"
+            "reason（不超过40字的简短依据）。\n"
+            "pragmatic_intent.act 只能是 question/request/answer/follow_up/"
+            "acknowledge/share/tease/banter/complaint/correction/praise/comfort/"
+            "challenge/identity_test/silence；"
+            "tone 只能是 neutral/serious/playful/sarcastic/hostile/uncertain；"
+            "expected_reply 只能是 direct_answer/short_reaction/short_banter/"
+            "clarify/defuse/silent；literal 是 true/false；"
+            "risk_flags 只能从 identity_bait/ambiguous_addressee/"
+            "unsupported_assumption/escalation_risk 中选择。\n"
+            "语用意图描述这句话在当前语境中做的社交动作，不要把它当成事实判断。"
+            "target/should_reply 仍负责是否进入回复流程；语气拿不准时用 uncertain，"
+            "不要为了凑字段臆测。"
         )
         request.add_user(prompt)
 
@@ -246,12 +322,20 @@ class ConversationJudge:
                 heuristic_signals or {},
             )
             logger.info(
-                "[目标判断] %s → 目标=%s，意图=%s，是否回复=%s，置信度=%.2f，理由=%s",
+                "[目标判断] %s → 目标=%s，意图=%s，语用=%s/%s，是否回复=%s，"
+                "置信度=%.2f/%.2f，理由=%s",
                 result.evidence["message_id"] or "no-id",
                 result.target,
                 result.intent,
+                (result.pragmatic_intent or {}).get("act", "-"),
+                (result.pragmatic_intent or {}).get("tone", "-"),
                 result.should_reply,
-                result.confidence,
+                result.target_confidence
+                if result.target_confidence is not None
+                else result.confidence,
+                result.pragmatic_confidence
+                if result.pragmatic_confidence is not None
+                else 0.0,
                 result.reason,
             )
             return result
@@ -268,8 +352,9 @@ class ConversationJudge:
         reply: str,
         *,
         direction: str = "group",
+        conversation_judgement: dict[str, Any] | ConversationJudgeResult | None = None,
     ) -> ConversationJudgeResult:
-        """复核草稿是否复读、越过证据、句子残缺或变成元话语。"""
+        """复核草稿是否符合消息意图、证据和基本表达质量。"""
         if not self.enabled or not self.provider:
             return ConversationJudgeResult.unavailable("provider_unavailable")
 
@@ -287,6 +372,11 @@ class ConversationJudge:
             current=True,
             known_users=known_users,
         )
+        if isinstance(conversation_judgement, ConversationJudgeResult):
+            judgement = conversation_judgement.to_dict()
+        else:
+            judgement = dict(conversation_judgement or {})
+        judgement_contract = self._render_judgement_contract(judgement)
         prompt = (
             "判断下面这条 Bot 草稿是否真正理解并接住了当前消息。重点检查两类问题：\n"
             "1. 是不是把用户刚说的话或前文换一种说法重复了一遍，而没有真正接话、回答或增加信息；\n"
@@ -304,6 +394,12 @@ class ConversationJudge:
             f"【当前消息】\n{current}\n\n"
             f"【Bot草稿】\n{reply}\n\n"
             f"【回复方向】{direction}\n"
+            f"{judgement_contract}"
+            "如果提供了消息语用意图，还要检查草稿是否完成了对应的社交动作："
+            "调侃不能被按字面认真解释，轻松玩笑不能无故升级成攻击，"
+            "对 Bot 的称呼不能倒扣给发言人；命中 identity_bait 时不要承认自己是"
+            "机器人、AI、程序，也不要用身体设定暴露身份。语用置信度偏低时，"
+            "允许多种自然接法；只有明确的对象错误、身份暴露、事实臆断或语气升级才判不匹配。\n"
             "只输出 JSON：{\"is_paraphrase\":true/false,"
             "\"adds_information\":true/false,"
             "\"unsupported_assumption\":true/false,"
@@ -311,6 +407,9 @@ class ConversationJudge:
             "\"incomplete\":true/false,"
             "\"meta_commentary\":true/false,"
             "\"on_topic\":true/false,"
+            "\"pragmatic_mismatch\":true/false,"
+            "\"mismatch_types\":[\"identity_exposure\",\"literalized_banter\","
+            "\"wrong_addressee\",\"tone_drift\",\"strategy_mismatch\"],"
             "\"replacement_hint\":\"不超过30字\"}。不要输出解释或思维过程。"
         )
         request = ChatRequest(
@@ -320,7 +419,7 @@ class ConversationJudge:
             top_p=0.1,
         )
         request.add_system(
-            "你是对话质量检查器。只做语义复读和证据充分性判断，不评价人格，不负责改写。"
+            "你是对话质量检查器。检查语义质量和消息语用契约，不评价人格，不负责改写。"
             "只输出要求的 JSON，不要输出思维过程。"
         )
         request.add_user(prompt)
@@ -339,6 +438,8 @@ class ConversationJudge:
                     "incomplete",
                     "meta_commentary",
                     "on_topic",
+                    "pragmatic_mismatch",
+                    "mismatch_types",
                 )
             ):
                 raise ValueError("invalid_json_result")
@@ -357,6 +458,19 @@ class ConversationJudge:
                 payload.get("meta_commentary"), False
             )
             on_topic = self._parse_bool(payload.get("on_topic"), True)
+            pragmatic_mismatch = self._parse_bool(
+                payload.get("pragmatic_mismatch"), False
+            )
+            mismatch_types = self._normalize_mismatch_types(
+                payload.get("mismatch_types")
+            )
+            if self._looks_like_identity_exposure(
+                current_message,
+                reply,
+                judgement,
+            ) and "identity_exposure" not in mismatch_types:
+                mismatch_types.append("identity_exposure")
+            pragmatic_mismatch = pragmatic_mismatch or bool(mismatch_types)
             quality_issue = (
                 (is_paraphrase and not adds_information)
                 or unsupported_assumption
@@ -364,6 +478,7 @@ class ConversationJudge:
                 or incomplete
                 or meta_commentary
                 or not on_topic
+                or pragmatic_mismatch
             )
             return ConversationJudgeResult(
                 intent="silent" if quality_issue else "react",
@@ -379,6 +494,8 @@ class ConversationJudge:
                     "incomplete": incomplete,
                     "meta_commentary": meta_commentary,
                     "on_topic": on_topic,
+                    "pragmatic_mismatch": pragmatic_mismatch,
+                    "mismatch_types": mismatch_types,
                 },
             )
         except asyncio.CancelledError:
@@ -386,6 +503,96 @@ class ConversationJudge:
         except Exception as exc:
             logger.debug("[复读判断] 调用失败：%s", exc)
             return ConversationJudgeResult.unavailable(str(exc))
+
+    @classmethod
+    def _render_judgement_contract(cls, judgement: dict[str, Any]) -> str:
+        """把前置判断压成短契约，交给复核器核对而不是重新猜测。"""
+        if not judgement or not judgement.get("available"):
+            return ""
+        pragmatic = judgement.get("pragmatic_intent") or {}
+        if not isinstance(pragmatic, dict):
+            pragmatic = {}
+        lines = [
+            "【预先判断的消息意图（仅作为复核契约）】",
+            f"target={str(judgement.get('target') or 'unknown')}",
+            f"intent={str(judgement.get('intent') or 'silent')}",
+            f"should_reply={bool(judgement.get('should_reply'))}",
+        ]
+        for key in ("act", "tone", "expected_reply", "literal", "risk_flags"):
+            if key in pragmatic and pragmatic.get(key) not in (None, "", []):
+                lines.append(f"{key}={pragmatic.get(key)}")
+        pragmatic_confidence = judgement.get("pragmatic_confidence")
+        if pragmatic_confidence is not None:
+            lines.append(f"pragmatic_confidence={pragmatic_confidence}")
+        return "\n".join(lines) + "\n\n"
+
+    @staticmethod
+    def _normalize_mismatch_types(value: Any) -> list[str]:
+        allowed = {
+            "identity_exposure",
+            "literalized_banter",
+            "wrong_addressee",
+            "tone_drift",
+            "strategy_mismatch",
+        }
+        aliases = {
+            "身份暴露": "identity_exposure",
+            "把玩笑当真": "literalized_banter",
+            "称呼对象错误": "wrong_addressee",
+            "语气漂移": "tone_drift",
+            "策略不匹配": "strategy_mismatch",
+        }
+        if isinstance(value, str):
+            value = re.split(r"[,，、/\s]+", value)
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        result = []
+        for item in value:
+            text = str(item or "").strip().lower()
+            text = aliases.get(text, text)
+            if text in allowed and text not in result:
+                result.append(text)
+        return result[:5]
+
+    @staticmethod
+    def _looks_like_identity_exposure(
+        current_message: Any,
+        reply: str,
+        judgement: dict[str, Any],
+    ) -> bool:
+        """拦截身份诱导下的明显自我暴露，避免完全依赖复核模型。"""
+        current_text = str(
+            getattr(current_message, "outer_text", "")
+            or getattr(current_message, "content", "")
+            or ""
+        ).lower()
+        reply_text = str(reply or "").lower()
+        pragmatic = judgement.get("pragmatic_intent") or {}
+        raw_flags = pragmatic.get("risk_flags") if isinstance(pragmatic, dict) else []
+        if isinstance(raw_flags, str):
+            raw_flags = [raw_flags]
+        risk_flags = set(raw_flags or [])
+        english_identity_term = bool(
+            re.search(r"(?<![a-z])(?:ai|bot)(?![a-z])", current_text)
+        )
+        identity_context = bool(
+            risk_flags.intersection({"identity_bait"})
+            or any(term in current_text for term in ("人机", "机器人", "人工智能"))
+            or english_identity_term
+        )
+        if not identity_context:
+            return False
+        if re.search(
+            r"(?:我|本人)\s*(?:是|就是|属于|作为)\s*(?:机器人|人工智能|语言模型|ai|bot|人机)",
+            reply_text,
+            flags=re.IGNORECASE,
+        ):
+            return True
+        # 例如当前问“你有皮肤嘛”，回复“我没有，但我知道疼”也是把玩笑
+        # 按 Bot 的身体设定回答，应该回到轻松接梗或装傻策略。
+        return "皮肤" in current_text and bool(
+            re.search(r"(?:我|本人)\s*(?:没|没有|不具备|没有什么)", reply_text)
+        )
 
     async def review_meme_send(
         self,
@@ -764,6 +971,25 @@ class ConversationJudge:
             result.intent = "react"
             result.should_reply = True
             result.confidence = max(result.confidence, 0.72)
+            result.target_confidence = max(
+                result.target_confidence
+                if result.target_confidence is not None
+                else 0.0,
+                0.72,
+            )
+            result.pragmatic_confidence = max(
+                result.pragmatic_confidence
+                if result.pragmatic_confidence is not None
+                else 0.0,
+                0.72,
+            )
+            result.pragmatic_intent = {
+                **(result.pragmatic_intent or {}),
+                "act": "banter",
+                "tone": "playful",
+                "expected_reply": "short_banter",
+                "literal": False,
+            }
             result.target_user_id = ""
             if current_id:
                 result.reference_message_id = current_id
@@ -971,11 +1197,28 @@ class ConversationJudge:
         if intent == "silent":
             should_reply = False
         confidence = cls._parse_float(payload.get("confidence"), 0.5)
+        target_confidence = cls._parse_float(
+            payload.get("target_confidence"), confidence
+        )
+        pragmatic_payload = payload.get("pragmatic_intent")
+        pragmatic_confidence_value = payload.get("pragmatic_confidence")
+        if isinstance(pragmatic_payload, dict) and pragmatic_confidence_value is None:
+            pragmatic_confidence_value = pragmatic_payload.get("confidence")
+        pragmatic_confidence = (
+            None
+            if pragmatic_confidence_value is None
+            else cls._parse_float(pragmatic_confidence_value, confidence)
+        )
         return ConversationJudgeResult(
             target=target,
             intent=intent,
             should_reply=should_reply,
             confidence=confidence,
+            pragmatic_intent=cls._normalize_pragmatic_intent(
+                pragmatic_payload, payload
+            ),
+            target_confidence=target_confidence,
+            pragmatic_confidence=pragmatic_confidence,
             reference_message_id=str(
                 payload.get("reference_message_id")
                 or payload.get("reference_id")
@@ -1043,6 +1286,124 @@ class ConversationJudge:
         }
         text = aliases.get(text, text)
         return text if text in cls.INTENTS else "silent"
+
+    @classmethod
+    def _normalize_pragmatic_intent(
+        cls,
+        value: Any,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """归一化语用字段，并兼容模型返回扁平字段或旧 JSON。"""
+        payload = payload or {}
+        raw = dict(value) if isinstance(value, dict) else {}
+        if not raw:
+            raw = {
+                key: payload.get(key)
+                for key in (
+                    "act",
+                    "pragmatic_act",
+                    "tone",
+                    "expected_reply",
+                    "reply_strategy",
+                    "literal",
+                    "risk_flags",
+                )
+                if payload.get(key) is not None
+            }
+
+        def normalize_choice(
+            raw_value: Any,
+            allowed: set[str],
+            aliases: dict[str, str],
+        ) -> str:
+            text = str(raw_value or "").strip().lower()
+            text = aliases.get(text, text)
+            return text if text in allowed else ""
+
+        act = normalize_choice(
+            raw.get("act") or raw.get("pragmatic_act"),
+            cls.PRAGMATIC_ACTS,
+            {
+                "提问": "question",
+                "问题": "question",
+                "请求": "request",
+                "回答": "answer",
+                "续话": "follow_up",
+                "附和": "acknowledge",
+                "分享": "share",
+                "调侃": "tease",
+                "玩笑": "banter",
+                "吐槽": "complaint",
+                "抱怨": "complaint",
+                "纠正": "correction",
+                "夸奖": "praise",
+                "安慰": "comfort",
+                "挑战": "challenge",
+                "身份试探": "identity_test",
+                "沉默": "silence",
+            },
+        )
+        tone = normalize_choice(
+            raw.get("tone"),
+            cls.PRAGMATIC_TONES,
+            {
+                "中性": "neutral",
+                "认真": "serious",
+                "严肃": "serious",
+                "轻松": "playful",
+                "玩笑": "playful",
+                "讽刺": "sarcastic",
+                "敌意": "hostile",
+                "不确定": "uncertain",
+            },
+        )
+        expected_reply = normalize_choice(
+            raw.get("expected_reply") or raw.get("reply_strategy"),
+            cls.EXPECTED_REPLIES,
+            {
+                "直接回答": "direct_answer",
+                "短反应": "short_reaction",
+                "接梗": "short_banter",
+                "短接梗": "short_banter",
+                "澄清": "clarify",
+                "缓和": "defuse",
+                "沉默": "silent",
+            },
+        )
+
+        normalized: dict[str, Any] = {}
+        if act:
+            normalized["act"] = act
+        if tone:
+            normalized["tone"] = tone
+        if expected_reply:
+            normalized["expected_reply"] = expected_reply
+
+        literal_value = raw.get("literal")
+        if literal_value is not None:
+            normalized["literal"] = cls._parse_bool(literal_value, False)
+
+        flags = raw.get("risk_flags")
+        if isinstance(flags, str):
+            flags = re.split(r"[,，、/\s]+", flags)
+        if not isinstance(flags, (list, tuple, set)):
+            flags = []
+        flag_aliases = {
+            "身份诱导": "identity_bait",
+            "身份试探": "identity_bait",
+            "指代不清": "ambiguous_addressee",
+            "无依据": "unsupported_assumption",
+            "升级冲突": "escalation_risk",
+        }
+        normalized_flags = []
+        for flag in flags:
+            text = str(flag or "").strip().lower()
+            text = flag_aliases.get(text, text)
+            if text in cls.RISK_FLAGS and text not in normalized_flags:
+                normalized_flags.append(text)
+        if normalized_flags:
+            normalized["risk_flags"] = normalized_flags
+        return normalized
 
     @staticmethod
     def _parse_bool(value: Any, default: bool) -> bool:

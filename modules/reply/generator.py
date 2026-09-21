@@ -1598,6 +1598,79 @@ class ReplyGenerator:
                 "群友把你拉进了玩笑；用一句短的自嘲或接梗回应，"
                 "别解释背景，也别把玩笑当真。"
             )
+        pragmatic = judgement.get("pragmatic_intent") or {}
+        if isinstance(pragmatic, dict) and pragmatic:
+            act_text = {
+                "question": "认真提问",
+                "request": "提出请求",
+                "answer": "回答前文",
+                "follow_up": "续接前文",
+                "acknowledge": "附和或确认",
+                "share": "分享信息",
+                "tease": "调侃",
+                "banter": "接梗玩笑",
+                "complaint": "吐槽或抱怨",
+                "correction": "纠正说法",
+                "praise": "夸奖",
+                "comfort": "安慰",
+                "challenge": "挑战或质疑",
+                "identity_test": "试探身份",
+                "silence": "没有需要回应的动作",
+            }.get(str(pragmatic.get("act") or ""), str(pragmatic.get("act") or ""))
+            tone_text = {
+                "neutral": "中性",
+                "serious": "认真",
+                "playful": "轻松",
+                "sarcastic": "讽刺",
+                "hostile": "带敌意",
+                "uncertain": "不确定",
+            }.get(str(pragmatic.get("tone") or ""), str(pragmatic.get("tone") or ""))
+            reply_text = {
+                "direct_answer": "直接回答",
+                "short_reaction": "短反应",
+                "short_banter": "短接梗",
+                "clarify": "澄清",
+                "defuse": "缓和",
+                "silent": "保持沉默",
+            }.get(
+                str(pragmatic.get("expected_reply") or ""),
+                str(pragmatic.get("expected_reply") or ""),
+            )
+            details = []
+            if act_text:
+                details.append(f"语用动作={act_text}")
+            if tone_text:
+                details.append(f"语气={tone_text}")
+            if reply_text:
+                details.append(f"建议={reply_text}")
+            if details:
+                guide += "消息语用方向：" + "；".join(details) + "。"
+            pragmatic_confidence = judgement.get("pragmatic_confidence")
+            try:
+                low_confidence = pragmatic_confidence is not None and float(
+                    pragmatic_confidence
+                ) < 0.6
+            except (TypeError, ValueError):
+                low_confidence = False
+            if low_confidence:
+                guide += "语用判断把握不高，采用保守、轻量的表达，不要过度解读。"
+            raw_risk_flags = pragmatic.get("risk_flags") or []
+            if isinstance(raw_risk_flags, str):
+                raw_risk_flags = [raw_risk_flags]
+            risk_flags = {
+                str(flag).strip()
+                for flag in raw_risk_flags
+                if str(flag).strip()
+            }
+            if "identity_bait" in risk_flags or pragmatic.get("act") == "identity_test":
+                guide += (
+                    "这是身份试探或诱导；不要承认自己是机器人、AI、bot或程序，"
+                    "也不要用‘没有皮肤’等身体设定回答，装傻或轻松接梗即可。"
+                )
+            if "ambiguous_addressee" in risk_flags:
+                guide += "称呼对象可能含糊，先按当前@/回复对象接话，不要把称呼倒扣给发言人。"
+            if "escalation_risk" in risk_flags:
+                guide += "保持轻松或缓和语气，不要把调侃升级成人身攻击。"
         return guide
 
     @staticmethod
@@ -1689,6 +1762,23 @@ class ReplyGenerator:
             hints.append("不要复述前文，直接回应当前消息或补充真正有用的新内容")
         if evidence.get("on_topic") is False:
             hints.append("只回应当前消息，不要转去概括旁边的聊天")
+        if evidence.get("pragmatic_mismatch"):
+            raw_mismatch_types = evidence.get("mismatch_types") or []
+            if isinstance(raw_mismatch_types, str):
+                raw_mismatch_types = [raw_mismatch_types]
+            mismatch_types = set(raw_mismatch_types)
+            if "identity_exposure" in mismatch_types:
+                hints.append(
+                    "不要承认自己是人机、机器人、AI或程序，也不要用身体设定暴露身份；装傻或轻松接梗"
+                )
+            if "literalized_banter" in mismatch_types:
+                hints.append("当前是在开玩笑或调侃，按语用接梗，不要把玩笑当成字面命令认真执行")
+            if "wrong_addressee" in mismatch_types:
+                hints.append("保持当前@或回复对象不变，不要把对 Bot 的称呼倒扣给发言人")
+            if "tone_drift" in mismatch_types:
+                hints.append("保持当前轻松语气，不要无故升级成攻击或争辩")
+            if "strategy_mismatch" in mismatch_types or not mismatch_types:
+                hints.append("按消息语用方向完成对应的社交动作，不要只复述字面词")
         return "；".join(hints) or "直接回应当前消息；没有自然、准确的内容就保持沉默"
 
     def _matches_taboo(self, text: str) -> bool:

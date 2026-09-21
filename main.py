@@ -2180,14 +2180,30 @@ class GroupChatBot:
         recent_messages: list,
         reply: str,
         direction: str,
+        conversation_judgement: dict | None = None,
     ) -> tuple[bool, str]:
         """重生成稿必须再通过一次质量复核；复核不可用时按未通过处理。"""
-        review = await judge.review_reply(
-            message,
-            recent_messages,
-            reply,
-            direction=direction,
-        )
+        review_kwargs = {"direction": direction}
+        # 兼容仍使用旧签名的测试替身/外部 Judge；正式实现会复用同一份语用判断。
+        if conversation_judgement:
+            review_kwargs["conversation_judgement"] = conversation_judgement
+        try:
+            review = await judge.review_reply(
+                message,
+                recent_messages,
+                reply,
+                **review_kwargs,
+            )
+        except TypeError as exc:
+            if not conversation_judgement or "conversation_judgement" not in str(exc):
+                raise
+            # 旧版外部 Judge 仍可完成基础复核，只是没有语用契约。
+            review = await judge.review_reply(
+                message,
+                recent_messages,
+                reply,
+                direction=direction,
+            )
         if not review.available:
             return False, "重答复核不可用"
         if review.should_reply:
@@ -2598,6 +2614,7 @@ class GroupChatBot:
                     recent_context_for_review,
                     review_text,
                     direction=direction,
+                    conversation_judgement=conversation_judgement,
                 )
                 review_evidence = review.evidence or {}
                 paraphrase_issue = bool(
@@ -2615,6 +2632,9 @@ class GroupChatBot:
                     review_evidence.get("meta_commentary")
                 )
                 off_topic_issue = review_evidence.get("on_topic") is False
+                pragmatic_issue = bool(
+                    review_evidence.get("pragmatic_mismatch")
+                )
                 if review.available and (
                     paraphrase_issue
                     or unsupported_issue
@@ -2622,8 +2642,23 @@ class GroupChatBot:
                     or incomplete_issue
                     or meta_commentary_issue
                     or off_topic_issue
+                    or pragmatic_issue
                 ):
-                    if paraphrase_issue:
+                    raw_mismatch_types = review_evidence.get("mismatch_types") or []
+                    if isinstance(raw_mismatch_types, str):
+                        raw_mismatch_types = [raw_mismatch_types]
+                    mismatch_types = set(raw_mismatch_types)
+                    if "identity_exposure" in mismatch_types:
+                        review_label = "暴露身份设定"
+                    elif "wrong_addressee" in mismatch_types:
+                        review_label = "称呼对象错位"
+                    elif "literalized_banter" in mismatch_types:
+                        review_label = "把玩笑按字面理解"
+                    elif "tone_drift" in mismatch_types:
+                        review_label = "语气偏离"
+                    elif pragmatic_issue:
+                        review_label = "语用意图不匹配"
+                    elif paraphrase_issue:
                         review_label = "语义复读"
                     elif unsupported_issue:
                         review_label = "把未确认信息当成事实"
@@ -2721,6 +2756,7 @@ class GroupChatBot:
                                     recent_context_for_review,
                                     retry_review_text,
                                     direction,
+                                    conversation_judgement,
                                 )
                             )
                             if retry_accepted:
