@@ -21,6 +21,40 @@ CONFIG_FILE = BASE_DIR / "config" / "config.yaml"
 
 _dashboard_basic_auth = HTTPBasic(auto_error=False)
 
+# 只允许面板保存这些功能路由，避免把任意字段误写入运行配置。
+LLM_ROUTE_KEYS = (
+    "reply",
+    "conversation_judge",
+    "reply_review",
+    "meme_review",
+    "search",
+    "vision",
+    "digest",
+    "group_analysis",
+    "profile",
+    "mbti",
+    "slang",
+    "expression_learning",
+)
+MINIMAX_OPENAI_BASE_URL = "https://api.minimax.cn/v1"
+
+
+def normalize_minimax_provider(provider):
+    """让面板展示的旧 MiniMax 配置也统一到 OpenAI 兼容入口。"""
+    normalized = dict(provider or {})
+    provider_type = str(normalized.get("provider_type") or "openai_compatible").lower()
+    base_url = str(normalized.get("base_url") or "").lower()
+    model = str(normalized.get("model") or "").lower()
+    if (
+        provider_type == "minimax"
+        or "api.minimaxi.com" in base_url
+        or "api.minimax.cn" in base_url
+        or ("minimax" in model and provider_type in {"anthropic", "claude"})
+    ):
+        normalized["provider_type"] = "openai_compatible"
+        normalized["base_url"] = MINIMAX_OPENAI_BASE_URL
+    return normalized
+
 
 async def require_dashboard_auth(
     credentials: HTTPBasicCredentials | None = Depends(_dashboard_basic_auth),
@@ -185,6 +219,18 @@ async def update_config(request: Request):
                     for key in ['base_url', 'model', 'temperature', 'max_tokens', 'top_p', 'timeout', 'provider_type', 'enabled']:
                         if key in provider_data:
                             provider[key] = provider_data[key]
+
+        # LLM 功能路由只引用已配置的 Provider 名称，不重复保存模型参数。
+        if 'llm_routing' in data and isinstance(data['llm_routing'], dict):
+            routing = current.get('llm_routing', {})
+            if not isinstance(routing, dict):
+                routing = {}
+            for key in LLM_ROUTE_KEYS:
+                if key not in data['llm_routing']:
+                    continue
+                value = data['llm_routing'][key]
+                routing[key] = str(value or '').strip()
+            current['llm_routing'] = routing
 
         # QQ 配置
         if 'qq' in data:
@@ -1281,12 +1327,13 @@ async def get_providers():
     providers = []
     for name, provider in normalize_llm_config(config).items():
         if isinstance(provider, dict):
+            provider = normalize_minimax_provider(provider)
             providers.append({
                 "name": name,
                 "base_url": provider.get('base_url', ''),
                 "model": provider.get('model', ''),
                 "enabled": provider.get('enabled', True),
-                "provider_type": provider.get('provider_type', 'openai'),
+                "provider_type": provider.get('provider_type', 'openai_compatible'),
                 "has_key": bool(provider.get('api_key')),
             })
     return {"providers": providers}
@@ -1315,7 +1362,7 @@ async def add_provider(request: Request):
             'api_key': data.get('api_key', ''),
             'base_url': data.get('base_url', 'https://api.openai.com/v1'),
             'model': data.get('model', 'gpt-4o'),
-            'provider_type': data.get('provider_type', 'openai'),
+            'provider_type': data.get('provider_type', 'openai_compatible'),
             'timeout': data.get('timeout', 120),
             'temperature': data.get('temperature', 0.8),
             'max_tokens': data.get('max_tokens', 2000),
@@ -1377,16 +1424,17 @@ async def test_provider(name: str):
             provider_config = current.get('providers', {}).get(name)
         if not provider_config:
             return {"success": False, "error": f"Provider '{name}' not found"}
+        provider_config = normalize_minimax_provider(provider_config)
 
         from modules.llm.openai_provider import create_provider
         test_provider = create_provider(
-            provider_config.get('provider_type', 'openai'),
+            provider_config.get('provider_type', 'openai_compatible'),
             {
                 'api_key': provider_config.get('api_key', ''),
                 'base_url': provider_config.get('base_url', 'https://api.openai.com/v1'),
                 'model': provider_config.get('model', 'gpt-4o'),
                 'timeout': 30,
-                'provider_type': provider_config.get('provider_type', 'openai'),
+                'provider_type': provider_config.get('provider_type', 'openai_compatible'),
             }
         )
 
@@ -1420,11 +1468,18 @@ async def test_vision(request: Request):
             api_key = str(vision_config.get("api_key", "")).strip()
         if not api_key:
             return {"success": False, "error": "API Key 不能为空"}
-        provider_type = data.get("provider_type") or "anthropic"
+        provider_type = data.get("provider_type") or "openai_compatible"
         base_url = (data.get("base_url") or "").strip()
         model = (data.get("model") or "").strip()
         if not base_url or not model:
             return {"success": False, "error": "Base URL 和模型不能为空"}
+        vision_config = normalize_minimax_provider({
+            "provider_type": provider_type,
+            "base_url": base_url,
+            "model": model,
+        })
+        provider_type = vision_config["provider_type"]
+        base_url = vision_config["base_url"]
 
         from modules.llm.openai_provider import create_provider
         from modules.llm.base import ChatRequest, ChatMessage

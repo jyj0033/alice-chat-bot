@@ -70,6 +70,31 @@ for _quiet_logger_name in (
     logging.getLogger(_quiet_logger_name).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+MINIMAX_OPENAI_BASE_URL = "https://api.minimax.cn/v1"
+
+
+def _normalize_llm_provider_config(config: dict | None) -> dict:
+    """统一 MiniMax 到 OpenAI 兼容协议，同时保留其它 Provider 的显式配置。"""
+    normalized = dict(config or {})
+    provider_type = str(
+        normalized.get("provider_type") or "openai_compatible"
+    ).strip().lower()
+    base_url = str(normalized.get("base_url") or "").strip()
+    model = str(normalized.get("model") or "").strip().lower()
+    base_lower = base_url.lower()
+    is_minimax = (
+        provider_type == "minimax"
+        or "api.minimaxi.com" in base_lower
+        or "api.minimax.cn" in base_lower
+        or ("minimax" in model and provider_type in {"anthropic", "claude"})
+    )
+    if is_minimax:
+        normalized["provider_type"] = "openai_compatible"
+        normalized["base_url"] = MINIMAX_OPENAI_BASE_URL
+    else:
+        normalized["provider_type"] = provider_type or "openai_compatible"
+    return normalized
+
 # 第一人称代词：只认「我」会漏掉习惯说「俺」「咱」的人——他们的自述永远
 # 匹配不上，画像里就只剩零碎日常，提炼不出东西。
 FIRST_PERSON_PRONOUNS = ("我", "俺", "咱")
@@ -285,10 +310,11 @@ class GroupChatBot:
         for name, provider_config in all_providers.items():
             if isinstance(provider_config, dict) and provider_config.get("enabled", True):
                 try:
+                    provider_config = _normalize_llm_provider_config(provider_config)
                     provider = create_provider(
-                        provider_config.get("provider_type", "openai"),
+                        provider_config.get("provider_type", "openai_compatible"),
                         {
-                            "provider_type": provider_config.get("provider_type", "openai"),
+                            "provider_type": provider_config.get("provider_type", "openai_compatible"),
                             "api_key": provider_config.get("api_key", ""),
                             "base_url": provider_config.get("base_url", "https://api.openai.com/v1"),
                             "model": provider_config.get("model", "gpt-4o"),
@@ -323,6 +349,38 @@ class GroupChatBot:
     def get_active_provider(self) -> Optional[LLMProvider]:
         """获取当前激活的 provider"""
         return self.llm_providers.get(self.active_provider_id)
+
+    def _get_routed_provider(self, role: str) -> Optional[LLMProvider]:
+        """获取某个功能显式指定的 Provider。
+
+        功能路由只保存 Provider 名称，不重复保存 API Key 和模型参数。未配置、
+        指向不存在的 Provider，或 Provider 已停用时返回 None，由调用方回退到
+        原有的默认 Provider，保证旧配置行为不变。
+        """
+        routes = self.config.get("llm_routing", {}) or {}
+        if not isinstance(routes, dict):
+            return None
+        provider_id = str(routes.get(role) or "").strip()
+        if not provider_id:
+            return None
+        provider = self.llm_providers.get(provider_id)
+        if provider is None:
+            logger.warning(
+                "LLM 功能路由 %s 指向不存在或未启用的 Provider「%s」，回退默认模型",
+                role,
+                provider_id,
+            )
+        return provider
+
+    def _get_provider_for_role(
+        self,
+        role: str,
+        fallback: Optional[LLMProvider] = None,
+    ) -> Optional[LLMProvider]:
+        """按功能选择 Provider；没有路由时沿用指定回退或当前主模型。"""
+        return self._get_routed_provider(role) or (
+            fallback if fallback is not None else self.get_active_provider()
+        )
 
     def _init_memory(self) -> None:
         """初始化记忆系统"""
@@ -690,14 +748,35 @@ class GroupChatBot:
         会持有旧实例，不会因为 Web 保存配置而被中途改写。
         """
         judge_config = self.config.get("conversation_judge", {}) or {}
-        judge_provider_id = str(
-            judge_config.get("provider_id") or self.active_provider_id or ""
+        routes = self.config.get("llm_routing", {}) or {}
+        if not isinstance(routes, dict):
+            routes = {}
+        # 新的功能路由优先；保留 conversation_judge.provider_id 作为旧配置兼容入口。
+        routed_judge_provider = self._get_routed_provider("conversation_judge")
+        legacy_judge_provider_id = str(judge_config.get("provider_id") or "").strip()
+        judge_provider_id = (
+            str(routes.get("conversation_judge") or "").strip()
+            or legacy_judge_provider_id
+            or self.active_provider_id
+            or ""
         )
-        judge_provider = self.llm_providers.get(judge_provider_id)
+        judge_provider = routed_judge_provider or self.llm_providers.get(
+            legacy_judge_provider_id
+        )
         if judge_provider is None:
             judge_provider = self.get_active_provider()
+        review_provider = self._get_provider_for_role(
+            "reply_review", fallback=judge_provider
+        )
+        meme_review_provider = self._get_provider_for_role(
+            "meme_review", fallback=review_provider
+        )
+        review_provider_id = str(routes.get("reply_review") or "").strip() or judge_provider_id or "active"
+        meme_review_provider_id = str(routes.get("meme_review") or "").strip() or review_provider_id
         self.conversation_judge = ConversationJudge(
             provider=judge_provider,
+            review_provider=review_provider,
+            meme_review_provider=meme_review_provider,
             bot_id=str(self.config.get("qq", {}).get("self_id", "") or ""),
             bot_name=self.personality.name,
             enabled=judge_config.get("enabled", True),
@@ -706,9 +785,11 @@ class GroupChatBot:
             context_messages=judge_config.get("context_messages", 16),
         )
         logger.info(
-            "✓ 群聊目标判断：启用=%s，提供商=%s，超时=%.1f秒",
+            "✓ 群聊意图链路：启用=%s，判断=%s，回复复核=%s，表情复核=%s，超时=%.1f秒",
             self.conversation_judge.enabled,
             judge_provider_id or "active",
+            review_provider_id,
+            meme_review_provider_id,
             self.conversation_judge.timeout,
         )
 
@@ -728,7 +809,7 @@ class GroupChatBot:
         search_client, tool_llm = self._init_search()
 
         self.reply_generator = ReplyGenerator(
-            llm_provider=self.get_active_provider(),
+            llm_provider=self._get_provider_for_role("reply"),
             personality_prompt=self.personality.build_persona_prompt(),
             speaking_style_manager=self.speaking_style_manager,
             tool_llm_provider=tool_llm,
@@ -753,24 +834,38 @@ class GroupChatBot:
 
         tool_llm = None
         if search_client.available and search_config.get("enabled", False):
-            llm_cfg = search_config.get("llm", {}) or {}
-            primary = self.get_active_provider()
-            api_key = llm_cfg.get("api_key") or getattr(primary, "api_key", "")
-            model = llm_cfg.get("model") or getattr(primary, "model", "")
-            try:
-                tool_llm = OpenAIProvider({
-                    "provider_type": "openai_compatible",
-                    "api_key": api_key,
-                    "base_url": llm_cfg.get(
-                        "base_url", "https://api.minimaxi.com/v1"
-                    ),
-                    "model": model or "MiniMax-M3",
-                    "timeout": float(llm_cfg.get("timeout", 60)),
-                })
-                logger.info(f"✓ 联网搜索语言模型：{tool_llm.model}")
-            except Exception as e:
-                logger.error(f"✗ 初始化联网搜索语言模型失败：{e}")
-                tool_llm = None
+            routed_search_provider = self._get_routed_provider("search")
+            if routed_search_provider is not None:
+                tool_llm = routed_search_provider
+                routes = self.config.get("llm_routing", {}) or {}
+                if not isinstance(routes, dict):
+                    routes = {}
+                logger.info(
+                    "✓ 联网搜索语言模型：复用 Provider「%s」/%s",
+                    routes.get("search"),
+                    getattr(tool_llm, "model", ""),
+                )
+            else:
+                llm_cfg = _normalize_llm_provider_config(
+                    search_config.get("llm", {}) or {}
+                )
+                primary = self.get_active_provider()
+                api_key = llm_cfg.get("api_key") or getattr(primary, "api_key", "")
+                model = llm_cfg.get("model") or getattr(primary, "model", "")
+                try:
+                    tool_llm = OpenAIProvider({
+                        "provider_type": "openai_compatible",
+                        "api_key": api_key,
+                        "base_url": llm_cfg.get(
+                            "base_url", MINIMAX_OPENAI_BASE_URL
+                        ),
+                        "model": model or "MiniMax-M3",
+                        "timeout": float(llm_cfg.get("timeout", 60)),
+                    })
+                    logger.info(f"✓ 联网搜索语言模型：{tool_llm.model}")
+                except Exception as e:
+                    logger.error(f"✗ 初始化联网搜索语言模型失败：{e}")
+                    tool_llm = None
 
         if search_client.available:
             logger.info(
@@ -800,25 +895,37 @@ class GroupChatBot:
             vision_config["api_key"] = primary.get("api_key", "")
         if not str(vision_config.get("base_url") or "").strip():
             vision_config["base_url"] = primary.get("base_url") or (
-                "https://api.minimaxi.com/anthropic"
+                MINIMAX_OPENAI_BASE_URL
             )
         if not str(vision_config.get("model") or "").strip():
             vision_config["model"] = primary.get("model") or "MiniMax-M3"
         if not str(vision_config.get("provider_type") or "").strip():
-            vision_config["provider_type"] = primary.get("provider_type") or "anthropic"
+            vision_config["provider_type"] = primary.get("provider_type") or "openai_compatible"
+        vision_config = _normalize_llm_provider_config(vision_config)
         if vision_config.get("enabled") is False:
             return None
+        routed_vision_provider = self._get_routed_provider("vision")
+        if routed_vision_provider is not None:
+            routes = self.config.get("llm_routing", {}) or {}
+            if not isinstance(routes, dict):
+                routes = {}
+            logger.info(
+                "✓ 视觉模型：复用功能路由 Provider「%s」/%s",
+                routes.get("vision"),
+                getattr(routed_vision_provider, "model", ""),
+            )
+            return routed_vision_provider
         if not str(vision_config.get("api_key") or "").strip():
             logger.warning("视觉模型没有密钥，图片无法转成描述")
             return None
         try:
             provider = create_provider(
-                vision_config.get("provider_type", "anthropic"),
+                vision_config.get("provider_type", "openai_compatible"),
                 {
-                    "provider_type": vision_config.get("provider_type", "anthropic"),
+                    "provider_type": vision_config.get("provider_type", "openai_compatible"),
                     "api_key": vision_config.get("api_key", ""),
                     "base_url": vision_config.get(
-                        "base_url", "https://api.minimaxi.com/anthropic"
+                        "base_url", MINIMAX_OPENAI_BASE_URL
                     ),
                     "model": vision_config.get("model", "MiniMax-M3"),
                     "timeout": vision_config.get("timeout", 60),
@@ -872,7 +979,7 @@ class GroupChatBot:
         self._init_llm()
 
         if self.reply_generator:
-            self.reply_generator.llm = self.get_active_provider()
+            self.reply_generator.llm = self._get_provider_for_role("reply")
             search_client, tool_llm = self._init_search()
             self.reply_generator.search_client = search_client
             self.reply_generator.tool_llm = tool_llm
@@ -3713,7 +3820,7 @@ class GroupChatBot:
                 )
                 return
 
-            provider = self.get_active_provider()
+            provider = self._get_provider_for_role("group_analysis")
             report = await GroupDailyAnalysis.analyze(
                 messages,
                 provider=provider,
@@ -4128,7 +4235,7 @@ class GroupChatBot:
                 lines.append(f"[{t}] {speaker}：{m.content[:80]}")
             chat_text = "\n".join(lines)
 
-            provider = self.get_active_provider()
+            provider = self._get_provider_for_role("digest")
             if not provider:
                 return
 
@@ -4740,10 +4847,12 @@ class GroupChatBot:
                     elif self._is_meaningful_chat(m):
                         entry["daily"].append(m)
 
-            provider = self.get_active_provider()
+            provider = self._get_provider_for_role("profile")
             if not provider:
                 result["error"] = "no active provider"
                 return result
+
+            mbti_provider = self._get_provider_for_role("mbti", fallback=provider)
 
             from modules.llm.base import ChatRequest
             from datetime import timedelta
@@ -4906,7 +5015,7 @@ class GroupChatBot:
                 )
                 if mbti_enabled and sample_size >= self._MBTI_MIN_SAMPLES and refresh_mbti:
                     fresh = await self._analyze_mbti(
-                        provider, latest_name, summary, self_text, daily_text
+                        mbti_provider, latest_name, summary, self_text, daily_text
                     )
                     if fresh:
                         fresh["sample_size"] = sample_size
@@ -5110,7 +5219,7 @@ class GroupChatBot:
         self, session_id: str, entries: list[dict], lines: list[str]
     ) -> int:
         """让 LLM 复核一批自动词条，证据不足时保留。"""
-        provider = self.get_active_provider()
+        provider = self._get_provider_for_role("slang")
         if not provider or not entries or len(lines) < 10:
             return 0
 
@@ -5193,7 +5302,7 @@ class GroupChatBot:
         if not auto_rows:
             return result
 
-        provider = self.get_active_provider()
+        provider = self._get_provider_for_role("slang")
         if not provider:
             result["error"] = "no active provider"
             return result
@@ -5261,7 +5370,7 @@ class GroupChatBot:
         from datetime import timedelta
 
         result = {"session": session_id, "found": 0, "saved": 0, "error": ""}
-        provider = self.get_active_provider()
+        provider = self._get_provider_for_role("slang")
         if not provider:
             result["error"] = "no active provider"
             return result
@@ -5501,7 +5610,7 @@ class GroupChatBot:
         if not str(session_id).startswith("group_"):
             result["error"] = "表达习惯只从群聊学习"
             return result
-        provider = self.get_active_provider()
+        provider = self._get_provider_for_role("expression_learning")
         if not provider:
             result["error"] = "no active provider"
             return result
@@ -6157,6 +6266,22 @@ class GroupChatBot:
                     "enabled": True
                 }
             },
+            # 按功能选择已配置的 Provider。留空时沿用当前激活的主模型；
+            # 这里只保存名称，不重复保存 API Key、地址和模型参数。
+            "llm_routing": {
+                "reply": "",
+                "conversation_judge": "",
+                "reply_review": "",
+                "meme_review": "",
+                "search": "",
+                "vision": "",
+                "digest": "",
+                "group_analysis": "",
+                "profile": "",
+                "mbti": "",
+                "slang": "",
+                "expression_learning": "",
+            },
             "qq": {
                 "ws_host": "0.0.0.0",
                 "ws_port": 3001,
@@ -6291,9 +6416,9 @@ class GroupChatBot:
                     "group_max_images": 4,
                     "vision": {
                         "enabled": True,
-                        "provider_type": "anthropic",
+                        "provider_type": "openai_compatible",
                         "api_key": "",
-                        "base_url": "https://api.minimaxi.com/anthropic",
+                        "base_url": MINIMAX_OPENAI_BASE_URL,
                         "model": "MiniMax-M3",
                         "timeout": 60
                     }
@@ -6384,7 +6509,7 @@ class GroupChatBot:
                 ],
                 "llm": {
                     "api_key": "",
-                    "base_url": "https://api.minimaxi.com/v1",
+                    "base_url": MINIMAX_OPENAI_BASE_URL,
                     "model": "",
                     "timeout": 60
                 },

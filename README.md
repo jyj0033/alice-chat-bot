@@ -90,14 +90,36 @@ alice-chat-bot/
 llm:
   primary:
     api_key: "your-api-key"
-    base_url: "https://api.siliconflow.cn/v1"
-    model: "deepseek-ai/DeepSeek-V3"
+    base_url: "https://api.minimax.cn/v1"
+    model: "MiniMax-M3"
     provider_type: "openai_compatible"
 ```
 
 支持以下 provider_type：
 - `openai_compatible` - OpenAI 兼容格式
-- `anthropic` - Claude 兼容格式
+- `anthropic` - Claude 兼容格式（仅为旧配置保留；MiniMax 使用 OpenAI 兼容格式）
+
+MiniMax 统一使用 `https://api.minimax.cn/v1`，包括普通对话、搜索和图片识别。
+
+各个 LLM 调用点可以复用不同的 Provider。`llm_routing` 只填写 Provider 名称，留空就沿用当前激活的主模型；也可以在 Web 管理面板的“LLM 模型管理 → 功能模型分工”中选择：
+
+```yaml
+llm_routing:
+  reply: primary                 # 普通回复
+  conversation_judge: primary    # 消息意图分析
+  reply_review:                  # 回复复核
+  meme_review:                   # 表情复核
+  search:                        # 搜索判断和带资料回复
+  vision:                        # 图片识别
+  digest:                        # 群聊纪要
+  group_analysis:                # 群聊日报
+  profile:                       # 用户画像
+  mbti:                          # MBTI 分析
+  slang:                         # 黑话提取和审核
+  expression_learning:          # 表达习惯学习
+```
+
+功能路由只引用已有 Provider，不会复制 API Key 或模型参数；搜索和视觉模型原有的独立配置仍可继续使用，显式选择功能路由后才会覆盖对应入口。
 
 ### 群聊目标判断
 

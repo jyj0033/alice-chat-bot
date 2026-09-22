@@ -166,6 +166,8 @@ class ConversationJudge:
         self,
         provider=None,
         *,
+        review_provider=None,
+        meme_review_provider=None,
         bot_id: str = "",
         bot_name: str = "爱丽丝",
         enabled: bool = True,
@@ -174,6 +176,10 @@ class ConversationJudge:
         context_messages: int = 16,
     ):
         self.provider = provider
+        # 目标判断、回复复核和表情复核可以使用不同的模型；未单独指定时
+        # 依次回退到目标判断 Provider，保持旧配置行为不变。
+        self.review_provider = review_provider or provider
+        self.meme_review_provider = meme_review_provider or self.review_provider
         self.bot_id = str(bot_id or "")
         self.bot_name = str(bot_name or "爱丽丝")
         self.enabled = bool(enabled)
@@ -355,7 +361,8 @@ class ConversationJudge:
         conversation_judgement: dict[str, Any] | ConversationJudgeResult | None = None,
     ) -> ConversationJudgeResult:
         """复核草稿是否符合消息意图、证据和基本表达质量。"""
-        if not self.enabled or not self.provider:
+        provider = self.review_provider or self.provider
+        if not self.enabled or not provider:
             return ConversationJudgeResult.unavailable("provider_unavailable")
 
         current_id = str(getattr(current_message, "message_id", "") or "")
@@ -413,7 +420,7 @@ class ConversationJudge:
             "\"replacement_hint\":\"不超过30字\"}。不要输出解释或思维过程。"
         )
         request = ChatRequest(
-            model=getattr(self.provider, "model", "") or "",
+            model=getattr(provider, "model", "") or "",
             temperature=0.0,
             max_tokens=min(self.max_tokens, 160),
             top_p=0.1,
@@ -425,7 +432,7 @@ class ConversationJudge:
         request.add_user(prompt)
         try:
             response = await asyncio.wait_for(
-                self.provider.chat(request), timeout=self.timeout
+                provider.chat(request), timeout=self.timeout
             )
             payload = self._parse_json(getattr(response, "content", ""))
             if not payload or not any(
@@ -604,7 +611,8 @@ class ConversationJudge:
         direction: str = "group",
     ) -> ConversationJudgeResult:
         """复核候选表情包是否适合当前语境。"""
-        if not self.enabled or not self.provider:
+        provider = self.meme_review_provider or self.review_provider or self.provider
+        if not self.enabled or not provider:
             return ConversationJudgeResult.unavailable("provider_unavailable")
 
         current_id = str(getattr(current_message, "message_id", "") or "")
@@ -634,7 +642,7 @@ class ConversationJudge:
             "\"confidence\":0到1,\"reason\":\"不超过40字\"}。不要输出解释或思维过程。"
         )
         request = ChatRequest(
-            model=getattr(self.provider, "model", "") or "",
+            model=getattr(provider, "model", "") or "",
             temperature=0.0,
             max_tokens=min(self.max_tokens, 160),
             top_p=0.1,
@@ -646,7 +654,7 @@ class ConversationJudge:
         request.add_user(prompt)
         try:
             response = await asyncio.wait_for(
-                self.provider.chat(request), timeout=self.timeout
+                provider.chat(request), timeout=self.timeout
             )
             payload = self._parse_json(getattr(response, "content", ""))
             if not payload or not any(

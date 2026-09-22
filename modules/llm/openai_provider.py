@@ -22,7 +22,7 @@ class OpenAIProvider(LLMProvider):
         "siliconflow": "/v1/chat/completions",
         "anthropic": "/v1/messages",  # Claude 兼容格式
         "claude": "/v1/messages",    # Claude 兼容格式
-        "minimax": "/v1/messages",   # Claude 兼容格式
+        "minimax": "/v1/chat/completions",  # MiniMax OpenAI 兼容格式
         "deepseek": "/v1/chat/completions",
         "nvidia": "/chat/completions",
         "ollama": "/api/chat",
@@ -36,14 +36,14 @@ class OpenAIProvider(LLMProvider):
         base_url = config.get("base_url", "https://api.openai.com/v1")
         self.model = config.get("model", "gpt-4o")
         self.timeout = config.get("timeout", 60)
-        self.provider_type = config.get("provider_type", "openai").lower()
+        self.provider_type = config.get("provider_type", "openai_compatible").lower()
 
         # OpenAI SDK 会自动添加 /chat/completions，不需要手动拼接
         # base_url 应该是类似 https://api.openai.com/v1 或 https://api.siliconflow.cn/v1
         pass
 
-        # Claude/minimax 兼容格式需要特殊 headers
-        if self.provider_type in ("anthropic", "claude", "minimax"):
+        # 只有 Claude/Anthropic 端点需要特殊 headers；MiniMax 走 OpenAI 兼容协议。
+        if self.provider_type in ("anthropic", "claude"):
             # Claude 兼容格式
             headers = {
                 "anthropic-version": "2023-06-01",
@@ -100,7 +100,7 @@ class OpenAIProvider(LLMProvider):
 
             message = response.choices[0].message
             # Claude 兼容格式响应解析
-            if self.provider_type in ("anthropic", "claude", "minimax"):
+            if self.provider_type in ("anthropic", "claude"):
                 # Claude 返回的是 Anthropic 格式，需要转换
                 content = message.content if hasattr(message, 'content') else str(message)
             else:

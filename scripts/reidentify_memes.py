@@ -33,6 +33,7 @@ from modules.llm.openai_provider import create_provider  # noqa: E402
 from core.config_store import load_config as load_config_file  # noqa: E402
 
 ALLOWED_CATEGORIES = {"待整理", "开心", "无语", "吐槽", "鼓励", "卖萌", "震惊", "其他"}
+MINIMAX_OPENAI_BASE_URL = "https://api.minimax.cn/v1"
 
 # --apply 时只删除白名单里的 id（人眼/明确理由确认过的非表情包），
 # 其余 is_meme=false 只当作分类/表述变更保留，避免模型误杀动漫表情包。
@@ -62,14 +63,25 @@ def _load_config() -> dict[str, Any]:
 
 
 def _init_vision(cfg: dict[str, Any]) -> Any:
-    vision = (cfg.get("image", {}) or {}).get("vision", {}) or {}
+    vision = dict((cfg.get("image", {}) or {}).get("vision", {}) or {})
+    provider_type = str(vision.get("provider_type") or "openai_compatible").lower()
+    base_url = str(vision.get("base_url") or "").lower()
+    if (
+        provider_type == "minimax"
+        or "api.minimaxi.com" in base_url
+        or "api.minimax.cn" in base_url
+        or ("minimax" in str(vision.get("model") or "").lower()
+            and provider_type in {"anthropic", "claude"})
+    ):
+        vision["provider_type"] = "openai_compatible"
+        vision["base_url"] = MINIMAX_OPENAI_BASE_URL
     if not vision.get("enabled", False):
         logger.critical("image.vision.enabled 为 false")
         raise SystemExit(1)
     return create_provider(
-        vision.get("provider_type", "openai"),
+        vision.get("provider_type", "openai_compatible"),
         {
-            "provider_type": vision.get("provider_type", "openai"),
+            "provider_type": vision.get("provider_type", "openai_compatible"),
             "api_key": vision.get("api_key", ""),
             "base_url": vision.get("base_url", "https://api.openai.com/v1"),
             "model": vision.get("model", "gpt-4o-mini"),

@@ -1537,6 +1537,23 @@
                     </div>
                 </div>
 
+                <div class="card" id="llm-routing-card">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <span class="card-ico"><svg class="icon-sm"><use href="#i-share"/></svg></span>
+                            功能模型分工
+                        </div>
+                        <span class="badge blue">按 Provider 复用</span>
+                    </div>
+                    <div class="hint" style="margin-bottom: 16px;">
+                        为不同功能选择已配置的 Provider。留空时沿用当前激活的主模型；这里只切换调用入口，不会复制或修改 Provider 的 API Key、地址和模型参数。
+                    </div>
+                    <div class="form-grid" id="llm-routing-grid"></div>
+                    <div class="btn-group" style="margin-top: 16px;">
+                        <button class="btn btn-primary" onclick="saveLLMRouting()"><svg class="icon-sm"><use href="#i-save"/></svg>保存功能分工</button>
+                    </div>
+                </div>
+
                 <div class="card" id="vision-config-card">
                     <div class="card-header">
                         <div class="card-title">
@@ -1560,8 +1577,8 @@
                         <div class="form-group">
                             <label>Provider 类型</label>
                             <select id="vision-provider-type">
-                                <option value="anthropic">Anthropic 兼容</option>
                                 <option value="openai_compatible">OpenAI 兼容</option>
+                                <option value="anthropic">Anthropic 兼容（兼容旧配置）</option>
                             </select>
                         </div>
                         <div class="form-group">
@@ -1571,7 +1588,7 @@
                         </div>
                         <div class="form-group">
                             <label>Base URL</label>
-                            <input type="text" id="vision-base-url" placeholder="https://api.minimaxi.com/anthropic">
+                            <input type="text" id="vision-base-url" placeholder="https://api.minimax.cn/v1">
                         </div>
                         <div class="form-group">
                             <label>模型</label>
@@ -1637,7 +1654,7 @@
                         </div>
                         <div class="form-group">
                             <label>Base URL</label>
-                            <input type="text" id="search-llm-base-url" placeholder="https://api.minimaxi.com/v1">
+                            <input type="text" id="search-llm-base-url" placeholder="https://api.minimax.cn/v1">
                         </div>
                         <div class="form-group">
                             <label>模型</label>
@@ -2480,7 +2497,7 @@
                     <div class="card-header"><div class="card-title"><span class="card-ico"><svg class="icon-sm"><use href="#i-cpu"/></svg></span>动态对话目标判断</div><span class="badge blue">LLM</span></div>
                     <div class="form-grid">
                         <div class="form-group"><label>启用动态判断</label><div class="toggle-row" style="padding-top: 6px; max-width: 120px;"><label class="toggle"><input type="checkbox" id="judge-enabled"><span class="toggle-slider"></span></label></div><div class="hint">结合上下文判断消息是在对谁说、是否接话；关闭后退回旧规则</div></div>
-                        <div class="form-group"><label>判断使用的 Provider</label><input type="text" id="judge-provider-id" placeholder="primary"><div class="hint">填写 LLM 配置中的 provider 名称，留空使用当前主模型</div></div>
+                        <div class="form-group"><label>判断使用的 Provider（兼容入口）</label><input type="text" id="judge-provider-id" placeholder="primary"><div class="hint">也可在“LLM 模型管理 → 功能模型分工”中选择；功能分工页的消息意图分析设置优先</div></div>
                         <div class="form-group"><label>判断超时（秒）</label><input type="number" id="judge-timeout" min="1" max="30" step="0.5"><div class="hint">超时会保守回退，不阻塞后续消息入库</div></div>
                         <div class="form-group"><label>判断最大 Tokens</label><input type="number" id="judge-max-tokens" min="120" max="500" step="10"></div>
                         <div class="form-group"><label>携带历史消息数</label><input type="number" id="judge-context-messages" min="6" max="30"><div class="hint">越大越能处理省略指代；普通群聊连续消息会先合并再判断</div></div>
@@ -2867,6 +2884,22 @@
 
         // 加载 LLM 配置
         // LLM Provider 管理
+        const MINIMAX_OPENAI_BASE_URL = 'https://api.minimax.cn/v1';
+        const LLM_ROUTING_FIELDS = [
+            {key: 'reply', label: '普通回复', hint: '群聊和私聊的正文生成'},
+            {key: 'conversation_judge', label: '消息意图分析', hint: '判断对象、接话意图和语用动作'},
+            {key: 'reply_review', label: '回复复核', hint: '依据消息意图检查草稿是否接对话'},
+            {key: 'meme_review', label: '表情复核', hint: '检查候选表情是否适合当前语境'},
+            {key: 'search', label: '搜索判断 / 带资料回复', hint: '需要联网或资料库时使用；会覆盖下方搜索 LLM 自定义配置'},
+            {key: 'vision', label: '图片识别', hint: '会覆盖下方视觉模型的独立参数'},
+            {key: 'digest', label: '群聊纪要', hint: '后台压缩会话记录'},
+            {key: 'group_analysis', label: '群聊日报', hint: '后台生成群聊分析报告'},
+            {key: 'profile', label: '用户画像', hint: '提炼用户长期特征'},
+            {key: 'mbti', label: 'MBTI 分析', hint: '从画像素材判断性格倾向'},
+            {key: 'slang', label: '黑话提取 / 审核', hint: '学习和清理群聊黑话'},
+            {key: 'expression_learning', label: '表达习惯学习', hint: '提炼可迁移的群聊表达方式'},
+        ];
+
         async function loadLLMConfig() {
             const [providersRes, configRes] = await Promise.all([
                 fetch(API + '/providers'),
@@ -2875,8 +2908,49 @@
             const providers = await providersRes.json();
             const config = await configRes.json();
             renderProviders(providers.providers || []);
+            renderLLMRouting(providers.providers || [], config);
             loadVisionConfig(config);
             loadSearchConfig(config);
+        }
+
+        function renderLLMRouting(providers, config) {
+            const grid = document.getElementById('llm-routing-grid');
+            if (!grid) return;
+            const options = ['<option value="">跟随当前主模型</option>'].concat(
+                (providers || []).map(p => `<option value="${escapeAttr(p.name)}">${escapeHtml(p.name)}${p.enabled === false ? '（已停用）' : ''}</option>`)
+            ).join('');
+            const routing = {...(config.llm_routing || {})};
+            // 兼容旧版只在 conversation_judge 下保存 Provider 的配置。
+            if (!routing.conversation_judge && config.conversation_judge?.provider_id) {
+                routing.conversation_judge = config.conversation_judge.provider_id;
+            }
+            grid.innerHTML = LLM_ROUTING_FIELDS.map(field => `
+                <div class="form-group">
+                    <label>${escapeHtml(field.label)}</label>
+                    <select id="llm-route-${escapeAttr(field.key)}">${options}</select>
+                    <div class="hint">${escapeHtml(field.hint)}</div>
+                </div>
+            `).join('');
+            LLM_ROUTING_FIELDS.forEach(field => {
+                const select = document.getElementById('llm-route-' + field.key);
+                if (select) select.value = routing[field.key] || '';
+            });
+        }
+
+        async function saveLLMRouting() {
+            const routing = {};
+            LLM_ROUTING_FIELDS.forEach(field => {
+                const select = document.getElementById('llm-route-' + field.key);
+                routing[field.key] = select ? select.value : '';
+            });
+            const res = await fetch(API + '/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({llm_routing: routing})
+            });
+            const data = await res.json();
+            showToast(data.success ? '功能模型分工已保存并已应用' : '保存失败: ' + (data.error || ''), data.success ? 'success' : 'error');
+            if (data.success) loadLLMConfig();
         }
 
         function loadSearchConfig(config) {
@@ -2887,7 +2961,9 @@
             document.getElementById('search-result-limit').value = s.result_limit ?? 5;
             const llm = s.llm || {};
             document.getElementById('search-llm-api-key').value = llm.api_key || '';
-            document.getElementById('search-llm-base-url').value = llm.base_url || 'https://api.minimaxi.com/v1';
+            const searchBaseUrl = llm.base_url || MINIMAX_OPENAI_BASE_URL;
+            document.getElementById('search-llm-base-url').value = searchBaseUrl.toLowerCase().includes('api.minimaxi.com')
+                ? MINIMAX_OPENAI_BASE_URL : searchBaseUrl;
             document.getElementById('search-llm-model').value = llm.model || '';
             document.getElementById('search-llm-timeout').value = llm.timeout ?? 60;
             const bocha = (s.backends || {}).bocha || {};
@@ -2947,10 +3023,20 @@
 
         function loadVisionConfig(config) {
             const vision = { ...(config.rich_media?.image?.vision || {}), ...(config.image?.vision || {}) };
+            // 旧版 MiniMax Anthropic 地址自动迁移到新的 OpenAI 兼容入口；保存时会写回新值。
+            const oldVisionBase = String(vision.base_url || '').toLowerCase();
+            const oldMiniMaxVision = oldVisionBase.includes('api.minimaxi.com')
+                || (String(vision.provider_type || '').toLowerCase() === 'minimax')
+                || (String(vision.model || '').toLowerCase().includes('minimax')
+                    && ['anthropic', 'claude'].includes(String(vision.provider_type || '').toLowerCase()));
+            if (oldMiniMaxVision) {
+                vision.provider_type = 'openai_compatible';
+                vision.base_url = MINIMAX_OPENAI_BASE_URL;
+            }
             document.getElementById('vision-enabled').checked = vision.enabled !== false;
-            document.getElementById('vision-provider-type').value = vision.provider_type || 'anthropic';
+            document.getElementById('vision-provider-type').value = vision.provider_type || 'openai_compatible';
             document.getElementById('vision-api-key').value = vision.api_key || '';
-            document.getElementById('vision-base-url').value = vision.base_url || '';
+            document.getElementById('vision-base-url').value = vision.base_url || MINIMAX_OPENAI_BASE_URL;
             document.getElementById('vision-model').value = vision.model || '';
             document.getElementById('vision-timeout').value = vision.timeout ?? 60;
             const st = document.getElementById('vision-status');
@@ -3082,8 +3168,16 @@
 
         async function editProvider(name) {
             const config = await fetch(API + '/config').then(r => r.json());
-            const provider = config.llm?.[name];
+            let provider = config.llm?.[name];
             if (!provider) return;
+            const providerBase = String(provider.base_url || '').toLowerCase();
+            const providerType = String(provider.provider_type || '').toLowerCase();
+            const providerModel = String(provider.model || '').toLowerCase();
+            if (providerType === 'minimax' || providerBase.includes('api.minimaxi.com')
+                || providerBase.includes('api.minimax.cn')
+                || (providerModel.includes('minimax') && ['anthropic', 'claude'].includes(providerType))) {
+                provider = {...provider, provider_type: 'openai_compatible', base_url: MINIMAX_OPENAI_BASE_URL};
+            }
 
             document.getElementById('form-provider-title').textContent = '编辑: ' + name;
             document.getElementById('edit-provider-name').value = name;
