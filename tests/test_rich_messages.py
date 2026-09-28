@@ -387,6 +387,36 @@ class VisionThinkingAndPayloadTests(unittest.TestCase):
         self.assertEqual(_strip_scene_prefix("熊猫头借口龙表情包"), "熊猫头借口龙表情包")
         self.assertEqual(_strip_scene_prefix(""), "")
 
+    def test_get_image_fallback_also_shrinks(self):
+        """QQ 图床直连失败时会走 get_image 读本地文件，这条路同样必须压缩。
+
+        探针把「下载」换成了读本地文件，覆盖不到这个分支；而线上 QQ 图床
+        带时效与防盗链，它其实才是常态路径。
+        """
+        from PIL import Image
+
+        import io as _io
+        import os as _os
+        import tempfile
+
+        picture = Image.frombytes("RGB", (1800, 1000), _os.urandom(1800 * 1000 * 3))
+        buffer = _io.BytesIO()
+        picture.save(buffer, format="JPEG", quality=100)
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
+            handle.write(buffer.getvalue())
+            temp_path = handle.name
+        self.addCleanup(lambda: _os.unlink(temp_path))
+
+        async def fake_api_call(action, params, timeout):
+            return {"path": temp_path} if action == "get_image" else {}
+
+        enricher = RichMediaEnricher({}, fake_api_call)
+        segment = MessageSegment(type="image", file="some-ref")
+        data_url = asyncio.run(enricher._download_image_data_url_via_get_image(segment))
+        self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
+        payload = base64.b64decode(data_url.split(",", 1)[1])
+        self.assertLessEqual(len(payload), enricher.image_vision_max_payload)
+
     def test_wired_into_data_url_conversion(self):
         from PIL import Image
 
