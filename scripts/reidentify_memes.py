@@ -8,6 +8,16 @@
 用法（容器内）：
     python scripts/reidentify_memes.py --dry-run
     python scripts/reidentify_memes.py --apply
+
+注意：本脚本的视觉调用必须与线上识别保持一致，否则它会被自己过时的参数坑死。
+2026-09-28 对齐过一次，三处都曾经是坏的：
+  1. max_tokens=300 —— M3 先吐 <think> 再给 JSON，思维链计入预算，300 会把输出
+     截断成不闭合的 JSON，`_parse_json` 解析不出来 → 这张直接跳过。
+     现在从 to_text_max_tokens 读（生产 2000）。
+  2. 直接把原图字节塞进请求 —— 端点单张媒体上限 10MiB，超了 400。
+     现在走 `_shrink_image_bytes` 压到 ≤vision_max_side/≤vision_max_payload_bytes。
+  3. `_parse_json` 不剥思考块、且正序试 JSON —— 思考块里的 `{` 会抢先命中。
+     现在复用 `_strip_thinking` + `RichMediaEnricher._json_candidates`（倒序）。
 """
 
 from __future__ import annotations
@@ -31,9 +41,25 @@ sys.path.insert(0, str(REPO))
 from modules.llm.base import ChatMessage, ChatRequest  # noqa: E402
 from modules.llm.openai_provider import create_provider  # noqa: E402
 from core.config_store import load_config as load_config_file  # noqa: E402
+from core.adapter.rich_media import (  # noqa: E402
+    RichMediaEnricher,
+    _bytes_to_data_url,
+    _extract_description_field,
+    _guess_media_type,
+    _loads_json_object,
+    _shrink_image_bytes,
+    _sniff_media_type,
+    _strip_thinking,
+)
 
 ALLOWED_CATEGORIES = {"待整理", "开心", "无语", "吐槽", "鼓励", "卖萌", "震惊", "其他"}
 MINIMAX_OPENAI_BASE_URL = "https://api.minimax.cn/v1"
+
+# 与线上识别一致的下限/上限，配置缺项时的兜底
+DEFAULT_VISION_MAX_SIDE = 1600
+DEFAULT_VISION_JPEG_QUALITY = 85
+DEFAULT_VISION_MAX_PAYLOAD = 2_000_000
+DEFAULT_VISION_MAX_TOKENS = 2000
 
 # --apply 时只删除白名单里的 id（人眼/明确理由确认过的非表情包），
 # 其余 is_meme=false 只当作分类/表述变更保留，避免模型误杀动漫表情包。
@@ -62,7 +88,26 @@ def _load_config() -> dict[str, Any]:
     return load_config_file(cfg_path)
 
 
-def _init_vision(cfg: dict[str, Any]) -> Any:
+def _image_tuning(cfg: dict[str, Any]) -> dict[str, int]:
+    """读和线上识别同一份「缩放 / 预算」参数。
+
+    合并规则与 main._get_rich_media_config 一致：rich_media.image 打底，
+    顶层 image 覆盖（顶层只放 vision，但保持一致免得以后踩坑）。
+    """
+    rich_image = dict((cfg.get("rich_media", {}) or {}).get("image", {}) or {})
+    top_image = dict(cfg.get("image", {}) or {})
+    merged = {**rich_image, **top_image}
+    return {
+        "max_side": int(merged.get("vision_max_side", DEFAULT_VISION_MAX_SIDE)),
+        "quality": int(merged.get("vision_jpeg_quality", DEFAULT_VISION_JPEG_QUALITY)),
+        "max_payload": int(
+            merged.get("vision_max_payload_bytes", DEFAULT_VISION_MAX_PAYLOAD)
+        ),
+        "max_tokens": int(merged.get("to_text_max_tokens", DEFAULT_VISION_MAX_TOKENS)),
+    }
+
+
+def _init_vision(cfg: dict[str, Any], max_tokens: int) -> Any:
     vision = dict((cfg.get("image", {}) or {}).get("vision", {}) or {})
     provider_type = str(vision.get("provider_type") or "openai_compatible").lower()
     base_url = str(vision.get("base_url") or "").lower()
@@ -87,24 +132,37 @@ def _init_vision(cfg: dict[str, Any]) -> Any:
             "model": vision.get("model", "gpt-4o-mini"),
             "timeout": vision.get("timeout", 60),
             "temperature": vision.get("temperature", 0.4),
-            "max_tokens": 300,
+            "max_tokens": max_tokens,
         },
     )
 
 
-def _data_url(path: Path) -> str:
+def _data_url(path: Path, tuning: dict[str, int]) -> str:
+    """把本地图片压成端点吃得下的 data URL。
+
+    不能直接塞原图：端点单张媒体上限 10MiB，超了直接 400。
+    走生产同一套 `_shrink_image_bytes`（顺带把动图拍平成单帧 JPEG）。
+    """
     data = path.read_bytes()
-    return "data:image/" + (path.suffix.lstrip(".") or "png") + ";base64," + base64.b64encode(data).decode()
+    media_type = _sniff_media_type(data, _guess_media_type(path.name, "image/jpeg"))
+    shrunk, media_type = _shrink_image_bytes(
+        data,
+        media_type,
+        max_side=tuning["max_side"],
+        quality=tuning["quality"],
+        max_bytes=tuning["max_payload"],
+    )
+    return _bytes_to_data_url(shrunk, media_type)
 
 
-async def _vision(provider: Any, data_url: str) -> str:
+async def _vision(provider: Any, data_url: str, max_tokens: int) -> str:
     request = ChatRequest(
         model=getattr(provider, "model", "") or "",
         messages=[ChatMessage(role="user", content=[
             {"type": "text", "text": PROMPT},
             {"type": "image_url", "image_url": {"url": data_url}},
         ])],
-        max_tokens=300,
+        max_tokens=max_tokens,
         temperature=0.4,
     )
     last_exc: Exception | None = None
@@ -121,37 +179,26 @@ async def _vision(provider: Any, data_url: str) -> str:
 
 
 def _parse_json(text: str) -> dict | None:
-    # 剥掉 ```json ... ``` 代码块围栏
-    text = re.sub(r"```(?:json)?\s*", "", text, flags=re.S)
-    for cand in re.findall(r"\{[^{}]*\}", text, re.S):
-        obj = _try_parse(cand)
-        if obj:
-            return obj
-    # 兜底：直接整体尝试
-    obj = _try_parse(text)
-    if obj:
-        return obj
-    return None
+    """解析模型输出，复用线上识别那套（不再自己造一套）。
 
-
-def _try_parse(cand: str) -> dict | None:
-    try:
-        obj = json.loads(cand)
-        if isinstance(obj, dict) and "is_meme" in obj and "category" in obj:
+    旧实现有两个会被 max_tokens 放大的毛病：不剥 `<think>`（思考块里的 `{` 会
+    抢先命中），以及正序取 JSON（真正的答案总在最后）。现在都走线上同一套：
+    `_strip_thinking` → `RichMediaEnricher._json_candidates`（倒序）→ `_loads_json_object`。
+    """
+    body = _strip_thinking(text)
+    for cand in RichMediaEnricher._json_candidates(body):
+        obj = _loads_json_object(cand)
+        if obj and ({"is_meme", "category"} & set(obj)):
             return obj
-    except json.JSONDecodeError:
-        pass
-    # 仅当确有 is_meme 时尝试修复未转义引号
-    if "is_meme" not in cand:
-        return None
-    repaired = _repair_unescaped_quotes(cand)
-    if repaired is not None:
-        try:
-            obj = json.loads(repaired)
-            if isinstance(obj, dict) and "is_meme" in obj:
+        repaired = _repair_unescaped_quotes(cand)
+        if repaired:
+            obj = _loads_json_object(repaired)
+            if obj and ({"is_meme", "category"} & set(obj)):
                 return obj
-        except json.JSONDecodeError:
-            pass
+    # 输出被截断、对象不闭合时，至少把 description 捞回来（is_meme/category 交给调用方保守处理）
+    salvaged = _extract_description_field(body)
+    if salvaged:
+        return {"description": salvaged, "_salvaged": True}
     return None
 
 
@@ -197,10 +244,16 @@ def main() -> None:
     ap.add_argument("--id", help="只处理指定 hash（完整或前12位）")
     ap.add_argument("--limit", type=int, default=0, help="最多处理 N 张")
     ap.add_argument("--fail", action="store_true", help="失败也继续（默认遇错中断以便修）")
+    ap.add_argument("--json", dest="json_out", default="", help="把逐张结果写到这个文件，便于复盘")
     args = ap.parse_args()
 
     cfg = _load_config()
-    provider = _init_vision(cfg)
+    tuning = _image_tuning(cfg)
+    logger.info(
+        "视觉参数：max_tokens=%d 缩放≤%dpx q%d 载荷≤%dB（与线上识别同源）",
+        tuning["max_tokens"], tuning["max_side"], tuning["quality"], tuning["max_payload"],
+    )
+    provider = _init_vision(cfg, tuning["max_tokens"])
     catalog = _load_catalog()
 
     raw_items = list(catalog["memes"].items())
@@ -220,7 +273,9 @@ def main() -> None:
                 continue
             logger.info("[%d/%d] 正在识别 %s（分类：%s）", idx, len(raw_items), meme_id[:12], item.get("category"))
             try:
-                text = await _vision(provider, _data_url(path))
+                text = await _vision(
+                    provider, _data_url(path, tuning), tuning["max_tokens"]
+                )
             except Exception as exc:  # noqa: BLE001
                 errors += 1
                 logger.error("[%d/%d] %s 识别失败：%s", idx, len(raw_items), meme_id[:12], exc)
@@ -229,11 +284,19 @@ def main() -> None:
                 continue
             obj = _parse_json(text)
             if not obj:
+                errors += 1
                 logger.error("[%d/%d] %s 输出无法解析：%r", idx, len(raw_items), meme_id[:12], text[:160])
                 continue
-            is_meme = bool(obj.get("is_meme", True))
+            # 输出被截断时只捞回 description：is_meme / category 无据可依，
+            # 保守当作「是表情包」保留，并沿用旧分类，绝不因此进待删清单。
+            salvaged = bool(obj.pop("_salvaged", False))
             desc = str(obj.get("description", "")).strip().replace("\n", " ")[:240]
-            cat = str(obj.get("category", "")).strip()
+            if salvaged:
+                is_meme = True
+                cat = str(item.get("category", "")).strip()
+            else:
+                is_meme = bool(obj.get("is_meme", True))
+                cat = str(obj.get("category", "")).strip()
             if cat not in ALLOWED_CATEGORIES:
                 cat = "待整理"
             changed = (
@@ -241,11 +304,13 @@ def main() -> None:
                 or (str(item.get("category", "")) != cat)
             )
             results.append({
-                "id": meme_id, "path": str(path), "is_meme": is_meme,
+                "id": meme_id, "path": str(path), "is_meme": is_meme, "salvaged": salvaged,
                 "old_meaning": item.get("meaning", ""), "new_meaning": desc,
                 "old_category": item.get("category", ""), "new_category": cat, "changed": changed, "raw": text,
             })
             flag = "非表情包-待删" if not is_meme else ("已变更" if changed else "不变")
+            if salvaged:
+                flag += "（截断-仅捞回描述）"
             logger.info(
                 "  %s｜旧分类[%s] %s → 新分类[%s] %s",
                 flag, results[-1]["old_category"], results[-1]["old_meaning"][:20],
@@ -257,9 +322,34 @@ def main() -> None:
 
     deletes = [r for r in results if not r["is_meme"]]
     changes = [r for r in results if r["is_meme"] and r["changed"]]
+    salvaged = [r for r in results if r.get("salvaged")]
+
+    if args.json_out:
+        out_path = Path(args.json_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(
+                {
+                    "tuning": tuning,
+                    "applied": bool(args.apply),
+                    "processed": len(results),
+                    "deletes": len(deletes),
+                    "changes": len(changes),
+                    "salvaged": len(salvaged),
+                    "results": results,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        logger.info("逐张结果已写入 %s", out_path)
 
     print("\n===== 汇总 =====")
     print(f"处理 {len(results)}，非表情包候选删除 {len(deletes)}，表述/分类变更 {len(changes)}")
+    if salvaged:
+        print(f"（其中 {len(salvaged)} 项输出被截断，仅捞回描述、保守保留原分类）")
     if not args.apply:
         print("\n--dry-run 未写回。要实际生效请加 --apply。")
         if deletes:
