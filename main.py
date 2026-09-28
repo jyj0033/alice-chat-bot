@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from core.adapter.qq_adapter import QQAdapter
 from core.adapter.base import Message
-from core.adapter.rich_media import RichMediaEnricher
+from core.adapter.rich_media import DEFAULT_VISION_PROMPT, RichMediaEnricher
 from core.config_store import load_config as load_config_file, save_config as save_config_file
 
 from modules.llm.openai_provider import create_provider, LLMProvider
@@ -6408,11 +6408,20 @@ class GroupChatBot:
                     "ocr_action": "ocr_image",
                     "ocr_timeout": 5.0,
                     "to_text_scope": "all",
-                    "to_text_prompt": "用一两句话（50字以内）客观描述图片中能直接看到的内容：主体、动作或表情、画面文字、明显颜色和构图；不要推测人物关系、前因后果、情绪意图或适用场景。",
+                    # 别在这里写回「只描写画面」的限制型提示词：那会把认人、认作品、
+                    # 认梗的能力一起禁掉，视觉模型就只能报出「一个长发女孩」。
+                    "to_text_prompt": DEFAULT_VISION_PROMPT,
                     "to_text_context": True,
                     "context_window": 6,
                     "to_text_timeout": 60,
-                    "max_download_bytes": 5242880,
+                    # 思维链（<think>）也算在这个预算里，给太少会整段截断、零输出。
+                    "to_text_max_tokens": 900,
+                    # QQ 原图常见 11~18MB，下载上限太小会直接「下载失败，无法识别」。
+                    "max_download_bytes": 20971520,
+                    # 端点多图层硬上限 10MiB，喂进去之前先压到下面这个规模。
+                    "vision_max_side": 1600,
+                    "vision_jpeg_quality": 85,
+                    "vision_max_payload_bytes": 2000000,
                     "cache_ttl": 600,
                     "group_enabled": True,
                     "group_interval_seconds": 60,

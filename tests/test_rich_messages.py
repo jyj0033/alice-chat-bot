@@ -12,7 +12,13 @@ from core.adapter.rich_content import (
     render_outer_text,
     render_segments,
 )
-from core.adapter.rich_media import RichMediaEnricher, VisionResult, _validate_http_url
+from core.adapter.rich_media import (
+    RichMediaEnricher,
+    VisionResult,
+    _shrink_image_bytes,
+    _strip_thinking,
+    _validate_http_url,
+)
 from modules.memory.context import ContextMessage
 from modules.social.conversation_floor import ActionType, ConversationFloorManager
 
@@ -124,18 +130,23 @@ class RichMediaEnricherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(legacy.description, "一张看不清的图片")
         self.assertTrue(legacy.uncertain)
 
-    def test_image_prompt_requires_objective_visual_description(self):
+    def test_image_prompt_asks_to_identify_before_describing(self):
+        """prompt 必须先要求认人/认作品，只描述画面等于没识别。"""
         enricher = RichMediaEnricher({}, lambda *_: None)
         prompt = enricher._build_image_prompt(
             MessageSegment(type="mface"),
             "小明说：这个不铲还偷偷练？",
         )
 
-        self.assertIn("客观描述", prompt)
-        self.assertIn("只描述画面、人物表情和图片文字", prompt)
+        self.assertIn("先认出这张图是什么", prompt)
+        self.assertIn("作品名 + 角色名", prompt)
+        self.assertIn("看不出具体是谁", prompt)
+        self.assertIn("绝对不要编造角色名、作品名、出处", prompt)
         self.assertIn("不要把前文人物、事件、评价或原话写进图片描述", prompt)
         self.assertIn('"confidence"', prompt)
-        self.assertNotIn("结合前文判断这张图在说什么、在回应谁", prompt)
+        # 旧的「只写直接可观察的事实」写法会把识别能力一起禁掉
+        self.assertNotIn("只写图片中直接可观察的事实", prompt)
+
 
     async def test_forward_expands_with_bounded_readable_excerpts(self):
         calls = []
@@ -214,6 +225,141 @@ class RichMediaEnricherTests(unittest.IsolatedAsyncioTestCase):
         await enricher.enrich(message, directed=True)
         self.assertEqual(calls, 1)
         self.assertIn("文章标题", message.content)
+
+
+class VisionThinkingAndPayloadTests(unittest.TestCase):
+    """端点先吐 <think> 再给 JSON，且不接受超过 10MiB 的媒体。"""
+
+    def test_thinking_block_is_stripped(self):
+        self.assertEqual(_strip_thinking("<think>a\nb</think>正文"), "正文")
+        # 被截断时只有开标签，也要把整段思考吃掉
+        self.assertEqual(_strip_thinking("正文<think>想了一半就断了"), "正文")
+        self.assertEqual(_strip_thinking("<thinking>x</thinking>ok"), "ok")
+
+    def test_description_is_read_from_json_after_thinking(self):
+        raw = (
+            "<think>The image shows a silver-haired girl with cat ears; "
+            "could be from a known game.</think>\n"
+            '{"description":"《崩坏：星穹铁道》风格的角色表情包",'
+            '"confidence":0.9,"uncertain":false}'
+        )
+        result = RichMediaEnricher._parse_vision_result(raw)
+        self.assertEqual(result.description, "《崩坏：星穹铁道》风格的角色表情包")
+        self.assertFalse(result.uncertain)
+
+    def test_thinking_is_never_used_as_a_description(self):
+        """整段输出被思考块吃光时，视为识别失败，不能把英文推理写进上下文。"""
+        truncated = "<think>The user wants a brief objective description of what is</think>"
+        self.assertIsNone(RichMediaEnricher._parse_vision_result(truncated))
+
+        unclosed = "<think>The image shows an anime-style character with teal hair"
+        self.assertIsNone(RichMediaEnricher._parse_vision_result(unclosed))
+
+    def test_last_json_object_wins(self):
+        """思考块里也可能出现大括号，真正的答案在最后。"""
+        raw = (
+            '<think>maybe {"draft":"wrong"} or others</think>'
+            '{"description":"熊猫头借口龙表情包","confidence":0.95,"uncertain":false}'
+        )
+        result = RichMediaEnricher._parse_vision_result(raw)
+        self.assertEqual(result.description, "熊猫头借口龙表情包")
+
+    def test_fenced_json_is_accepted(self):
+        raw = (
+            "<think>thinking…</think>\n```json\n"
+            '{"description":"《蔚蓝档案》风格表情包","confidence":0.7,"uncertain":false}\n```'
+        )
+        result = RichMediaEnricher._parse_vision_result(raw)
+        self.assertEqual(result.description, "《蔚蓝档案》风格表情包")
+
+    def test_oversized_image_is_shrunk_below_the_endpoint_limit(self):
+        """端点硬上限 10MiB；QQ 原图常见 11~18MB，必须压下去。"""
+        from PIL import Image
+
+        import io as _io
+        import os as _os
+
+        # 必须用噪声：纯色/渐变图压出来只有几百 KB，根本走不到缩放分支。
+        picture = Image.frombytes("RGB", (1800, 1000), _os.urandom(1800 * 1000 * 3))
+        buffer = _io.BytesIO()
+        picture.save(buffer, format="JPEG", quality=100)
+        original = buffer.getvalue()
+        self.assertGreater(len(original), 2_000_000)
+
+        shrunk, media_type = _shrink_image_bytes(
+            original,
+            "image/jpeg",
+            max_side=800,
+            quality=85,
+            max_bytes=2_000_000,
+        )
+        self.assertEqual(media_type, "image/jpeg")
+        self.assertLessEqual(len(shrunk), 2_000_000)
+        self.assertLess(len(shrunk), len(original))
+        with Image.open(_io.BytesIO(shrunk)) as check:
+            # 断言的是传入的 max_side，确认参数真的透传下去了
+            self.assertLessEqual(max(check.size), 800)
+
+    def test_animated_gif_is_flattened_to_one_static_frame(self):
+        from PIL import Image
+
+        import io as _io
+
+        # 这张 GIF 只有 3KB，重编码成 JPEG 反而更大——旧逻辑「变大就用原图」会让它
+        # 原样发给端点，等于没拍平。动图必须强制转单帧 JPEG。
+        frames = [Image.new("RGB", (900, 900), color) for color in ((255, 0, 0), (0, 255, 0))]
+        buffer = _io.BytesIO()
+        frames[0].save(buffer, format="GIF", save_all=True, append_images=frames[1:], duration=200)
+        original = buffer.getvalue()
+        self.assertGreater(getattr(Image.open(_io.BytesIO(original)), "n_frames", 1), 1)
+
+        shrunk, media_type = _shrink_image_bytes(
+            original, "image/gif", max_side=1600, quality=85, max_bytes=2_000_000
+        )
+        self.assertEqual(media_type, "image/jpeg")
+        with Image.open(_io.BytesIO(shrunk)) as check:
+            self.assertEqual(getattr(check, "n_frames", 1), 1)
+
+    def test_small_jpeg_is_passed_through_untouched(self):
+        from PIL import Image
+
+        import io as _io
+
+        buffer = _io.BytesIO()
+        Image.new("RGB", (320, 240), (10, 20, 30)).save(buffer, format="JPEG", quality=90)
+        original = buffer.getvalue()
+        shrunk, media_type = _shrink_image_bytes(
+            original, "image/jpeg", max_side=1600, quality=85, max_bytes=2_000_000
+        )
+        self.assertEqual(shrunk, original)
+        self.assertEqual(media_type, "image/jpeg")
+
+    def test_broken_bytes_fall_back_to_the_original(self):
+        """预处理不能因为一张坏图把整个识别流程整死。"""
+        broken = b"\xff\xd8\xff\xe0not-really-a-jpeg"
+        shrunk, media_type = _shrink_image_bytes(
+            broken, "image/jpeg", max_side=1600, quality=85, max_bytes=2_000_000
+        )
+        self.assertEqual(shrunk, broken)
+        self.assertEqual(media_type, "image/jpeg")
+
+    def test_wired_into_data_url_conversion(self):
+        from PIL import Image
+
+        import io as _io
+
+        enricher = RichMediaEnricher({}, lambda *_: None)
+        self.assertEqual(enricher.image_vision_max_payload, 2_000_000)
+        self.assertGreaterEqual(enricher.image_vision_max_tokens, 900)
+
+        picture = Image.new("RGB", (3000, 2000), (200, 30, 30))
+        buffer = _io.BytesIO()
+        picture.save(buffer, format="PNG")
+        data_url = enricher._to_vision_data_url(buffer.getvalue(), "image/png")
+        self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
+        payload = base64.b64decode(data_url.split(",", 1)[1])
+        self.assertLessEqual(len(payload), enricher.image_vision_max_payload)
+        self.assertLess(len(payload), 10 * 1024 * 1024)
 
 
 class RichMessageFloorTests(unittest.TestCase):

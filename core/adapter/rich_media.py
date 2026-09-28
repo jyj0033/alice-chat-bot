@@ -12,6 +12,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
+import io
 import ipaddress
 import json
 import logging
@@ -40,6 +41,16 @@ logger = logging.getLogger(__name__)
 # 视觉模型判定图片敏感/违规被拒时的占位描述：不暴露原图，只说明爱丽丝不想看。
 # 作为摘要写入上下文后，LLM 会明白 bot 不愿讨论该内容，而不是当成"没有描述"。
 SENSITIVE_IMAGE_NOTE = "爱丽丝不喜欢看这个内容"
+
+# 图片识别的兜底提示词。
+#
+# 这里踩过一次大坑：旧提示词写的是「客观描述画面，不要推测人物关系/前因后果/
+# 适用场景」，本意是防幻觉，实际效果是把模型最强的能力（认人、认作品、认梗）
+# 一起禁掉了——群里发的角色图、游戏梗图，最后只变成「银发紫瞳的动漫少女」，
+# 等于没认出来。现在的原则是「先认，认不出再描述，全程不许编造」。
+DEFAULT_VISION_PROMPT = (
+    "先认出这张图是什么，再用一两句话把最有用的信息说清楚。"
+)
 
 
 @dataclass(frozen=True)
@@ -95,19 +106,32 @@ class RichMediaEnricher:
         )
         self.image_to_text_scope = str(image.get("to_text_scope", "mention_only")).lower()
         self.image_to_text_prompt = str(
-            image.get(
-                "to_text_prompt",
-                "用一两句话（50字以内）客观描述图片中能直接看到的内容：主体、动作或表情、"
-                "画面文字、明显颜色和构图；不要推测人物关系、前因后果、情绪意图或适用场景。",
-            )
+            image.get("to_text_prompt", DEFAULT_VISION_PROMPT)
         )
         self.image_to_text_timeout = max(1.0, float(image.get("to_text_timeout", 60)))
         # get_image 是本地文件查找，NapCat 响应很快；单独设短超时避免失败路径拖垮识别
         self._get_image_timeout = min(10.0, max(2.0, self.image_to_text_timeout * 0.3))
         self.image_to_text_context = bool(image.get("to_text_context", True))
         self.image_context_window = max(1, int(image.get("context_window", 6)))
+        # 下载上限是「能不能把图拿到手」，跟送进模型的体积无关；QQ 原图常见
+        # 11~18MB，卡在 5MB 会让整批图片直接下载失败（线上实测日志）。
         self.image_max_download_bytes = max(
-            64 * 1024, int(image.get("max_download_bytes", 5 * 1024 * 1024))
+            64 * 1024, int(image.get("max_download_bytes", 20 * 1024 * 1024))
+        )
+        # 喂给视觉模型前的缩放参数。端点单张媒体上限 10MiB，留足余量压到 2MB。
+        self.image_vision_max_side = max(320, int(image.get("vision_max_side", 1600)))
+        self.image_vision_jpeg_quality = max(40, min(95, int(image.get("vision_jpeg_quality", 85))))
+        self.image_vision_max_payload = max(
+            200_000, int(image.get("vision_max_payload_bytes", 2_000_000))
+        )
+        # 端点会先输出 <think> 再给 JSON，预算太小会被思考吃光；900 实测够用。
+        vision_section = image.get("vision", {}) or {}
+        self.image_vision_max_tokens = max(
+            300,
+            int(
+                vision_section.get("max_tokens")
+                or image.get("to_text_max_tokens", 900)
+            ),
         )
         self.image_cache_ttl = max(60.0, float(image.get("cache_ttl", 600)))
         self.image_max_images = max(1, int(image.get("max_images", 10)))
@@ -456,7 +480,7 @@ class RichMediaEnricher:
         if desc == SENSITIVE_IMAGE_NOTE:
             segment.summary = describe_media_in_words(segment.type, "爱丽丝不想看")
             return True
-        summary = describe_media_in_words(segment.type, desc[:100])
+        summary = describe_media_in_words(segment.type, desc[:160])
         if vision_result.uncertain:
             summary = summary.rstrip("。") + "（视觉识别不确定）。"
         segment.summary = summary
@@ -468,15 +492,13 @@ class RichMediaEnricher:
         conversation_context: str = "",
         group_image_urls: list[dict] | None = None,
     ) -> VisionResult | None:
-        """三级回退识别图片：
+        """识别图片：下载原图 → 缩放压体积 → 转 base64 喂视觉模型。
 
-        1. 直传图床 URL（当前图 + 组图）。MiniMax 等兼容端点抓取多张远程 URL 时，
-           任意一张抓不到整组就被拒（503/400），所以这只是快路径。
-        2. 全部转 base64 再传：逐张尽力下载（当前图失败走 NapCat get_image 兜底），
-           抓不到的组图直接丢弃，绝不让一张坏 URL 拖垮整组。
-        3. 组图识别失败 → 降级为仅当前图单图 base64。
-
-        prompt 由「意图导向基础提示 + 消息类型提示 + 前文对话」组成。
+        为什么统一走 base64，而不是先把图片 URL 交给端点自己抓：
+        线上实测端点对单张媒体有 10MiB 上限（400 `media exceeds size limit:
+        max 10485760 bytes`），QQ 群里的原图普遍 11~18MB，直传 URL 必然被打回；
+        而我们先下载再缩放，既绕开上限，也顺带修掉「动图 GIF 十几 MB」这类情况。
+        代价是多一次下载，但 NapCat 通常已把文件缓存在本地，走 get_image 很快。
         """
         if self.vision_provider is None:
             logger.info("[图片] 未配置视觉模型，跳过识别")
@@ -497,32 +519,15 @@ class RichMediaEnricher:
             cap = self.image_group_max_images - 1  # 除当前图外最多带几张
             group_items = [g for g in group_image_urls[:cap] if g.get("url")]
 
-        # 1. 直传图床 URL（当前图 + 前图）
-        url = segment.url
-        if url:
-            try:
-                result = await self._vision_chat(
-                    prompt, [url, *(g["url"] for g in group_items)]
-                )
-                if result:
-                    return result
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if _is_sensitive_rejection(exc):
-                    return VisionResult(SENSITIVE_IMAGE_NOTE, confidence=1.0, uncertain=False)
-                logger.debug(
-                    "通过图片地址调用视觉模型失败（%s，组图 %d 张），改用 Base64 编码：%s",
-                    url, len(group_items), exc,
-                )
-
-        # 2. 回退：全部转 base64（当前图优先 get_image 兜底，组图尽力而为，失败丢弃）
+        # 1. 当前图：下载 → 缩放 → base64（当前图拿不到就整次放弃）
         current_b64 = await self._download_image_data_url(segment)
         if not current_b64:
             logger.warning(
                 "图片下载失败，无法识别：地址=%s，文件=%s", url, segment.file or segment.file_id
             )
             return None
+
+        # 2. 组图尽力而为：抓不到的直接丢弃，绝不让一张坏图拖垮整组
         group_b64s: list[str] = []
         if group_items:
             raw = await asyncio.gather(
@@ -530,6 +535,7 @@ class RichMediaEnricher:
                 return_exceptions=True,
             )
             group_b64s = [b for b in raw if isinstance(b, str) and b]
+
         try:
             if group_b64s:
                 try:
@@ -541,7 +547,7 @@ class RichMediaEnricher:
                 except Exception as exc:
                     if _is_sensitive_rejection(exc):
                         return VisionResult(SENSITIVE_IMAGE_NOTE, confidence=1.0, uncertain=False)
-                    logger.warning("组图 Base64 编码识别失败，降级为单图：%s", exc)
+                    logger.warning("组图识别失败，降级为单图：%s", exc)
             result = await self._vision_chat(prompt, [current_b64])
             if result:
                 return result
@@ -554,6 +560,19 @@ class RichMediaEnricher:
             logger.warning("视觉识别失败：%s", exc)
         return None
 
+    def _to_vision_data_url(self, data: bytes, media_type: str) -> str:
+        """原始字节 → 压到端点吃得下的大小 → data URL。"""
+        if not data:
+            return ""
+        shrunk, shrunk_type = _shrink_image_bytes(
+            data,
+            media_type,
+            max_side=self.image_vision_max_side,
+            quality=self.image_vision_jpeg_quality,
+            max_bytes=self.image_vision_max_payload,
+        )
+        return _bytes_to_data_url(shrunk, shrunk_type)
+
     async def _download_group_image_base64(self, item: dict) -> str:
         """尽力把一张组图转成 base64 data URL；失败返回空串（由调用方丢弃）。
 
@@ -564,7 +583,7 @@ class RichMediaEnricher:
             return ""
         data = await self._http_get_bytes(url)
         if data:
-            return _bytes_to_data_url(data, _guess_media_type(url, ""))
+            return self._to_vision_data_url(data, _sniff_media_type(data, _guess_media_type(url, "")))
         file_ref = str(item.get("file") or "")
         if file_ref:
             try:
@@ -572,7 +591,10 @@ class RichMediaEnricher:
                 path = result.get("path") if isinstance(result, dict) else ""
                 if path:
                     with open(path, "rb") as f:
-                        return _bytes_to_data_url(f.read(), _guess_media_type(path, ""))
+                        raw = f.read()
+                    return self._to_vision_data_url(
+                        raw, _sniff_media_type(raw, _guess_media_type(path, ""))
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -585,23 +607,33 @@ class RichMediaEnricher:
         conversation_context: str,
         group_image_urls: list[dict] | None = None,
     ) -> str:
-        """构造只输出画面事实的视觉 prompt。"""
+        """构造「先认、认不出再描述、不许编造」的视觉 prompt。"""
         parts = [
             self.image_to_text_prompt,
-            "输出规则：只写图片中直接可观察的事实，不要结合群聊推断谁在说谁、"
-            "不要解释梗的前因后果，不要写“适合用来……”或替群友评价这张图。",
+            "识别要求：\n"
+            "1. 只要你认得画面里的人、角色、作品、梗、名场面、地标、品牌、商品、"
+            "动物品种或界面截图里的软件，就直接点名。这是最有用的信息——"
+            "只写「一个长发女孩」等于没认出来。\n"
+            "2. 认得出作品就写全「作品名 + 角色名」，认得出真人就写名字或身份，"
+            "认得出梗就写梗名（例如「熊猫头」「借口龙」）。\n"
+            "3. 画面里的文字照抄下来，它常常就是这张图的梗本身。\n"
+            "4. 认不出来、或只是看着像但没有把握，就退回客观画面描述，"
+            "并直说「看不出具体是谁」——不要硬给一个名字。\n"
+            "5. 绝对不要编造角色名、作品名、出处或剧情；拿不准就把 uncertain 置为 true。\n"
+            "6. 不要结合群聊推断谁在说谁，不要替群友评价这张图、也不要写「适合用来……」；"
+            "不要加引号复述群友说过的句子。",
         ]
         if segment.type == "mface":
-            parts.append("这是群友发的表情包/梗图，仍然只描述画面、人物表情和图片文字。")
+            parts.append("这是群友发的表情包/梗图，先看它是什么梗，再说画面。")
         if group_image_urls and self.image_group_enabled:
             parts.append(
                 f"这些图是同一人连续发的（共{len(group_image_urls) + 1}张），"
-                "请分别概括每张图能直接看到的内容，不要推断这组图在回应谁或想表达什么。"
+                "请分别说明每张图是什么，不要推断这组图在回应谁或想表达什么。"
             )
         if conversation_context and self.image_to_text_context:
             parts.append(
                 f"前文对话仅用于确认图片边界：\n{conversation_context}\n"
-                "不要把前文人物、事件、评价或原话写进图片描述；不要加引号复述群友说过的句子。"
+                "不要把前文人物、事件、评价或原话写进图片描述。"
             )
         parts.append(
             "只输出 JSON，不要输出解释，格式如："
@@ -613,30 +645,31 @@ class RichMediaEnricher:
 
     @staticmethod
     def _parse_vision_result(text: str) -> VisionResult | None:
-        """解析视觉模型结果；兼容旧模型的纯文本输出，但标记为不确定。"""
+        """解析视觉模型结果。
+
+        端点会先输出 `<think>…</think>` 再给 JSON，而且历史上干过这类事：
+        思考块把 token 预算吃光、正文被截断，此时如果把原文当描述兜底，就会把
+        模型的英文推理过程（"The image shows an anime-style…"）当成图片描述
+        写进群聊上下文。所以这里一律先剥思考块，再只从正文里找 JSON。
+        """
         raw = str(text or "").strip()
         if not raw:
             return None
+        body = _strip_thinking(raw)
 
         payload: dict[str, Any] | None = None
-        candidates = [raw]
-        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-        if match and match.group(0) not in candidates:
-            candidates.append(match.group(0))
-        for candidate in candidates:
-            candidate = re.sub(
-                r"^```(?:json)?\s*|\s*```$", "", candidate.strip(), flags=re.I
-            )
-            try:
-                value = json.loads(candidate)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict):
+        for candidate in RichMediaEnricher._json_candidates(body):
+            value = _loads_json_object(candidate)
+            if value is not None:
                 payload = value
                 break
 
         if payload is None:
-            return VisionResult(raw[:240], confidence=0.45, uncertain=True)
+            # 无结构化输出的旧模型：只能用正文兜底，且必须标记不确定。
+            # 正文为空（整段都被思考块吃掉）时视为识别失败，不要硬造描述。
+            if not body:
+                return None
+            return VisionResult(body[:240], confidence=0.45, uncertain=True)
 
         description = str(
             payload.get("description")
@@ -662,6 +695,26 @@ class RichMediaEnricher:
             uncertain = True
         return VisionResult(description[:240], confidence=confidence, uncertain=uncertain)
 
+    @staticmethod
+    def _json_candidates(body: str) -> list[str]:
+        """按「越靠后越可信」的顺序给出候选 JSON 串。
+
+        模型常见两种写法：裸 JSON，以及 ```json … ``` 围栏。思考块里也常出现
+        `{` 字符，所以不走贪心匹配，而是先用平铺正则取出所有对象再倒序试——
+        真正的答案总是在最后。
+        """
+        text = body.strip()
+        candidates: list[str] = []
+        for match in reversed(list(_FLAT_JSON_RE.finditer(text))):
+            candidates.append(match.group(0))
+        # 兜底：也允许「没有嵌套、但被文本包围」的整段，交给 json.loads 判断
+        if text not in candidates:
+            candidates.append(text)
+        stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+        if stripped and stripped not in candidates:
+            candidates.append(stripped)
+        return candidates
+
     async def _vision_chat(self, prompt: str, image_urls: list[str]) -> VisionResult | None:
         from modules.llm.base import ChatMessage, ChatRequest
 
@@ -675,17 +728,27 @@ class RichMediaEnricher:
         request = ChatRequest(
             model=getattr(self.vision_provider, "model", "") or "",
             messages=[ChatMessage(role="user", content=content)],
-            max_tokens=300,
+            # 预算太小会被 <think> 吃光、正文被截断（实测 300 时 4/10 完全没有输出），
+            # 900 是实测足够且不夸张的档位。
+            max_tokens=self.image_vision_max_tokens,
             temperature=0.4,
         )
         response = await asyncio.wait_for(
             self.vision_provider.chat(request),
             timeout=self.image_to_text_timeout,
         )
-        return self._parse_vision_result(response.content or "")
+        result = self._parse_vision_result(response.content or "")
+        if result is None:
+            # 空响应/纯思考无正文 → 按识别失败处理，让上层走"看不清"而不是把
+            # 思考过程当描述。
+            logger.warning(
+                "[图片] 视觉模型没有给出可用描述（原始输出 %d 字符）",
+                len(response.content or ""),
+            )
+        return result
 
     async def _download_image_data_url(self, segment: MessageSegment) -> str:
-        """下载当前图片转 base64 data URL。
+        """下载当前图片，缩放压体积后转 base64 data URL。
 
         先直连图床 URL；失败/超限时走 NapCat get_image 取本地文件兜底
         （QQ 图床 URL 常带时效与防盗链，服务器直连失败的可靠替代）。
@@ -695,13 +758,15 @@ class RichMediaEnricher:
         if url and aiohttp is not None:
             data = await self._http_get_bytes(url)
             if data:
-                return _bytes_to_data_url(data, _sniff_media_type(data, _guess_media_type(url, "")))
+                return self._to_vision_data_url(
+                    data, _sniff_media_type(data, _guess_media_type(url, ""))
+                )
             logger.debug("图片地址下载失败（%s），正在改用获取图片接口", url[:80])
         # get_image 兜底：NapCat 已把图片下载到本地，取路径读文件
         return await self._download_image_data_url_via_get_image(segment)
 
     async def _download_image_data_url_via_get_image(self, segment: MessageSegment) -> str:
-        """调用 NapCat get_image 取本地文件路径，读文件转 base64 data URL。"""
+        """调用 NapCat get_image 取本地文件路径，读文件缩放后转 base64 data URL。"""
         file_ref = segment.file or segment.file_id or segment.unique_id
         if not file_ref:
             return ""
@@ -713,13 +778,17 @@ class RichMediaEnricher:
             if path:
                 with open(path, "rb") as f:
                     data = f.read()
-                return _bytes_to_data_url(data, _sniff_media_type(data, _guess_media_type(path, "")))
+                return self._to_vision_data_url(
+                    data, _sniff_media_type(data, _guess_media_type(path, ""))
+                )
             # 部分实现不返回本地路径，只给 url；再用直连试一次
             alt_url = result.get("url") or ""
             if alt_url and aiohttp is not None:
                 data = await self._http_get_bytes(alt_url)
                 if data:
-                    return _bytes_to_data_url(data, _guess_media_type(alt_url, ""))
+                    return self._to_vision_data_url(
+                        data, _sniff_media_type(data, _guess_media_type(alt_url, ""))
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -887,6 +956,129 @@ def _sniff_media_type(data: bytes, fallback: str = "image/jpeg") -> str:
 def _bytes_to_data_url(data: bytes, media_type: str) -> str:
     import base64
     return f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+# 端点认得的静态图片格式；不在这张表里的（动图、BMP、AVIF…）一律转成 JPEG，
+# 免得端点直接 400 掉整次识别。
+_STATIC_VISION_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+
+
+def _shrink_image_bytes(
+    data: bytes,
+    media_type: str,
+    *,
+    max_side: int,
+    quality: int,
+    max_bytes: int,
+) -> tuple[bytes, str]:
+    """把图片缩到视觉端点吃得下的大小。
+
+    为什么必须做：MiniMax 端点对单张媒体有 10MiB 硬上限（实测直接返回 400
+    `media exceeds size limit: max 10485760 bytes`），而 QQ 群里的原图随手
+    就是 11~18MB，所谓「动画表情」其实常是十几 MB 的 GIF——不缩就必然失败，
+    bot 只能看到「一张图，看不清画面」。
+
+    只动喂给视觉模型的这一份，原图照常入库/转发表情包，所以不影响画质。
+    多帧动图只取第一帧：端点本来也不读动画，整段传上去只会白白撞体积上限，
+    所以动图**一定**会被重编码成单帧 JPEG，哪怕重编码后反而大几十字节。
+    任何失败都退回原图，绝不因为预处理把一次识别整死。
+    """
+    if not data:
+        return data, media_type
+    try:
+        from PIL import Image
+    except Exception:
+        logger.debug("未安装 Pillow，跳过视觉图片缩放")
+        return data, media_type
+
+    try:
+        with Image.open(io.BytesIO(data)) as probe:
+            probe.load()
+            frame_count = int(getattr(probe, "n_frames", 1) or 1)
+            if probe.mode in ("RGBA", "LA", "P"):
+                rgba = probe.convert("RGBA")
+                frame = Image.new("RGB", rgba.size, (255, 255, 255))
+                frame.paste(rgba, mask=rgba.split()[-1])
+            elif probe.mode != "RGB":
+                frame = probe.convert("RGB")
+            else:
+                frame = probe.copy()
+
+        width, height = frame.size
+        if max(width, height) > max_side:
+            ratio = max_side / float(max(width, height))
+            frame = frame.resize(
+                (max(1, int(width * ratio)), max(1, int(height * ratio))),
+                Image.LANCZOS,
+            )
+
+        # 已是合规 JPEG 且体积够小 → 原样返回，避免无谓的重编码损失
+        if media_type == "image/jpeg" and len(data) <= max_bytes:
+            return data, media_type
+
+        current_quality = max(40, min(95, int(quality)))
+        encoded = b""
+        for _ in range(6):
+            buffer = io.BytesIO()
+            frame.save(buffer, format="JPEG", quality=current_quality, optimize=True)
+            encoded = buffer.getvalue()
+            if len(encoded) <= max_bytes:
+                break
+            if current_quality > 60:
+                current_quality -= 12
+            else:
+                frame = frame.resize(
+                    (max(1, int(frame.size[0] * 0.75)), max(1, int(frame.size[1] * 0.75))),
+                    Image.LANCZOS,
+                )
+        if not encoded:
+            return data, media_type
+        # 重编码反而变大（本来就压得很狠的小图）→ 静态图就直接用原图，没必要为了
+        # 几 KB 走一次有损编码；但动图必须换成单帧 JPEG，否则「只取第一帧」形同虚设，
+        # 端点收到的还是整段 GIF。也顺手挡掉端点未必支持的冷门静态格式。
+        if (
+            frame_count <= 1
+            and media_type in _STATIC_VISION_MEDIA_TYPES
+            and len(encoded) >= len(data)
+            and len(data) <= max_bytes
+        ):
+            return data, media_type
+        return encoded, "image/jpeg"
+    except Exception as exc:
+        logger.debug("视觉图片缩放失败，回退原图：%s", exc)
+        return data, media_type
+
+
+_THINK_BLOCK_RE = re.compile(
+    r"<think(?:ing)?>.*?(?:</think(?:ing)?>|$)", re.DOTALL | re.IGNORECASE
+)
+_FLAT_JSON_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+
+
+def _strip_thinking(text: str) -> str:
+    """剥掉模型的思考块。
+
+    端点会先吐 `<think>…</think>` 再给正文；截断时可能只有开标签没有闭合，
+    所以这里连「未闭合的思考块」一起吃掉，避免把英文推理当成描述写进群聊。
+    """
+    return _THINK_BLOCK_RE.sub(" ", text or "").strip()
+
+
+def _loads_json_object(candidate: str) -> dict[str, Any] | None:
+    """把候选串解析成 dict；失败返回 None（不抛异常，调用方继续试下一个）。"""
+    text = str(candidate or "").strip()
+    if not text:
+        return None
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if isinstance(value, dict):
+        return value
+    return None
 
 
 class _PreviewHTMLParser(HTMLParser):
