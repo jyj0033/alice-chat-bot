@@ -1053,8 +1053,10 @@ class GroupDailyAnalysis:
 
         unhinged_quotes = report.get("unhinged_quotes", []) or []
         if unhinged_quotes:
-            lines.append("\n我挑出来的五句逆天现场：")
-            for index, quote in enumerate(unhinged_quotes[:5], 1):
+            # 「宁缺毋滥」时可能不足 5 条，标题按实际条数写，不要写死「五句」
+            picked = unhinged_quotes[:5]
+            lines.append(f"\n我挑出来的 {len(picked)} 句逆天现场：")
+            for index, quote in enumerate(picked, 1):
                 sender = ui_text(
                     cls._name_for_id(quote.get("sender_id", ""), top_users, sender_names),
                     24,
