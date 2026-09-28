@@ -409,11 +409,7 @@ class ReplyGenerator:
                     meme_category, meme_id, meme_called = self._extract_send_meme_call(response)
             except Exception as e:
                 logger.error(f"语言模型调用失败：{e}", exc_info=True)
-                if direction != "to_bot":
-                    # 群友互聊/推断的延续对话场景 LLM 挂了 → 安静潜水，比说错话好
-                    return None
-                reply = self._get_fallback_reply()
-                trusted_reply = True
+                return self._give_up_reply("语言模型调用失败")
 
         # 4. 清理思考过程
         if not trusted_reply:
@@ -453,10 +449,7 @@ class ReplyGenerator:
                 # 重答也走 tool_use 且没文字 → 别再兜底，否则会无限循环
                 if not reply2 and not meme_called:
                     self._note_invalid_draft("empty", reply2)
-                    if direction != "to_bot":
-                        return None
-                    reply = self._get_fallback_reply()
-                    trusted_reply = True
+                    return self._give_up_reply("重答仍为空输出")
                 elif reply2:
                     if self._has_tool_markup(reply2):
                         self._note_invalid_draft("protocol", reply2)
@@ -469,11 +462,7 @@ class ReplyGenerator:
                     reply = reply2
             except Exception as e:
                 logger.error(f"语言模型回退调用失败：{e}", exc_info=True)
-                reply2 = ""
-                if direction != "to_bot":
-                    return None
-                reply = self._get_fallback_reply()
-                trusted_reply = True
+                return self._give_up_reply("重答调用失败")
         elif has_meme and not reply:
             # LLM 选择只发图不发文字：content 为空但 tool_calls 已经把
             # meme_category/meme_id 抓到。让 reply 走一个空字符串，让下游
@@ -490,25 +479,16 @@ class ReplyGenerator:
                 has_meme=has_meme,
             )
             if reply is None and not has_meme:
-                if direction != "to_bot":
-                    logger.debug(f"语言模型选择沉默或未给出可发送回复（回复方向={direction}）")
-                    return None
-                logger.warning("明确对机器人的消息没有可发送回复，使用兜底回复")
-                reply = self._get_fallback_reply()
+                return self._give_up_reply("模型未给出可发送回复")
             if reply is None:
                 reply = ""
 
         # 5. 参与决策：LLM 有权选择沉默（群友互聊/自言自语时）。
-        # 明确对 bot 的消息不能被模型偶发输出的 <silent> 吞掉，异常时使用
-        # 和网络/模型失败相同的短兜底回复；只有隐式延续和普通插话保留沉默权。
+        # 模型偶发输出 <silent>（包括被点名时）一律按沉默处理，不再替换成兜底话术。
         # 注意：LLM 调 send_meme 只发图 → reply 为空但不是沉默，是合法「只发图」，
-        # 不应被 silent 兜底覆盖成文字，否则用户看到的就不是干净发图了。
+        # 不应被 silent 判定覆盖成文字，否则用户看到的就不是干净发图了。
         if self._is_silent(reply) and not has_meme:
-            if direction != "to_bot":
-                logger.debug(f"语言模型选择沉默（回复方向={direction}）")
-                return None
-            logger.warning("明确对机器人的消息被语言模型判为沉默，使用兜底回复")
-            reply = self._get_fallback_reply()
+            return self._give_up_reply("模型输出 <silent>")
 
         # 6. 过滤回复
         # 注意：LLM 调 send_meme 只发图 → reply 必为空但合法，不能被「空回复」过滤器吞掉。
@@ -733,9 +713,8 @@ class ReplyGenerator:
         if kind == "silent":
             return None
         self._note_invalid_draft("missing_say", retry_text)
-        if direction != "to_bot":
-            return None
-        return self._get_fallback_reply()
+        # 重写后仍拿不到 <say> → 放弃本轮（不发明兜底话术），由调用方决定沉默。
+        return None
 
     # === 检索判断（什么时候查、查什么） ===
 
@@ -2493,7 +2472,6 @@ class ReplyGenerator:
     )
     _SELF_RESTATEMENT_WINDOW = 60.0
     _HOLLOW_PINGS = frozenset({"在吗", "在嘛", "在不在"})
-    _SHORT_DIRECT_FALLBACKS = ("？", "啥", "啊？")
 
     @classmethod
     def has_media_context(cls, current_message: str, source_texts: list) -> bool:
@@ -2548,11 +2526,6 @@ class ReplyGenerator:
         标签外会被丢掉，标签里交给语义复核。
         """
         return cls.looks_like_bot_self_id(reply) or cls.looks_like_caption_leak(reply)
-
-    @classmethod
-    def short_direct_fallback(cls) -> str:
-        """被点名但重答仍不可用时的短反应，不当客服澄清。"""
-        return random.choice(cls._SHORT_DIRECT_FALLBACKS)
 
     @classmethod
     def needs_reply_quality_review(
@@ -2638,18 +2611,19 @@ class ReplyGenerator:
 
         return delay
 
-    def _get_fallback_reply(self) -> str:
-        """获取备用回复（LLM调用失败时）"""
-        fallbacks = [
-            "啊？刚才没听清再说一遍？",
-            "这我还真不知道诶",
-            "有点困，刚才说的啥",
-            "抱歉走神了，你再说一遍？",
-            "等等让我想想...",
-            "emmm...",
-            "好像有点道理？",
-        ]
-        return random.choice(fallbacks)
+    def _give_up_reply(self, reason: str) -> None:
+        """放弃本轮回复，返回 None 让上层按沉默处理。
+
+        为什么不再用兜底话术：这里原先是随机发一句「有点困，刚才说的啥」
+        「抱歉走神了，你再说一遍？」之类。那是字面意义上的**脱离上下文**——
+        群里看到的是一句跟当前话题完全无关的回应，比不说更糟，还会让人以为
+        bot 在装傻。同类短反应（「？」「啥」「啊？」）也一并去掉。
+
+        返回 None = 不发送；下游 main.py 会记一条 `[沉默]` 日志。真正需要归因的
+        失败路径（模型报错、空输出、格式不合规）都已在各自分支里打了 ERROR/WARNING。
+        """
+        logger.info("[沉默] 放弃本轮回复：%s", reason)
+        return None
 
     def get_stats(self) -> Dict[str, int]:
         """获取统计信息"""

@@ -1,9 +1,12 @@
 """回复处境：上下文格式、跨群去重、被赶闭嘴、模板泄漏。"""
 import unittest
+from datetime import datetime, timedelta
 
 from core.adapter.rich_content import describe_media_in_words
 from modules.memory.context import (
     ContextManager,
+    ContextMessage,
+    ContextWindow,
     asks_about_unseen_media,
     is_unresolved_media,
     opaque_media_content,
@@ -129,6 +132,76 @@ class ReplySituationTests(unittest.TestCase):
         self.assertIn("回你的「你这是白天补觉吧」", text)
         self.assertNotIn("消息ID", text)
         self.assertNotIn("动态判断", text)
+
+
+class ContextWindowAgeTests(unittest.TestCase):
+    """窗口的时间淘汰开关：<=0 只留条数上界，不按时间砍。"""
+
+    def test_non_positive_hours_disables_time_eviction(self):
+        for hours in (0, 0.0, -1, -2.5):
+            manager = ContextManager(max_messages=10, max_age_hours=hours)
+            self.assertIsNone(manager.max_age, f"hours={hours}")
+            self.assertIsNone(
+                manager.get_window("g1").max_age, f"hours={hours}"
+            )
+
+    def test_positive_hours_still_builds_a_timedelta(self):
+        manager = ContextManager(max_messages=10, max_age_hours=2)
+        self.assertEqual(manager.max_age, timedelta(hours=2))
+        self.assertEqual(manager.max_age_hours, 2.0)
+
+    def test_bad_value_falls_back_to_two_hours(self):
+        manager = ContextManager(max_messages=10, max_age_hours="oops")
+        self.assertEqual(manager.max_age, timedelta(hours=2))
+
+    def test_cleanup_keeps_old_messages_when_max_age_is_none(self):
+        window = ContextWindow(max_messages=10, max_age=None)
+        window.add(
+            ContextMessage(
+                sender_id="u1",
+                sender_name="小明",
+                content="三小时前说的话",
+                timestamp=datetime.now() - timedelta(hours=3),
+            )
+        )
+        window._cleanup()
+        self.assertEqual(len(window.messages), 1)
+        self.assertEqual(window.messages[0].content, "三小时前说的话")
+
+    def test_cleanup_drops_old_messages_when_max_age_set(self):
+        window = ContextWindow(max_messages=10, max_age=timedelta(hours=2))
+        window.add(
+            ContextMessage(
+                sender_id="u1",
+                sender_name="小明",
+                content="三小时前说的话",
+                timestamp=datetime.now() - timedelta(hours=3),
+            )
+        )
+        window.add(
+            ContextMessage(
+                sender_id="u2",
+                sender_name="小红",
+                content="刚刚说的话",
+                timestamp=datetime.now(),
+            )
+        )
+        window._cleanup()
+        self.assertEqual([m.content for m in window.messages], ["刚刚说的话"])
+
+    def test_max_messages_still_caps_the_window(self):
+        """去掉时间约束后，条数上界仍在，窗口不会无限膨胀。"""
+        window = ContextWindow(max_messages=3, max_age=None)
+        for i in range(6):
+            window.add(
+                ContextMessage(
+                    sender_id="u1",
+                    sender_name="小明",
+                    content=f"第{i}条",
+                    timestamp=datetime.now() - timedelta(hours=10 - i),
+                )
+            )
+        self.assertEqual([m.content for m in window.messages], ["第3条", "第4条", "第5条"])
 
 
 if __name__ == "__main__":

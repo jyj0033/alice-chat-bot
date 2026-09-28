@@ -166,10 +166,13 @@ class ContextWindow:
     def __init__(
         self,
         max_messages: int = 50,
-        max_age: timedelta = timedelta(hours=2)
+        max_age: timedelta | None = timedelta(hours=2)
     ):
         self.messages: Deque[ContextMessage] = deque(maxlen=max_messages)
         self.max_messages = max_messages
+        # None = 不按时间淘汰，窗口只受 max_messages 限制。
+        # 群聊里一个话题可能横跨几小时，硬砍 2 小时会把正在延续的上下文整段丢掉；
+        # 而 deque 的 maxlen 本身已经给了上界，时间维度没必要再切一刀。
         self.max_age = max_age
         self._last_cleanup = datetime.now()
         # 标记是否已经尝试从 SQLite 恢复过最近历史；新窗口只尝试一次。
@@ -186,13 +189,17 @@ class ContextWindow:
 
     def _maybe_cleanup(self) -> None:
         """定期清理过期消息"""
+        if self.max_age is None:
+            return
         now = datetime.now()
         if now - self._last_cleanup > timedelta(minutes=5):
             self._cleanup()
             self._last_cleanup = now
 
     def _cleanup(self) -> None:
-        """清理过期消息"""
+        """清理过期消息；max_age 为 None 时不做时间淘汰。"""
+        if self.max_age is None:
+            return
         cutoff = datetime.now() - self.max_age
         while self.messages and self.messages[0].timestamp < cutoff:
             self.messages.popleft()
@@ -382,10 +389,17 @@ class ContextWindow:
 class ContextManager:
     """上下文管理器 - 管理多个会话的上下文"""
 
-    def __init__(self, max_messages: int = 50, max_age_hours: int = 2):
+    def __init__(self, max_messages: int = 50, max_age_hours: float = 2):
         self._windows: dict[str, ContextWindow] = {}
         self.max_messages = max_messages
-        self.max_age = timedelta(hours=max_age_hours)
+        # <=0 表示不按时间淘汰（窗口只受 max_messages 限制）。
+        # 生产曾用 2 小时，会把横跨几小时的话题整段砍掉；配置成 0 即可关掉这一刀。
+        try:
+            hours = float(max_age_hours)
+        except (TypeError, ValueError):
+            hours = 2.0
+        self.max_age_hours = hours
+        self.max_age = timedelta(hours=hours) if hours > 0 else None
 
     def get_window(self, session_id: str) -> ContextWindow:
         """获取会话的上下文窗口"""

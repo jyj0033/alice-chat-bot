@@ -2884,21 +2884,13 @@ class GroupChatBot:
                                 retry_failure = ""
 
                         if retry_failure:
-                            if direction == "to_bot":
-                                logger.info(
-                                    "[语义复核] 重答未通过（%s），改用短反应",
-                                    retry_failure,
-                                )
-                                reply = self.reply_generator.short_direct_fallback()
-                                tool_meme_category = None
-                                tool_meme_id = ""
-                                tool_meme_called = False
-                            else:
-                                logger.info(
-                                    "[语义复核] 重答未通过（%s），放弃群聊插话",
-                                    retry_failure,
-                                )
-                                return
+                            # 兜底短反应（「？」「啥」）已按用户要求去掉：
+                            # 重答仍不合格 → 一律沉默，不用无上下文的话术顶上。
+                            logger.info(
+                                "[语义复核] 重答未通过（%s），放弃本轮回复",
+                                retry_failure,
+                            )
+                            return
 
             leak_text = reply or ""
             if self.meme_manager:
@@ -2913,15 +2905,9 @@ class GroupChatBot:
                     )
                 )
             ):
-                if direction == "to_bot":
-                    logger.info("[语义复核] 内部话术泄漏，改用短反应")
-                    reply = self.reply_generator.short_direct_fallback()
-                    tool_meme_category = None
-                    tool_meme_id = ""
-                    tool_meme_called = False
-                else:
-                    logger.info("[语义复核] 内部话术泄漏，放弃群聊插话")
-                    return
+                # 同上一处：不再用「？」这类短反应顶上，泄漏/残句一律沉默。
+                logger.info("[语义复核] 内部话术泄漏或残句，放弃本轮回复")
+                return
 
             if direction == "group" and leak_text.strip():
                 now = datetime.now()
@@ -3559,10 +3545,13 @@ class GroupChatBot:
                 session_id,
                 limit=restore_limit * 4,  # 较大的取样窗口，供下面过滤“仅上下文”与低价值
             )
-            cutoff = datetime.now() - window.max_age
+            # max_age 为 None 表示不按时间淘汰（context_max_age_hours <= 0）。
+            cutoff = (
+                datetime.now() - window.max_age if window.max_age is not None else None
+            )
             restored_count = 0
             for memory in rows:  # 数据库按新到旧；头插后自然变成时间正序
-                if memory.created_at < cutoff:
+                if cutoff is not None and memory.created_at < cutoff:
                     break
                 meta = memory.metadata or {}
                 # 只恢复「有实义内容」的消息；纯应声/仅上下文的历史不是一个

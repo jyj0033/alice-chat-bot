@@ -86,8 +86,13 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertTrue(decision.should_speak)
         self.assertEqual(decision.probability, 0.95)
 
-    def test_explicit_silent_reply_falls_back_without_second_delay(self):
-        """明确对 bot 的消息不能被 <silent> 吞掉，生成器也不应重复等待。"""
+    def test_explicit_silent_reply_stays_silent_without_fallback(self):
+        """模型输出 <silent> 时按沉默处理，不再发明无上下文的兜底话术。
+
+        历史上这里会随机发一句「有点困，刚才说的啥」「抱歉走神了，你再说一遍？」
+        之类，那是字面意义上的脱离上下文——群里看到的是一句跟当前话题完全无关的
+        回应。现在统一改为放弃本轮回复（返回 None），也不应触发额外的等待延迟。
+        """
         import asyncio
         from unittest.mock import AsyncMock, patch
         from modules.llm.base import ChatResponse
@@ -109,8 +114,40 @@ class HumanizationLogicTests(unittest.TestCase):
                 return reply, sleep
 
         reply, sleep = asyncio.run(run())
-        self.assertTrue(reply)
+        self.assertIsNone(reply)
         sleep.assert_not_awaited()
+
+    def test_llm_failure_goes_silent_instead_of_fallback_patter(self):
+        """模型调用失败直接沉默，不再发「刚才没听清再说一遍」这类话术。"""
+        import asyncio
+
+        class _Provider:
+            model = "test"
+
+            async def chat(self, request):
+                raise RuntimeError("boom")
+
+        async def run():
+            generator = ReplyGenerator(llm_provider=_Provider())
+            for direction in ("to_bot", "group", "to_bot_implicit"):
+                reply = await generator.generate(
+                    context_prompt="[刚刚] 小明(对你说)：在吗",
+                    current_message="在吗",
+                    direction=direction,
+                )
+                self.assertIsNone(reply, f"direction={direction} 应沉默")
+            return True
+
+        self.assertTrue(asyncio.run(run()))
+
+    def test_give_up_reply_returns_none(self):
+        """统一的放弃入口只返回 None，不产生任何可发送文本。"""
+        generator = ReplyGenerator(llm_provider=None, bot_name="爱丽丝")
+        self.assertIsNone(generator._give_up_reply("单元测试"))
+        # 旧的兜底话术入口应已彻底移除
+        self.assertFalse(hasattr(generator, "_get_fallback_reply"))
+        self.assertFalse(hasattr(ReplyGenerator, "short_direct_fallback"))
+        self.assertFalse(hasattr(ReplyGenerator, "_SHORT_DIRECT_FALLBACKS"))
 
     def test_conversation_is_committed_only_after_successful_send(self):
         decider = EnhancedSpeakingDecider()
