@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""群日报生成探针：复现「金句 / 逆天语录整块消失」并定位原因。
+"""群日报生成探针：复现日报结构问题，并校准逆天语录的入选门槛。
 
 不复刻生产 prompt —— 直接调真的 `GroupDailyAnalysis.analyze()`，只把
 provider 包一层记录「端点原始返回 / finish_reason / token 用量」。

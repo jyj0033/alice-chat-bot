@@ -425,18 +425,20 @@ class GroupDailyAnalysis:
             "日常吐槽、接梗和普通反应不要为了填充版面单列出来。"
             "点评风格：语言要接地气，多用互联网黑话；吐槽要精准、避重就轻，优先调侃具体场面，不上纲上线，不做人身攻击。"
             "避免使用‘具有代表性’‘可以看出’‘反映了’‘体现了’‘这说明’等报告腔。\n"
-            "unhinged_quotes 是本篇门槛最高的区（日报里叫‘逆天语录’），只收‘没有任何上下文、单看这一句就让人接不上话’的真实原话，"
-            "并且至少命中一条：①逻辑断裂——答非所问、两句之间硬接、突然自曝；"
-            "②反差荒谬——正经话题里突然冒出的暴论或离谱类比；③一本正经的荒诞断言——把明显不成立的事说得毫无自觉。"
-            "以下一律不收：单纯脏话、复读刷屏、只有表情、玩梗台词（哪怕出自名场面）、日常吐槽、口误、"
-            "求人/道歉/问候、抽象名词堆砌、需要额外背景才懂的笑话、带人身攻击的内容。"
+            "unhinged_quotes 是本篇门槛最高的区（日报里叫‘逆天语录’）：只收今天最离谱、最反差、最让人接不上话的真实原话。"
+            "先排除掉这几类：单纯脏话、复读刷屏、只有表情、玩梗台词（哪怕出自名场面）、日常吐槽、口误、"
+            "求人/道歉/问候、报数据或约时间这类平平常常的接话、抽象名词堆砌、带人身攻击的内容。"
+            "够得上门槛的是这几种形态：把话题硬拐到完全不相干的地方；答非所问却答得很自信；"
+            "忽然一本正经地自曝；用离谱类比解释正经事（比如认真讨论某个角色的强度，却给出一个风马牛不相及的地名当理由）。"
+            "命中任意一种就写进来，不要因为‘需要一点上下文才懂’而放过它 —— 判据是这句话本身够不够炸，"
+            "不是不看上下文能不能看懂。"
             "content 必须来自原文或只是删减标点，不能改写成段子；"
             "reason 只写我当时的短反应和点评，15到50字，允许吐槽、偏心、接梗或补半句原因；不要解释‘这句话体现了什么’。"
             "可以参考‘好，话题又拐回来了’‘这句一出来我就知道今晚还早’‘这也能接上，服了’这种口气，但不能凭空补事实、关系或背景，"
             "也不要把 reason 写成总结段落。"
-            f"打分纪律：每条先独立打0到100分，绝大多数句子都该在50分以下，只有真正逆天的才够到{unhinged_min_score}分以上；"
+            f"打分纪律：每条先独立打0到100分，普通的句子都在50分以下，只有真正逆天的才够到{unhinged_min_score}分以上；"
             f"低于{unhinged_min_score}分的不要写进来（写进来我也会丢掉），也不要把条目挤在同一个分数上。"
-            "如果今天一条都够不上这个标准就返回空数组 —— 这里宁缺毋滥，空着比凑数好。"
+            "一天能挑出1到3句最好；实在一句都够不上才返回空数组。这里仍然是宁缺毋滥，但别把真正逆天的句子漏掉。"
             "sender_id、sender_ids 只能使用原文中的用户ID。"
             "输出必须是纯 JSON 对象，不要 Markdown 代码块，不要在 JSON 外解释。\n\n"
             f"【输出结构示例】\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
@@ -1878,11 +1880,19 @@ class GroupDailyAnalysis:
                     icon_color=coral,
                 )
                 y += 56
-                wild_width = (content_width - 64 - 24) // 2
+                wild_items = [
+                    item
+                    for item in unhinged_quotes[:MAX_UNHINGED_QUOTES]
+                    if isinstance(item, dict)
+                ]
+                # 一天只有一条时铺满整行，免得右边空掉半个版面。
+                wild_width = (
+                    content_width - 64
+                    if len(wild_items) == 1
+                    else (content_width - 64 - 24) // 2
+                )
                 wild_data = []
-                for item in unhinged_quotes[:MAX_UNHINGED_QUOTES]:
-                    if not isinstance(item, dict):
-                        continue
+                for item in wild_items:
                     rank = len(wild_data) + 1
                     sender_id = str(item.get("sender_id") or "")
                     name = display_name(sender_id)
@@ -1933,7 +1943,7 @@ class GroupDailyAnalysis:
                     )
                     draw.text(
                         (margin + 32, y + 24),
-                        "今天最离谱的几句，宁缺毋滥",
+                        f"今天最离谱的{len(wild_data)}句，宁缺毋滥",
                         font=hero_small,
                         fill=coral,
                     )
