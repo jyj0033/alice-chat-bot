@@ -57,6 +57,36 @@ def _merge_protocol_stops(stop) -> list[str]:
     return stops
 
 
+# 声明了服务端 web_search 的那一轮，温度压到这个值（可被 provider 配置
+# search_temperature 覆盖）。
+# 为什么必须压：服务端检索会把「半对资料」塞进上下文，而事实型问答沿用聊天温度
+# （生产 0.8 / top_p 0.9）时，模型每次采样会落在不同的错误片段上。实测同一问题
+# （「崩铁现在up角色是谁」）4 次采样得到 4 个互不相同的答案，其中一次检索词猜错
+# 版本号、20 条来源全是《鸣潮》的资料。压到 0.3 是检索类问答的常规做法。
+SERVER_SEARCH_TEMPERATURE = 0.3
+
+# 服务端搜索路径的「时效 / 来源取舍」约束。
+#
+# 为什么需要单独加这一段：同一套约束在客户端搜索链里已经存在
+# （见 _generate_with_search 内的 writer 提示），但服务端搜索走的是 generate() 的
+# 普通分支，完全不经过那段提示——等于「模型自己搜、自己答，却没人告诉它资料过时了
+# 该怎么办」。实测后果：模型会把别的作品的资料认成本作，也会把猜出来的版本号
+# 当事实报出去。
+SERVER_SEARCH_GUARDRAIL = (
+    "【本轮已开启联网检索】\n"
+    "今天是{today}。查到资料后按下面要求回答：\n"
+    "1. 对方问「现在/当前/最新」时，只回答【正在进行】的内容；"
+    "标着未来日期的是还没发生的事，要说清「几号才开 / 下个版本才上」，不能当成现在。\n"
+    "2. 同一件事有多条资料且说法不一致时，以日期最新的为准；"
+    "拿不准是哪条就用「大概 / 应该是」这类留余地的说法。\n"
+    "3. 资料过时、对不上、或根本没查到，就像记不清一样自然带过"
+    "（比如「这我哪记得」「好久没关注了」），绝不要编造版本号、角色名或日期。\n"
+    "4. 检索结果里出现的其他作品（别的游戏 / 番剧）内容不要混进来认成本作——"
+    "同名版本号很容易串到别的游戏上。\n"
+    "5. 不要说「据xx」「搜索显示」「资料库」，不要贴链接。"
+)
+
+
 def strip_emoji(text: str) -> str:
     """移除文字回复中的 Emoji。
 
@@ -340,7 +370,12 @@ class ReplyGenerator:
         if self._should_declare_server_search(server_search, search_decision):
             # 只影响本次请求：request 由 _build_request 每轮新建，不跨轮复用。
             request.tools.append({"type": "web_search"})
-            logger.info("[搜索判断] 本次请求按需声明服务端 web_search")
+            search_temperature = self._apply_server_search_guardrails(request)
+            logger.info(
+                "[搜索判断] 本次请求按需声明服务端 web_search（温度压至 %.2f，"
+                "已追加时效取舍约束）",
+                search_temperature,
+            )
         # 工具调用：send_meme 是结构化输出，正常路径走原生 tool_use，
         # 异常端点漏成 `<invoke>` 文本时再走 _extract_native_tool_calls 兜底。
         # None 表示本轮没有发图请求；空字符串只表示模型确实调用了
@@ -747,6 +782,53 @@ class ReplyGenerator:
         if server_search is not True:
             return False
         return bool((search_decision or {}).get("need_search"))
+
+    def _apply_server_search_guardrails(self, request: ChatRequest) -> float:
+        """给「本轮声明了服务端搜索」的请求压温度 + 追加时效取舍约束。
+
+        两件事必须在同一个地方做，因为它们服务同一个目的：把服务端检索拿回来的
+        「半对资料」约束住，别让它变成信口开河的依据。
+
+        ① 压温度：事实型问答在 0.8 下每次采样会落在不同的错误片段上，
+           实测同题 4 次得 4 个不同答案。只压不高——配置本身更低时保留配置值。
+        ② 补约束：`_generate_with_search` 的 writer 提示里有一整套
+           「只答正在进行的内容 / 日期新的优先 / 不确定别编造」，但服务端搜索走的
+           是普通分支，不经过那段提示。这里把要点补上，否则模型在资料过时或
+           搜到别的作品时没有任何行为指导。
+        追加成 system 消息而非 user 消息：Responses Provider 的 `_split_system`
+        会把所有 system 消息合并进顶层 `instructions`，不会伪造出一轮用户发言。
+
+        返回本轮实际使用的温度（便于日志与测试断言）。
+        """
+        import datetime as _dt
+
+        provider_config = getattr(self.llm, "config", {})
+        if not isinstance(provider_config, dict):
+            provider_config = {}
+        # 注意用 is None 判定而不是 dict.get(key, default)：main._init_llm 会把
+        # search_temperature 显式置为 None（配置未填时），此时 .get 会返回 None
+        # 而不是默认值。
+        configured_floor = provider_config.get("search_temperature")
+        try:
+            floor = (
+                SERVER_SEARCH_TEMPERATURE
+                if configured_floor is None
+                else float(configured_floor)
+            )
+        except (TypeError, ValueError):
+            floor = SERVER_SEARCH_TEMPERATURE
+        floor = max(0.0, min(2.0, floor))
+
+        # 注意 request.temperature 可能已被情感状态上调/下调过，用 min 只压不抬。
+        try:
+            current = float(request.temperature)
+        except (TypeError, ValueError):
+            current = floor
+        request.temperature = min(current, floor)
+
+        today = _dt.datetime.now().strftime("%Y年%m月%d日")
+        request.add_system(SERVER_SEARCH_GUARDRAIL.format(today=today))
+        return request.temperature
 
     async def _has_knowledge(self) -> bool:
         store = self.knowledge_store

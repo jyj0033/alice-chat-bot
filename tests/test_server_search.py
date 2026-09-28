@@ -9,11 +9,12 @@
 """
 import asyncio
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 from modules.llm.base import ChatMessage, ChatRequest, ChatResponse
 from modules.llm.responses_provider import MIN_OUTPUT_TOKENS, ResponsesProvider
-from modules.reply.generator import ReplyGenerator
+from modules.reply.generator import SERVER_SEARCH_TEMPERATURE, ReplyGenerator
 
 SEND_MEME = {
     "type": "function",
@@ -167,15 +168,96 @@ class ResponsesReasoningEffortTests(unittest.TestCase):
         self.assertEqual(body["max_output_tokens"], MIN_OUTPUT_TOKENS)
 
 
+class ServerSearchGuardrailTests(unittest.TestCase):
+    """声明服务端搜索的那一轮：压温度 + 补时效取舍约束。
+
+    背景（2026-09-28 线上探针，见 scripts/probe_search_stability.py）：
+    服务端检索会把抓到的网页正文塞进上下文。模型不知道「当前版本号」时会把它
+    猜出来的版本号写进检索词（实测猜过 3.1 / 3.7 / 2.4），第一轮检索因此系统性
+    跑偏——猜 3.7 那次 20 条来源全是《鸣潮》的。再叠加 0.8 温度采样，同一问题
+    4 次得到 4 个互不相同的答案。
+    """
+
+    class _StubLLM:
+        def __init__(self, config):
+            self.config = config
+            self.model = "stub"
+
+    def _generator(self, **config):
+        base = {"temperature": 0.8, "top_p": 0.9}
+        base.update(config)
+        return ReplyGenerator(llm_provider=self._StubLLM(base))
+
+    @staticmethod
+    def _request() -> ChatRequest:
+        return ChatRequest(
+            messages=[ChatMessage(role="system", content="人设"),
+                      ChatMessage(role="user", content="崩铁现在up角色是谁")],
+            temperature=0.8,
+        )
+
+    def test_temperature_is_clamped_down(self):
+        generator = self._generator()
+        request = self._request()
+
+        used = generator._apply_server_search_guardrails(request)
+
+        self.assertAlmostEqual(used, 0.3)
+        self.assertAlmostEqual(request.temperature, 0.3)
+
+    def test_temperature_never_raised(self):
+        """配置本身更低时保留配置值——这一层只压不抬。"""
+        generator = self._generator()
+        request = self._request()
+        request.temperature = 0.1
+
+        generator._apply_server_search_guardrails(request)
+
+        self.assertAlmostEqual(request.temperature, 0.1)
+
+    def test_configurable_floor(self):
+        generator = self._generator(search_temperature=0.0)
+        request = self._request()
+        generator._apply_server_search_guardrails(request)
+        self.assertAlmostEqual(request.temperature, 0.0)
+
+    def test_none_config_falls_back_to_builtin(self):
+        """main._init_llm 在配置未填时会把该键显式置为 None，不能当成 0。"""
+        generator = self._generator(search_temperature=None)
+        request = self._request()
+        generator._apply_server_search_guardrails(request)
+        self.assertAlmostEqual(request.temperature, SERVER_SEARCH_TEMPERATURE)
+
+    def test_guardrail_mentions_today_and_key_rules(self):
+        generator = self._generator()
+        request = self._request()
+        before = len(request.messages)
+
+        generator._apply_server_search_guardrails(request)
+
+        self.assertEqual(len(request.messages), before + 1)
+        added = request.messages[-1]
+        self.assertEqual(added.role, "system")
+        today = datetime.now().strftime("%Y年%m月%d日")
+        self.assertIn(today, added.content)
+        # 四条关键约束：时效取最新、不确定别编造、别串到别的作品
+        self.assertIn("只回答【正在进行】的内容", added.content)
+        self.assertIn("以日期最新的为准", added.content)
+        self.assertIn("绝不要编造版本号", added.content)
+        self.assertIn("别的游戏", added.content)
+
+
 class _RecordingProvider:
     """记录每次请求，并按调用场景返回判断器结果或正文。"""
 
     model = "test"
 
-    def __init__(self, decision: str, supports_server_search: bool = True):
+    def __init__(self, decision: str, supports_server_search: bool = True,
+                 config: dict | None = None):
         self.requests = []
         self._decision = decision
         self.supports_server_search = supports_server_search
+        self.config = config if config is not None else {}
 
     @staticmethod
     def _blob(request) -> str:
@@ -227,10 +309,31 @@ class ServerSearchDeclarationIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self._judge_called(provider), "判断器未被调用，按需声明会失效")
         self.assertIn(WEB_SEARCH, self._main_request(provider).tools)
 
-    async def test_does_not_declare_web_search_for_chitchat(self):
+    async def test_guardrails_ride_along_with_declaration(self):
+        """声明了服务端搜索 → 温度被压到下限，且带上了时效取舍约束。"""
+        provider = await self._run(self._NEED)
+        request = self._main_request(provider)
+
+        self.assertIn(WEB_SEARCH, request.tools)
+        self.assertLessEqual(request.temperature, SERVER_SEARCH_TEMPERATURE)
+        guardrails = [
+            m for m in request.messages
+            if m.role == "system" and "本轮已开启联网检索" in str(m.content)
+        ]
+        self.assertEqual(len(guardrails), 1)
+
+    async def test_no_guardrails_when_not_declared(self):
+        """闲聊不声明搜索，也就不能压温度、不能塞约束（否则是全局行为改变）。"""
         provider = await self._run(self._SKIP)
+        request = self._main_request(provider)
+
         self.assertTrue(self._judge_called(provider))
-        self.assertNotIn(WEB_SEARCH, self._main_request(provider).tools)
+        self.assertNotIn(WEB_SEARCH, request.tools)
+        self.assertGreater(request.temperature, SERVER_SEARCH_TEMPERATURE)
+        self.assertFalse([
+            m for m in request.messages
+            if m.role == "system" and "本轮已开启联网检索" in str(m.content)
+        ])
 
     async def test_no_declaration_when_provider_lacks_capability(self):
         provider = await self._run(self._NEED, supports=False)
