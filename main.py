@@ -479,7 +479,14 @@ class GroupChatBot:
             "max_messages": max(20, min(5000, int(analysis_cfg.get("max_messages", 500)))),
             "max_prompt_chars": max(4000, min(60000, int(analysis_cfg.get("max_prompt_chars", 24000)))),
             "max_topics": max(1, min(10, int(analysis_cfg.get("max_topics", 5)))),
-            "max_quotes": max(1, min(8, int(analysis_cfg.get("max_quotes", 3)))),
+            # 金句区已取消（日报只保留逆天语录），这两个值是逆天语录的条数上限和
+            # 入选门槛分：宁缺毋滥，够不上门槛的一天可以一条都没有。
+            "max_unhinged_quotes": max(
+                1, min(8, int(analysis_cfg.get("max_unhinged_quotes", 4)))
+            ),
+            "unhinged_min_score": max(
+                0, min(100, int(analysis_cfg.get("unhinged_min_score", 75)))
+            ),
             "max_titles": max(1, min(8, int(analysis_cfg.get("max_titles", 5)))),
             "max_tokens": max(400, min(6000, int(analysis_cfg.get("max_tokens", 2400)))),
             "max_report_chars": max(1200, min(10000, int(analysis_cfg.get("max_report_chars", 6000)))),
@@ -3829,7 +3836,8 @@ class GroupChatBot:
                 provider=provider,
                 max_chars=config.get("max_prompt_chars", 24000),
                 max_topics=config.get("max_topics", 5),
-                max_quotes=config.get("max_quotes", 3),
+                max_unhinged_quotes=config.get("max_unhinged_quotes", 4),
+                unhinged_min_score=config.get("unhinged_min_score", 75),
                 max_titles=config.get("max_titles", 5),
                 max_tokens=config.get("max_tokens", 2400),
                 retries=config.get("retries", 2),
@@ -6460,12 +6468,13 @@ class GroupChatBot:
                     "max_messages": 500,
                     "max_prompt_chars": 24000,
                     "max_topics": 5,
-                    "max_quotes": 3,
+                    "max_unhinged_quotes": 4,
+                    "unhinged_min_score": 75,
                     "max_titles": 5,
-                    # 日报 JSON 很长（5 话题 + 5 画像 + 3 金句 + 5 逆天语录 + 锐评维度），
+                    # 日报 JSON 很长（5 话题 + 5 画像 + 4 逆天语录 + 锐评维度），
                     # 而 Responses 端点把 reasoning token 也计进输出上限。
                     # 1800 会在写到 unhinged_quotes 时被截断 → JSON 不闭合 →
-                    # 金句和逆天语录整块消失。实测完整输出约 2100~2200 token。
+                    # 逆天语录整块消失。实测完整输出约 2100~2200 token。
                     "max_tokens": 4000,
                     "max_report_chars": 6000,
                     "retention_days": 30,

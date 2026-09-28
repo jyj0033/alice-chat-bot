@@ -95,7 +95,12 @@ def _report_config(cfg: dict) -> dict:
         "max_messages": max(20, min(5000, int(analysis_cfg.get("max_messages", 500)))),
         "max_prompt_chars": max(4000, min(60000, int(analysis_cfg.get("max_prompt_chars", 24000)))),
         "max_topics": max(1, min(10, int(analysis_cfg.get("max_topics", 5)))),
-        "max_quotes": max(1, min(8, int(analysis_cfg.get("max_quotes", 3)))),
+        "max_unhinged_quotes": max(
+            1, min(8, int(analysis_cfg.get("max_unhinged_quotes", 4)))
+        ),
+        "unhinged_min_score": max(
+            0, min(100, int(analysis_cfg.get("unhinged_min_score", 75)))
+        ),
         "max_titles": max(1, min(8, int(analysis_cfg.get("max_titles", 5)))),
         "max_tokens": max(400, min(6000, int(analysis_cfg.get("max_tokens", 2400)))),
         "retries": max(1, min(8, int(analysis_cfg.get("retries", 2)))),
@@ -127,6 +132,7 @@ async def main_async() -> None:
     print(f"web_search    : {raw_cfg.get('web_search')} | reasoning_effort={raw_cfg.get('reasoning_effort')}")
     print(f"日报预算      : max_tokens={rc['max_tokens']} retries={rc['retries']} "
           f"max_prompt_chars={rc['max_prompt_chars']}")
+    print(f"逆天语录      : 上限={rc['max_unhinged_quotes']} 条，门槛分={rc['unhinged_min_score']}")
 
     memory_cfg = cfg.get("memory") or {}
     storage = AsyncMemoryStorage(
@@ -162,7 +168,8 @@ async def main_async() -> None:
         provider=recorder,
         max_chars=rc["max_prompt_chars"],
         max_topics=rc["max_topics"],
-        max_quotes=rc["max_quotes"],
+        max_unhinged_quotes=rc["max_unhinged_quotes"],
+        unhinged_min_score=rc["unhinged_min_score"],
         max_titles=rc["max_titles"],
         max_tokens=rc["max_tokens"],
         retries=rc["retries"],
@@ -184,7 +191,8 @@ async def main_async() -> None:
             GroupDailyAnalysis.build_statistics(humans),
             max_chars=rc["max_prompt_chars"],
             max_topics=rc["max_topics"],
-            max_quotes=rc["max_quotes"],
+            max_unhinged_quotes=rc["max_unhinged_quotes"],
+            unhinged_min_score=rc["unhinged_min_score"],
             max_titles=rc["max_titles"],
             bot_name="爱丽丝",
             bot_persona="",
@@ -196,9 +204,12 @@ async def main_async() -> None:
     print("analyze() 结果：")
     print(f"  analysis_error = {report.get('analysis_error')!r}")
     print(f"  title          = {report.get('title')!r}")
-    for key in ("topics", "profiles", "quotes", "unhinged_quotes"):
+    for key in ("topics", "profiles", "unhinged_quotes"):
         items = report.get(key) or []
         print(f"  {key:15s}= {len(items)} 条")
+        if key == "unhinged_quotes":
+            for item in items:
+                print(f"      · {item.get('score')} 分｜{item.get('content')!r}")
     qr = report.get("quality_review") or {}
     print(f"  quality_review = {len(qr.get('dimensions') or [])} 个维度")
     print("=" * 72)

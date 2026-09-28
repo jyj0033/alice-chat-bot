@@ -50,7 +50,7 @@ class _ScriptedProvider:
 
 
 def _full_report_payload():
-    """一份结构完整的日报，两条引文都来自 GroupAnalysisTests.setUp 的真实消息。"""
+    """一份结构完整的日报，逆天语录来自 GroupAnalysisTests.setUp 的真实消息。"""
     return {
         "title": "今晚的群聊小剧场",
         "subtitle": "大家从开黑聊到了配队",
@@ -65,11 +65,6 @@ def _full_report_payload():
             "title": "抽象配队师",
             "mbti": "今日观察派",
             "reason": "吐槽配队",
-        }],
-        "quotes": [{
-            "content": "这波配队太抽象了",
-            "sender_id": "u1",
-            "reason": "这句我得记一下",
         }],
         "unhinged_quotes": [{
             "content": "我可以，八点半上线",
@@ -122,7 +117,7 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
         ordinary_message = _message("日报", "u3", "丙", datetime(2026, 8, 24, 21, 0))
         self.assertEqual(len(GroupDailyAnalysis.human_messages([ordinary_message])), 1)
 
-    async def test_llm_result_is_normalized_and_quote_must_have_source(self):
+    async def test_llm_result_is_normalized_and_unhinged_quote_must_have_source(self):
         provider = _Provider({
             "title": "今晚的群聊小剧场",
             "subtitle": "大家从开黑聊到了配队",
@@ -132,9 +127,9 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
                 "detail": "讨论上线时间和游戏安排",
                 "sender_ids": ["u1", "u2", "unknown"],
             }],
+            # 金句区已下线：模型即使给了 quotes 也不该出现在返回里。
             "quotes": [
-                {"content": "这波配队太抽象了", "sender_id": "u1", "reason": "吐槽有画面"},
-                {"content": "模型编的不存在原话", "sender_id": "u2", "reason": "不应保留"},
+                {"content": "这波配队太抽象了", "sender_id": "u1", "reason": "过时的金句区"},
             ],
             "unhinged_quotes": [
                 {
@@ -147,7 +142,7 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
                     "content": "我可以，八点半上线",
                     "sender_id": "u2",
                     "score": 60,
-                    "reason": "这句至少是真的",
+                    "reason": "这句只是普通接话，够不上门槛",
                 },
                 {
                     "content": "模型编的逆天原话",
@@ -177,36 +172,41 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
             self.messages,
             provider=provider,
             max_topics=3,
-            max_quotes=3,
+            max_unhinged_quotes=4,
+            unhinged_min_score=75,
             max_titles=3,
             bot_name="爱丽丝",
             bot_persona="我说话很短，偶尔会吐槽。",
         )
         self.assertEqual(report["summary"], "今晚约了开黑，大家讨论了配队。")
         self.assertEqual(report["topics"][0]["sender_ids"], ["u1", "u2"])
-        self.assertEqual(len(report["quotes"]), 1)
-        self.assertEqual(report["quotes"][0]["content"], "这波配队太抽象了")
-        self.assertEqual(len(report["unhinged_quotes"]), 2)
+        # 金句整块下线：返回结构里不再有 quotes 键，模型硬塞的也不消费。
+        self.assertNotIn("quotes", report)
+        # 99 分那条是编的（原句匹配失败），60 分那条低于门槛分 → 只剩 91 分。
+        self.assertEqual(len(report["unhinged_quotes"]), 1)
         self.assertEqual(report["unhinged_quotes"][0]["score"], 91)
-        self.assertEqual(report["unhinged_quotes"][1]["score"], 60)
+        self.assertEqual(report["unhinged_quotes"][0]["content"], "这波配队太抽象了")
         self.assertEqual(report["titles"][0]["sender_id"], "u1")
         self.assertEqual(report["title"], "今晚的群聊小剧场")
         self.assertEqual(report["subtitle"], "大家从开黑聊到了配队")
         self.assertEqual(report["profiles"][0]["mbti"], "今日观察派")
         self.assertEqual(report["quality_review"]["dimensions"][0]["percentage"], 70.0)
-        self.assertIn("【群聊原文】", provider.request.messages[-1].content)
-        self.assertIn("第一人称", provider.request.messages[-1].content)
-        self.assertIn('"quality_review"', provider.request.messages[-1].content)
-        self.assertIn('"profiles"', provider.request.messages[-1].content)
-        self.assertIn('"unhinged_quotes"', provider.request.messages[-1].content)
-        self.assertIn("逆天语录", provider.request.messages[-1].content)
-        self.assertIn("短反应", provider.request.messages[-1].content)
-        self.assertIn("多用互联网黑话", provider.request.messages[-1].content)
-        self.assertIn("话题又拐回来了", provider.request.messages[-1].content)
-        self.assertIn("我说话很短", provider.request.messages[-1].content)
+        prompt = provider.request.messages[-1].content
+        self.assertIn("【群聊原文】", prompt)
+        self.assertIn("第一人称", prompt)
+        self.assertIn('"quality_review"', prompt)
+        self.assertIn('"profiles"', prompt)
+        self.assertIn('"unhinged_quotes"', prompt)
+        self.assertNotIn('"quotes"', prompt)
+        self.assertIn("逆天语录", prompt)
+        self.assertIn("短反应", prompt)
+        self.assertIn("多用互联网黑话", prompt)
+        self.assertIn("话题又拐回来了", prompt)
+        self.assertIn("宁缺毋滥", prompt)
+        self.assertIn("我说话很短", prompt)
         rendered = GroupDailyAnalysis.render_report(report)
-        self.assertNotIn("我当时想说", rendered)
-        self.assertIn("吐槽有画面", rendered)
+        self.assertNotIn("我忍不住记下的几句", rendered)
+        self.assertIn("好家伙，原来还能这么说", rendered)
         self.assertIn("逆天现场", rendered)
 
     async def test_provider_failure_keeps_local_statistics(self):
@@ -221,7 +221,7 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
     def test_looks_like_report_rejects_truncated_inner_fragment(self):
         # 截断时 _parse_json 会退而返回内层碎片（单个 profiles 项）。
         # 那种碎片能在 `if parsed` 上成真，必须由结构完整性判据挡掉，
-        # 否则日报会静默变成只剩统计的一页，金句和逆天语录凭空消失。
+        # 否则日报会静默变成只剩统计的一页，逆天语录凭空消失。
         fragment = {
             "sender_id": "u1",
             "title": "接话担当",
@@ -237,7 +237,13 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(
             GroupDailyAnalysis._looks_like_report(
-                {"summary": "今晚聊了很久。", "topics": [], "quotes": [], "unhinged_quotes": []}
+                {"summary": "今晚聊了很久。", "topics": [], "profiles": [], "unhinged_quotes": []}
+            )
+        )
+        # 今天一条逆天语录都没有（空数组）仍然算完整，不能被误判成截断。
+        self.assertTrue(
+            GroupDailyAnalysis._looks_like_report(
+                {"summary": "今晚聊了很久。", "topics": [{"name": "x", "detail": "y"}], "unhinged_quotes": []}
             )
         )
 
@@ -247,7 +253,6 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
             ' "topics": [{"name": "话题", "detail": "细节", "sender_ids": ["u1"]}],'
             ' "profiles": [{"sender_id": "u1", "title": "接话担当", "mbti": "观察",'
             ' "reason": "接话"}],'
-            ' "quotes": [{"content": "这波配队太抽象了", "sender_id": "u1", "reason": "吐槽"}],'
             ' "unhinged_quotes": [{"content": "我可以，八点半上线", "sender_id": "u2",'
         )
         provider = _ScriptedProvider([
@@ -265,7 +270,7 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.requests[0].max_tokens, 1000)
         self.assertGreater(provider.requests[1].max_tokens, 1000)
         self.assertEqual(report["analysis_error"], "")
-        self.assertEqual(len(report["quotes"]), 1)
+        self.assertNotIn("quotes", report)
         self.assertEqual(len(report["unhinged_quotes"]), 1)
         self.assertEqual(report["unhinged_quotes"][0]["score"], 90)
 
@@ -275,11 +280,46 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
         report = await GroupDailyAnalysis.analyze(
             self.messages, provider=provider, max_tokens=1000, retries=2
         )
-        # 不能静默产出一份只有标题、没有金句/逆天语录的「半份日报」
+        # 不能静默产出一份只有标题、没有逆天语录的「半份日报」
         self.assertTrue(report["analysis_error"])
-        self.assertEqual(report["quotes"], [])
+        self.assertNotIn("quotes", report)
         self.assertEqual(report["unhinged_quotes"], [])
         self.assertEqual(report["statistics"]["message_count"], 3)
+
+    async def test_low_score_unhinged_quotes_are_dropped(self):
+        """门槛分是代码侧硬闸门：分数不够的候选一律不出现（宁缺毋滥）。"""
+        provider = _Provider({
+            "title": "今晚",
+            "summary": "大家随便聊了几句。",
+            "topics": [{"name": "闲聊", "detail": "没什么重点", "sender_ids": ["u1"]}],
+            "profiles": [{
+                "sender_id": "u1",
+                "title": "围观群众",
+                "mbti": "",
+                "reason": "今天没怎么说话",
+            }],
+            "unhinged_quotes": [
+                {
+                    "content": "这波配队太抽象了",
+                    "sender_id": "u1",
+                    "score": 74,
+                    "reason": "差一分",
+                },
+                {
+                    "content": "我可以，八点半上线",
+                    "sender_id": "u2",
+                    "score": 60,
+                    "reason": "普通接话",
+                },
+            ],
+        })
+        report = await GroupDailyAnalysis.analyze(
+            self.messages, provider=provider, unhinged_min_score=75
+        )
+        self.assertEqual(report["unhinged_quotes"], [])
+        # 空数组不该被判成「结构不完整」而触发降级
+        self.assertEqual(report["analysis_error"], "")
+        self.assertEqual(report["title"], "今晚")
 
     async def test_report_image_is_a_png(self):
         report = await GroupDailyAnalysis.analyze(self.messages, provider=None)
@@ -360,11 +400,6 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
                 "mbti": "今日观察",
                 "reason": "我注意到甲今天一直在接住大家的话头。",
             }],
-            "quotes": [{
-                "sender_id": "u2",
-                "content": "先别决定，先复盘一下",
-                "reason": "把一个普通安排拐成了复盘会议。",
-            }],
             "unhinged_quotes": [
                 {
                     "sender_id": "u3",
@@ -426,9 +461,10 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
                 "mbti": "一个很长的轻量标签",
                 "reason": long_text,
             }],
-            "quotes": [{
+            "unhinged_quotes": [{
                 "sender_id": "u2",
                 "content": long_text,
+                "score": 99,
                 "reason": long_text,
             }],
             "quality_review": {
@@ -457,7 +493,7 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
             "max_messages": 100,
             "max_prompt_chars": 10000,
             "max_topics": 2,
-            "max_quotes": 2,
+            "max_unhinged_quotes": 2,
             "max_titles": 2,
             "max_tokens": 300,
             "max_report_chars": 2000,

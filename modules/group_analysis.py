@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 # 两处保持一致；截断重试时按这个上限爬升。
 MAX_REPORT_OUTPUT_TOKENS = 6000
 
+# 「逆天语录」是宁缺毋滥的区，宁可一天一条都没有，也不要拿普通吐槽来凑数：
+# 上限压到 4 条，并且低于门槛分的一律在代码侧丢掉（prompt 里同步告知门槛，
+# 让模型没有「先写上、分数随便给」的余地）。两个值都能被 config 覆盖。
+MAX_UNHINGED_QUOTES = 4
+UNHINGED_MIN_SCORE = 75
+
 
 class _ScaledDraw:
     """在高分辨率画布上使用逻辑坐标绘图，最后缩小以获得抗锯齿效果。"""
@@ -346,7 +352,8 @@ class GroupDailyAnalysis:
         statistics: dict,
         max_chars: int = 24000,
         max_topics: int = 5,
-        max_quotes: int = 3,
+        max_unhinged_quotes: int = MAX_UNHINGED_QUOTES,
+        unhinged_min_score: int = UNHINGED_MIN_SCORE,
         max_titles: int = 5,
         bot_name: str = "爱丽丝",
         bot_persona: str = "",
@@ -379,18 +386,11 @@ class GroupDailyAnalysis:
                     "reason": "我为什么注意到这个人，80到140字",
                 }
             ],
-            "quotes": [
-                {
-                    "content": "必须来自原文的完整或近似原话",
-                    "sender_id": "用户ID",
-                    "reason": "我看到这里时的短点评，15到50字，像聊天，不像分析",
-                }
-            ],
             "unhinged_quotes": [
                 {
                     "content": "必须来自原文的完整或近似原话",
                     "sender_id": "用户ID",
-                    "score": 92,
+                    "score": unhinged_min_score,
                     "reason": "我对这句的口语化点评，15到50字，不写成报告",
                 }
             ],
@@ -417,17 +417,26 @@ class GroupDailyAnalysis:
             "如果原文里没有我的发言，不要虚构我参与过、说过或做过什么；我只能说我看到、听到或注意到。"
             "原文中标记为“我”的行才是 Bot 自己说过的话。\n"
             "标题可以有一点文学感或群聊梗，但必须能从当天消息得到依据；副标题要像给朋友看的手写批注。\n"
-            f"topics 最多{max_topics}条，profiles 最多{max_titles}人，quotes 最多{max_quotes}句；"
-            "unhinged_quotes 固定最多5句，按 score 从高到低排列；"
+            f"topics 最多{max_topics}条，profiles 最多{max_titles}人；"
+            f"unhinged_quotes 最多{max_unhinged_quotes}句，按 score 从高到低排列；"
             "profiles 只能从参与者里挑有明显行为特征的人，MBTI 只是轻量玩笑标签，不要当成心理诊断。"
             "quality_review 如果素材不足可以返回空对象，但有素材时要给出3到5个具体维度和锐评。\n"
-            "金句区要像我在群里看到后顺手记下来的东西：content 必须来自原文或只是删减标点，不能改写成鸡汤。"
-            "reason 只写我当时的短反应和点评，15到50字，允许吐槽、偏心、接梗或补半句原因；不要解释‘这句话体现了什么’。"
-            "可以参考‘好，话题又拐回来了’‘这句一出来我就知道今晚还早’‘这也能接上，服了’这种口气，但不能凭空补事实、关系或背景。"
-            "避免使用‘具有代表性’‘可以看出’‘反映了’‘体现了’‘这说明’等报告腔，也不要把 reason 写成总结段落。"
+            "不要输出 quotes 字段。日报里不再单独摘金句，值得留的句子一律只通过 unhinged_quotes 呈现，"
+            "日常吐槽、接梗和普通反应不要为了填充版面单列出来。"
             "点评风格：语言要接地气，多用互联网黑话；吐槽要精准、避重就轻，优先调侃具体场面，不上纲上线，不做人身攻击。"
-            "unhinged_quotes 是独立的‘逆天语录’区：只挑今天最离谱、最反差、最让人接不上话的真实原话，"
-            "不要因为单纯脏话、刷屏、普通问候或一般吐槽就入选；score 用0到100表示逆天程度，宁缺毋滥。"
+            "避免使用‘具有代表性’‘可以看出’‘反映了’‘体现了’‘这说明’等报告腔。\n"
+            "unhinged_quotes 是本篇门槛最高的区（日报里叫‘逆天语录’），只收‘没有任何上下文、单看这一句就让人接不上话’的真实原话，"
+            "并且至少命中一条：①逻辑断裂——答非所问、两句之间硬接、突然自曝；"
+            "②反差荒谬——正经话题里突然冒出的暴论或离谱类比；③一本正经的荒诞断言——把明显不成立的事说得毫无自觉。"
+            "以下一律不收：单纯脏话、复读刷屏、只有表情、玩梗台词（哪怕出自名场面）、日常吐槽、口误、"
+            "求人/道歉/问候、抽象名词堆砌、需要额外背景才懂的笑话、带人身攻击的内容。"
+            "content 必须来自原文或只是删减标点，不能改写成段子；"
+            "reason 只写我当时的短反应和点评，15到50字，允许吐槽、偏心、接梗或补半句原因；不要解释‘这句话体现了什么’。"
+            "可以参考‘好，话题又拐回来了’‘这句一出来我就知道今晚还早’‘这也能接上，服了’这种口气，但不能凭空补事实、关系或背景，"
+            "也不要把 reason 写成总结段落。"
+            f"打分纪律：每条先独立打0到100分，绝大多数句子都该在50分以下，只有真正逆天的才够到{unhinged_min_score}分以上；"
+            f"低于{unhinged_min_score}分的不要写进来（写进来我也会丢掉），也不要把条目挤在同一个分数上。"
+            "如果今天一条都够不上这个标准就返回空数组 —— 这里宁缺毋滥，空着比凑数好。"
             "sender_id、sender_ids 只能使用原文中的用户ID。"
             "输出必须是纯 JSON 对象，不要 Markdown 代码块，不要在 JSON 外解释。\n\n"
             f"【输出结构示例】\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
@@ -453,7 +462,7 @@ class GroupDailyAnalysis:
         start = 0
         best: dict = {}
         best_score = -1
-        schema_keys = {"title", "summary", "topics", "profiles", "quotes", "unhinged_quotes"}
+        schema_keys = {"title", "summary", "topics", "profiles", "unhinged_quotes"}
         while True:
             start = text.find("{", start)
             if start < 0:
@@ -477,14 +486,18 @@ class GroupDailyAnalysis:
     def _looks_like_report(parsed: Any) -> bool:
         """判断解析结果是不是一份**结构完整**的日报，而不是截断后捞到的内层碎片。
 
-        这是「金句和逆天语录凭空消失」的闸门。输出被输出上限截断时，最外层 JSON
+        这是「逆天语录凭空消失」的闸门。输出被输出上限截断时，最外层 JSON
         不闭合，`_parse_json` 会退而返回内层最完整的那个对象（例如单个 profiles
         项，只有 sender_id/title/mbti/reason 四个键）。那种碎片能让 `if parsed`
         成真 —— 于是既不重试、也不写 `analysis_error`，日报静默渲染成只剩统计的
-        一页，`topics` / `quotes` / `unhinged_quotes` 全是空。
+        一页，`topics` / `profiles` / `unhinged_quotes` 全是空。
 
         判据取「summary 是非空字符串」+ 三个列表里至少两个是 list：正常输出必然
-        满足；碎片一定不满足（它连 summary 都没有）。
+        满足（一份完整日报三个区都会给出，空的也要给空数组）；碎片一定不满足
+        （它连 summary 都没有）。
+
+        注意 `unhinged_quotes` 允许是空数组（宁缺毋滥），空数组仍是 list，
+        所以不会因为「今天没有逆天语录」被误判成不完整。
         """
         if not isinstance(parsed, dict):
             return False
@@ -493,7 +506,7 @@ class GroupDailyAnalysis:
             return False
         lists = [
             key
-            for key in ("topics", "quotes", "unhinged_quotes")
+            for key in ("topics", "profiles", "unhinged_quotes")
             if isinstance(parsed.get(key), list)
         ]
         return len(lists) >= 2
@@ -523,7 +536,6 @@ class GroupDailyAnalysis:
         for section in (
             report.get("profiles"),
             report.get("titles"),
-            report.get("quotes"),
             report.get("unhinged_quotes"),
         ):
             for item in section or []:
@@ -633,10 +645,13 @@ class GroupDailyAnalysis:
         max_count: int,
         kind: str,
         source_messages: list,
+        min_score: int = 0,
     ) -> list[dict]:
         if not isinstance(raw, list):
             return []
         output = []
+        # 逆天语录要多看候选再按分数截断，所以它的候选窗口是 max_count*2；
+        # 其它区按出现顺序凑够就走。
         for item in raw[:max_count * 2]:
             if not isinstance(item, dict):
                 continue
@@ -656,7 +671,7 @@ class GroupDailyAnalysis:
                     output.append(
                         {"name": name, "detail": detail, "sender_ids": sender_ids}
                     )
-            elif kind in {"quote", "unhinged_quote"}:
+            elif kind == "unhinged_quote":
                 content = cls._short_text(item.get("content"), 220)
                 reason = cls._short_text(item.get("reason"), 80)
                 if not content:
@@ -678,27 +693,37 @@ class GroupDailyAnalysis:
                         kind, sender_id, content[:60], match_info,
                     )
                     continue
+                try:
+                    score = float(
+                        item.get("score")
+                        or item.get("unhinged_score")
+                        or item.get("rank_score")
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    score = 0
+                score = max(0, min(100, int(round(score))))
+                # 「宁缺毋滥」不能只写在 prompt 里：实测模型会把几乎所有候选都打到
+                # 85 分以上，分数因此失去区分度。所以门槛必须在代码侧再兜一刀，
+                # 低于 min_score 的直接丢掉，宁可这一天一条逆天语录都没有。
+                if score < min_score:
+                    logger.info(
+                        "[群日报] %s 丢弃：逆天度 %d 低于门槛 %d，发送者=%s，候选=%r",
+                        kind, score, min_score, sender_id, matched[:60],
+                    )
+                    continue
                 logger.info(
-                    "[群日报] %s 命中：发送者=%s，详情=%s",
-                    kind, sender_id, match_info,
+                    "[群日报] %s 命中：发送者=%s，逆天度=%d，详情=%s",
+                    kind, sender_id, score, match_info,
                 )
-                quote = {
-                    "content": matched,
-                    "sender_id": sender_id,
-                    "reason": reason or "这句我得记一下",
-                }
-                if kind == "unhinged_quote":
-                    try:
-                        score = float(
-                            item.get("score")
-                            or item.get("unhinged_score")
-                            or item.get("rank_score")
-                            or 0
-                        )
-                    except (TypeError, ValueError):
-                        score = 0
-                    quote["score"] = max(0, min(100, int(round(score))))
-                output.append(quote)
+                output.append(
+                    {
+                        "content": matched,
+                        "sender_id": sender_id,
+                        "reason": reason or "这句我得记一下",
+                        "score": score,
+                    }
+                )
             else:
                 title = cls._short_text(item.get("title"), 24)
                 reason = cls._short_text(item.get("reason"), 140)
@@ -823,7 +848,8 @@ class GroupDailyAnalysis:
         provider=None,
         max_chars: int = 24000,
         max_topics: int = 5,
-        max_quotes: int = 3,
+        max_unhinged_quotes: int = MAX_UNHINGED_QUOTES,
+        unhinged_min_score: int = UNHINGED_MIN_SCORE,
         max_titles: int = 5,
         max_tokens: int = 4000,
         retries: int = 2,
@@ -846,7 +872,6 @@ class GroupDailyAnalysis:
             "subtitle": "",
             "summary": "",
             "topics": [],
-            "quotes": [],
             "unhinged_quotes": [],
             "titles": [],
             "profiles": [],
@@ -888,7 +913,8 @@ class GroupDailyAnalysis:
                     statistics,
                     max_chars=max_chars,
                     max_topics=max_topics,
-                    max_quotes=max_quotes,
+                    max_unhinged_quotes=max_unhinged_quotes,
+                    unhinged_min_score=unhinged_min_score,
                     max_titles=max_titles,
                     bot_name=bot_name,
                     bot_persona=bot_persona,
@@ -937,9 +963,8 @@ class GroupDailyAnalysis:
 
         known_ids = {cls._sender(message)[0] for message in human_messages}
         logger.info(
-            "[群日报] 解析结果：字段=%s，普通摘录=%s，趣闻摘录=%s，画像=%s，话题=%s",
+            "[群日报] 解析结果：字段=%s，逆天语录=%s，画像=%s，话题=%s",
             sorted(parsed.keys()),
-            type(parsed.get("quotes")).__name__,
             type(parsed.get("unhinged_quotes")).__name__,
             type(parsed.get("profiles") or parsed.get("titles")).__name__,
             type(parsed.get("topics")).__name__,
@@ -951,11 +976,13 @@ class GroupDailyAnalysis:
         report["topics"] = cls._normalise_items(
             parsed.get("topics"), known_ids, max_topics, "topic", human_messages
         )
-        report["quotes"] = cls._normalise_items(
-            parsed.get("quotes"), known_ids, max_quotes, "quote", human_messages
-        )
         report["unhinged_quotes"] = cls._normalise_items(
-            parsed.get("unhinged_quotes"), known_ids, 5, "unhinged_quote", human_messages
+            parsed.get("unhinged_quotes"),
+            known_ids,
+            max_unhinged_quotes,
+            "unhinged_quote",
+            human_messages,
+            min_score=unhinged_min_score,
         )
         report["titles"] = cls._normalise_items(
             parsed.get("profiles") or parsed.get("titles"),
@@ -1038,23 +1065,10 @@ class GroupDailyAnalysis:
                     f"{index}. {ui_text(topic.get('name'), 40)}：{ui_text(topic.get('detail'), 220)}"
                 )
 
-        quotes = report.get("quotes", []) or []
-        if quotes:
-            lines.append("\n我忍不住记下的几句：")
-            for quote in quotes:
-                sender = ui_text(
-                    cls._name_for_id(quote.get("sender_id", ""), top_users, sender_names),
-                    24,
-                )
-                lines.append(
-                    f"「{ui_text(quote.get('content'), 220)}」——{sender}"
-                    f"\n  {ui_text(quote.get('reason'), 80)}"
-                )
-
         unhinged_quotes = report.get("unhinged_quotes", []) or []
         if unhinged_quotes:
-            # 「宁缺毋滥」时可能不足 5 条，标题按实际条数写，不要写死「五句」
-            picked = unhinged_quotes[:5]
+            # 「宁缺毋滥」时可能一条都不够门槛，标题按实际条数写，不要写死「五句」
+            picked = unhinged_quotes[:MAX_UNHINGED_QUOTES]
             lines.append(f"\n我挑出来的 {len(picked)} 句逆天现场：")
             for index, quote in enumerate(picked, 1):
                 sender = ui_text(
@@ -1851,92 +1865,7 @@ class GroupDailyAnalysis:
                     current_y += row_height + 18
                 y += people_height + 48
 
-            # 06 / Quotes
-            quotes = report.get("quotes", []) or []
-            if quotes:
-                section_label("", "群聊金句  ·  Quotes", margin, y, "quote")
-                y += 56
-                quote_bubble_width = content_width - 190
-                quote_data = []
-                for item in quotes[:6]:
-                    sender_id = str(item.get("sender_id") or "")
-                    name = display_name(sender_id)
-                    content_lines = wrap_text(
-                        display_text(item.get("content"), 220),
-                        quote_font,
-                        quote_bubble_width - 82,
-                        max_lines=3,
-                    )
-                    reason_lines = wrap_text(
-                        display_text(item.get("reason"), 130),
-                        small_font,
-                        quote_bubble_width - 116,
-                        max_lines=2,
-                    )
-                    quote_height = max(
-                        132,
-                        72
-                        + block_height(content_lines, quote_font, 7)
-                        + 30
-                        + block_height(reason_lines, small_font, 5)
-                        + 18,
-                    )
-                    quote_data.append((sender_id, name, content_lines, reason_lines, quote_height))
-                quotes_height = 82 + sum(item[4] + 22 for item in quote_data) + 18
-                panel(
-                    margin,
-                    y,
-                    content_width,
-                    quotes_height,
-                    surface,
-                    border=line,
-                    accent=cyan,
-                    shadow_color=shadow,
-                )
-                draw.text((margin + 32, y + 26), "这几句我记住了，像聊天一样留下来", font=hero_small, fill=cyan)
-                current_y = y + 78
-                for index, (sender_id, name, content_lines, reason_lines, row_height) in enumerate(quote_data):
-                    right_aligned = index % 2 == 1
-                    avatar_x = width - margin - 40 if right_aligned else margin + 40
-                    avatar_radius = 27
-                    avatar_gap = 14
-                    bubble_width = quote_bubble_width
-                    bubble_x = (
-                        margin + 90
-                        if not right_aligned
-                        else avatar_x - avatar_radius - avatar_gap - bubble_width
-                    )
-                    bubble_y = current_y + 28
-                    bubble_fill = "#fff2f5" if not right_aligned else "#fff7d8"
-                    avatar(avatar_x, current_y + 48, name, avatar_radius, coral if not right_aligned else peach, sender_id)
-                    name_x = bubble_x + 18 if not right_aligned else bubble_x + bubble_width - 18 - int(draw.textlength(name, font=small_bold))
-                    draw.text((name_x, current_y + 3), name, font=small_bold, fill=dark_muted)
-                    draw.rounded_rectangle(
-                        (bubble_x, bubble_y, bubble_x + bubble_width, bubble_y + row_height - 12),
-                        radius=22,
-                        fill=bubble_fill,
-                        outline=line,
-                        width=1,
-                    )
-                    tail = (
-                        [(bubble_x, bubble_y + 24), (bubble_x - 16, bubble_y + 38), (bubble_x, bubble_y + 52)]
-                        if not right_aligned
-                        else [(bubble_x + bubble_width, bubble_y + 24), (bubble_x + bubble_width + 8, bubble_y + 38), (bubble_x + bubble_width, bubble_y + 52)]
-                    )
-                    draw.polygon(tail, fill=bubble_fill, outline=line)
-                    draw_lucide("quote", bubble_x + 18, bubble_y + 16, 22, coral if not right_aligned else peach, stroke=1.5)
-                    draw_block(content_lines or [""], bubble_x + 54, bubble_y + 16, quote_font, ink, leading=5)
-                    reason_y = bubble_y + 22 + block_height(content_lines, quote_font, 7)
-                    draw.rounded_rectangle(
-                        (bubble_x + 22, reason_y - 8, bubble_x + bubble_width - 22, reason_y - 6),
-                        radius=1,
-                        fill="#eadfd5",
-                    )
-                    draw_block(reason_lines, bubble_x + 22, reason_y + 5, small_font, muted, leading=3)
-                    current_y += row_height + 22
-                y += quotes_height + 48
-
-            # 07 / Unhinged quotes
+            # 06 / Unhinged quotes
             unhinged_quotes = report.get("unhinged_quotes", []) or []
             if unhinged_quotes:
                 section_label(
@@ -1951,7 +1880,7 @@ class GroupDailyAnalysis:
                 y += 56
                 wild_width = (content_width - 64 - 24) // 2
                 wild_data = []
-                for item in unhinged_quotes[:5]:
+                for item in unhinged_quotes[:MAX_UNHINGED_QUOTES]:
                     if not isinstance(item, dict):
                         continue
                     rank = len(wild_data) + 1
@@ -2076,7 +2005,7 @@ class GroupDailyAnalysis:
                         current_y += row_height + 18
                     y += wild_height + 48
 
-            # 08 / Quality review
+            # 07 / Quality review
             quality = report.get("quality_review", {}) or {}
             dimensions = quality.get("dimensions", []) if isinstance(quality, dict) else []
             if isinstance(quality, dict) and dimensions:
@@ -2625,26 +2554,6 @@ class GroupDailyAnalysis:
                 )
 
             sender_names = stats.get("sender_names", {}) or {}
-            quotes = report.get("quotes", []) or []
-            if quotes:
-                quote_rows = [
-                    (
-                        f"{cls._name_for_id(item.get('sender_id', ''), top_users, sender_names)} 说：",
-                        f"「{cls._short_text(item.get('content'), 90)}」  "
-                        f"{cls._short_text(item.get('reason'), 70)}",
-                    )
-                    for item in quotes[:5]
-                ]
-                right_y = draw_list_card(
-                    margin + column_width + column_gap,
-                    right_y,
-                    column_width,
-                    "我忍不住记下的几句",
-                    quote_rows,
-                    pink,
-                    fill="#fff8f7",
-                )
-
             titles = report.get("titles", []) or []
             if titles:
                 title_rows = [
@@ -2709,7 +2618,7 @@ class GroupDailyAnalysis:
         report_label: str = "今日",
         width: int = 1080,
     ) -> bytes | None:
-        """以参考项目的日记、画像、金句和锐评结构渲染日报。"""
+        """以参考项目的日记、画像、逆天语录和锐评结构渲染日报。"""
         try:
             from PIL import Image, ImageDraw, ImageFont
         except ImportError:
@@ -2770,7 +2679,6 @@ class GroupDailyAnalysis:
             section_font = load_font(28, True)
             item_title_font = load_font(24, True)
             body_font = load_font(22)
-            quote_font = load_font(25, True)
             small_font = load_font(18)
             small_bold_font = load_font(18, True)
             stat_font = load_font(40, True)
@@ -3148,60 +3056,7 @@ class GroupDailyAnalysis:
                     row_y += row_height + 18
                 y += profile_height_total + 32
 
-            # 6. 金句：还原成一来一回的聊天气泡，并保留 AI 的具体锐评。
-            quotes = report.get("quotes", []) or []
-            if quotes:
-                quote_header = 72
-                quote_data = []
-                bubble_width = int(content_width * 0.76)
-                for item in quotes[:6]:
-                    sender_id = str(item.get("sender_id") or "")
-                    name = display_name(sender_id)
-                    content_lines = wrap(cls._short_text(item.get("content"), 220), quote_font, bubble_width - 56)
-                    reason_lines = wrap(cls._short_text(item.get("reason"), 110), small_font, bubble_width - 56)
-                    bubble_height = 42 + lines_height(content_lines, quote_font, 2) + 20
-                    bubble_height += 28 + lines_height(reason_lines, small_font, 1) + 20
-                    quote_data.append((sender_id, name, content_lines, reason_lines, bubble_height))
-                quote_height = quote_header + sum(max(112, item[4]) + 30 for item in quote_data) + 10
-                card(margin, y, content_width, quote_height, fill="#fffdf8", shadow_color=pink)
-                heading(margin + 24, y + 20, "群聊金句", pink)
-                current_y = y + quote_header
-                for index, (sender_id, name, content_lines, reason_lines, bubble_height) in enumerate(quote_data):
-                    row_height = max(112, bubble_height)
-                    right_aligned = index % 2 == 1
-                    if right_aligned:
-                        avatar_x = width - margin - 38
-                        bubble_x = width - margin - 88 - bubble_width
-                    else:
-                        avatar_x = margin + 38
-                        bubble_x = margin + 88
-                    avatar_y = current_y + 42
-                    avatar(avatar_x, avatar_y, name, radius=28, sender_id=sender_id)
-                    name_x = bubble_x + 20 if not right_aligned else bubble_x + bubble_width - 20 - int(draw.textlength(name, font=small_bold_font))
-                    draw.text((name_x, current_y + 4), name, font=small_bold_font, fill=ink)
-                    bubble_y = current_y + 34
-                    bubble_fill = "#fff1f5" if not right_aligned else "#fff6d9"
-                    draw.rounded_rectangle(
-                        (bubble_x, bubble_y, bubble_x + bubble_width, bubble_y + bubble_height),
-                        radius=22,
-                        fill=bubble_fill,
-                        outline=ink,
-                        width=3,
-                    )
-                    tail = (
-                        [(bubble_x, bubble_y + 24), (bubble_x - 18, bubble_y + 38), (bubble_x, bubble_y + 52)]
-                        if not right_aligned
-                        else [(bubble_x + bubble_width, bubble_y + 24), (bubble_x + bubble_width + 18, bubble_y + 38), (bubble_x + bubble_width, bubble_y + 52)]
-                    )
-                    draw.polygon(tail, fill=bubble_fill, outline=ink)
-                    quote_y = bubble_y + 22
-                    quote_y = draw_lines(content_lines, bubble_x + 28, quote_y, quote_font, ink, gap=2)
-                    quote_y += 8
-                    draw_lines(reason_lines, bubble_x + 28, quote_y, small_font, muted, gap=1)
-                    current_y += row_height + 30
-                y += quote_height + 32
-
-            # 7. 聊天质量锐评：参考项目里最有“人”的部分，保留具体吐槽和总评气泡。
+            # 6. 聊天质量锐评：参考项目里最有“人”的部分，保留具体吐槽和总评气泡。
             quality = report.get("quality_review", {}) or {}
             dimensions = quality.get("dimensions", []) if isinstance(quality, dict) else []
             if isinstance(quality, dict) and dimensions:
