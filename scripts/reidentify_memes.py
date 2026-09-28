@@ -18,6 +18,9 @@
      现在走 `_shrink_image_bytes` 压到 ≤vision_max_side/≤vision_max_payload_bytes。
   3. `_parse_json` 不剥思考块、且正序试 JSON —— 思考块里的 `{` 会抢先命中。
      现在复用 `_strip_thinking` + `RichMediaEnricher._json_candidates`（倒序）。
+  4. 分类词表只认 `DEFAULT_CATEGORIES` 那 8 个 —— 图库里由面板手工整理的分类
+     （委屈/愤怒/困倦/拒绝…）会被当非法值打回「待整理」，一次平掉二十多张。
+     现在词表 = 默认 8 个 ∪ 图库里实际存在的分类，并把当前分类告诉模型。
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ sys.path.insert(0, str(REPO))
 
 from modules.llm.base import ChatMessage, ChatRequest  # noqa: E402
 from modules.llm.openai_provider import create_provider  # noqa: E402
+from modules.meme_manager import DEFAULT_CATEGORIES  # noqa: E402
 from core.config_store import load_config as load_config_file  # noqa: E402
 from core.adapter.rich_media import (  # noqa: E402
     RichMediaEnricher,
@@ -52,7 +56,7 @@ from core.adapter.rich_media import (  # noqa: E402
     _strip_thinking,
 )
 
-ALLOWED_CATEGORIES = {"待整理", "开心", "无语", "吐槽", "鼓励", "卖萌", "震惊", "其他"}
+ALLOWED_CATEGORIES = set(DEFAULT_CATEGORIES)
 MINIMAX_OPENAI_BASE_URL = "https://api.minimax.cn/v1"
 
 # 与线上识别一致的下限/上限，配置缺项时的兜底
@@ -70,17 +74,41 @@ DELETE_ALLOWLIST = {
     "d1a2a3145a37bda2b2958628e096932799541c54a324ce0335ee476b72a28e72",  # 游戏截图
 }
 
-PROMPT = """请识别这张图片，严格按下面的 JSON 输出，不要输出任何多余文字：
+PROMPT_TEMPLATE = """请识别这张图片，严格按下面的 JSON 输出，不要输出任何多余文字：
 
 {
   "is_meme": true 或 false,
   "description": "用一句话（50字以内）客观描述画面：主体是什么、人物表情/动作、图上有哪些文字，直接可观察，不要推断前因后果、不要解释梗、不要写『适合用来…』",
-  "category": "从 待整理/开心/无语/吐槽/鼓励/卖萌/震惊/其他 里选一个"
+  "category": "从 ⟨CATEGORIES⟩ 里选一个，不要自己造新词"
 }
 
 注意：description 里要用「」引用画面文字，绝对不要用英文双引号"，否则 JSON 会解析失败。
 
-判断 is_meme 的规则：只有真正的表情包/梗图/表情贴图才是 true（有夸张表情、网络梗、动物表情、动漫颜艺等）。以下都算 false：普通生活照片、风景、游戏截图、聊天记录截图、网页弹窗、二维码、色情擦边图、以及『xxx不喜欢看这个』这类功能标记图。"""
+判断 is_meme 的规则：只有真正的表情包/梗图/表情贴图才是 true（有夸张表情、网络梗、动物表情、动漫颜艺等）。以下都算 false：普通生活照片、风景、游戏截图、聊天记录截图、网页弹窗、二维码、色情擦边图、以及『xxx不喜欢看这个』这类功能标记图。
+
+这张图当前归在「⟨CURRENT⟩」。如果新描述放到这个分类里仍然合适，就继续选它；只有明显不符时才换。"""
+
+
+def _allowed_categories(catalog: dict[str, Any]) -> list[str]:
+    """可用分类 = 代码里的默认词表 ∪ 图库里实际存在过的分类。
+
+    不能只用 `DEFAULT_CATEGORIES`：面板里手工整理出来的分类（委屈/愤怒/困倦/拒绝…）
+    不在默认词表里，只认默认值会把它们当非法值打回「待整理」，一次平掉二十多张。
+    """
+    existing = {
+        str(v.get("category") or "").strip()
+        for v in (catalog.get("memes") or {}).values()
+    }
+    vocab = set(ALLOWED_CATEGORIES) | {c for c in existing if c}
+    # 默认词表在前、其余按字典序，保证输出稳定
+    return list(DEFAULT_CATEGORIES) + sorted(vocab - set(DEFAULT_CATEGORIES))
+
+
+def _build_prompt(categories: list[str], current: str) -> str:
+    return (
+        PROMPT_TEMPLATE.replace("⟨CATEGORIES⟩", " / ".join(categories))
+        .replace("⟨CURRENT⟩", current or "待整理")
+    )
 
 
 def _load_config() -> dict[str, Any]:
@@ -155,11 +183,11 @@ def _data_url(path: Path, tuning: dict[str, int]) -> str:
     return _bytes_to_data_url(shrunk, media_type)
 
 
-async def _vision(provider: Any, data_url: str, max_tokens: int) -> str:
+async def _vision(provider: Any, data_url: str, prompt: str, max_tokens: int) -> str:
     request = ChatRequest(
         model=getattr(provider, "model", "") or "",
         messages=[ChatMessage(role="user", content=[
-            {"type": "text", "text": PROMPT},
+            {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": data_url}},
         ])],
         max_tokens=max_tokens,
@@ -237,6 +265,34 @@ def _path_for(idx: str, item: dict) -> Path:
     return REPO / "data" / "memes" / str(item.get("category", "待整理")) / str(item.get("filename"))
 
 
+def _relocate(item: dict, new_cat: str) -> bool:
+    """把条目挪到新分类目录，返回 category 是否真的变了。
+
+    只有「文件确实落在新目录」才改写 `item['category']`。旧代码是
+    `if src.exists() and not dst.exists(): src.rename(dst)` 之后**无条件**改 category：
+    目标已有同名文件时文件没搬、catalog 却指向新目录 → 之后 `_path_for` 全部取不到文件。
+    """
+    old_cat = str(item.get("category") or "待整理")
+    if new_cat == old_cat:
+        return False
+    filename = str(item.get("filename"))
+    base = REPO / "data" / "memes"
+    src, dst = base / old_cat / filename, base / new_cat / filename
+    if src.exists():
+        if dst.exists():
+            logger.warning(
+                "分类未迁移（目标已有同名文件）：%s %s -> %s", filename, old_cat, new_cat
+            )
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+    elif not dst.exists():
+        logger.warning("分类未迁移（源文件缺失）：%s，保留原分类 %s", src, old_cat)
+        return False
+    item["category"] = new_cat
+    return True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="写回 catalog.json 并删除非表情包")
@@ -255,6 +311,10 @@ def main() -> None:
     )
     provider = _init_vision(cfg, tuning["max_tokens"])
     catalog = _load_catalog()
+    categories = _allowed_categories(catalog)
+    logger.info("可用分类（默认 %d + 图库自定义 %d）：%s",
+                len(DEFAULT_CATEGORIES), len(categories) - len(DEFAULT_CATEGORIES),
+                " / ".join(categories))
 
     raw_items = list(catalog["memes"].items())
     if args.id:
@@ -271,10 +331,12 @@ def main() -> None:
             if not path.exists():
                 logger.warning("[%d/%d] %s 文件缺失 %s", idx, len(raw_items), meme_id[:12], path)
                 continue
-            logger.info("[%d/%d] 正在识别 %s（分类：%s）", idx, len(raw_items), meme_id[:12], item.get("category"))
+            old_cat = str(item.get("category", "")).strip()
+            logger.info("[%d/%d] 正在识别 %s（分类：%s）", idx, len(raw_items), meme_id[:12], old_cat)
+            prompt = _build_prompt(categories, old_cat)
             try:
                 text = await _vision(
-                    provider, _data_url(path, tuning), tuning["max_tokens"]
+                    provider, _data_url(path, tuning), prompt, tuning["max_tokens"]
                 )
             except Exception as exc:  # noqa: BLE001
                 errors += 1
@@ -293,12 +355,13 @@ def main() -> None:
             desc = str(obj.get("description", "")).strip().replace("\n", " ")[:240]
             if salvaged:
                 is_meme = True
-                cat = str(item.get("category", "")).strip()
+                cat = old_cat
             else:
                 is_meme = bool(obj.get("is_meme", True))
                 cat = str(obj.get("category", "")).strip()
-            if cat not in ALLOWED_CATEGORIES:
-                cat = "待整理"
+            if cat not in categories:
+                # 模型造了新词：沿用原分类，不去动用户的整理结果
+                cat = old_cat if old_cat in categories else "待整理"
             changed = (
                 (str(item.get("meaning", "")) != desc)
                 or (str(item.get("category", "")) != cat)
@@ -368,16 +431,7 @@ def main() -> None:
         item = catalog["memes"].get(r["id"])
         if not item:
             continue
-        old_cat = item.get("category", "待整理")
-        new_cat = r["new_category"]
-        if new_cat != old_cat:
-            src = REPO / "data" / "memes" / old_cat / str(item.get("filename"))
-            dst_dir = REPO / "data" / "memes" / new_cat
-            dst = dst_dir / str(item.get("filename"))
-            dst_dir.mkdir(parents=True, exist_ok=True)
-            if src.exists() and not dst.exists():
-                src.rename(dst)
-            item["category"] = new_cat
+        if _relocate(item, r["new_category"]):
             changed_any = True
         item["meaning"] = r["new_meaning"]
         item["description"] = r["new_meaning"]
@@ -399,16 +453,7 @@ def main() -> None:
         if item:
             item["meaning"] = r["new_meaning"]
             item["description"] = r["new_meaning"]
-            if r["new_category"] != item.get("category", "待整理"):
-                old_cat = item.get("category", "待整理")
-                new_cat = r["new_category"]
-                src = REPO / "data" / "memes" / old_cat / str(item.get("filename"))
-                dst_dir = REPO / "data" / "memes" / new_cat
-                dst = dst_dir / str(item.get("filename"))
-                dst_dir.mkdir(parents=True, exist_ok=True)
-                if src.exists() and not dst.exists():
-                    src.rename(dst)
-                item["category"] = new_cat
+            _relocate(item, r["new_category"])
             changed_any = True
             print(f"保留(非白名单): {r['id'][:12]} | 新[{(item.get('category', ''))}] {r['new_meaning'][:40]}")
 
