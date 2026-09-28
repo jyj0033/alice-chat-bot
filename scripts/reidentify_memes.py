@@ -293,6 +293,72 @@ def _relocate(item: dict, new_cat: str) -> bool:
     return True
 
 
+async def _recognize_all(
+    provider: Any,
+    raw_items: list[tuple[str, dict]],
+    categories: list[str],
+    tuning: dict[str, int],
+    args: argparse.Namespace,
+    results: list[dict],
+) -> None:
+    """逐张识别，把记录追加进 results（不做任何写回）。"""
+    errors = 0
+    for idx, (meme_id, item) in enumerate(raw_items, 1):
+        path = _path_for(meme_id, item)
+        if not path.exists():
+            logger.warning("[%d/%d] %s 文件缺失 %s", idx, len(raw_items), meme_id[:12], path)
+            continue
+        old_cat = str(item.get("category", "")).strip()
+        logger.info("[%d/%d] 正在识别 %s（分类：%s）", idx, len(raw_items), meme_id[:12], old_cat)
+        prompt = _build_prompt(categories, old_cat)
+        try:
+            text = await _vision(
+                provider, _data_url(path, tuning), prompt, tuning["max_tokens"]
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            logger.error("[%d/%d] %s 识别失败：%s", idx, len(raw_items), meme_id[:12], exc)
+            if not args.fail:
+                raise
+            continue
+        obj = _parse_json(text)
+        if not obj:
+            errors += 1
+            logger.error("[%d/%d] %s 输出无法解析：%r", idx, len(raw_items), meme_id[:12], text[:160])
+            continue
+        # 输出被截断时只捞回 description：is_meme / category 无据可依，
+        # 保守当作「是表情包」保留，并沿用旧分类，绝不因此进待删清单。
+        salvaged = bool(obj.pop("_salvaged", False))
+        desc = str(obj.get("description", "")).strip().replace("\n", " ")[:240]
+        if salvaged:
+            is_meme = True
+            cat = old_cat
+        else:
+            is_meme = bool(obj.get("is_meme", True))
+            cat = str(obj.get("category", "")).strip()
+        if cat not in categories:
+            # 模型造了新词：沿用原分类，不去动用户的整理结果
+            cat = old_cat if old_cat in categories else "待整理"
+        changed = (
+            (str(item.get("meaning", "")) != desc)
+            or (str(item.get("category", "")) != cat)
+        )
+        results.append({
+            "id": meme_id, "path": str(path), "is_meme": is_meme, "salvaged": salvaged,
+            "old_meaning": item.get("meaning", ""), "new_meaning": desc,
+            "old_category": item.get("category", ""), "new_category": cat, "changed": changed, "raw": text,
+        })
+        flag = "非表情包-待删" if not is_meme else ("已变更" if changed else "不变")
+        if salvaged:
+            flag += "（截断-仅捞回描述）"
+        logger.info(
+            "  %s｜旧分类[%s] %s → 新分类[%s] %s",
+            flag, results[-1]["old_category"], results[-1]["old_meaning"][:20],
+            cat, desc[:40],
+        )
+    logger.info("处理完成，失败或无法解析：%d 项", errors)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="写回 catalog.json 并删除非表情包")
@@ -301,87 +367,46 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0, help="最多处理 N 张")
     ap.add_argument("--fail", action="store_true", help="失败也继续（默认遇错中断以便修）")
     ap.add_argument("--json", dest="json_out", default="", help="把逐张结果写到这个文件，便于复盘")
+    ap.add_argument(
+        "--max-tokens", type=int, default=0,
+        help="覆盖视觉预算（默认取 to_text_max_tokens）。多格漫画/复杂图只吐 <think> 不出 JSON 时调大重试",
+    )
+    ap.add_argument(
+        "--from-json", dest="from_json", default="",
+        help="直接套用之前 `--dry-run --json` 导出的结果，不再识别。"
+             "保证『审核过的那份』就是『实际写回的那份』（重新识别会重新采样，结果会漂）",
+    )
     args = ap.parse_args()
 
     cfg = _load_config()
     tuning = _image_tuning(cfg)
-    logger.info(
-        "视觉参数：max_tokens=%d 缩放≤%dpx q%d 载荷≤%dB（与线上识别同源）",
-        tuning["max_tokens"], tuning["max_side"], tuning["quality"], tuning["max_payload"],
-    )
-    provider = _init_vision(cfg, tuning["max_tokens"])
+    if args.max_tokens > 0:
+        tuning["max_tokens"] = args.max_tokens
     catalog = _load_catalog()
     categories = _allowed_categories(catalog)
     logger.info("可用分类（默认 %d + 图库自定义 %d）：%s",
                 len(DEFAULT_CATEGORIES), len(categories) - len(DEFAULT_CATEGORIES),
                 " / ".join(categories))
 
-    raw_items = list(catalog["memes"].items())
-    if args.id:
-        raw_items = [kv for kv in raw_items if str(kv[0]).startswith(args.id.lower())]
-    if args.limit > 0:
-        raw_items = raw_items[: args.limit]
-
     results: list[dict] = []
 
-    async def run() -> None:
-        errors = 0
-        for idx, (meme_id, item) in enumerate(raw_items, 1):
-            path = _path_for(meme_id, item)
-            if not path.exists():
-                logger.warning("[%d/%d] %s 文件缺失 %s", idx, len(raw_items), meme_id[:12], path)
-                continue
-            old_cat = str(item.get("category", "")).strip()
-            logger.info("[%d/%d] 正在识别 %s（分类：%s）", idx, len(raw_items), meme_id[:12], old_cat)
-            prompt = _build_prompt(categories, old_cat)
-            try:
-                text = await _vision(
-                    provider, _data_url(path, tuning), prompt, tuning["max_tokens"]
-                )
-            except Exception as exc:  # noqa: BLE001
-                errors += 1
-                logger.error("[%d/%d] %s 识别失败：%s", idx, len(raw_items), meme_id[:12], exc)
-                if not args.fail:
-                    raise
-                continue
-            obj = _parse_json(text)
-            if not obj:
-                errors += 1
-                logger.error("[%d/%d] %s 输出无法解析：%r", idx, len(raw_items), meme_id[:12], text[:160])
-                continue
-            # 输出被截断时只捞回 description：is_meme / category 无据可依，
-            # 保守当作「是表情包」保留，并沿用旧分类，绝不因此进待删清单。
-            salvaged = bool(obj.pop("_salvaged", False))
-            desc = str(obj.get("description", "")).strip().replace("\n", " ")[:240]
-            if salvaged:
-                is_meme = True
-                cat = old_cat
-            else:
-                is_meme = bool(obj.get("is_meme", True))
-                cat = str(obj.get("category", "")).strip()
-            if cat not in categories:
-                # 模型造了新词：沿用原分类，不去动用户的整理结果
-                cat = old_cat if old_cat in categories else "待整理"
-            changed = (
-                (str(item.get("meaning", "")) != desc)
-                or (str(item.get("category", "")) != cat)
-            )
-            results.append({
-                "id": meme_id, "path": str(path), "is_meme": is_meme, "salvaged": salvaged,
-                "old_meaning": item.get("meaning", ""), "new_meaning": desc,
-                "old_category": item.get("category", ""), "new_category": cat, "changed": changed, "raw": text,
-            })
-            flag = "非表情包-待删" if not is_meme else ("已变更" if changed else "不变")
-            if salvaged:
-                flag += "（截断-仅捞回描述）"
-            logger.info(
-                "  %s｜旧分类[%s] %s → 新分类[%s] %s",
-                flag, results[-1]["old_category"], results[-1]["old_meaning"][:20],
-                cat, desc[:40],
-            )
-        logger.info("处理完成，失败或无法解析：%d 项", errors)
-
-    asyncio.run(run())
+    if args.from_json:
+        payload = json.loads(Path(args.from_json).read_text(encoding="utf-8"))
+        results = list(payload.get("results") or [])
+        logger.info("套用 %s 里的 %d 条结果，本次不调用视觉接口", args.from_json, len(results))
+        logger.info("（导出时的视觉参数：%s）", payload.get("tuning"))
+    else:
+        logger.info(
+            "视觉参数：max_tokens=%d 缩放≤%dpx q%d 载荷≤%dB（与线上识别同源）",
+            tuning["max_tokens"], tuning["max_side"], tuning["quality"], tuning["max_payload"],
+        )
+        provider = _init_vision(cfg, tuning["max_tokens"])
+        raw_items = list(catalog["memes"].items())
+        if args.id:
+            raw_items = [kv for kv in raw_items if str(kv[0]).startswith(args.id.lower())]
+        if args.limit > 0:
+            raw_items = raw_items[: args.limit]
+        asyncio.run(_recognize_all(provider, raw_items, categories, tuning, args, results))
 
     deletes = [r for r in results if not r["is_meme"]]
     changes = [r for r in results if r["is_meme"] and r["changed"]]
