@@ -187,6 +187,12 @@ def create_provider(provider_type: str, config: dict) -> LLMProvider:
         from .claude_provider import ClaudeProvider
         return ClaudeProvider(config)
 
+    # OpenAI Responses API（/v1/responses）：支持服务端 web_search，
+    # 与 Chat Completions 的请求/响应结构完全不同，必须走独立 Provider。
+    if provider_type in ("responses", "openai_responses"):
+        from .responses_provider import ResponsesProvider
+        return ResponsesProvider(config)
+
     # OpenAI 兼容格式使用 OpenAIProvider（包括 minimax/siliconflow/nvidia 等）
     if provider_type in ("openai", "compatible", "openai_compatible", "siliconflow", "deepseek", "minimax", "nvidia"):
         return OpenAIProvider(config)

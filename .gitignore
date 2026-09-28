@@ -34,6 +34,9 @@ logs/
 *.cache
 .playwright-mcp/
 
+# 本地智能体工作目录（记忆/会话数据，属本机状态）
+.workbuddy/
+
 # 数据库
 *.db
 *.sqlite

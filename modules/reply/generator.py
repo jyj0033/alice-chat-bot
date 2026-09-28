@@ -83,6 +83,7 @@ def split_reply_into_messages(
     - 短回复（<= min_split_length）整条一条
     - 长回复按逗号/句号等断句标点拆分，每条语义尽量完整
     - 括号/引号内部的标点不断句（真人不会在括号中间停顿）
+    - 换行也作为断句点：模型输出多个 <say> 时以换行分隔，一条对应一条气泡
     - 太短的碎片并入前一段，避免碎消息
     - 最多拆 max_segments 条，超出则从后往前合并
     """
@@ -103,7 +104,7 @@ def split_reply_into_messages(
             depth += 1
         elif ch in CLOSE_CHARS:
             depth = max(0, depth - 1)
-        elif depth == 0 and ch in "，。！？!?…~、；;":
+        elif depth == 0 and ch in "，。！？!?…~、；;\n":
             boundaries.append(i)
 
     if not boundaries:
@@ -319,10 +320,27 @@ class ReplyGenerator:
                 glossary,
             )
         has_web = bool(self.search_client and self.search_client.available)
-        use_web = bool(search_decision.get("need_search") and has_web)
+        # 主模型自带服务端搜索（Responses / MiniMax Server Tools）时：
+        #   ① 关掉「外部搜索 + 资料注入」的联网那一路，否则同一句话会被搜两次；
+        #   ② web_search 改为**按需声明**——只在检索判断器认为这条消息需要查资料时，
+        #      才把 {"type":"web_search"} 加进本次请求的 tools。
+        # 为什么不做成常驻声明：常驻会让「晚饭吃啥」这类闲聊也触发多轮服务端联网，
+        # 而每轮抓回的网页正文都会留在上下文里被后续轮次反复重发，实测输入 token
+        # 从 233（不搜）涨到 2 万~68 万（搜 2~6 轮）；且端点忽略 max_uses 限流字段
+        # （加 max_uses=1 反而搜了 6 次），客户端无从限轮，只能从源头少发。
+        # 判断器仍保留：它现在还承担本地资料库（梗库/黑话）的检索。
+        # 严格用 `is True` 判定：测试里 self.llm 常是 MagicMock，
+        # getattr(mock, "supports_server_search", False) 会返回真值 mock，
+        # 用布尔真值判断会把它误当成「自带服务端搜索」而关掉 web 注入。
+        server_search = getattr(self.llm, "supports_server_search", False) is True
+        use_web = bool(search_decision.get("need_search") and has_web and not server_search)
         if knowledge_hits and search_decision.get("freshness") != "current":
             if any(item.get("confidence") == "exact" for item in knowledge_hits):
                 use_web = False
+        if self._should_declare_server_search(server_search, search_decision):
+            # 只影响本次请求：request 由 _build_request 每轮新建，不跨轮复用。
+            request.tools.append({"type": "web_search"})
+            logger.info("[搜索判断] 本次请求按需声明服务端 web_search")
         # 工具调用：send_meme 是结构化输出，正常路径走原生 tool_use，
         # 异常端点漏成 `<invoke>` 文本时再走 _extract_native_tool_calls 兜底。
         # None 表示本轮没有发图请求；空字符串只表示模型确实调用了
@@ -581,11 +599,20 @@ class ReplyGenerator:
             return "missing", ""
         matches = cls._SAY_RE.findall(raw)
         if matches:
-            inner = (matches[-1] or "").strip()
-            inner = re.sub(r"</?say\s*>", "", inner, flags=re.IGNORECASE).strip()
-            inner = cls._strip_model_protocol_tokens(inner)
-            if cls._has_tool_markup(inner):
-                return "missing", ""
+            # 模型可能一口气给多个 <say>（真人连发几条气泡就是这样），全部保留、
+            # 用换行分隔，交由 split_reply_into_messages 拆成多条发送。
+            # 注意：这里曾用 matches[-1] 只取最后一块 —— Responses 等端点常输出
+            # 「答案1 / 答案2 / 答案3」多块，取最后一块会把真正的答案丢掉。
+            blocks = []
+            for piece in matches:
+                piece = re.sub(r"</?say\s*>", "", (piece or ""), flags=re.IGNORECASE)
+                piece = cls._strip_model_protocol_tokens(piece).strip()
+                if not piece:
+                    continue
+                if cls._has_tool_markup(piece):
+                    return "missing", ""
+                blocks.append(piece)
+            inner = "\n".join(blocks).strip()
             if not inner or cls._is_silent(inner):
                 return "silent", ""
             return "say", inner
@@ -702,6 +729,25 @@ class ReplyGenerator:
             "freshness": "stable",
         }
 
+    @staticmethod
+    def _should_declare_server_search(
+        server_search: bool, search_decision: Dict[str, Any] | None
+    ) -> bool:
+        """本次请求要不要声明服务端 web_search（按需联网）。
+
+        常驻声明的代价：闲聊也会触发多轮服务端搜索，而每轮抓回的网页正文
+        会留在上下文里被后续每一轮重发，输入 token 实测从 233 涨到 2 万~68 万；
+        端点又不接受 max_uses 限流，客户端只能从源头少发。
+        因此只在检索判断器认为「需要查资料」时才声明。
+
+        用 `is not True` 做门槛而不是布尔真值：测试里 llm 常是 MagicMock，
+        `getattr(mock, "supports_server_search", False)` 会返回一个真值 mock，
+        用布尔真值判断会把它误当成具备服务端搜索能力。
+        """
+        if server_search is not True:
+            return False
+        return bool((search_decision or {}).get("need_search"))
+
     async def _has_knowledge(self) -> bool:
         store = self.knowledge_store
         if store is None:
@@ -756,7 +802,11 @@ class ReplyGenerator:
         query 应结合最近聊天把「这个」「那角色」还原成具体主题。
         """
         judge_llm = self.tool_llm or self.llm
-        has_web = bool(self.search_client and self.search_client.available)
+        # 服务端搜索也算「有联网能力」，否则生产里 search.enabled=false 时
+        # has_web 恒为 False，判断器永远返回「不需要检索」，按需声明会把搜索彻底关死。
+        # 能力取自主模型 self.llm —— tool_llm 只是做判断的另一个模型，不承担搜索。
+        server_search = getattr(self.llm, "supports_server_search", False) is True
+        has_web = bool(self.search_client and self.search_client.available) or server_search
         if not judge_llm:
             return self._no_search_decision()
         has_kb = await self._has_knowledge()

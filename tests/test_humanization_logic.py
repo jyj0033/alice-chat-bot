@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from modules.memory.context import ContextManager
 from modules.personality.emotional_state import Emotion, EmotionalManager
-from modules.reply.generator import ReplyGenerator
+from modules.reply.generator import ReplyGenerator, split_reply_into_messages
 from modules.social.attention import AttentionManager
 from modules.social.awareness import SocialContext, TopicAnalyzer, TriggerDetector
 from modules.social.enhanced_decider import EnhancedSpeakingDecider
@@ -1184,6 +1184,21 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertIn("不符合发送格式", retry_user)
         self.assertEqual(generator.format_invalid, 1)
         self.assertEqual(generator.rewrites, 1)
+
+    def test_multiple_say_blocks_are_all_kept(self):
+        """多个 <say> 对应真人连发多条气泡，不能只留最后一条。
+
+        回归：曾用 matches[-1] 只取最后一块，Responses 端点输出
+        「答案1 / 答案2」多块时会把真正的答案丢掉。
+        """
+        kind, content = ReplyGenerator.extract_sendable_reply(
+            "<say>现在4.5下半，砂金UP</say>\n<say>同池还有不死途复刻</say>"
+        )
+        self.assertEqual(kind, "say")
+        self.assertIn("砂金UP", content)
+        self.assertIn("不死途复刻", content)
+        segs = split_reply_into_messages(content)
+        self.assertEqual(len(segs), 2)
 
     def test_only_say_channel_is_sendable(self):
         kind, content = ReplyGenerator.extract_sendable_reply(

@@ -82,6 +82,11 @@ def _normalize_llm_provider_config(config: dict | None) -> dict:
     base_url = str(normalized.get("base_url") or "").strip()
     model = str(normalized.get("model") or "").strip().lower()
     base_lower = base_url.lower()
+    # Responses API 是独立的协议形态（input/instructions/output_text），
+    # 不能被下面的 MiniMax 归一化改写成 chat/completions，否则请求体会不兼容。
+    if provider_type in ("responses", "openai_responses"):
+        normalized["provider_type"] = provider_type
+        return normalized
     is_minimax = (
         provider_type == "minimax"
         or "api.minimaxi.com" in base_lower
@@ -322,6 +327,10 @@ class GroupChatBot:
                             "temperature": provider_config.get("temperature", 0.8),
                             "max_tokens": provider_config.get("max_tokens", 2000),
                             "top_p": provider_config.get("top_p", 0.9),
+                            # 仅 Responses Provider 使用：服务端联网搜索开关、
+                            # 以及输出上限（reasoning token 计入其中，需留余量）。
+                            "web_search": provider_config.get("web_search", False),
+                            "max_output_tokens": provider_config.get("max_output_tokens"),
                         }
                     )
                     self.llm_providers[name] = provider
