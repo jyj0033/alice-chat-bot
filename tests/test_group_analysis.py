@@ -35,6 +35,51 @@ class _Provider:
         return SimpleNamespace(content=json.dumps(self.payload, ensure_ascii=False))
 
 
+class _ScriptedProvider:
+    """按脚本依次返回 (content, finish_reason)，并记录每次请求（用于验证预算爬升）。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.requests = []
+
+    async def chat(self, request):
+        self.requests.append(request)
+        index = min(len(self.requests) - 1, len(self.script) - 1)
+        content, finish_reason = self.script[index]
+        return SimpleNamespace(content=content, finish_reason=finish_reason)
+
+
+def _full_report_payload():
+    """一份结构完整的日报，两条引文都来自 GroupAnalysisTests.setUp 的真实消息。"""
+    return {
+        "title": "今晚的群聊小剧场",
+        "subtitle": "大家从开黑聊到了配队",
+        "summary": "今晚约了开黑，大家讨论了配队。",
+        "topics": [{
+            "name": "开黑安排",
+            "detail": "讨论上线时间和游戏安排",
+            "sender_ids": ["u1", "u2"],
+        }],
+        "profiles": [{
+            "sender_id": "u1",
+            "title": "抽象配队师",
+            "mbti": "今日观察派",
+            "reason": "吐槽配队",
+        }],
+        "quotes": [{
+            "content": "这波配队太抽象了",
+            "sender_id": "u1",
+            "reason": "这句我得记一下",
+        }],
+        "unhinged_quotes": [{
+            "content": "我可以，八点半上线",
+            "sender_id": "u2",
+            "score": 90,
+            "reason": "接得太顺了",
+        }],
+    }
+
+
 class _AnalysisStorage:
     def __init__(self, messages):
         self.messages = messages
@@ -172,6 +217,69 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
         rendered = GroupDailyAnalysis.render_report(report, "今日")
         self.assertIn("我按看到的消息做的本地统计", rendered)
         self.assertNotIn("📒", rendered)
+
+    def test_looks_like_report_rejects_truncated_inner_fragment(self):
+        # 截断时 _parse_json 会退而返回内层碎片（单个 profiles 项）。
+        # 那种碎片能在 `if parsed` 上成真，必须由结构完整性判据挡掉，
+        # 否则日报会静默变成只剩统计的一页，金句和逆天语录凭空消失。
+        fragment = {
+            "sender_id": "u1",
+            "title": "接话担当",
+            "mbti": "今日观察",
+            "reason": "接话",
+        }
+        self.assertFalse(GroupDailyAnalysis._looks_like_report(fragment))
+        self.assertFalse(GroupDailyAnalysis._looks_like_report({}))
+        self.assertFalse(GroupDailyAnalysis._looks_like_report(None))
+        # 只有 summary、没有任何列表区 → 也算不完整
+        self.assertFalse(
+            GroupDailyAnalysis._looks_like_report({"summary": "大家好安静。"})
+        )
+        self.assertTrue(
+            GroupDailyAnalysis._looks_like_report(
+                {"summary": "今晚聊了很久。", "topics": [], "quotes": [], "unhinged_quotes": []}
+            )
+        )
+
+    async def test_truncated_report_retries_with_a_bigger_output_budget(self):
+        partial = (
+            '{"title": "今晚", "subtitle": "夜谈", "summary": "大家聊了很久。",'
+            ' "topics": [{"name": "话题", "detail": "细节", "sender_ids": ["u1"]}],'
+            ' "profiles": [{"sender_id": "u1", "title": "接话担当", "mbti": "观察",'
+            ' "reason": "接话"}],'
+            ' "quotes": [{"content": "这波配队太抽象了", "sender_id": "u1", "reason": "吐槽"}],'
+            ' "unhinged_quotes": [{"content": "我可以，八点半上线", "sender_id": "u2",'
+        )
+        provider = _ScriptedProvider([
+            (partial, "incomplete"),
+            (json.dumps(_full_report_payload(), ensure_ascii=False), "stop"),
+        ])
+        report = await GroupDailyAnalysis.analyze(
+            self.messages,
+            provider=provider,
+            max_tokens=1000,
+            retries=2,
+            bot_name="爱丽丝",
+        )
+        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(provider.requests[0].max_tokens, 1000)
+        self.assertGreater(provider.requests[1].max_tokens, 1000)
+        self.assertEqual(report["analysis_error"], "")
+        self.assertEqual(len(report["quotes"]), 1)
+        self.assertEqual(len(report["unhinged_quotes"]), 1)
+        self.assertEqual(report["unhinged_quotes"][0]["score"], 90)
+
+    async def test_every_attempt_truncated_degrades_loudly(self):
+        partial = '{"title": "今晚", "profiles": [{"sender_id": "u1", "title": "接话担当"'
+        provider = _ScriptedProvider([(partial, "incomplete"), (partial, "incomplete")])
+        report = await GroupDailyAnalysis.analyze(
+            self.messages, provider=provider, max_tokens=1000, retries=2
+        )
+        # 不能静默产出一份只有标题、没有金句/逆天语录的「半份日报」
+        self.assertTrue(report["analysis_error"])
+        self.assertEqual(report["quotes"], [])
+        self.assertEqual(report["unhinged_quotes"], [])
+        self.assertEqual(report["statistics"]["message_count"], 3)
 
     async def test_report_image_is_a_png(self):
         report = await GroupDailyAnalysis.analyze(self.messages, provider=None)

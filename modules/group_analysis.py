@@ -24,6 +24,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# 日报输出上限的天花板。main._group_analysis_config 也把 max_tokens 限制在 6000，
+# 两处保持一致；截断重试时按这个上限爬升。
+MAX_REPORT_OUTPUT_TOKENS = 6000
+
 
 class _ScaledDraw:
     """在高分辨率画布上使用逻辑坐标绘图，最后缩小以获得抗锯齿效果。"""
@@ -469,6 +473,31 @@ class GroupDailyAnalysis:
                 start = start
             start += 1
 
+    @staticmethod
+    def _looks_like_report(parsed: Any) -> bool:
+        """判断解析结果是不是一份**结构完整**的日报，而不是截断后捞到的内层碎片。
+
+        这是「金句和逆天语录凭空消失」的闸门。输出被输出上限截断时，最外层 JSON
+        不闭合，`_parse_json` 会退而返回内层最完整的那个对象（例如单个 profiles
+        项，只有 sender_id/title/mbti/reason 四个键）。那种碎片能让 `if parsed`
+        成真 —— 于是既不重试、也不写 `analysis_error`，日报静默渲染成只剩统计的
+        一页，`topics` / `quotes` / `unhinged_quotes` 全是空。
+
+        判据取「summary 是非空字符串」+ 三个列表里至少两个是 list：正常输出必然
+        满足；碎片一定不满足（它连 summary 都没有）。
+        """
+        if not isinstance(parsed, dict):
+            return False
+        summary = parsed.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            return False
+        lists = [
+            key
+            for key in ("topics", "quotes", "unhinged_quotes")
+            if isinstance(parsed.get(key), list)
+        ]
+        return len(lists) >= 2
+
     @classmethod
     def _short_text(cls, value: Any, limit: int) -> str:
         text = cls._SPACE_RE.sub(" ", str(value or "")).strip()
@@ -796,7 +825,7 @@ class GroupDailyAnalysis:
         max_topics: int = 5,
         max_quotes: int = 3,
         max_titles: int = 5,
-        max_tokens: int = 2400,
+        max_tokens: int = 4000,
         retries: int = 2,
         bot_name: str = "爱丽丝",
         bot_persona: str = "",
@@ -843,8 +872,13 @@ class GroupDailyAnalysis:
         # 网络抖动/限流一般两次内能回来，超过上限直接降级为纯统计，避免无限重试。
         last_error = ""
         parsed: dict = {}
-        for attempt in range(1, max(1, int(retries)) + 1):
-            request = ChatRequest(temperature=0.45, max_tokens=max_tokens, top_p=0.92)
+        # Responses 端点把 reasoning token 计进输出上限，日报 JSON 又长，预算不够时
+        # 会在写到一半时被截断（finish_reason=incomplete）。这里遇到截断就把预算翻倍
+        # 再试一次，避免必须靠人工调配置。
+        budget = max(400, int(max_tokens))
+        attempts = max(1, int(retries))
+        for attempt in range(1, attempts + 1):
+            request = ChatRequest(temperature=0.45, max_tokens=budget, top_p=0.92)
             request.add_system(
                 "你只负责生成群聊日报 JSON，不要和群友对话或输出解释文字；报告必须保持 Bot 的第一人称视角。"
             )
@@ -862,20 +896,40 @@ class GroupDailyAnalysis:
             )
             try:
                 response = await provider.chat(request)
-                parsed = cls._parse_json(getattr(response, "content", "") or "")
-                if parsed:
+                content = getattr(response, "content", "") or ""
+                finish_reason = str(getattr(response, "finish_reason", "") or "")
+                candidate = cls._parse_json(content)
+                if cls._looks_like_report(candidate):
+                    parsed = candidate
                     break
-                last_error = "输出不是有效 JSON"
+                if finish_reason == "incomplete" and budget < MAX_REPORT_OUTPUT_TOKENS:
+                    bumped = min(MAX_REPORT_OUTPUT_TOKENS, budget * 2)
+                    last_error = f"输出被 {budget} token 上限截断"
+                    logger.warning(
+                        "[群日报] 输出未完成（finish_reason=incomplete），预算 %d → %d 后重试",
+                        budget,
+                        bumped,
+                    )
+                    budget = bumped
+                elif candidate:
+                    last_error = "输出被截断，日报结构不完整"
+                else:
+                    last_error = "输出不是有效 JSON"
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 last_error = str(exc) or exc.__class__.__name__
-            if attempt < max(1, int(retries)):
+            if attempt < attempts:
                 logger.warning("[群日报] 语言模型调用失败，第%d次重试：%s", attempt, last_error)
                 await asyncio.sleep(1.5 * attempt)
 
-        if not parsed:
+        if not cls._looks_like_report(parsed):
             report["analysis_error"] = last_error or "LLM 调用失败"
+            logger.error(
+                "[群日报] 未能生成完整日报，降级为本地统计：%s（output 预算 %d）",
+                last_error or "LLM 调用失败",
+                budget,
+            )
             report["title"] = "我先把今天的脚印收好"
             report["subtitle"] = "AI 暂时没接上，我先替它看着"
             report["summary"] = "我先按自己看到的消息做了个统计，暂时没提炼出更具体的总结。"
