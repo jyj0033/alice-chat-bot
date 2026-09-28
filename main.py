@@ -328,9 +328,11 @@ class GroupChatBot:
                             "max_tokens": provider_config.get("max_tokens", 2000),
                             "top_p": provider_config.get("top_p", 0.9),
                             # 仅 Responses Provider 使用：服务端联网搜索开关、
-                            # 以及输出上限（reasoning token 计入其中，需留余量）。
+                            # 输出上限（reasoning token 计入其中，需留余量）、
+                            # 以及推理档位（不设 low 时辅助任务会被推理吃空预算）。
                             "web_search": provider_config.get("web_search", False),
                             "max_output_tokens": provider_config.get("max_output_tokens"),
+                            "reasoning_effort": provider_config.get("reasoning_effort", "low"),
                         }
                     )
                     self.llm_providers[name] = provider

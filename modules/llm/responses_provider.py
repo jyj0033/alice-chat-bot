@@ -18,6 +18,10 @@ Anthropic Messages API 与 OpenAI Responses API 上可用，**不支持**
   - **没有 `stop` 参数**（Chat Completions 用来注入协议边界的 `]<]minimax` 在此失效）
   - `max_output_tokens` **把 reasoning token 计入**，且 usage 里查不到 reasoning 明细，
     因此对预算要做下限保护，否则回复会被推理挤到截断。
+  - `reasoning: {"effort": ...}` 是唯一能约束推理占用的手段（本 Provider 默认传 low）：
+    不传时模型自适应，实测把整 2000 预算烧在 reasoning 上、status=incomplete 且
+    一条 message 都不产出；传 "low" 后同等任务 output 降到 188 并正常产出。
+    `"none"` 会被端点拒绝——该模型要求 adaptive thinking。
 """
 from __future__ import annotations
 
@@ -60,11 +64,20 @@ class ResponsesProvider(LLMProvider):
         self.web_search = bool(config.get("web_search", False))
         configured = int(config.get("max_output_tokens") or config.get("max_tokens") or 0)
         self.max_output_tokens = max(MIN_OUTPUT_TOKENS, configured)
+        # reasoning 档位，默认 low：不传时模型自行决定推理长度，辅助任务会把
+        # 整个输出预算烧在 reasoning 上、一条 message 都不产出（线上约 71% 失败）。
+        # 显式配置成 null 或空串可关闭，恢复模型自适应（详见 _build_body）。
+        configured_effort = config.get("reasoning_effort", "low")
+        self.reasoning_effort = (
+            str(configured_effort).strip().lower() if configured_effort else None
+        )
         self._warned_stop = False
         self.url = f"{base_url}/responses"
         logger.info(
-            "Responses 提供商已初始化：地址=%s，模型=%s，服务端搜索=%s，输出上限=%d",
-            self.url, self.model, "开" if self.web_search else "关", self.max_output_tokens,
+            "Responses 提供商已初始化：地址=%s，模型=%s，服务端搜索=%s，"
+            "输出上限=%d，推理档位=%s",
+            self.url, self.model, "开" if self.web_search else "关",
+            self.max_output_tokens, self.reasoning_effort or "自适应",
         )
 
     @property
@@ -180,8 +193,16 @@ class ResponsesProvider(LLMProvider):
                 out.append(item)
         return out
 
-    async def chat(self, request: ChatRequest) -> ChatResponse:
-        """发送请求（单次请求内完成服务端搜索 + 作答）。"""
+    def _build_body(self, request: ChatRequest) -> dict:
+        """组装 Responses 请求体（独立出来便于离线断言字段）。
+
+        `reasoning.effort` 是这里的保命参数：不传时模型会自行决定推理长度，
+        实测「从 64 条词表里挑出不合语境的条目」这种辅助任务会把
+        max_output_tokens=2000 全部烧在 reasoning 上，status=incomplete、
+        一条 message 都不产出（线上辅助任务约 71% 失败）。传 effort=low 后
+        同等任务 output 降到 188、正常产出。effort=none 会被端点拒绝
+        （该模型要求 adaptive thinking）。
+        """
         instructions, items = self._split_system(request.messages)
         body: dict = {
             "model": request.model or self.model,
@@ -201,11 +222,18 @@ class ResponsesProvider(LLMProvider):
         tools = self._build_tools(request.tools)
         if tools:
             body["tools"] = tools
-        # 观测用：明确标出本轮是否声明了服务端搜索，方便对照 prompt_tokens 分布。
-        if any(
-            isinstance(t, dict) and t.get("type") in _SERVER_TOOL_TYPES for t in tools
-        ):
-            logger.info("[Responses] 本轮按需声明服务端 web_search")
+            # 观测用：明确标出本轮是否声明了服务端搜索，方便对照 prompt_tokens 分布。
+            if any(
+                isinstance(t, dict) and t.get("type") in _SERVER_TOOL_TYPES for t in tools
+            ):
+                logger.info("[Responses] 本轮按需声明服务端 web_search")
+        if self.reasoning_effort:
+            body["reasoning"] = {"effort": self.reasoning_effort}
+        return body
+
+    async def chat(self, request: ChatRequest) -> ChatResponse:
+        """发送请求（单次请求内完成服务端搜索 + 作答）。"""
+        body = self._build_body(request)
         # Responses API 没有 stop 参数。Chat Completions 那套协议边界停止序列
         # （generator._PROTOCOL_STOP_SEQUENCES）在此不可用，只能靠文本清洗兜底。
         if request.stop and not self._warned_stop:

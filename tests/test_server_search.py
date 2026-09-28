@@ -11,7 +11,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from modules.llm.base import ChatResponse
+from modules.llm.base import ChatMessage, ChatRequest, ChatResponse
 from modules.llm.responses_provider import MIN_OUTPUT_TOKENS, ResponsesProvider
 from modules.reply.generator import ReplyGenerator
 
@@ -118,6 +118,53 @@ class ServerSearchDeclarationLogicTests(unittest.TestCase):
         self.assertFalse(decide(True, {}))
         # 非严格 True（如 MagicMock 的假真值）不得被当成具备能力
         self.assertFalse(decide("yes", need))
+
+
+class ResponsesReasoningEffortTests(unittest.TestCase):
+    """reasoning 档位：默认 low，显式配置可关闭。
+
+    背景：不传 reasoning 时模型自适应推理长度，辅助任务（如「从 64 条词表里
+    挑出不合语境的条目」）会把整个 max_output_tokens 烧在 reasoning 上，
+    返回 status=incomplete 且一条 message 都没有——线上实测约 71% 失败。
+    """
+
+    def _provider(self, **extra) -> ResponsesProvider:
+        config = {
+            "api_key": "k",
+            "base_url": "https://api.minimax.cn/v1",
+            "model": "MiniMax-M3.1-Flash-Preview",
+            "max_tokens": 500,
+        }
+        config.update(extra)
+        return ResponsesProvider(config)
+
+    @staticmethod
+    def _body(provider: ResponsesProvider) -> dict:
+        return provider._build_body(ChatRequest(messages=[
+            ChatMessage(role="system", content="s"),
+            ChatMessage(role="user", content="u"),
+        ]))
+
+    def test_defaults_to_low_effort(self):
+        provider = self._provider()
+        self.assertEqual(provider.reasoning_effort, "low")
+        self.assertEqual(self._body(provider)["reasoning"], {"effort": "low"})
+
+    def test_can_be_disabled_explicitly(self):
+        provider = self._provider(reasoning_effort=None)
+        self.assertIsNone(provider.reasoning_effort)
+        self.assertNotIn("reasoning", self._body(provider))
+
+    def test_configurable_and_normalized(self):
+        provider = self._provider(reasoning_effort="MINIMAL")
+        self.assertEqual(provider.reasoning_effort, "minimal")
+        self.assertEqual(self._body(provider)["reasoning"], {"effort": "minimal"})
+
+    def test_body_carries_instructions_input_and_budget(self):
+        body = self._body(self._provider())
+        self.assertEqual(body["instructions"], "s")
+        self.assertEqual(body["input"], [{"role": "user", "content": "u"}])
+        self.assertEqual(body["max_output_tokens"], MIN_OUTPUT_TOKENS)
 
 
 class _RecordingProvider:
