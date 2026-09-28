@@ -230,6 +230,39 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.evidence["unsupported_assumption"])
         self.assertTrue(result.evidence["needs_clarification"])
 
+    async def test_review_prompt_forbids_turning_hedged_identity_into_fact(self):
+        """视觉识别给出的身份带「疑似」，复核必须拦住把它说成确证。
+
+        保守规则：摘要写「疑似《崩坏3》的琪亚娜」，草稿就不能说「这是琪亚娜」。
+        """
+        provider = _FakeProvider(
+            '{"is_paraphrase":false,"adds_information":true,'
+            '"unsupported_assumption":true,"needs_clarification":true,'
+            '"replacement_hint":"身份只是疑似"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot")
+
+        await judge.review_reply(
+            self._message(content="看看这个"),
+            [
+                ContextMessage(
+                    sender_id="u2",
+                    sender_name="小红",
+                    content="一张图，画面是白发绿眼角色在做憋笑表情（看不出具体是谁）。",
+                    message_id="m1",
+                )
+            ],
+            "这不是琪亚娜吗～",
+            direction="group",
+        )
+
+        sent = "\n".join(
+            str(getattr(message, "content", "")) for message in provider.requests[0].messages
+        )
+        self.assertIn("疑似/看起来像/可能是/看不出具体是谁", sent)
+        self.assertIn("都是没认准", sent)
+        self.assertIn("草稿就不能说", sent)
+
     async def test_review_flags_meta_commentary_and_incomplete_reply(self):
         provider = _FakeProvider(
             '{"is_paraphrase":false,"adds_information":true,'

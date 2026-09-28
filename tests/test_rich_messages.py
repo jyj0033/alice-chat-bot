@@ -148,6 +148,105 @@ class RichMediaEnricherTests(unittest.IsolatedAsyncioTestCase):
         # 旧的「只写直接可观察的事实」写法会把识别能力一起禁掉
         self.assertNotIn("只写图片中直接可观察的事实", prompt)
 
+    def test_image_prompt_keeps_identity_claims_hedged(self):
+        """保守规则：凭印象认出来的身份必须带保留词，免得被下游说成确证。"""
+        enricher = RichMediaEnricher({}, lambda *_: None)
+        prompt = enricher._build_image_prompt(MessageSegment(type="image"), "")
+
+        self.assertIn("疑似《崩坏3》的琪亚娜", prompt)
+        self.assertIn("不要写成「这就是琪亚娜」", prompt)
+        self.assertIn("比写得肯定更重要", prompt)
+
+    def test_image_prompt_scopes_uncertain_to_description_trust(self):
+        """uncertain 只表示「描述可不可信」，不能因为认不出人物就置 true。
+
+        旧文案「confidence 低于0.65时 uncertain 必须为 true」让模型对身份没把握
+        （confidence 常落在 0.5~0.62）就把整条描述标成不可信，而
+        `_has_objective_media_evidence` 拿这个标记当「没有客观摘要」→ 群聊里
+        纯图片消息直接不插话。等于因为没认出名字，就对绝大多数图片闭嘴。
+        """
+        enricher = RichMediaEnricher({}, lambda *_: None)
+        prompt = enricher._build_image_prompt(MessageSegment(type="image"), "")
+
+        self.assertNotIn("confidence 低于0.65时 uncertain 必须为 true", prompt)
+        self.assertIn("与认不认得出人物无关", prompt)
+        self.assertIn("uncertain 仍然为 false", prompt)
+        self.assertIn("只有图看不清", prompt)
+
+    def test_low_identity_confidence_is_not_a_description_failure(self):
+        """模型对身份没把握（confidence 0.5）不等于描述不可用。"""
+        for payload in (
+            '{"description":"白发绿眼角色憋笑，底部写着「憨笑」","confidence":0.5,'
+            '"uncertain":false}',
+            # 模型干脆没给 uncertain 字段时，按「描述可用」处理
+            '{"description":"白发绿眼角色憋笑，底部写着「憨笑」","confidence":0.5}',
+        ):
+            with self.subTest(payload=payload):
+                result = RichMediaEnricher._parse_vision_result(payload)
+                self.assertEqual(result.description, "白发绿眼角色憋笑，底部写着「憨笑」")
+                self.assertFalse(result.uncertain)
+
+    def test_model_can_still_flag_an_unreadable_image(self):
+        """真有看不清的图，模型显式置 true 仍然生效——那种才该闭嘴。"""
+        result = RichMediaEnricher._parse_vision_result(
+            '{"description":"一片模糊的色块，看不出内容","confidence":0.3,'
+            '"uncertain":true}'
+        )
+        self.assertTrue(result.uncertain)
+
+    def test_salvaged_truncated_json_is_usable_not_flagged(self):
+        """截断会切掉 uncertain 字段，但 description 已完整——按可用处理。"""
+        result = RichMediaEnricher._parse_vision_result(
+            '{"description":"熊猫头表情包，配文「借口龙」","confidence":0.55'
+        )
+        self.assertEqual(result.description, "熊猫头表情包，配文「借口龙」")
+        self.assertFalse(result.uncertain)
+
+    async def test_uncertain_flag_alone_decides_whether_the_bot_may_speak(self):
+        """`（视觉识别不确定）` 是下游的硬开关，不是装饰。
+
+        `main._has_objective_media_evidence` 拿它当「没有客观识别摘要」→ 群聊里
+        纯图片消息且无人 @ 时直接不插话。所以「认不出这是谁」绝不能顺手把它打开，
+        否则等于 bot 对绝大多数图片闭嘴。
+        """
+        from main import GroupChatBot
+
+        def gate(text: str) -> bool:
+            return GroupChatBot._has_objective_media_evidence(
+                Message(
+                    message_id="m1",
+                    message_type="group",
+                    sender_id="u2",
+                    sender_name="小红",
+                    content=text,
+                )
+            )
+
+        async def describe(uncertain: bool):
+            enricher = RichMediaEnricher({}, lambda *_: None)
+
+            async def fake_call(segment, conversation_context="", group_image_urls=None):
+                return VisionResult(
+                    "白发绿眼角色憋笑，底部写着「憨笑」",
+                    confidence=0.5,
+                    uncertain=uncertain,
+                )
+
+            enricher._call_vision = fake_call
+            segment = MessageSegment(type="image")
+            self.assertTrue(await enricher._describe_image(segment, ""))
+            return segment.summary
+
+        # 认不出人物但描述可信 → 允许插话（这正是本次要修的场景）
+        usable = await describe(uncertain=False)
+        self.assertNotIn("视觉识别不确定", usable)
+        self.assertTrue(gate(usable))
+
+        # 真的看不清 → 仍然不许插话
+        unusable = await describe(uncertain=True)
+        self.assertIn("视觉识别不确定", unusable)
+        self.assertFalse(gate(unusable))
+
 
     async def test_forward_expands_with_bounded_readable_excerpts(self):
         calls = []
@@ -386,6 +485,17 @@ class VisionThinkingAndPayloadTests(unittest.TestCase):
         # 没有引导语时不要乱删内容
         self.assertEqual(_strip_scene_prefix("熊猫头借口龙表情包"), "熊猫头借口龙表情包")
         self.assertEqual(_strip_scene_prefix(""), "")
+
+    def test_scene_prefix_stripping_keeps_the_hedge_word(self):
+        """「画面疑似X」只能吃掉「画面」——「疑似」是保守规则的核心，删不得。"""
+        self.assertEqual(
+            _strip_scene_prefix("画面疑似蔚蓝档案风格的二次元角色"),
+            "疑似蔚蓝档案风格的二次元角色",
+        )
+        self.assertEqual(_strip_scene_prefix("图中好像有个猫耳少女"), "好像有个猫耳少女")
+        self.assertEqual(
+            _strip_scene_prefix("画面是疑似《明日方舟》的角色"), "疑似《明日方舟》的角色"
+        )
 
     def test_get_image_fallback_also_shrinks(self):
         """QQ 图床直连失败时会走 get_image 读本地文件，这条路同样必须压缩。

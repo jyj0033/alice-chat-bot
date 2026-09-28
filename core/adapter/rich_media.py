@@ -617,14 +617,24 @@ class RichMediaEnricher:
             "1. 只要你认得画面里的人、角色、作品、梗、名场面、地标、品牌、商品、"
             "动物品种或界面截图里的软件，就直接点名。这是最有用的信息——"
             "只写「一个长发女孩」等于没认出来。\n"
-            "2. 认得出作品就写全「作品名 + 角色名」，认得出真人就写名字或身份，"
+            "2. 认得出作品就写「作品名 + 角色名」，认得出真人就写名字或身份，"
             "认得出梗就写梗名（例如「熊猫头」「借口龙」）。\n"
-            "3. 画面里的文字照抄下来，它常常就是这张图的梗本身。\n"
-            "4. 认不出来、或只是看着像但没有把握，就退回客观画面描述，"
+            "3. 光凭印象认出来的**身份**要带保留词——写「疑似《崩坏3》的琪亚娜」"
+            "「看起来像明日方舟的澄闪」，不要写成「这就是琪亚娜」。"
+            "名字写对、语气留有余地，比写得肯定更重要。\n"
+            "4. 画面里的文字照抄下来，它常常就是这张图的梗本身。\n"
+            "5. 认不出来、或只是看着像但没有把握，就退回客观画面描述，"
             "并直说「看不出具体是谁」——不要硬给一个名字。\n"
-            "5. 绝对不要编造角色名、作品名、出处或剧情；拿不准就把 uncertain 置为 true。\n"
-            "6. 不要结合群聊推断谁在说谁，不要替群友评价这张图、也不要写「适合用来……」；"
-            "不要加引号复述群友说过的句子。",
+            "6. 绝对不要编造角色名、作品名、出处或剧情。\n"
+            "7. 不要结合群聊推断谁在说谁，不要替群友评价这张图、也不要写「适合用来……」；"
+            "不要加引号复述群友说过的句子。\n"
+            "关于 uncertain —— 它只表示「**这份描述本身可不可信**」，"
+            "与认不认得出人物无关：\n"
+            "  · 只有图看不清（太糊、太暗、被裁掉），或者你对自己写下的画面内容没把握时，"
+            "才把 uncertain 置为 true；\n"
+            "  · 认不出画面里的人是谁**不算**——那种情况按第 5 条在 description 里写"
+            "「看不出具体是谁」就行，uncertain 仍然为 false；\n"
+            "  · 拿不准时宁可少写一点、写保守一点，也不要因此把整条描述标成不可信。",
         ]
         if segment.type == "mface":
             parts.append("这是群友发的表情包/梗图，先看它是什么梗，再说画面。")
@@ -642,7 +652,8 @@ class RichMediaEnricher:
             "只输出 JSON，不要输出解释，格式如："
             '{"description":"画面中可直接看到的事实",'
             '"confidence":0.85,"uncertain":false}。'
-            "无法确认的内容不要猜，confidence 低于0.65时 uncertain 必须为 true。"
+            "confidence 是你对「description 与画面是否相符」的把握；"
+            "uncertain 只在描述本身不可信时才为 true（见上），认不出人物不算。"
         )
         return "\n".join(parts)
 
@@ -695,15 +706,19 @@ class RichMediaEnricher:
         except (TypeError, ValueError):
             confidence = 0.5
         confidence = max(0.0, min(1.0, confidence))
-        uncertain_value = payload.get("uncertain", confidence < 0.65)
+        # uncertain 只表示「这份描述本身可不可信」，**不再**由 confidence 反推。
+        # 旧代码有 `if confidence < 0.65: uncertain = True`，等于把「认不出这是谁」
+        # （模型对身份没把握，confidence 常在 0.5~0.62）当成「描述不可用」，而下游
+        # `_has_objective_media_evidence` 拿它当「没有客观摘要」→ 群聊里纯图片消息
+        # 直接不插话。结果是 bot 对绝大多数图片闭嘴，代价却只是没认出名字。
+        # 模型没给 uncertain 时按「描述可用」处理：它毕竟写出了内容。
+        uncertain_value = payload.get("uncertain", False)
         if isinstance(uncertain_value, str):
             uncertain = uncertain_value.strip().lower() in {
                 "1", "true", "yes", "是", "不确定"
             }
         else:
             uncertain = bool(uncertain_value)
-        if confidence < 0.65:
-            uncertain = True
         return VisionResult(description[:240], confidence=confidence, uncertain=uncertain)
 
     @staticmethod
@@ -1075,8 +1090,12 @@ _DESCRIPTION_FIELD_TRUNCATED_RE = re.compile(
 _CONFIDENCE_FIELD_RE = re.compile(r'"confidence"\s*:\s*(?P<value>[0-9]*\.?[0-9]+)')
 _UNCERTAIN_FIELD_RE = re.compile(r'"uncertain"\s*:\s*(?P<value>true|false)', re.IGNORECASE)
 # 描述本身的开头，模板里已经写了「画面是」，重复一次会变成「画面是画面是…」。
-_SCENE_PREFIX_RE = re.compile(
-    r"^(?:这张)?(?:图|图片|画面|照片|表情包|视频|图里|图中)(?:中|里|上)?(?:是|为|显示|展示)[:：,，\s]*"
+_SCENE_NOUN = r"(?:这张)?(?:图|图片|画面|照片|表情包|视频|图里|图中)(?:中|里|上)?"
+_SCENE_PREFIX_RE = re.compile(rf"^{_SCENE_NOUN}(?:是|为|显示|展示)[:：,，\s]*")
+# 「画面疑似…」「图中好像…」：只能吃掉前面的名词，后面那个保留词必须留着——
+# 它是「不许把疑似说成确证」这条规则赖以生效的东西，一起删掉就等于把保留词抹了。
+_SCENE_HEDGE_PREFIX_RE = re.compile(
+    rf"^{_SCENE_NOUN}(?=(?:疑似|好像|似乎|看起来|看着像))"
 )
 
 
@@ -1121,8 +1140,15 @@ def _extract_description_field(text: str) -> str:
 
 
 def _strip_scene_prefix(text: str) -> str:
-    """去掉描述开头的「画面是」这类引导语，避免和模板拼成「画面是画面是…」。"""
-    cleaned = _SCENE_PREFIX_RE.sub("", str(text or "").strip()).strip()
+    """去掉描述开头的「画面是」这类引导语，避免和模板拼成「画面是画面是…」。
+
+    模型既写「画面是一个动漫角色」，也写「画面疑似蔚蓝档案风格」。后者只能吃掉
+    「画面」两字：把「疑似」一起删掉就等于把保留词抹了，下游复核就没法拦住
+    草稿把疑似身份说成确证。
+    """
+    cleaned = str(text or "").strip()
+    cleaned = _SCENE_PREFIX_RE.sub("", cleaned).strip()
+    cleaned = _SCENE_HEDGE_PREFIX_RE.sub("", cleaned).strip()
     return cleaned or str(text or "").strip()
 
 
@@ -1130,7 +1156,9 @@ def _salvage_truncated_json(text: str) -> "VisionResult | None":
     """从被 max_tokens 截断的 JSON 正文里尽量捞回可用字段。
 
     能捞多少算多少：截断一般发生在 description 之后的字段上，所以优先救
-    description；confidence / uncertain 捞不到时宁愿标「不确定」，也不要谎报把握。
+    description。捞不到 uncertain 时按「描述可用」处理——description 的值既然
+    已经完整吐出来了，就该拿去用；旧代码在这里一律标不确定，等于因为一句回答
+    被截断就把整张图判成「看不清」。
     """
     body = text or ""
     description = _extract_description_field(body)
@@ -1143,7 +1171,7 @@ def _salvage_truncated_json(text: str) -> "VisionResult | None":
             confidence = float(match.group("value"))
         except ValueError:
             pass
-    uncertain = True
+    uncertain = False
     flag = _UNCERTAIN_FIELD_RE.search(body)
     if flag:
         uncertain = flag.group("value").lower() == "true"
