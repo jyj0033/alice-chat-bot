@@ -124,13 +124,15 @@ class RichMediaEnricher:
         self.image_vision_max_payload = max(
             200_000, int(image.get("vision_max_payload_bytes", 2_000_000))
         )
-        # 端点会先输出 <think> 再给 JSON，预算太小会被思考吃光；900 实测够用。
+        # 端点会先输出 <think> 再给 JSON，而思维链同样计入 max_tokens。900 在
+        # 「把整张梗图的文字照抄下来」这种长输出上会被截断成不闭合的 JSON
+        # （线上实测出现过），给到 2000 留余量。只有生成侧计费，不算浪费。
         vision_section = image.get("vision", {}) or {}
         self.image_vision_max_tokens = max(
             300,
             int(
                 vision_section.get("max_tokens")
-                or image.get("to_text_max_tokens", 900)
+                or image.get("to_text_max_tokens", 2000)
             ),
         )
         self.image_cache_ttl = max(60.0, float(image.get("cache_ttl", 600)))
@@ -469,7 +471,8 @@ class RichMediaEnricher:
 
         if not vision_result or not vision_result.description.strip():
             return False
-        desc = vision_result.description.strip()
+        # 模板里已经写了「画面是」，模型再以「画面是…」开头会拼成「画面是画面是…」
+        desc = _strip_scene_prefix(vision_result.description)
         metadata = getattr(segment, "data", None)
         if isinstance(metadata, dict):
             # 表情库使用这一份不带群聊语境的描述；segment.summary 仍保留给
@@ -665,8 +668,16 @@ class RichMediaEnricher:
                 break
 
         if payload is None:
-            # 无结构化输出的旧模型：只能用正文兜底，且必须标记不确定。
-            # 正文为空（整段都被思考块吃掉）时视为识别失败，不要硬造描述。
+            # 1. 先试从被截断的 JSON 里捞字段——description 的值往往已经吐完了
+            salvaged = _salvage_truncated_json(body)
+            if salvaged is not None:
+                return salvaged
+            # 2. 正文本身就是 JSON 残片（连 description 的值都没吐出来）时，
+            #    绝不能整段当描述：那会把 `{"description":"…` 写进群聊上下文。
+            if body.lstrip().startswith("{") or '"description"' in body:
+                return None
+            # 3. 无结构化输出的旧模型：只能用正文兜底，且必须标记不确定。
+            #    正文为空（整段都被思考块吃掉）时视为识别失败，不要硬造描述。
             if not body:
                 return None
             return VisionResult(body[:240], confidence=0.45, uncertain=True)
@@ -1053,6 +1064,20 @@ _THINK_BLOCK_RE = re.compile(
     r"<think(?:ing)?>.*?(?:</think(?:ing)?>|$)", re.DOTALL | re.IGNORECASE
 )
 _FLAT_JSON_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+# 被 max_tokens 截断时 JSON 对象不闭合，整块匹配必然失败，但 description 的值
+# 往往已经完整吐出来了，所以单独再捞一次。
+_DESCRIPTION_FIELD_RE = re.compile(
+    r'"description"\s*:\s*"(?P<value>(?:[^"\\]|\\.)*)"', re.DOTALL
+)
+_DESCRIPTION_FIELD_TRUNCATED_RE = re.compile(
+    r'"description"\s*:\s*"(?P<value>.+)', re.DOTALL
+)
+_CONFIDENCE_FIELD_RE = re.compile(r'"confidence"\s*:\s*(?P<value>[0-9]*\.?[0-9]+)')
+_UNCERTAIN_FIELD_RE = re.compile(r'"uncertain"\s*:\s*(?P<value>true|false)', re.IGNORECASE)
+# 描述本身的开头，模板里已经写了「画面是」，重复一次会变成「画面是画面是…」。
+_SCENE_PREFIX_RE = re.compile(
+    r"^(?:这张)?(?:图|图片|画面|照片|表情包|视频|图里|图中)(?:中|里|上)?(?:是|为|显示|展示)[:：,，\s]*"
+)
 
 
 def _strip_thinking(text: str) -> str:
@@ -1062,6 +1087,67 @@ def _strip_thinking(text: str) -> str:
     所以这里连「未闭合的思考块」一起吃掉，避免把英文推理当成描述写进群聊。
     """
     return _THINK_BLOCK_RE.sub(" ", text or "").strip()
+
+
+def _decode_json_string(value: str) -> str:
+    """把 JSON 字符串字面量的内容解出来（处理 \\" \\n 这类转义）。"""
+    try:
+        return str(json.loads(f'"{value}"')).strip()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return str(value or "").strip()
+
+
+def _extract_description_field(text: str) -> str:
+    """从（可能被截断的）JSON 正文里捞 description 的值，捞不到返回空串。
+
+    为什么需要它：输出被 max_tokens 截断时 JSON 不闭合，`{...}` 整块匹配失败，
+    于是落回「正文兜底」，把 `{"description":"一张 chibi 风格…","confidence":0.55`
+    这串原始 JSON 当成图片描述写进了群聊上下文（线上实测出现过）。
+    description 的值本身通常是完整的，所以按字段单独抽一次就能救回来。
+    """
+    body = text or ""
+    complete = _DESCRIPTION_FIELD_RE.search(body)
+    if complete:
+        return _decode_json_string(complete.group("value"))
+    truncated = _DESCRIPTION_FIELD_TRUNCATED_RE.search(body)
+    if not truncated:
+        return ""
+    value = truncated.group("value")
+    # 值后面可能还挂着已经完整的兄弟字段（"description":"…","confidence":0.5），切掉
+    tail = value.rfind('","')
+    if tail > 0:
+        value = value[:tail]
+    return _decode_json_string(value.strip().rstrip('"'))
+
+
+def _strip_scene_prefix(text: str) -> str:
+    """去掉描述开头的「画面是」这类引导语，避免和模板拼成「画面是画面是…」。"""
+    cleaned = _SCENE_PREFIX_RE.sub("", str(text or "").strip()).strip()
+    return cleaned or str(text or "").strip()
+
+
+def _salvage_truncated_json(text: str) -> "VisionResult | None":
+    """从被 max_tokens 截断的 JSON 正文里尽量捞回可用字段。
+
+    能捞多少算多少：截断一般发生在 description 之后的字段上，所以优先救
+    description；confidence / uncertain 捞不到时宁愿标「不确定」，也不要谎报把握。
+    """
+    body = text or ""
+    description = _extract_description_field(body)
+    if not description:
+        return None
+    confidence = 0.55
+    match = _CONFIDENCE_FIELD_RE.search(body)
+    if match:
+        try:
+            confidence = float(match.group("value"))
+        except ValueError:
+            pass
+    uncertain = True
+    flag = _UNCERTAIN_FIELD_RE.search(body)
+    if flag:
+        uncertain = flag.group("value").lower() == "true"
+    return VisionResult(description[:240], confidence=confidence, uncertain=uncertain)
 
 
 def _loads_json_object(candidate: str) -> dict[str, Any] | None:

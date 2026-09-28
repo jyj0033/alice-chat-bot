@@ -16,6 +16,7 @@ from core.adapter.rich_media import (
     RichMediaEnricher,
     VisionResult,
     _shrink_image_bytes,
+    _strip_scene_prefix,
     _strip_thinking,
     _validate_http_url,
 )
@@ -343,6 +344,49 @@ class VisionThinkingAndPayloadTests(unittest.TestCase):
         self.assertEqual(shrunk, broken)
         self.assertEqual(media_type, "image/jpeg")
 
+    def test_truncated_json_still_yields_the_description(self):
+        """线上实测：长输出被 max_tokens 截断，JSON 不闭合，description 已成完整。"""
+        raw = (
+            "<think>这个是憋笑梗图</think>"
+            '{"description":"一张 chibi 风格表情包，白发绿眼角色在做「憋笑」表情",'
+            '"confidence":0.55'
+        )
+        result = RichMediaEnricher._parse_vision_result(raw)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.description, "一张 chibi 风格表情包，白发绿眼角色在做「憋笑」表情")
+        self.assertAlmostEqual(result.confidence, 0.55)
+
+    def test_truncated_json_never_leaks_raw_json_as_description(self):
+        """线上实测的坏样子：整串 JSON 原文被当成描述写进群聊上下文。"""
+        raw = (
+            '{"description":"一张 chibi 风格表情包，画面中是一个白发绿眼的二次元角色",'
+            '"confidence":0.55,"uncertain":false'
+        )
+        result = RichMediaEnricher._parse_vision_result(raw)
+        self.assertIsNotNone(result)
+        self.assertNotIn("{", result.description)
+        self.assertNotIn("confidence", result.description)
+
+    def test_json_fragment_without_description_is_a_failure(self):
+        """连 description 的值都没吐出来时，宁可不写描述，也不写一坨 JSON。"""
+        for raw in ('{"description":', '{"description":"', '{"confid'):
+            with self.subTest(raw=raw):
+                self.assertIsNone(RichMediaEnricher._parse_vision_result(raw))
+
+    def test_salvaged_json_escapes_are_decoded(self):
+        raw = '{"description":"第一行\\n第二行 \\"带引号\\"","confidence":0.7'
+        result = RichMediaEnricher._parse_vision_result(raw)
+        self.assertEqual(result.description, '第一行\n第二行 "带引号"')
+
+    def test_scene_prefix_is_not_repeated_by_the_template(self):
+        """模型也爱以「画面是…」开头，会和「一张图，画面是{}。」拼成「画面是画面是」。"""
+        self.assertEqual(_strip_scene_prefix("画面是一个动漫角色"), "一个动漫角色")
+        self.assertEqual(_strip_scene_prefix("图中是一位女孩"), "一位女孩")
+        self.assertEqual(_strip_scene_prefix("这张图是熊猫头梗图"), "熊猫头梗图")
+        # 没有引导语时不要乱删内容
+        self.assertEqual(_strip_scene_prefix("熊猫头借口龙表情包"), "熊猫头借口龙表情包")
+        self.assertEqual(_strip_scene_prefix(""), "")
+
     def test_wired_into_data_url_conversion(self):
         from PIL import Image
 
@@ -350,7 +394,7 @@ class VisionThinkingAndPayloadTests(unittest.TestCase):
 
         enricher = RichMediaEnricher({}, lambda *_: None)
         self.assertEqual(enricher.image_vision_max_payload, 2_000_000)
-        self.assertGreaterEqual(enricher.image_vision_max_tokens, 900)
+        self.assertEqual(enricher.image_vision_max_tokens, 2000)
 
         picture = Image.new("RGB", (3000, 2000), (200, 30, 30))
         buffer = _io.BytesIO()

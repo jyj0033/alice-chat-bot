@@ -6414,8 +6414,9 @@ class GroupChatBot:
                     "to_text_context": True,
                     "context_window": 6,
                     "to_text_timeout": 60,
-                    # 思维链（<think>）也算在这个预算里，给太少会整段截断、零输出。
-                    "to_text_max_tokens": 900,
+                    # 思维链（<think>）也算在这个预算里：给 900 时，「把整张梗图的
+                    # 文字照抄下来」这种长输出会被截断成不闭合的 JSON。
+                    "to_text_max_tokens": 2000,
                     # QQ 原图常见 11~18MB，下载上限太小会直接「下载失败，无法识别」。
                     "max_download_bytes": 20971520,
                     # 端点多图层硬上限 10MiB，喂进去之前先压到下面这个规模。
