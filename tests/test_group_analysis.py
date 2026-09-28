@@ -203,6 +203,10 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("多用互联网黑话", prompt)
         self.assertIn("话题又拐回来了", prompt)
         self.assertIn("宁缺毋滥", prompt)
+        # 逆天语录必须是分档标准，不能退回成「最离谱、最反差」这种笼统说法
+        for tier in ("情绪越界", "争议暴论", "一本正经的胡说八道", "逻辑跳脱"):
+            self.assertIn(tier, prompt)
+        self.assertIn("至少列出5个", prompt)
         self.assertIn("我说话很短", prompt)
         rendered = GroupDailyAnalysis.render_report(report)
         self.assertNotIn("我忍不住记下的几句", rendered)
