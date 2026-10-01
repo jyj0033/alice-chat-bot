@@ -332,7 +332,15 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(image.startswith(b"\x89PNG\r\n\x1a\n"))
 
     async def test_report_fetches_and_uses_cached_avatars(self):
-        report = await GroupDailyAnalysis.analyze(self.messages, provider=None)
+        # 头像只画在带 sender_id 的画像卡和逆天语录卡上。用真实 LLM 结构产出这两块，
+        # 否则 provider=None 的空报告里没有任何绘制点，渲染结果和有无头像必然相同。
+        report = await GroupDailyAnalysis.analyze(
+            self.messages, provider=_Provider(_full_report_payload())
+        )
+        self.assertTrue(
+            report["profiles"] or report["unhinged_quotes"],
+            "报告里必须存在会消费头像的区块，否则下面的头像断言是空转",
+        )
         avatar_image = Image.new("RGB", (64, 64), (244, 128, 168))
         avatar_buffer = io.BytesIO()
         avatar_image.save(avatar_buffer, format="PNG")
@@ -491,6 +499,9 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
 
         provider = _Provider({"summary": "大家约了晚上开黑。"})
         bot = GroupChatBot.__new__(GroupChatBot)
+        # 功能路由会读 config.llm_routing；真实运行由 _load_config 保证存在，
+        # 这里补空配置让替身能走到回退到 get_active_provider 的分支。
+        bot.config = {}
         bot._group_analysis_config = {
             "enabled": True,
             "min_messages": 2,
