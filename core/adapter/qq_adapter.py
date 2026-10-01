@@ -4,7 +4,6 @@ QQ 适配器 - 使用 NapCat/OneBot v11 协议
 """
 import asyncio
 import base64
-import contextlib
 import json
 import logging
 import uuid
@@ -48,6 +47,7 @@ class QQAdapter(PlatformAdapter):
         self.ws_port = config.get("ws_port", 3001)
 
         self._server = None
+        self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._running = False
         self._connected = False
         self._clients: Set[websockets.WebSocketServerProtocol] = set()
@@ -74,6 +74,7 @@ class QQAdapter(PlatformAdapter):
 
     async def connect(self) -> None:
         """启动 WebSocket 服务端接收 NapCat 连接"""
+        self._owner_loop = asyncio.get_running_loop()
         self._running = True
         self._connected = False
 
@@ -192,6 +193,15 @@ class QQAdapter(PlatformAdapter):
             message = response.get("message") or response.get("wording") or "NapCat API 调用失败"
             future.set_exception(RuntimeError(f"{message} (retcode={retcode})"))
 
+    def _foreign_owner_loop(self) -> asyncio.AbstractEventLoop | None:
+        """Dashboard/关闭线程不能直接操作 QQ 循环的连接和 Future。"""
+        owner = self._owner_loop
+        if owner is None or owner is asyncio.get_running_loop():
+            return None
+        if not owner.is_running():
+            raise ConnectionError("QQ event loop is not running")
+        return owner
+
     async def call_api(
         self,
         action: str,
@@ -199,6 +209,10 @@ class QQAdapter(PlatformAdapter):
         timeout: float | None = 10.0,
     ):
         """向 NapCat 调用 API 并等待匹配 echo 的响应。"""
+        owner = self._foreign_owner_loop()
+        if owner is not None:
+            future = asyncio.run_coroutine_threadsafe(self.call_api(action, params, timeout), owner)
+            return await asyncio.wrap_future(future)
         if not self._clients:
             raise ConnectionError("No NapCat connected")
         echo = f"alice-{uuid.uuid4().hex}"
@@ -341,6 +355,11 @@ class QQAdapter(PlatformAdapter):
 
     async def _broadcast(self, message: str) -> None:
         """广播消息到所有客户端"""
+        owner = self._foreign_owner_loop()
+        if owner is not None:
+            future = asyncio.run_coroutine_threadsafe(self._broadcast(message), owner)
+            await asyncio.wrap_future(future)
+            return
         if self._clients:
             await asyncio.gather(
                 *[client.send(message) for client in self._clients],
@@ -649,14 +668,18 @@ class QQAdapter(PlatformAdapter):
         return await self.send_message(f"private_{user_id}", content)
 
     async def disconnect(self) -> None:
+        owner = self._foreign_owner_loop()
+        if owner is not None:
+            future = asyncio.run_coroutine_threadsafe(self.disconnect(), owner)
+            await asyncio.wrap_future(future)
+            return
         self._running = False
         self._connected = False
         if self._message_tasks:
             tasks = list(self._message_tasks)
             for task in tasks:
                 task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.gather(*tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
             self._message_tasks.clear()
         for future in self._pending_api.values():
             if not future.done():
