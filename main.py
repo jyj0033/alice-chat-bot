@@ -4,6 +4,7 @@
 """
 import asyncio
 from dataclasses import dataclass, replace
+import inspect
 import json
 import logging
 import random
@@ -126,6 +127,7 @@ class _MessageFlowState:
     rich_directed: bool
     recent_context_for_judgement: list[Any]
     message_version: int | None
+    archive_task: asyncio.Task | None = None
 
 
 class GroupChatBot:
@@ -177,6 +179,8 @@ class GroupChatBot:
 
         # 状态
         self._running = False
+        self._stop_guard = threading.Lock()
+        self._stop_task: asyncio.Task | None = None
         self._tasks: list[asyncio.Task] = []
         self._start_time: float = 0
         # 每会话正在进行的回复生成任务（同一会话同时只生成一条回复）
@@ -195,6 +199,7 @@ class GroupChatBot:
         # 批次有最长等待时间，避免消息持续到来时一直等不到判断。
         self._conversation_judge_batch_started_at: dict[str, float] = {}
         self._rich_media_tasks: set[asyncio.Task] = set()
+        self._media_tasks_by_message: dict[tuple[str, str], asyncio.Task] = {}
         self._meme_collect_tasks: set[asyncio.Task] = set()
         # 用户消息、Bot 回复等轻量记忆写入任务。单独跟踪，停止时等待/取消，
         # 避免 create_task 后进程退出导致最后几条记忆丢失。
@@ -225,7 +230,9 @@ class GroupChatBot:
 
     @property
     def _image_group_config(self) -> dict:
-        return self.config.get("image", {}) or {} if self.config else {}
+        config = getattr(self, "config", None) or {}
+        rich_image = (config.get("rich_media", {}) or {}).get("image", {}) or {}
+        return {**rich_image, **(config.get("image", {}) or {})}
 
     async def initialize(self) -> None:
         """初始化 Bot"""
@@ -439,6 +446,9 @@ class GroupChatBot:
 
         # 记忆检索参数（向量检索 + 时间衰减）
         self.memory_search_top_k = memory_config.get("retrieval_top_k", 5)
+        self.memory_retrieval_timeout = memory_config.get("retrieval_timeout_seconds", 5.0)
+        self.memory_min_similarity = memory_config.get("retrieval_min_similarity", 0.2)
+        self.memory_min_rerank_score = memory_config.get("retrieval_min_rerank_score", 0.1)
         self.memory_half_life_days = memory_config.get("half_life_days", 30)
         self.memory_similarity_weight = memory_config.get("similarity_weight", 0.85)
         self.memory_decay_presets = {
@@ -804,6 +814,9 @@ class GroupChatBot:
             timeout=judge_config.get("timeout", 8.0),
             max_tokens=judge_config.get("max_tokens", 220),
             context_messages=judge_config.get("context_messages", 16),
+            other_target_context_seconds=(self.config.get("conversation_floor", {}) or {}).get(
+                "other_target_context_seconds", 900.0
+            ),
         )
         logger.info(
             "✓ 群聊意图链路：启用=%s，判断=%s，回复复核=%s，表情复核=%s，超时=%.1f秒",
@@ -1095,6 +1108,7 @@ class GroupChatBot:
         )
         await ingest_lock.acquire()
         message_version = None
+        archive_task = None
         try:
             # 进程重启后，先恢复该会话最近仍在上下文有效期内的 episodic 消息，
             # 再追加当前消息；这样首条消息不会让 Bot 突然失去刚才的对话。
@@ -1153,7 +1167,7 @@ class GroupChatBot:
             self._maybe_schedule_digest(session_id)
 
             # 群日报单独保存完整群消息，不参与普通长期记忆筛选和召回。
-            self._store_group_analysis_message(message, session_id)
+            archive_task = self._store_group_analysis_message(message, session_id)
 
             # 记录媒体轨迹，供"连图整体识别"判断连续纯图片
             self._record_media_trail(message)
@@ -1173,19 +1187,94 @@ class GroupChatBot:
             rich_directed=rich_directed,
             recent_context_for_judgement=recent_context_for_judgement,
             message_version=message_version,
+            archive_task=archive_task,
         )
+
+    async def _prepare_media_for_judgement(
+        self, message: Message, state: _MessageFlowState
+    ) -> asyncio.Task | None:
+        """先取得本条或所引用图片的证据；取消一次回复不取消共享识别。"""
+        pending = getattr(self, "_media_tasks_by_message", None)
+        if pending is None:
+            pending = self._media_tasks_by_message = {}
+        enrichment_task = None
+        if message.rich_type:
+            outer_text = message.outer_text if message.segments else message.content
+            personality = getattr(self, "personality", None)
+            names = (
+                getattr(personality, "name", ""),
+                getattr(personality, "nickname", ""),
+                "爱丽丝", "小艾",
+            )
+            directed = state.rich_directed or any(name and name in outer_text for name in names)
+            enrichment_task = asyncio.create_task(
+                self._enrich_context_message(message, directed, archive_task=state.archive_task)
+            )
+            self._rich_media_tasks.add(enrichment_task)
+            key = (message.session_id, str(message.message_id or ""))
+            if key[1]:
+                pending[key] = enrichment_task
+
+            def finished(task):
+                self._rich_media_tasks.discard(task)
+                if pending.get(key) is task:
+                    pending.pop(key, None)
+                if not task.cancelled() and task.exception() is not None:
+                    logger.debug("媒体增强任务未完成：%s", task.exception())
+
+            enrichment_task.add_done_callback(finished)
+            if (
+                self.meme_manager
+                and self.meme_manager.auto_collect_enabled
+                and any(segment.type in {"image", "mface"} for segment in message.segments)
+            ):
+                collect_task = asyncio.create_task(
+                    self._collect_meme_after_enrichment(message, enrichment_task)
+                )
+                self._meme_collect_tasks.add(collect_task)
+                collect_task.add_done_callback(self._meme_collect_tasks.discard)
+
+        tasks = [enrichment_task] if enrichment_task else []
+        # 紧跟图片的追问可能先于识别完成到达，只等待相关发言者/明确引用的媒体。
+        recent = self.context_manager.get_window(message.session_id).get_recent(6)
+        for item in recent:
+            if (
+                item.sender_id != message.sender_id
+                and str(item.message_id or "") != str(message.reply_to_id or "")
+            ):
+                continue
+            task = pending.get((message.session_id, str(item.message_id or "")))
+            if task is not None and task not in tasks:
+                tasks.append(task)
+        # 明确引用的那张图可能已经滑出最近几条，但识别仍在进行。这里按引用 ID
+        # 直接查任务映射：映射里只存还在飞行的识别任务，命中即说明证据还没到位。
+        reply_to_id = str(message.reply_to_id or "").strip()
+        if reply_to_id:
+            referenced = pending.get((message.session_id, reply_to_id))
+            if referenced is not None and referenced not in tasks:
+                tasks.append(referenced)
+        if tasks:
+            results = await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks), return_exceptions=True
+            )
+            if any(isinstance(result, asyncio.CancelledError) for result in results):
+                raise asyncio.CancelledError
+        return enrichment_task
 
     async def _decide_incoming_message(
         self, message: Message, state: _MessageFlowState
     ) -> dict | None:
-        """等待必要的合并窗口，判断消息目标并生成回复决策。"""
+        """等待必要的媒体证据和合并窗口，再判断消息目标。"""
+        enrichment_task = await self._prepare_media_for_judgement(message, state)
         session_id = state.session_id
         is_reply_to_bot = state.is_reply_to_bot
         continuing = state.continuing
         rich_trigger = state.rich_trigger
         rich_reasons = state.rich_reasons
         rich_directed = state.rich_directed
-        recent_context_for_judgement = state.recent_context_for_judgement
+        recent_context_for_judgement = self.context_manager.get_window(
+            session_id
+        ).get_recent(30)
         message_version = state.message_version
         # 普通群聊做短暂合并，只判断批次里的最新消息；前面的消息已经留在
         # recent_context 中供判断器理解。明确对 bot 的消息和强触发不等待。
@@ -1269,32 +1358,6 @@ class GroupChatBot:
                     and conversation_judgement.should_reply
                 )
             )
-
-        # 富媒体增强可能涉及 NapCat API 或安全网页预览。它在后台执行，决策仍走
-        # 快速路径；真正生成回复前会等待本条消息的增强结果。
-        enrichment_task = None
-        if message.rich_type:
-            enrichment_task = asyncio.create_task(
-                self._enrich_context_message(message, rich_directed)
-            )
-            self._rich_media_tasks.add(enrichment_task)
-            enrichment_task.add_done_callback(self._rich_media_tasks.discard)
-
-        # 表情自动收集放在富媒体增强之后：如果视觉识别已经给出简短描述，
-        # 描述会一并写进素材元数据；整个过程独立于回复任务，不拖慢发言决策。
-        if (
-            self.meme_manager
-            and self.meme_manager.auto_collect_enabled
-            and any(
-                getattr(segment, "type", "") in {"image", "mface"}
-                for segment in (message.segments or [])
-            )
-        ):
-            collect_task = asyncio.create_task(
-                self._collect_meme_after_enrichment(message, enrichment_task)
-            )
-            self._meme_collect_tasks.add(collect_task)
-            collect_task.add_done_callback(self._meme_collect_tasks.discard)
 
         # === 2. 发言决策（目标判断已完成，下面只做本地策略合并） ===
         decision = self._decide_reply(
@@ -1404,7 +1467,7 @@ class GroupChatBot:
         """等待图片增强完成后，把直接图片交给本地表情库。"""
         try:
             if enrichment_task:
-                await enrichment_task
+                await asyncio.shield(enrichment_task)
             if self.meme_manager and self.qq_adapter:
                 await self.meme_manager.collect_message(message, self.qq_adapter)
         except asyncio.CancelledError:
@@ -2302,6 +2365,30 @@ class GroupChatBot:
             logger.debug("[发言收尾] 检测到新群消息，继续等待 %.1fs", idle_seconds)
 
     @staticmethod
+    async def _review_reply_with_context(
+        judge, message, recent_messages, reply, *, direction,
+        conversation_judgement=None, generation_context="",
+    ):
+        """正式判断器复用生成证据，旧版外部判断器只接收其支持的参数。"""
+        kwargs = {"direction": direction}
+        optional = {
+            "conversation_judgement": conversation_judgement,
+            "generation_context": generation_context,
+        }
+        try:
+            parameters = inspect.signature(judge.review_reply).parameters
+            accepts_kwargs = any(
+                item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+            )
+            kwargs.update({
+                key: value for key, value in optional.items()
+                if value and (accepts_kwargs or key in parameters)
+            })
+        except (TypeError, ValueError):
+            pass
+        return await judge.review_reply(message, recent_messages, reply, **kwargs)
+
+    @staticmethod
     async def _validate_retried_reply(
         judge,
         message: Message,
@@ -2309,29 +2396,14 @@ class GroupChatBot:
         reply: str,
         direction: str,
         conversation_judgement: dict | None = None,
+        generation_context: str = "",
     ) -> tuple[bool, str]:
         """重生成稿必须再通过一次质量复核；复核不可用时按未通过处理。"""
-        review_kwargs = {"direction": direction}
-        # 兼容仍使用旧签名的测试替身/外部 Judge；正式实现会复用同一份语用判断。
-        if conversation_judgement:
-            review_kwargs["conversation_judgement"] = conversation_judgement
-        try:
-            review = await judge.review_reply(
-                message,
-                recent_messages,
-                reply,
-                **review_kwargs,
-            )
-        except TypeError as exc:
-            if not conversation_judgement or "conversation_judgement" not in str(exc):
-                raise
-            # 旧版外部 Judge 仍可完成基础复核，只是没有语用契约。
-            review = await judge.review_reply(
-                message,
-                recent_messages,
-                reply,
-                direction=direction,
-            )
+        review = await GroupChatBot._review_reply_with_context(
+            judge, message, recent_messages, reply, direction=direction,
+            conversation_judgement=conversation_judgement,
+            generation_context=generation_context,
+        )
         if not review.available:
             return False, "重答复核不可用"
         if review.should_reply:
@@ -2352,14 +2424,13 @@ class GroupChatBot:
         # 只有真实 @/引用/私聊才拥有定向回复的过期保护；模型判断出的隐式
         # 续话仍要服从后续群消息，避免把猜测当成硬指向。
         explicit_directed = bool(decision.get("explicit_directed"))
-        effective_context_item = None
         effective_message_id = str(message.message_id or "")
 
         try:
             enrichment_task = decision.get("enrichment_task")
             if enrichment_task:
                 try:
-                    await enrichment_task
+                    await asyncio.shield(enrichment_task)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -2430,48 +2501,16 @@ class GroupChatBot:
                         logger.info("[发送复核] %s，放弃草稿", divert_reason)
                         return
 
-            # 普通插话等待期间如果出现了新消息，先对最新消息重新做动态
-            # 目标判断；定向回复仍保留原始问题，不被旁边的新话题带走。
+            # 普通插话只属于原触发消息；新消息由自己的处理任务重新决定，
+            # 不能在旧任务里同时换目标、保留旧方向和旧发言计划。
             if (
                 message.message_type == "group"
                 and not explicit_directed
                 and decision.get("context_marker")
                 != self._latest_user_context_marker(session_id)
             ):
-                latest_item = self._latest_user_context_message(session_id)
-                latest_judgement = await self._judge_context_message(
-                    session_id,
-                    latest_item,
-                    continuation_hint=False,
-                )
-                if latest_judgement.available:
-                    latest_id = str(getattr(latest_item, "message_id", "") or "")
-                    self.context_manager.update_message_analysis(
-                        session_id,
-                        latest_id,
-                        directed_to_bot=(latest_judgement.target == "bot"),
-                        target=latest_judgement.target,
-                        intent=latest_judgement.intent,
-                        confidence=latest_judgement.confidence,
-                        reason=latest_judgement.reason,
-                    )
-                    if not latest_judgement.should_reply:
-                        logger.info("[发送复核] 最新消息经动态判断不应参与")
-                        return
-                    if latest_judgement.target == "bot":
-                        # 新定向消息会由 _handle_message 的任务替换机制负责。
-                        logger.info("[发送复核] 最新消息已动态判断为对机器人说，放弃旧插话")
-                        return
-                    conversation_judgement = latest_judgement.to_dict()
-                    effective_context_item = latest_item
-                    effective_message_id = str(latest_id or "")
-                    decision["context_marker"] = self._latest_user_context_marker(
-                        session_id
-                    )
-                else:
-                    # 旧判断只属于原始触发消息，不能在目标已经切换后继续
-                    # 作为新消息的生成约束；本轮改用本地 floor 的保守回退。
-                    conversation_judgement = {}
+                logger.info("[发送复核] 新消息已接管发言机会，放弃旧插话")
+                return
 
             # 思考期间群聊可能已经向前发展；普通插话过期时放弃，仍适合时
             # 把行为计划切换到最新群友消息，避免旧计划套新上下文。
@@ -2484,36 +2523,16 @@ class GroupChatBot:
             if plan_cancelled:
                 return
 
-            # 如果插话计划已经切到等待期间的新消息，搜索判断、挫败检测等仍使用
-            # 旧触发消息会造成“计划回 m2、搜索却搜 m1”的错位。保持定向回复的
-            # 原始消息语义不变，只对非定向插话同步当前目标内容。
+            # 行为计划、检索和正文必须指向同一条触发消息。
             generation_message = message.content
-            if action_plan and not action_plan.directed and action_plan.target_message_id:
-                for candidate in reversed(
-                    self.context_manager.get_window(session_id).get_recent(30)
-                ):
-                    if str(candidate.message_id or "") == str(action_plan.target_message_id):
-                        generation_message = candidate.content
-                        effective_context_item = candidate
-                        effective_message_id = str(candidate.message_id or "")
-                        break
-
-            if effective_context_item is None and effective_message_id:
-                for candidate in reversed(
-                    self.context_manager.get_window(session_id).get_recent(50)
-                ):
-                    if str(candidate.message_id or "") == effective_message_id:
-                        effective_context_item = candidate
-                        break
+            if (
+                action_plan and not action_plan.directed and action_plan.target_message_id
+                and str(action_plan.target_message_id) != effective_message_id
+            ):
+                logger.info("[发送复核] 行为计划与触发消息不一致，放弃旧插话")
+                return
 
             effective_message = message
-            if effective_context_item is not None and (
-                str(getattr(effective_context_item, "message_id", "") or "")
-                != str(message.message_id or "")
-            ):
-                effective_message = self._context_message_as_platform_message(
-                    session_id, effective_context_item
-                )
 
             # 普通插话的目标如果在动态判断后又变了，新的消息处理任务会重新
             # 决定是否发言；旧任务不得把过期草稿发进群。
@@ -2537,6 +2556,11 @@ class GroupChatBot:
             )
 
             # === 构建提示词（此刻的上下文 = 思考期间的最新消息，不会回旧话题） ===
+            recent_context_for_review = [
+                replace(item) for item in self.context_manager.get_window(session_id).get_recent(
+                    self.context_manager.max_messages
+                )
+            ]
             context_prompt = self.context_manager.build_context_prompt(
                 session_id=session_id,
                 bot_name=self.personality.name,
@@ -2730,19 +2754,18 @@ class GroupChatBot:
             review_text = reply
             if self.meme_manager:
                 review_text, _ = self.meme_manager.strip_directives(review_text)
-            recent_context_for_review = self.context_manager.get_window(
-                session_id
-            ).get_recent(16)
             recent_texts = [
                 m.content for m in recent_context_for_review if not m.is_bot
             ]
             if judge and review_text.strip():
-                review = await judge.review_reply(
+                review = await self._review_reply_with_context(
+                    judge,
                     effective_message,
                     recent_context_for_review,
                     review_text,
                     direction=direction,
                     conversation_judgement=conversation_judgement,
+                    generation_context=context_prompt,
                 )
                 review_evidence = review.evidence or {}
                 paraphrase_issue = bool(
@@ -2827,6 +2850,7 @@ class GroupChatBot:
                         ),
                         avoid_paraphrase=paraphrase_issue,
                         reply_review_hint=review_hint,
+                        reviewed_draft=review_text,
                     )
                     # generate() 当前返回包含表情包工具结果的 dict；兼容旧版
                     # 直接返回字符串，避免复读重答分支把 dict 当作文本继续处理。
@@ -2885,6 +2909,7 @@ class GroupChatBot:
                                     retry_review_text,
                                     direction,
                                     conversation_judgement,
+                                    generation_context=context_prompt,
                                 )
                             )
                             if retry_accepted:
@@ -3283,6 +3308,8 @@ class GroupChatBot:
         self,
         message: Message,
         directed: bool,
+        *,
+        archive_task: asyncio.Task | None = None,
     ) -> None:
         """后台增强富媒体，并原位更新已经进入滑动窗口的那条消息。"""
         original_content = message.content
@@ -3300,6 +3327,15 @@ class GroupChatBot:
                 message.message_id,
                 message.content,
             )
+            if archive_task is not None and message.message_id:
+                await asyncio.shield(archive_task)
+                content = f"{message.content} [{message.rich_type}]".strip()
+                try:
+                    await self.memory_storage.update_group_analysis_message_content(
+                        message.session_id, str(message.message_id), content[:2000]
+                    )
+                except Exception as exc:
+                    logger.warning("媒体归档回填失败：%s", exc)
             logger.debug("[富媒体] %s", message.content[:120])
 
     def _record_media_trail(self, message: Message) -> None:
@@ -3613,7 +3649,9 @@ class GroupChatBot:
             window.restored_from_storage = False
             logger.debug("恢复近期记忆失败：%s", exc)
 
-    def _store_group_analysis_message(self, message: Message, session_id: str) -> None:
+    def _store_group_analysis_message(
+        self, message: Message, session_id: str
+    ) -> asyncio.Task | None:
         """保存完整群聊流水，供日报使用，不进入普通记忆链路。"""
         config = getattr(self, "_group_analysis_config", {}) or {}
         if not config.get("enabled", True) or message.message_type != "group":
@@ -3652,6 +3690,7 @@ class GroupChatBot:
         task = self._track_memory_task(_save())
         self._group_analysis_write_tasks.add(task)
         task.add_done_callback(self._group_analysis_write_tasks.discard)
+        return task
 
     def _store_group_analysis_bot_message(self, session_id: str, content: str) -> None:
         """保存 Bot 群消息到日报流水，但不把 Bot 计入群友统计。"""
@@ -5798,19 +5837,14 @@ class GroupChatBot:
                 half_life_days=self.memory_half_life_days,
                 similarity_weight=self.memory_similarity_weight,
                 decay_presets=self.memory_decay_presets,
+                retrieval_timeout=getattr(self, "memory_retrieval_timeout", 5.0),
+                min_similarity=getattr(self, "memory_min_similarity", 0.2),
+                min_rerank_score=getattr(self, "memory_min_rerank_score", 0.1),
             )
         except Exception as e:
             logger.error(f"语义检索失败：{e}")
 
-        if not memories:
-            # 兜底只取该会话最近的消息，不按重要性拿一条无关的旧画像/旧事实。
-            try:
-                memories = await self.memory_storage.retrieve_session_recent(
-                    session_id, limit=limit, memory_type="episodic"
-                )
-            except Exception as e:
-                logger.error(f"读取相关记忆失败：{e}")
-                memories = []
+        # 无相关结果时允许空召回；最近对话已有独立窗口，不能再用任意旧消息补位。
 
         # 排除当前消息自己（若已落库且被召回）：通过 metadata.message_id 匹配
         if exclude_id:
@@ -6112,9 +6146,34 @@ class GroupChatBot:
             logger.error(f"记忆衰减失败：{e}")
 
     async def stop(self) -> None:
-        """停止 Bot"""
+        """多个关闭入口共享一次清理，避免重复断连/关闭数据库。"""
+        guard = getattr(self, "_stop_guard", None)
+        if guard is None:
+            guard = self._stop_guard = threading.Lock()
+        with guard:
+            task = getattr(self, "_stop_task", None)
+            if task is None:
+                task = self._stop_task = asyncio.create_task(self._stop_impl())
+        if task.done():
+            task.result()
+        elif task.get_loop() is asyncio.get_running_loop():
+            await asyncio.shield(task)
+        else:
+            async def wait_for_stop():
+                await asyncio.shield(task)
+            future = asyncio.run_coroutine_threadsafe(wait_for_stop(), task.get_loop())
+            await asyncio.wrap_future(future)
+
+    async def _stop_impl(self) -> None:
+        """停止 Bot 并释放资源。"""
         logger.info("正在停止爱丽丝...")
         self._running = False
+        # 先停止接收入站消息，再排空后台写入，避免清理期间产生新任务。
+        if self.qq_adapter:
+            try:
+                await self.qq_adapter.disconnect()
+            except Exception as exc:
+                logger.warning("QQ 断连失败，继续释放存储：%s", exc)
 
         current_loop = asyncio.get_running_loop()
 
@@ -6202,14 +6261,11 @@ class GroupChatBot:
         self._session_message_versions.clear()
         self._conversation_judge_batch_started_at.clear()
         self._rich_media_tasks.clear()
+        getattr(self, "_media_tasks_by_message", {}).clear()
         self._meme_collect_tasks.clear()
         self._digest_tasks.clear()
         self._group_analysis_tasks.clear()
         self._memory_tasks.clear()
-
-        # 断开 QQ 连接
-        if self.qq_adapter:
-            await self.qq_adapter.disconnect()
 
         # 关闭嵌入服务连接
         try:
@@ -6452,6 +6508,9 @@ class GroupChatBot:
                 "share_across_sessions": False,
                 "db_path": "data/memory.db",
                 "retrieval_top_k": 5,
+                "retrieval_timeout_seconds": 5.0,
+                "retrieval_min_similarity": 0.2,
+                "retrieval_min_rerank_score": 0.1,
                 "half_life_days": 30,
                 "similarity_weight": 0.85,
                 "digest": {
