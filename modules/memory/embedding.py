@@ -8,6 +8,7 @@
 """
 import asyncio
 import logging
+import math
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -96,7 +97,7 @@ class EmbeddingRerankService:
                 self._embed_dim = len(vecs[0])
             return vecs
         except Exception as e:
-            logger.error(f"生成向量失败：{e}")
+            logger.error("生成向量失败（%s）：%s", type(e).__name__, e)
             return None
 
     async def embed_many(self, texts: list[str]) -> Optional[list[list[float]]]:
@@ -116,7 +117,14 @@ class EmbeddingRerankService:
     # ---------- 重排 ----------
 
     async def rerank(self, query: str, documents: list[str], top_n: int = 5) -> Optional[list[int]]:
-        """重排文档，返回相关性降序的文档索引；失败返回 None"""
+        """重排文档，保留旧的仅返回索引接口。"""
+        results = await self.rerank_with_scores(query, documents, top_n)
+        return None if results is None else [index for index, _ in results]
+
+    async def rerank_with_scores(
+        self, query: str, documents: list[str], top_n: int = 5,
+    ) -> Optional[list[tuple[int, Optional[float]]]]:
+        """返回索引及真实相关度；旧端点未提供分数时保留 None，不以排名冒充分数。"""
         if not self.enabled or not documents:
             return None
         try:
@@ -143,15 +151,25 @@ class EmbeddingRerankService:
                     return None
                 data = await resp.json()
 
-            results = data.get("results", [])
-            if not results:
-                return []
-            if "index" in results[0]:
-                # 按 relevance_score 降序（接口通常已排好序，这里兜底）
-                if "relevance_score" in results[0]:
-                    results = sorted(results, key=lambda r: r["relevance_score"], reverse=True)
-                return [r["index"] for r in results]
-            return [r.get("index", i) for i, r in enumerate(results)]
+            ranked = []
+            for position, row in enumerate(data.get("results", [])):
+                if not isinstance(row, dict):
+                    continue
+                index = row.get("index", position)
+                if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(documents):
+                    continue
+                score = row.get("relevance_score")
+                if score is not None:
+                    try:
+                        score = float(score)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(score):
+                        continue
+                ranked.append((index, score))
+            if ranked and all(score is not None for _, score in ranked):
+                ranked.sort(key=lambda item: item[1], reverse=True)
+            return ranked
         except Exception as e:
-            logger.error(f"重排失败：{e}")
+            logger.error("重排失败（%s）：%s", type(e).__name__, e)
             return None
