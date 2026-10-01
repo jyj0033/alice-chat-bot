@@ -1505,6 +1505,28 @@ class MemoryStorage:
         return int(cursor.lastrowid)
 
     @_db_locked
+    def update_group_analysis_message_content(
+        self, session_id: str, message_id: str, content: str,
+    ) -> bool:
+        """识图完成后只回填同群同消息的归档正文，保留作者、时间和其他记忆。"""
+        session_id = str(session_id or "").strip()
+        message_id = str(message_id or "").strip()
+        if not session_id or not message_id:
+            return False
+        cursor = self.conn.execute(
+            """
+            UPDATE memories SET content = ?
+            WHERE memory_type = 'group_analysis'
+              AND source_session = ?
+              AND json_valid(metadata)
+              AND CAST(json_extract(metadata, '$.message_id') AS TEXT) = ?
+            """,
+            (content, session_id, message_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    @_db_locked
     def get_group_analysis_messages(
         self,
         session: str,
@@ -2816,7 +2838,6 @@ class AsyncMemoryStorage:
 
     def __init__(self, storage: MemoryStorage):
         self._storage = storage
-        self._embed_lock = asyncio.Lock()
 
     async def store(self, memory: Memory) -> int:
         """异步存储，并在服务可用时生成嵌入向量"""
@@ -2885,6 +2906,15 @@ class AsyncMemoryStorage:
         """异步保存群分析专用消息，不生成嵌入向量。"""
         return await asyncio.to_thread(
             self._storage.store_group_analysis_message, memory
+        )
+
+    async def update_group_analysis_message_content(
+        self, session_id: str, message_id: str, content: str,
+    ) -> bool:
+        """异步回填已落盘的群分析消息正文。"""
+        return await asyncio.to_thread(
+            self._storage.update_group_analysis_message_content,
+            session_id, message_id, content,
         )
 
     async def get_group_analysis_messages(
@@ -3102,29 +3132,72 @@ class AsyncMemoryStorage:
         decay_presets: Optional[dict] = None,
         memory_types: Optional[list[str]] = None,
         strict_session: bool = False,
+        *,
+        retrieval_timeout: float = 5.0,
+        min_similarity: float = 0.2,
+        min_rerank_score: float = 0.1,
     ) -> list[Memory]:
-        """两阶段语义检索：
-        1. 有嵌入服务：向量召回 top-30 → 重排 → top-N
-        2. 否则回退 TF-IDF
-        """
-        service = self._storage._embedding_service
-        if service and service.enabled:
-            try:
-                result = await self._vector_search(
-                    query, session, limit, top_k_candidates,
-                    half_life_days, similarity_weight, decay_presets,
-                    memory_types, strict_session,
-                )
-                if result is not None:
-                    return result
-            except Exception as e:
-                logger.error(f"向量检索失败，回退 TF-IDF：{e}")
-
-        return await asyncio.to_thread(
-            self._storage.semantic_search, query, session, limit,
-            top_k_candidates, half_life_days, similarity_weight, decay_presets,
+        """在同一个短预算内检索；向量失败时使用并行准备的词法结果。"""
+        if limit <= 0:
+            return []
+        budget = self._retrieval_number(retrieval_timeout, 5.0, minimum=0.01)
+        min_similarity = self._retrieval_number(min_similarity, 0.2, maximum=1.0)
+        min_rerank_score = self._retrieval_number(min_rerank_score, 0.1, maximum=1.0)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + budget
+        # 词法回退不等远端超时才开始，也不创建跨 loop 的共享任务或锁。
+        lexical_task = asyncio.create_task(asyncio.to_thread(
+            self._storage.semantic_search, query, session,
+            max(limit, self.VECTOR_RECALL_K), top_k_candidates,
+            half_life_days, similarity_weight, decay_presets,
             memory_types, strict_session,
-        )
+        ))
+        try:
+            service = self._storage._embedding_service
+            if service and service.enabled:
+                try:
+                    result = await asyncio.wait_for(
+                        self._vector_search(
+                            query, session, limit, top_k_candidates,
+                            half_life_days, similarity_weight, decay_presets,
+                            memory_types, strict_session,
+                            min_similarity=min_similarity,
+                            min_rerank_score=min_rerank_score,
+                            lexical_task=lexical_task,
+                        ),
+                        timeout=max(0.0, deadline - loop.time()),
+                    )
+                    if result is not None:
+                        return result
+                except asyncio.TimeoutError:
+                    logger.warning("记忆检索超过 %.2fs 预算，回退已完成的词法结果", budget)
+                except Exception as exc:
+                    logger.warning("向量检索失败（%s），回退词法检索：%s", type(exc).__name__, exc)
+
+            if lexical_task.done():
+                return lexical_task.result()[:limit]
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return []
+            return (await asyncio.wait_for(asyncio.shield(lexical_task), remaining))[:limit]
+        except asyncio.TimeoutError:
+            logger.warning("词法检索超过 %.2fs 预算，本轮不注入旧记忆", budget)
+            return []
+        finally:
+            if not lexical_task.done():
+                lexical_task.cancel()
+            await asyncio.gather(lexical_task, return_exceptions=True)
+
+    @staticmethod
+    def _retrieval_number(value, default: float, *, minimum: float = 0.0, maximum=None) -> float:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(value):
+            return default
+        value = max(minimum, value)
+        return min(maximum, value) if maximum is not None else value
 
     async def _vector_search(
         self,
@@ -3137,152 +3210,136 @@ class AsyncMemoryStorage:
         decay_presets: Optional[dict],
         memory_types: Optional[list[str]] = None,
         strict_session: bool = False,
+        *,
+        min_similarity: float = 0.2,
+        min_rerank_score: float = 0.1,
+        lexical_task: Optional[asyncio.Task] = None,
     ) -> Optional[list[Memory]]:
-        """向量召回 + 重排。任一环节失败返回 None（调用方回退 TF-IDF）"""
+        """只使用已有向量召回；缺向量条目仍可通过词法召回，不现场补齐。"""
         service = self._storage._embedding_service
         if not service or not service.enabled:
             return None
-        try:
-            similarity_weight = min(1.0, max(0.0, float(similarity_weight)))
-        except (TypeError, ValueError):
-            similarity_weight = 0.85
-
+        similarity_weight = self._retrieval_number(similarity_weight, 0.85, maximum=1.0)
         candidates = await asyncio.to_thread(
             self._storage._get_candidates,
-            session,
-            top_k_candidates,
-            memory_types,
-            strict_session,
+            session, top_k_candidates, memory_types, strict_session,
         )
         if not candidates:
             return []
 
-        # 1. 查询向量
+        candidates, vecs = await asyncio.to_thread(self._get_existing_vectors, candidates)
+        if not candidates:
+            return None
         query_vec = await service.embed([query])
-        if not query_vec:
+        if not query_vec or not query_vec[0]:
             return None
 
-        # 2. 文档向量（缓存优先，缺的批量补齐并持久化）
-        vecs = await self._ensure_vectors(candidates)
-        if vecs is None:
-            return None
-
-        # 3. 余弦相似度召回 top_k
         import numpy as np
-        q = np.array(query_vec[0], dtype=np.float32)
-        M = np.array(vecs, dtype=np.float32)
+        q = np.asarray(query_vec[0], dtype=np.float32)
+        if q.ndim != 1 or not np.all(np.isfinite(q)):
+            return None
+        compatible = [
+            (memory, vector) for memory, vector in zip(candidates, vecs)
+            if len(vector) == len(q)
+        ]
+        if not compatible:
+            return None
+        candidates = [memory for memory, _ in compatible]
+        M = np.asarray([vector for _, vector in compatible], dtype=np.float32)
         qn = np.linalg.norm(q)
         if qn == 0:
             return None
         norms = np.linalg.norm(M, axis=1)
         denom = norms * qn
         sims = np.zeros(len(candidates))
-        mask = denom > 1e-9
+        mask = (denom > 1e-9) & np.all(np.isfinite(M), axis=1)
         sims[mask] = np.sum(M[mask] * q, axis=1) / denom[mask]
+        sims_by_id = {memory.id: float(sims[i]) for i, memory in enumerate(candidates)}
+        order = sorted(range(len(candidates)), key=lambda i: -sims[i])
+        recalled_by_id = {
+            candidates[i].id: candidates[i]
+            for i in order[:self.VECTOR_RECALL_K]
+            if mask[i] and sims[i] >= min_similarity
+        }
 
-        # 先按相似度取候选；跨会话共享开启时也不能让无关的本会话内容
-        # 抢走真正相关的其他会话记忆。
-        order = list(range(len(candidates)))
-        order.sort(key=lambda i: -sims[i])
-        vec_recalled = [candidates[i] for i in order[:self.VECTOR_RECALL_K]]
-
-        # 3.5 词法召回（TF-IDF）与向量召回合并：人名/游戏黑话等专有名词靠字面匹配兜底
-        recalled_by_id = {m.id: m for m in vec_recalled}
+        # 人名、游戏黑话可由词法命中补充；它本身有最低匹配门槛。
         try:
-            lexical = await asyncio.to_thread(
-                self._storage.semantic_search, query, session,
-                limit=self.VECTOR_RECALL_K, top_k_candidates=top_k_candidates,
-                half_life_days=half_life_days, similarity_weight=similarity_weight,
-                decay_presets=decay_presets, memory_types=memory_types,
-                strict_session=strict_session,
-            )
-            for m in lexical:
-                if m.id not in recalled_by_id:
-                    recalled_by_id[m.id] = m
-        except Exception as e:
-            logger.debug(f"词法召回失败，已跳过：{e}")
-        recalled = list(recalled_by_id.values())
-
-        # 4. 重排
-        docs = [m.content for m in recalled]
-        reranked_idx = await service.rerank(query, docs, top_n=limit)
-        if reranked_idx is not None:
-            ranked = [recalled[i] for i in reranked_idx if 0 <= i < len(recalled)]
-            # 重排服务只返回顺序，不一定返回分数；用排名近似相关度，
-            # 再混入有效重要性，让 half_life/similarity_weight 在嵌入模式下
-            # 仍然生效，避免冷门旧记忆永远压过新事实。
-            now = datetime.now()
-            denom = max(1, len(ranked) - 1)
-            ranked = [
-                memory for _, memory in sorted(
-                    enumerate(ranked),
-                    key=lambda item: (
-                        similarity_weight * (1.0 - item[0] / denom)
-                        + (1.0 - similarity_weight)
-                        * self._storage._effective_importance(
-                            item[1], now, half_life_days, presets=decay_presets
-                        )
-                    ),
-                    reverse=True,
-                )
-            ]
-            return ranked[:limit]
-
-        # 重排失败：退回向量相似度排序
-        now = datetime.now()
-        weight = similarity_weight
-        ordered = sorted(
-            recalled,
-            key=lambda m: (
-                weight * sims[candidates.index(m)]
-                + (1.0 - weight)
-                * self._storage._effective_importance(
-                    m, now, half_life_days, presets=decay_presets
-                )
-            ),
-            reverse=True,
-        )
-        return ordered[:limit]
-
-    async def _ensure_vectors(self, memories: list) -> Optional[list]:
-        """确保候选记忆都有向量：缓存/DB 优先，缺失的批量嵌入并持久化"""
-        service = self._storage._embedding_service
-        storage = self._storage
-
-        vecs = []
-        missing = []
-        missing_idx = []
-        for i, m in enumerate(memories):
-            v = storage._get_embed(m.id)
-            if v is None:
-                v = await asyncio.to_thread(storage.get_embedding, m.id)
-                if v is not None:
-                    storage._cache_embed(m.id, v)
-            if v is not None:
-                vecs.append(v)
+            if lexical_task is not None:
+                lexical = await asyncio.shield(lexical_task)
             else:
-                vecs.append(None)
-                missing.append(m)
-                missing_idx.append(i)
+                lexical = await asyncio.to_thread(
+                    self._storage.semantic_search, query, session,
+                    max(limit, self.VECTOR_RECALL_K), top_k_candidates,
+                    half_life_days, similarity_weight, decay_presets,
+                    memory_types, strict_session,
+                )
+            for memory in lexical:
+                recalled_by_id.setdefault(memory.id, memory)
+        except Exception as exc:
+            logger.debug("词法召回失败，已跳过：%s", exc)
+        recalled = list(recalled_by_id.values())
+        if not recalled:
+            return []
 
-        if missing:
-            # 批量嵌入缺失部分（限流：分批）
-            async with self._embed_lock:
-                texts = [m.content for m in missing]
-                new_vecs = await service.embed_many(texts)
-                if new_vecs is None:
-                    return None
-                for m, v in zip(missing, new_vecs):
-                    if v:
-                        await asyncio.to_thread(storage.update_embedding, m.id, v)
-            # 填回
-            for k, i in enumerate(missing_idx):
-                v = storage._get_embed(missing[k].id)
-                vecs[i] = v
+        docs = [memory.content for memory in recalled]
+        scored_rerank = getattr(service, "rerank_with_scores", None)
+        if callable(scored_rerank):
+            reranked = await scored_rerank(query, docs, top_n=limit)
+        else:
+            # 兼容外部旧服务及测试替身：没有真实分数时，不把名次当作相关度。
+            indices = await service.rerank(query, docs, top_n=limit)
+            reranked = None if indices is None else [(index, None) for index in indices]
+        now = datetime.now()
 
-        if any(v is None for v in vecs):
-            return None
-        return vecs
+        def weighted(memory, relevance):
+            return (
+                similarity_weight * relevance
+                + (1.0 - similarity_weight) * self._storage._effective_importance(
+                    memory, now, half_life_days, presets=decay_presets,
+                )
+            )
+
+        if reranked is not None:
+            ranked = []
+            seen = set()
+            for index, score in reranked:
+                if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(recalled):
+                    continue
+                memory = recalled[index]
+                if memory.id in seen:
+                    continue
+                seen.add(memory.id)
+                if score is not None:
+                    if not math.isfinite(score) or score < min_rerank_score:
+                        continue
+                    relevance = min(1.0, max(0.0, score))
+                else:
+                    relevance = max(0.0, sims_by_id.get(memory.id, 0.0))
+                ranked.append((weighted(memory, relevance), memory))
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            return [memory for _, memory in ranked[:limit]]
+
+        # 重排不可用时仍只在通过向量/词法门槛的候选中排序。
+        return sorted(
+            recalled,
+            key=lambda memory: weighted(memory, max(0.0, sims_by_id.get(memory.id, 0.0))),
+            reverse=True,
+        )[:limit]
+
+    def _get_existing_vectors(self, memories: list[Memory]) -> tuple[list[Memory], list[list]]:
+        """读取缓存和已落盘向量；生成向量仍由 store/upsert 的写入路径负责。"""
+        candidates = []
+        vecs = []
+        for memory in memories:
+            vector = self._storage._get_embed(memory.id)
+            if vector is None:
+                vector = self._storage.get_embedding(memory.id)
+                if vector is not None:
+                    self._storage._cache_embed(memory.id, vector)
+            if vector:
+                candidates.append(memory)
+                vecs.append(vector)
+        return candidates, vecs
 
     async def apply_time_decay(
         self, half_life_days: float = 30.0, min_importance: float = 0.1, max_age_days: float = 180.0,
