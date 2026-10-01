@@ -392,8 +392,8 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.evidence.get("continuity_veto"))
         self.assertEqual(result.reference_message_id, "m3")
 
-    async def test_judged_other_target_also_vetoes_false_bot(self):
-        """即使没有 reply 段，上一句动态判断已是 other 也要否决。"""
+    async def test_judged_other_target_is_not_reused_as_hard_evidence(self):
+        """模型自己的旧推断不能不断续期、覆盖本轮的语义判断。"""
         provider = _FakeProvider(
             '{"target":"bot","intent":"answer","should_reply":true,'
             '"confidence":0.9,"reason":"在问Alice"}'
@@ -421,9 +421,9 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
 
         result = await judge.judge(current, history)
 
-        self.assertFalse(result.should_reply)
-        self.assertNotEqual(result.target, "bot")
-        self.assertTrue(result.evidence.get("continuity_veto"))
+        self.assertTrue(result.should_reply)
+        self.assertEqual(result.target, "bot")
+        self.assertFalse(result.evidence.get("continuity_veto"))
 
     async def test_explicit_bot_mention_is_not_vetoed(self):
         """当前句真的 @ 了 Bot，即使上一句在对别人说，也允许回答。"""
