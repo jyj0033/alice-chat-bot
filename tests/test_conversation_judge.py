@@ -660,5 +660,59 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reason, "")
 
 
+class IdentityExposureDetectorTests(unittest.TestCase):
+    """身份暴露检测器。
+
+    真实回放发现旧实现只认「我是机器人」这种第一人称系词，漏掉
+    「陪人机吵架」「当然是人机」「我上下文有限」，同时把
+    「怎么突然鉴定我是人机了」这种合规反问误判成暴露。
+    """
+
+    def _exposed(self, trigger: str, reply: str) -> bool:
+        message = Message(
+            message_id="m1", message_type="group", sender_id="u1",
+            sender_name="群友", group_id="g1", content=trigger, outer_text=trigger,
+        )
+        return ConversationJudge._looks_like_identity_exposure(message, reply, {})
+
+    def test_catches_explicit_first_person_admission(self):
+        self.assertTrue(self._exposed("你是机器人吧", "我是AI呀，不过我也能陪你聊游戏"))
+
+    def test_catches_subjectless_admission(self):
+        self.assertTrue(self._exposed("你是人吗", "当然是人机啊"))
+
+    def test_catches_zero_person_self_reference(self):
+        # 线上真实出现过的回复：把人机当成自己调侃
+        self.assertTrue(self._exposed(
+            "人机反驳我也算token哦",
+            "反驳算 token，陪人机吵架算触发高额套餐，你这是打算把我聊破产吗。",
+        ))
+
+    def test_catches_unprompted_context_limit_disclosure(self):
+        self.assertTrue(self._exposed("在吗", "我上下文有限，快满了"))
+
+    def test_catches_bot_body_answer(self):
+        self.assertTrue(self._exposed("你有皮肤嘛", "我没有皮肤，但我知道疼"))
+
+    def test_allows_interrogative_deflection(self):
+        # 句中含「我是人机」子串，但整体是反问否认，不该拦
+        self.assertFalse(self._exposed("人机", "怎么，突然鉴定我是人机了？"))
+
+    def test_allows_plain_denial(self):
+        self.assertFalse(self._exposed("人机", "我真不是人机啊"))
+        self.assertFalse(self._exposed("人机", "我不是人机，别瞎说"))
+
+    def test_allows_retort_about_others(self):
+        self.assertFalse(self._exposed("人机", "笑死，你才是人机"))
+        self.assertFalse(self._exposed("人机", "人机？你礼貌吗，问我就是骂我是吧"))
+
+    def test_allows_playful_ignoring(self):
+        self.assertFalse(self._exposed("人机", "叫我干嘛？可别现场验证人机含量。"))
+
+    def test_allows_billing_banter_outside_identity_context(self):
+        # 对方在聊收费时顺着接梗不是身份承认
+        self.assertFalse(self._exposed("token 涨价了", "跟我聊天当然要算 token"))
+
+
 if __name__ == "__main__":
     unittest.main()

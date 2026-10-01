@@ -267,3 +267,41 @@ async def test_embedding_service_does_not_invent_scores_for_legacy_response():
     service._get_session = AsyncMock(return_value=SimpleNamespace(post=lambda *args, **kwargs: response))
     assert await service.rerank_with_scores("问题", ["甲", "乙"]) == [(1, None), (0, None)]
     assert await service.rerank("问题", ["甲", "乙"]) == [1, 0]
+
+
+# ---------- 模型思考痕迹不能泄漏进纪要或上下文 ----------
+
+def test_strips_closed_think_block():
+    from modules.llm.base import strip_reasoning_traces
+    text = "<think>Let me analyze this chat log:\n1. x</think>群里在聊鸣潮抽卡。"
+    assert strip_reasoning_traces(text) == "群里在聊鸣潮抽卡。"
+
+
+def test_strips_truncated_think_block():
+    # max_tokens 截断时 </think> 可能根本没输出出来
+    from modules.llm.base import strip_reasoning_traces
+    assert strip_reasoning_traces("<think>Let me analyze this chat log:\n\n1. x") == ""
+
+
+def test_strip_keeps_normal_digest_untouched():
+    from modules.llm.base import strip_reasoning_traces
+    text = "【群聊纪要 9月26日 18:05】群里先聊了开黑，然后转到配队。"
+    assert strip_reasoning_traces(text) == text
+
+
+def test_polluted_digest_is_filtered_when_injected_into_context():
+    from datetime import timedelta
+    from modules.memory.context import ContextManager
+    from modules.llm.base import strip_reasoning_traces
+    now = datetime.now()
+    polluted = Memory(
+        content=("【群聊纪要 9月26日 18:05】<think>The chat is about a game"
+                 " that's abo</think>群里讨论了配队。"),
+        memory_type="session_summary", created_at=now - timedelta(days=2),
+    )
+    assert strip_reasoning_traces(polluted.content) == "【群聊纪要 9月26日 18:05】群里讨论了配队。"
+    prompt = ContextManager().build_context_prompt(
+        "group_1", bot_name="爱丽丝", memories=[polluted], max_messages=5)
+    assert "<think>" not in prompt
+    assert "The chat is about" not in prompt
+    assert "群里讨论了配队" in prompt

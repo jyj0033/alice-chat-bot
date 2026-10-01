@@ -12,7 +12,7 @@ import re
 import time
 from typing import Optional, Dict, Any
 
-from modules.llm.base import ChatMessage, ChatRequest, ChatResponse
+from modules.llm.base import ChatMessage, ChatRequest, ChatResponse, strip_reasoning_traces
 from modules.personality.speaking_style import SpeakingStyleManager, create_default_style
 from modules.personality.emotional_state import EmotionalState
 
@@ -2690,13 +2690,7 @@ class ReplyGenerator:
 
     def _clean_thinking_process(self, text: str) -> str:
         """清理思考过程（如 DeepSeek 的 <think>...</think>）"""
-        # 移除 <think>...</think> 标签
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-        # 移除 (思考中...)、【思考】等模式
-        text = re.sub(r'【思考】.*?(?=【|$)', '', text, flags=re.DOTALL)
-        text = re.sub(r'\(思考中[^)]*\)', '', text)
-        # 移除 "让我想想" 等思考前置语
-        text = re.sub(r'^(让我想想|等我想想|等等我)[，,]', '', text)
+        text = strip_reasoning_traces(text)
         text = self._strip_model_protocol_tokens(text)
         # 清理多余空白
         text = re.sub(r'\n{3,}', '\n\n', text)

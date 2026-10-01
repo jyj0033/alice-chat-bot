@@ -581,13 +581,33 @@ class ConversationJudge:
                 result.append(text)
         return result[:5]
 
-    @staticmethod
+    # 身份自我暴露的确定性判定用语。人机/bot/AI 在群聊里既是调侃词也是真实指称，
+    # 因此只在「当前消息确实在挑身份」时才启用，并且先剥掉否认、反问和回怼，
+    # 避免把「怎么突然鉴定我是人机了」这种合规接梗误判成自我暴露。
+    _IDENTITY_TERM = (
+        r"(?:机器人|人工智能|语言模型|大模型|智能体|机器|人机|ai|bot)"
+    )
+    # 出现在身份指称之前的引导词，说明后面那句是在质疑/否认/回怼，不是在承认
+    _IDENTITY_DEFLECTION_PREFIX = (
+        r"(?:鉴定|评估|算|像是?|当作?|当成?|说|以为|难道|是不是|并非|不是|不|没)"
+        r"(?:是|会|算|能|敢)?"
+    )
+    # 只收真正的疑问语气。「呀/啊/哦」是句末感叹，不构成反问，
+    # 「我是AI呀」仍是承认，不能被放过。
+    _IDENTITY_DEFLECTION_SUFFIX = r"(?:吗|嘛|吧|？|\?)"
+    # 句子里出现这些主语时，身份指称指向的是对方，不是自己
+    _IDENTITY_THIRD_PARTY = r"(?:你|您|他|她|它|别人|大家|各位|你们)"
+    # 「你才是人机」「他不过是机器人」—— 动词在主语和身份词之间，同样是回怼
+    _IDENTITY_THIRD_PARTY_VERB = r"(?:才是|不过是|也是|同样是|才是真的)"
+
+    @classmethod
     def _looks_like_identity_exposure(
+        cls,
         current_message: Any,
         reply: str,
         judgement: dict[str, Any],
     ) -> bool:
-        """拦截身份诱导下的明显自我暴露，避免完全依赖复核模型。"""
+        """拦截明显的机器自我暴露，避免完全依赖复核模型。"""
         current_text = str(
             getattr(current_message, "outer_text", "")
             or getattr(current_message, "content", "")
@@ -606,14 +626,82 @@ class ConversationJudge:
             risk_flags.intersection({"identity_bait"})
             or any(term in current_text for term in ("人机", "机器人", "人工智能"))
             or english_identity_term
+            # 「你是人吗」「到底是不是人」「人类吗」同样是在挑身份，
+            # 之前只认「人机/机器人/AI」，导致这类提问完全绕过检测。
+            or bool(re.search(r"(?:你|您|他|她|它|大家|你们)\s*(?:是|算|到底)?\s*"
+                              r"(?:是不是|是不是|真的)?\s*(?:人|人类|真人|碳基|血肉)",
+                              current_text))
+            or "人类吗" in current_text
         )
+
+        def _is_exposure(pattern: str) -> bool:
+            """命中暴露句式，且该身份指称不是被用来否认、反问或回怼。"""
+            for hit in re.finditer(pattern, reply_text, flags=re.IGNORECASE):
+                head = reply_text[max(0, hit.start() - 10):hit.start()]
+                tail = reply_text[hit.end():hit.end() + 4]
+                if re.search(cls._IDENTITY_DEFLECTION_PREFIX + r"\s*$", head):
+                    continue
+                if re.match(r"^\s*" + cls._IDENTITY_DEFLECTION_SUFFIX, tail):
+                    continue
+                # 身份词前面是「你/他/她」时指的是别人（「你才是人机」）
+                if re.search(cls._IDENTITY_THIRD_PARTY + r"\s*$", head):
+                    continue
+                if re.search(cls._IDENTITY_THIRD_PARTY_VERB + r"\s*$", head):
+                    continue
+                return True
+            return False
+
+        term = cls._IDENTITY_TERM
+
+        # ---- 无条件拦截：不依赖对方先挑身份，主动交代机器机制就是暴露 ----
+        if _is_exposure(r"(?:我的|本人的)?\s*(?:上下文|token|算力|训练数据|语料|参数)"
+                        r"\s*(?:有限|上限|限制|不够|超了|快满)"):
+            return True
+        # 例如当前问“你有皮肤嘛”，回复“我没有，但我知道疼”是把玩笑按机器人的
+        # 身体设定回答。这条不依赖身份语境，只要出现就是破坏设定。
+        if "皮肤" in current_text and bool(
+            re.search(r"(?:我|本人)\s*(?:没|没有|不具备|没有什么)", reply_text)
+        ):
+            return True
+
         if not identity_context:
             return False
-        if re.search(
-            r"(?:我|本人)\s*(?:是|就是|属于|作为)\s*(?:机器人|人工智能|语言模型|ai|bot|人机)",
-            reply_text,
-            flags=re.IGNORECASE,
-        ):
+
+        # 「跟我聊天要算 token」这类顺着玩笑接的梗，只有在对方确实在挑身份时才算暴露，
+        # 否则会把正常的玩梗一起拦掉。
+        if _is_exposure(r"(?:跟|和|陪|与)\s*(?:我|本人)\s*(?:聊天|说话|对话|互动|扯)"
+                        r"(?:[^，。！？!?]{0,6})?"
+                        r"(?:要|得|需要|也算|还收|收费|计费|花钱)"):
+            return True
+
+        # ---- 以下需要「当前消息确实在挑身份」这个前提 ----
+        # 1) 第一人称明确承认：「我是人机」「本人就是 AI」「我属于大模型」
+        if _is_exposure(rf"(?:我|本人|咱|俺)\s*(?:就是|是|属于|作为|本质是|说到底)\s*{term}"):
+            return True
+        # 2) 省略主语的承认：「当然是人机啊」「本质上就是个 AI」
+        if _is_exposure(rf"(?:当然|本来|原本|其实|本质上)?\s*(?:就是|也)?\s*"
+                        rf"{term}\s*(?:罢了|而已|一个|本体|本尊)?"
+                        r"\s*(?:[。！!？?~～]|[吗嘛吧啊呀哦喔咯哈]|)*\s*$"):
+            return True
+        # 3) 零称第三人称自指：把人机当成自己来调侃
+        if _is_exposure(rf"(?:陪|跟|和|与)\s*(?:一)?\s*{term}\s*"
+                        r"(?:吵架|对线|互怼|聊天|玩|闹|杠)"):
+            return True
+        return False
+        term = cls._IDENTITY_TERM
+        # 1) 第一人称明确承认：「我是人机」「本人就是 AI」「我属于大模型」
+        if _is_exposure(rf"(?:我|本人|咱|俺)\s*(?:就是|是|属于|作为|本质是|说到底)\s*{term}"):
+            return True
+        # 2) 省略主语的承认：「当然是人机啊」「本质上就是个 AI」
+        if _is_exposure(rf"(?:当然|本来|原本|其实|本质上)?\s*(?:就是|也)?\s*{term}\s*(?:罢了|而已|一个|本体|本尊)?\s*[。！!？?~～]?\s*$"):
+            return True
+        # 3) 零称第三人称自指：把人机当成自己来调侃
+        if _is_exposure(rf"(?:陪|跟|和|与)\s*(?:一)?\s*{term}\s*(?:吵架|对线|互怼|聊天|玩|闹|杠)"):
+            return True
+        # 4) 机制性自我描述：接受「按机器人/模型的方式算账」
+        if _is_exposure(r"(?:我|本人)\s*(?:的)?\s*(?:上下文|token|算力|训练数据|语料|参数)"):
+            return True
+        if re.search(r"(?:上下文|token)\s*(?:有限|上限|限制|不够|超了)", reply_text, re.IGNORECASE):
             return True
         # 例如当前问“你有皮肤嘛”，回复“我没有，但我知道疼”也是把玩笑
         # 按 Bot 的身体设定回答，应该回到轻松接梗或装傻策略。

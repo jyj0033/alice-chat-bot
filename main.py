@@ -4289,7 +4289,7 @@ class GroupChatBot:
             if not provider:
                 return
 
-            from modules.llm.base import ChatRequest
+            from modules.llm.base import ChatRequest, strip_reasoning_traces
             req = ChatRequest(
                 temperature=0.4,
                 max_tokens=self._digest_config.get("max_tokens", 200),
@@ -4303,7 +4303,10 @@ class GroupChatBot:
             req.add_user(f"【群聊记录】\n{chat_text}")
 
             resp = await provider.chat(req)
-            summary = (resp.content or "").strip()
+            # 纪要是长期记忆，会被反复注入后续上下文。开了 thinking 的端点
+            # 可能把 <think> 推理块一起带回来，存进去就等于把模型推理
+            # 当成「爱丽丝记得的事」，必须先剥掉。
+            summary = strip_reasoning_traces(resp.content)
             if not summary:
                 return
 

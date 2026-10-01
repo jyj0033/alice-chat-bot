@@ -6,8 +6,29 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, AsyncIterator, Any
 import logging
+import re
 
 logger = logging.getLogger(__name__)
+
+# 模型的思考过程痕迹。部分端点（尤其是开了 thinking 的）在正文里会带上
+# <think>…</think>，被存进纪要或注入上下文后会污染后续回复，
+# 也会把「另一个模型的推理」当成「爱丽丝记得的事」。
+_REASONING_PATTERNS = (
+    re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL),
+    re.compile(r"<think>.*$", re.IGNORECASE | re.DOTALL),   # 思考块被 max_tokens 截断
+    re.compile(r"【思考】.*?(?=【|$)", re.DOTALL),
+    re.compile(r"\(思考中[^)]*\)"),
+    re.compile(r"^(?:让我想想|等我想想|等等我)[，,]", re.MULTILINE),
+)
+
+
+def strip_reasoning_traces(text: Any) -> str:
+    """去掉模型输出里的思考过程，只留下结论正文。"""
+    result = str(text or "")
+    for pattern in _REASONING_PATTERNS:
+        result = pattern.sub("", result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
 
 
 @dataclass

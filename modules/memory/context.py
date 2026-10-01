@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional, Deque
 
+from modules.llm.base import strip_reasoning_traces
+
 logger = logging.getLogger(__name__)
 
 _UNSEEN_MEDIA_RE = re.compile(
@@ -569,7 +571,9 @@ class ContextManager:
                     id_name[m.sender_id] = m.sender_name
 
             def _memory_line(item) -> str:
-                content = item.content
+                # 历史纪要是在加过滤之前写的，正文里可能带着 <think> 推理块。
+                # 注入上下文时再挡一次，避免旧数据继续污染回复。
+                content = strip_reasoning_traces(item.content)
                 meta = item.metadata or {}
                 sid = meta.get("sender_id")
                 if sid and sid in id_name:
