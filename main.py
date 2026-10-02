@@ -2368,12 +2368,14 @@ class GroupChatBot:
     async def _review_reply_with_context(
         judge, message, recent_messages, reply, *, direction,
         conversation_judgement=None, generation_context="",
+        media_claim_evidence=None,
     ):
         """正式判断器复用生成证据，旧版外部判断器只接收其支持的参数。"""
         kwargs = {"direction": direction}
         optional = {
             "conversation_judgement": conversation_judgement,
             "generation_context": generation_context,
+            "media_claim_evidence": media_claim_evidence,
         }
         try:
             parameters = inspect.signature(judge.review_reply).parameters
@@ -2397,18 +2399,117 @@ class GroupChatBot:
         direction: str,
         conversation_judgement: dict | None = None,
         generation_context: str = "",
+        media_claim_evidence=None,
     ) -> tuple[bool, str]:
         """重生成稿必须再通过一次质量复核；复核不可用时按未通过处理。"""
         review = await GroupChatBot._review_reply_with_context(
             judge, message, recent_messages, reply, direction=direction,
             conversation_judgement=conversation_judgement,
             generation_context=generation_context,
+            media_claim_evidence=media_claim_evidence,
         )
         if not review.available:
             return False, "重答复核不可用"
         if review.should_reply:
             return True, ""
         return False, str(review.reason or "重答仍未通过语义复核")
+
+    def _media_claim_evidence(
+        self, reply: str, current_content: str, recent_texts: list
+    ) -> dict | None:
+        """媒体没看清却冒出具体名词时，整理成给复核器核对的证据。
+
+        线上真实样本：收到「一张图，看不清画面」后回复「国庆在家吃鸳鸯锅，爽啊」
+        ——**鸳鸯锅**是编的，群友当场纠正说不是鸳鸯锅；另一条
+        「你那个108的早坏了，这臭表倒是不错」——**臭表**同样无据。
+
+        这是**软信号**，只作证据不作拦截：直接丢回复会误伤「顺着上文接话」，
+        真正该由复核器判断这个名词到底是不是在描述画面。
+        """
+        suspicious = self.reply_generator.introduces_unseen_content(
+            reply, current_content, recent_texts
+        )
+        if not suspicious:
+            return None
+        return {
+            "本轮消息里媒体没有看清": True,
+            "草稿中查不到出处的名词": suspicious,
+        }
+
+    @staticmethod
+    def _first_review_flags(review_evidence: dict | None) -> dict:
+        """把复核证据摊成各个「有问题」的布尔旗标。"""
+        evidence = review_evidence or {}
+        return {
+            "paraphrase_issue": bool(
+                evidence.get("is_paraphrase")
+                and not evidence.get("adds_information")
+            ),
+            "unsupported_issue": bool(evidence.get("unsupported_assumption")),
+            "clarification_issue": bool(evidence.get("needs_clarification")),
+            "incomplete_issue": bool(evidence.get("incomplete")),
+            "meta_commentary_issue": bool(evidence.get("meta_commentary")),
+            "off_topic_issue": evidence.get("on_topic") is False,
+            # 「切题」不等于「答了所问」：同一话题答的是另一件事时 on_topic 仍为 true。
+            # 缺字段按未发现问题处理 —— 复核器 prompt 是本次才加的，老响应不输出这一项，
+            # 不能因为新增检查项缺席就把所有正常回复判死。
+            "answers_wrong_question_issue": (
+                "answers_the_question" in evidence
+                and evidence.get("answers_the_question") is False
+            ),
+            "pragmatic_issue": bool(evidence.get("pragmatic_mismatch")),
+        }
+
+    @staticmethod
+    def _first_review_label(flags: dict, mismatch_types: set) -> str:
+        """给「需要重答」的草稿归一个人类可读的类目，只写日志。"""
+        if "identity_exposure" in mismatch_types:
+            return "暴露身份设定"
+        if "wrong_addressee" in mismatch_types:
+            return "称呼对象错位"
+        if flags.get("answers_wrong_question_issue"):
+            return "答的不是被问的那个问题"
+        if "literalized_banter" in mismatch_types:
+            return "把玩笑按字面理解"
+        if "tone_drift" in mismatch_types:
+            return "语气偏离"
+        for key, label in (
+            ("pragmatic_issue", "语用意图不匹配"),
+            ("paraphrase_issue", "语义复读"),
+            ("unsupported_issue", "把未确认信息当成事实"),
+            ("clarification_issue", "指代不清，需要澄清"),
+            ("incomplete_issue", "句子不完整"),
+            ("meta_commentary_issue", "元话语"),
+        ):
+            if flags.get(key):
+                return label
+        return "偏离当前话题"
+
+    @staticmethod
+    def _first_review_verdict(
+        review, review_evidence: dict | None
+    ) -> tuple[str, str, dict]:
+        """首轮草稿的复核裁决，返回 (verdict, 原因/类目, 旗标)。
+
+        verdict:
+          ``unavailable`` —— 复核器不可用。**不放行**：线上 20:15:29 上游返回 529，
+            整层复核失效，草稿「你那个108的早坏了，这臭表倒是不错」未经任何复核
+            就发到了群里。重答复核早就按「不可用即不通过」处理
+            （见 :meth:`_validate_retried_reply`），此前首轮却是
+            ``review.available and (...)`` —— 同一套代码两套策略。
+          ``retry``        —— 草稿有问题，要求重新生成。
+          ``pass``         —— 通过。
+        """
+        flags = GroupChatBot._first_review_flags(review_evidence)
+        if not review.available:
+            return "unavailable", str(review.reason or "上游异常"), flags
+        if not any(flags.values()):
+            return "pass", "", flags
+        raw = (review_evidence or {}).get("mismatch_types") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        label = GroupChatBot._first_review_label(flags, set(raw))
+        return "retry", label, flags
 
     async def _compose_and_send(self, message: Message, decision: dict) -> None:
         """慢路径：思考延迟 → 用最新上下文生成回复 → 发送"""
@@ -2758,6 +2859,12 @@ class GroupChatBot:
                 m.content for m in recent_context_for_review if not m.is_bot
             ]
             if judge and review_text.strip():
+                # 媒体没看清却冒出具体名词（菜名/型号/款式…）——这是**软信号**，
+                # 不在这里丢弃：直接拦会误伤「顺着上文接话」。把程序挑出的候选词
+                # 当成证据交给复核器，由它逐个判断是不是真的在描述画面。
+                media_claim_evidence = self._media_claim_evidence(
+                    review_text, effective_message.content, recent_texts
+                )
                 review = await self._review_reply_with_context(
                     judge,
                     effective_message,
@@ -2766,61 +2873,24 @@ class GroupChatBot:
                     direction=direction,
                     conversation_judgement=conversation_judgement,
                     generation_context=context_prompt,
+                    media_claim_evidence=media_claim_evidence,
                 )
                 review_evidence = review.evidence or {}
-                paraphrase_issue = bool(
-                    review_evidence.get("is_paraphrase")
-                    and not review_evidence.get("adds_information")
+                review_verdict, review_label, review_flags = (
+                    self._first_review_verdict(review, review_evidence)
                 )
-                unsupported_issue = bool(
-                    review_evidence.get("unsupported_assumption")
-                )
-                clarification_issue = bool(
-                    review_evidence.get("needs_clarification")
-                )
-                incomplete_issue = bool(review_evidence.get("incomplete"))
-                meta_commentary_issue = bool(
-                    review_evidence.get("meta_commentary")
-                )
-                off_topic_issue = review_evidence.get("on_topic") is False
-                pragmatic_issue = bool(
-                    review_evidence.get("pragmatic_mismatch")
-                )
-                if review.available and (
-                    paraphrase_issue
-                    or unsupported_issue
-                    or clarification_issue
-                    or incomplete_issue
-                    or meta_commentary_issue
-                    or off_topic_issue
-                    or pragmatic_issue
-                ):
-                    raw_mismatch_types = review_evidence.get("mismatch_types") or []
-                    if isinstance(raw_mismatch_types, str):
-                        raw_mismatch_types = [raw_mismatch_types]
-                    mismatch_types = set(raw_mismatch_types)
-                    if "identity_exposure" in mismatch_types:
-                        review_label = "暴露身份设定"
-                    elif "wrong_addressee" in mismatch_types:
-                        review_label = "称呼对象错位"
-                    elif "literalized_banter" in mismatch_types:
-                        review_label = "把玩笑按字面理解"
-                    elif "tone_drift" in mismatch_types:
-                        review_label = "语气偏离"
-                    elif pragmatic_issue:
-                        review_label = "语用意图不匹配"
-                    elif paraphrase_issue:
-                        review_label = "语义复读"
-                    elif unsupported_issue:
-                        review_label = "把未确认信息当成事实"
-                    elif clarification_issue:
-                        review_label = "指代不清，需要澄清"
-                    elif incomplete_issue:
-                        review_label = "句子不完整"
-                    elif meta_commentary_issue:
-                        review_label = "元话语"
-                    else:
-                        review_label = "偏离当前话题"
+                paraphrase_issue = review_flags["paraphrase_issue"]
+                if review_verdict == "unavailable":
+                    # 复核器挂掉时不放行本轮回复，宁可沉默。
+                    logger.info(
+                        "[语义复核] 复核不可用（%s），放弃本轮回复：%s",
+                        review_label,
+                        review_text[:40],
+                    )
+                    if direction == "to_bot":
+                        self.attention_manager.on_no_reply(group_id, message.sender_id)
+                    return
+                if review_verdict == "retry":
                     # 检查器给出的自然语言理由只写日志，不回灌给生成模型，
                     # 避免“先澄清/先整理”被模型当作要发给群友的话。
                     review_reason = str(review.reason or "").strip()
@@ -2910,6 +2980,11 @@ class GroupChatBot:
                                     direction,
                                     conversation_judgement,
                                     generation_context=context_prompt,
+                                    media_claim_evidence=self._media_claim_evidence(
+                                        retry_review_text,
+                                        effective_message.content,
+                                        recent_texts,
+                                    ),
                                 )
                             )
                             if retry_accepted:
