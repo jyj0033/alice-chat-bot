@@ -46,6 +46,67 @@ MIN_OUTPUT_TOKENS = 2000
 # 服务端工具类型：由上层按需塞进 request.tools，此处只按能力开关放行。
 _SERVER_TOOL_TYPES = {"web_search"}
 
+# 检索留痕里最多列出多少条来源标题。实测单轮可达 50 条，全打会把日志冲垮，
+# 而事后审计只需要判断「有没有真实来源、来源大致是什么」。
+_CITATION_LOG_LIMIT = 5
+_SEARCH_QUERY_KEYS = ("query", "q", "text")
+
+
+def _collect_search_evidence(items: list) -> tuple:
+    """从 output 数组抽出服务端检索的调用与引用来源。
+
+    返回 ``(查询词列表, [(标题, URL)])``，均已去重并保持出现顺序。
+    只取用于观测的摘要，不取正文。
+
+    为什么需要它：声明了 ``web_search`` 的那一轮，模型可以在没有任何来源的
+    情况下给出极其具体的细节。检索到的真实资料和凭空编造，在回复正文里
+    长得一模一样，不留痕就永远无法事后区分。
+    """
+    queries: list = []
+    citations: list = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+
+        if item_type == "web_search_call":
+            action = item.get("action")
+            buckets = [action, item] if isinstance(action, dict) else [item]
+            for bucket in buckets:
+                found = ""
+                for key in _SEARCH_QUERY_KEYS:
+                    val = bucket.get(key)
+                    if isinstance(val, str) and val.strip():
+                        found = val.strip()
+                        break
+                if found:
+                    queries.append(found)
+                    break
+
+        if item_type == "message":
+            for part in (item.get("content") or []):
+                if not isinstance(part, dict):
+                    continue
+                for ann in (part.get("annotations") or []):
+                    if not isinstance(ann, dict):
+                        continue
+                    url = str(ann.get("url") or "")
+                    title = str(ann.get("title") or "")
+                    if url or title:
+                        citations.append((title, url))
+
+    def _dedup(seq):
+        seen = set()
+        out = []
+        for value in seq:
+            if value not in seen:
+                seen.add(value)
+                out.append(value)
+        return out
+
+    return _dedup(queries), _dedup(citations)
+
 
 class ResponsesProvider(LLMProvider):
     """OpenAI Responses API Provider（支持服务端 web_search）。"""
@@ -266,9 +327,47 @@ class ResponsesProvider(LLMProvider):
             logger.error("[Responses] 客户端请求出错：%s", exc)
             raise
 
-        return self._parse(payload)
+        return self._parse(payload, self._declared_server_search(body))
 
-    def _parse(self, payload: dict) -> ChatResponse:
+    @staticmethod
+    def _log_search_evidence(items: list) -> None:
+        """把这一轮服务端检索的调用与来源写进日志。
+
+        这一步不是装饰。声明了 ``web_search`` 却拿不回任何来源，说明本次回答
+        的具体细节完全出自模型生成——那正是幻觉最容易藏身的地方，必须显式
+        报警而不是安静地混在正常日志里。
+        """
+        queries, citations = _collect_search_evidence(items)
+        if not queries and not citations:
+            logger.warning(
+                "[Responses] 本轮声明了服务端 web_search，但响应里没有任何检索调用或"
+                "引用来源——本次回答的具体细节不可溯源，请人工核查。"
+            )
+            return
+
+        preview = " | ".join(
+            f"{title} <{url}>" if url else (title or "(无标题)")
+            for title, url in citations[:_CITATION_LOG_LIMIT]
+        )
+        more = (
+            f"，…另有 {len(citations) - _CITATION_LOG_LIMIT} 条"
+            if len(citations) > _CITATION_LOG_LIMIT
+            else ""
+        )
+        logger.info(
+            "[Responses] 服务端检索留痕：调用 %d 次，查询=%s，来源 %d 条：%s%s",
+            len(queries), queries, len(citations), preview or "(无标题)", more,
+        )
+
+    @staticmethod
+    def _declared_server_search(body: dict) -> bool:
+        """本次请求是否向服务端声明了 web_search。"""
+        return any(
+            isinstance(t, dict) and t.get("type") in _SERVER_TOOL_TYPES
+            for t in (body.get("tools") or [])
+        )
+
+    def _parse(self, payload: dict, declared_search: bool = False) -> ChatResponse:
         """解析 output 数组：取 output_text、抽 function_call、忽略 reasoning。"""
         items = [i for i in (payload.get("output") or []) if isinstance(i, dict)]
 
@@ -321,6 +420,9 @@ class ResponsesProvider(LLMProvider):
             status, types, len(content), len(tool_calls),
             [tc.get("name") for tc in tool_calls],
         )
+
+        if declared_search:
+            self._log_search_evidence(items)
 
         return ChatResponse(
             content=content,
