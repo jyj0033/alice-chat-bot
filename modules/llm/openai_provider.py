@@ -98,6 +98,21 @@ class OpenAIProvider(LLMProvider):
                     f"路径（当前收到: {snippet}...）"
                 )
 
+            # 200 但 choices 为空：中转网关在上游报错、限流、内容过滤，或模型把
+            # 输出预算全花在 reasoning 上时会这样返回（第三方中转实测约 2%）。
+            # 原先直接取 choices[0] 只会抛裸 IndexError，上层看到的
+            # "list index out of range" 既认不出是哪家返回的、也看不出原因。
+            # 这里换成带上下文的报错，方便判断该找中转还是该改请求参数。
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise ValueError(
+                    "LLM 返回了空 choices（HTTP 200 但没有候选结果）："
+                    f"model={getattr(response, 'model', '') or '?'}，"
+                    f"id={getattr(response, 'id', '') or '?'}，"
+                    f"usage={getattr(response, 'usage', None)!r}，"
+                    f"响应={str(response)[:300]}"
+                )
+
             message = response.choices[0].message
             # Claude 兼容格式响应解析
             if self.provider_type in ("anthropic", "claude"):
