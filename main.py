@@ -65,25 +65,28 @@ logging.basicConfig(
 # 容器重建会连带销毁 `docker logs` 的历史：之前每次 `docker compose up -d
 # --force-recreate` 之后，昨天以前的日志就再也查不到了，出了问题只能靠
 # 内存里的片段反推。logs/ 是挂载卷，补一份滚动文件日志，日志就能跨重启留存。
-try:
-    from logging.handlers import RotatingFileHandler
+# 测试也在同一个目录下跑 pytest，测试里的异常栈会写进同一份日志，看起来像
+# 线上故障。跑测试时不挂文件日志。
+if "pytest" not in sys.modules:
+    try:
+        from logging.handlers import RotatingFileHandler
 
-    _log_dir = Path(__file__).resolve().parent / "logs"
-    _log_dir.mkdir(parents=True, exist_ok=True)
-    _file_handler = RotatingFileHandler(
-        _log_dir / "bot.log",
-        maxBytes=20 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    _file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    ))
-    logging.getLogger().addHandler(_file_handler)
-except Exception as _log_file_error:  # 写不了文件日志不该拖垮启动
-    logging.getLogger(__name__).warning(
-        "写文件日志失败（继续只输出到 stdout）：%s", _log_file_error
-    )
+        _log_dir = Path(__file__).resolve().parent / "logs"
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _file_handler = RotatingFileHandler(
+            _log_dir / "bot.log",
+            maxBytes=20 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        _file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        ))
+        logging.getLogger().addHandler(_file_handler)
+    except Exception as _log_file_error:  # 写不了文件日志不该拖垮启动
+        logging.getLogger(__name__).warning(
+            "写文件日志失败（继续只输出到 stdout）：%s", _log_file_error
+        )
 # 第三方组件的信息日志通常是英文且重复；保留警告和错误，避免污染 Bot 中文日志。
 for _quiet_logger_name in (
     "asyncio",
