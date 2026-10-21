@@ -221,6 +221,48 @@ class MediaLifecycleTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await asyncio.gather(archive, enhancement, return_exceptions=True)
 
+    async def test_state_archive_task_reaches_the_backfill(self):
+        """快速路径存的归档任务，要一路传到识别完成后的回填里。
+
+        断在这里的后果很隐蔽：归档一直是占位符，但不报任何错。
+        """
+        bot = self._bot()
+        image = self._message()
+        self._record(bot, image)
+        bot.memory_storage = SimpleNamespace(
+            update_group_analysis_message_content=AsyncMock(return_value=True),
+        )
+        archive = asyncio.create_task(asyncio.sleep(0))
+
+        async def enrich(message, **kwargs):
+            message.content = "一张图，画面是真实描述。"
+
+        bot.qq_adapter = SimpleNamespace(enrich_message=enrich)
+        state = self._state(image, archive_task=archive)
+
+        await bot._prepare_media_for_judgement(image, state)
+
+        bot.memory_storage.update_group_analysis_message_content.assert_awaited_once_with(
+            image.session_id, image.message_id, "一张图，画面是真实描述。 [image]"
+        )
+
+    async def test_group_analysis_store_returns_the_archive_task(self):
+        """群日报落库要把写入任务交回去，识别完成后才能按顺序回填。"""
+        bot = self._bot()
+        bot.memory_storage = SimpleNamespace(
+            store_group_analysis_message=AsyncMock(return_value=1),
+        )
+        bot._group_analysis_config = {"enabled": True}
+        bot._group_analysis_write_tasks = set()
+        bot._memory_tasks = set()
+        message = self._message(message_type="group")
+
+        task = bot._store_group_analysis_message(message, message.session_id)
+
+        self.assertIsNotNone(task, "落库必须返回写入任务，否则回填会写空行")
+        await task
+        bot.memory_storage.store_group_analysis_message.assert_awaited_once()
+
     async def test_stale_reply_does_not_retarget_itself_after_thinking(self):
         bot = self._bot()
         message = self._message(content="鸣潮，启动！", rich_type="", rich_only=False)
