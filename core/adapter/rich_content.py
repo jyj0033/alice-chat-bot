@@ -306,7 +306,11 @@ def describe_media_in_words(kind: str, description: str = "") -> str:
     desc = re.sub(r"\s+", " ", str(description or "")).strip().rstrip("。．. ")
     if kind in {"video"}:
         return f"一段视频，画面是{desc}。" if desc else "一段视频，看不清画面。"
-    if kind in {"mface", "face"}:
+    if kind in {"face", "QQ表情"}:
+        # QQ 普通表情只有表情 id，没有图片文件，送不了视觉模型。这里不能写
+        # "看不清画面"：那等于告诉模型图糊了，模型会顺着这个假象胡编。
+        return f"一个 QQ 表情，{desc}。" if desc else "一个 QQ 表情。"
+    if kind in {"mface"}:
         noun = "表情"
     elif kind in {"image", "图片"}:
         noun = "图"
@@ -317,6 +321,14 @@ def describe_media_in_words(kind: str, description: str = "") -> str:
     else:
         return desc
     return f"一张{noun}，画面是{desc}。" if desc else f"一张{noun}，看不清画面。"
+
+
+# QQ/OneBot 给的占位摘要。它们不是画面描述，必须当空处理，否则会被当成
+# 真实描述写进上下文和归档（"一张图，画面是[动画表情]。"）。
+_PLACEHOLDER_SUMMARIES = frozenset({
+    "", "图片", "[图片]", "表情包", "[表情包]", "动画表情", "[动画表情]",
+    "QQ表情", "[QQ表情]", "表情", "[表情]",
+})
 
 
 def _segment_summary(segment_type: str, data: dict[str, Any]) -> str:
@@ -336,7 +348,7 @@ def _segment_summary(segment_type: str, data: dict[str, Any]) -> str:
         return describe_media_in_words("video", name)
     if segment_type in {"image", "mface", "face"}:
         summary = _short(data.get("summary"), 60)
-        if summary in ("[图片]", "图片", "[表情包]", "表情包", ""):
+        if summary in _PLACEHOLDER_SUMMARIES:
             summary = ""
         return describe_media_in_words(segment_type, summary)
     return f"[{label}]"

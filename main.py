@@ -153,6 +153,8 @@ class _MessageFlowState:
     rich_directed: bool
     recent_context_for_judgement: list[Any]
     message_version: int | None
+    # 群日报归档的写入任务。视觉识别完成后要等它落库，才能回填真实描述。
+    archive_task: asyncio.Task | None = None
 
 
 class GroupChatBot:
@@ -223,6 +225,10 @@ class GroupChatBot:
         self._conversation_judge_batch_started_at: dict[str, float] = {}
         self._rich_media_tasks: set[asyncio.Task] = set()
         self._meme_collect_tasks: set[asyncio.Task] = set()
+        # 正在识别中的媒体任务。键是 (会话, 消息 id) 和 (会话, 发送者)，
+        # 后者让"同一发送者紧接着追问同一张图"也能等到识别结果。
+        self._media_tasks_by_message: dict[tuple[str, str], asyncio.Task] = {}
+        self._media_tasks_by_sender: dict[tuple[str, str], asyncio.Task] = {}
         # 用户消息、Bot 回复等轻量记忆写入任务。单独跟踪，停止时等待/取消，
         # 避免 create_task 后进程退出导致最后几条记忆丢失。
         self._memory_tasks: set[asyncio.Task] = set()
@@ -1120,6 +1126,7 @@ class GroupChatBot:
         )
         await ingest_lock.acquire()
         message_version = None
+        archive_task = None
         try:
             # 进程重启后，先恢复该会话最近仍在上下文有效期内的 episodic 消息，
             # 再追加当前消息；这样首条消息不会让 Bot 突然失去刚才的对话。
@@ -1178,7 +1185,7 @@ class GroupChatBot:
             self._maybe_schedule_digest(session_id)
 
             # 群日报单独保存完整群消息，不参与普通长期记忆筛选和召回。
-            self._store_group_analysis_message(message, session_id)
+            archive_task = self._store_group_analysis_message(message, session_id)
 
             # 记录媒体轨迹，供"连图整体识别"判断连续纯图片
             self._record_media_trail(message)
@@ -1198,7 +1205,159 @@ class GroupChatBot:
             rich_directed=rich_directed,
             recent_context_for_judgement=recent_context_for_judgement,
             message_version=message_version,
+            archive_task=archive_task,
         )
+
+    # === 富媒体证据准备 ============================================
+    # 视觉识别要十几秒。目标判断如果先跑，看到的只是「看不清画面」占位符，
+    # 只能对着占位符猜画面内容（曾经把占位符当成"群友在吐槽图片糊"）。
+    # 所以识别必须在判断之前完成。
+
+    def _media_task_registries(
+        self,
+    ) -> tuple[dict[tuple[str, str], asyncio.Task], dict[tuple[str, str], asyncio.Task]]:
+        """两个登记表：按 (会话, 消息) 和按 (会话, 发送者)。
+
+        懒创建，测试里可能只预置了其中一个。
+        """
+        registry = getattr(self, "_media_tasks_by_message", None)
+        if registry is None:
+            registry = {}
+            self._media_tasks_by_message = registry
+        senders = getattr(self, "_media_tasks_by_sender", None)
+        if senders is None:
+            senders = {}
+            self._media_tasks_by_sender = senders
+        return registry, senders
+
+    def _start_media_enrichment(
+        self,
+        message: Message,
+        directed: bool,
+        archive_task: asyncio.Task | None = None,
+    ) -> asyncio.Task:
+        """启动这条消息的富媒体增强，并登记起来供后续消息等待。"""
+        task = asyncio.create_task(
+            self._enrich_context_message(message, directed, archive_task=archive_task)
+        )
+        self._rich_media_tasks.add(task)
+        task.add_done_callback(self._rich_media_tasks.discard)
+
+        registry, senders = self._media_task_registries()
+        message_key = (message.session_id, str(message.message_id or ""))
+        registry[message_key] = task
+        task.add_done_callback(
+            lambda t, key=message_key: self._drop_media_task(registry, key, t)
+        )
+
+        sender_key = (message.session_id, str(message.sender_id or ""))
+        if sender_key[1]:
+            senders[sender_key] = task
+            task.add_done_callback(
+                lambda t, key=sender_key: self._drop_media_task(senders, key, t)
+            )
+        return task
+
+    @staticmethod
+    def _drop_media_task(
+        registry: dict[tuple[str, str], asyncio.Task],
+        key: tuple[str, str],
+        task: asyncio.Task,
+    ) -> None:
+        """识别任务结束后从登记表移除；只移除属于自己的那一条。"""
+        if registry.get(key) is task:
+            registry.pop(key, None)
+
+    def _pending_media_tasks_for(self, message: Message) -> list[asyncio.Task]:
+        """这条消息可能依赖的、仍在识别中的媒体任务。
+
+        两种情况：引用了一张还在识别的图；或者同一发送者紧接着发了文字
+        追问（"这个技能怎么用？"）。后者必须等，否则追问会被当成没有
+        上下文的独立消息。
+        """
+        tasks: list[asyncio.Task] = []
+        registry, senders = self._media_task_registries()
+        reply_to_id = str(getattr(message, "reply_to_id", "") or "").strip()
+        if reply_to_id:
+            task = registry.get((message.session_id, reply_to_id))
+            if task is not None:
+                tasks.append(task)
+        sender_id = str(getattr(message, "sender_id", "") or "").strip()
+        if sender_id:
+            task = senders.get((message.session_id, sender_id))
+            if task is not None and task not in tasks:
+                tasks.append(task)
+        return tasks
+
+    @staticmethod
+    async def _wait_media_task(task: asyncio.Task) -> None:
+        """等识别任务完成。
+
+        用 shield 包一层：识别任务是共享的（后续消息可能还在等它），
+        外层被取消时不能把它一起取消掉。
+        """
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    async def _prepare_media_for_judgement(
+        self,
+        message: Message,
+        state: _MessageFlowState,
+    ) -> tuple[asyncio.Task | None, bool]:
+        """目标判断前准备好富媒体证据。
+
+        返回 (本条消息自己的识别任务, 是否等过媒体)。没有媒体时任务为 None。
+        """
+        task = None
+        waited = False
+        if getattr(message, "rich_type", ""):
+            task = self._start_media_enrichment(
+                message,
+                state.rich_directed,
+                archive_task=state.archive_task,
+            )
+        # 引用了正在识别的图、或同一发送者的追问：先等那边的识别结果。
+        for pending in self._pending_media_tasks_for(message):
+            if pending is task or pending.done():
+                continue
+            waited = True
+            await self._wait_media_task(pending)
+        if task is not None:
+            waited = True
+            await self._wait_media_task(task)
+            self._forget_media_task(message, task)
+        return task, waited
+
+    def _forget_media_task(self, message: Message, task: asyncio.Task) -> None:
+        """识别已完成，把本条消息从登记表里摘掉。"""
+        registry, senders = self._media_task_registries()
+        message_key = (message.session_id, str(message.message_id or ""))
+        self._drop_media_task(registry, message_key, task)
+        sender_key = (message.session_id, str(message.sender_id or ""))
+        if sender_key[1]:
+            self._drop_media_task(senders, sender_key, task)
+
+    def _rich_media_describes(self, message: Message, directed: bool) -> bool:
+        """当前配置下这条消息的图片会不会被视觉识别描述。"""
+        enricher = getattr(
+            getattr(self, "qq_adapter", None), "rich_media_enricher", None
+        )
+        if enricher is None:
+            return False
+        has_image = any(
+            getattr(segment, "type", "") in ("image", "mface")
+            for segment in (getattr(message, "segments", None) or [])
+        )
+        if not has_image:
+            return False
+        try:
+            return bool(enricher.describes_images(directed))
+        except Exception:
+            return False
 
     async def _decide_incoming_message(
         self, message: Message, state: _MessageFlowState
@@ -1225,6 +1384,18 @@ class GroupChatBot:
             or continuing
             or bool(rich_trigger.get("forced_trigger", False))
         )
+        # 先把富媒体证据准备好再判断：判断器必须看到真实画面描述，而不是
+        # 「看不清画面」占位符。识别耗时十几秒，这段时间和下面的合并窗口
+        # 是并行的，不额外拉长总时长。
+        content_before_media = message.content
+        enrichment_task, media_evidence_ready = await self._prepare_media_for_judgement(
+            message, state
+        )
+        if message.content != content_before_media:
+            # 识别会原位改写上下文里的那条消息，刷新快照才能把新描述带给判断器。
+            recent_context_for_judgement = self.context_manager.get_window(
+                session_id
+            ).get_recent(30)
         if judge_enabled and not bypass_judge_batch:
             batch_ready = await self._wait_for_conversation_judge_batch(
                 session_id, message_version
@@ -1252,6 +1423,8 @@ class GroupChatBot:
             # 非显式定向的旧消息不值得在队列里继续消耗一次 LLM 判断：后面
             # 的消息才是当前群聊状态。显式 @/引用 Bot 仍保留，避免用户的
             # 定向问题因为旁边新消息到达而被静默。
+            # 带媒体的消息例外：它已经等完识别，延迟来自我们自己的视觉识别
+            # 而不是群聊走远，判断器拿到的是最新上下文，会自己决定该不该接。
             explicit_directed = (
                 message.message_type == "private"
                 or message.mentioned_me
@@ -1260,6 +1433,7 @@ class GroupChatBot:
             if (
                 message.message_type == "group"
                 and not explicit_directed
+                and not media_evidence_ready
                 and self._session_message_versions.get(session_id, 0)
                 != message_version
             ):
@@ -1295,15 +1469,18 @@ class GroupChatBot:
                 )
             )
 
-        # 富媒体增强可能涉及 NapCat API 或安全网页预览。它在后台执行，决策仍走
-        # 快速路径；真正生成回复前会等待本条消息的增强结果。
-        enrichment_task = None
-        if message.rich_type:
-            enrichment_task = asyncio.create_task(
-                self._enrich_context_message(message, rich_directed)
+        # 富媒体增强已经在判断之前跑完了（见 _prepare_media_for_judgement）。
+        # scope=directed 时，早期增强可能因为还没判定为定向而没识别，这里补跑。
+        if (
+            enrichment_task is not None
+            and rich_directed
+            and not state.rich_directed
+            and message.content == content_before_media
+            and self._rich_media_describes(message, rich_directed)
+        ):
+            enrichment_task = self._start_media_enrichment(
+                message, rich_directed, archive_task=state.archive_task
             )
-            self._rich_media_tasks.add(enrichment_task)
-            enrichment_task.add_done_callback(self._rich_media_tasks.discard)
 
         # 表情自动收集放在富媒体增强之后：如果视觉识别已经给出简短描述，
         # 描述会一并写进素材元数据；整个过程独立于回复任务，不拖慢发言决策。
@@ -1429,7 +1606,8 @@ class GroupChatBot:
         """等待图片增强完成后，把直接图片交给本地表情库。"""
         try:
             if enrichment_task:
-                await enrichment_task
+                # 识别任务是共享的，收集任务被取消不能连带取消识别。
+                await asyncio.shield(enrichment_task)
             if self.meme_manager and self.qq_adapter:
                 await self.meme_manager.collect_message(message, self.qq_adapter)
         except asyncio.CancelledError:
@@ -2168,6 +2346,7 @@ class GroupChatBot:
                 "[图片]",
                 "[表情包]",
                 "[QQ表情]",
+                "[动画表情]",
                 "视觉识别不确定",
             )
         ):
@@ -2384,7 +2563,9 @@ class GroupChatBot:
             enrichment_task = decision.get("enrichment_task")
             if enrichment_task:
                 try:
-                    await enrichment_task
+                    # 识别任务是共享的（后续消息可能还在等它），回复被取消时
+                    # 不能把它一起取消掉，所以用 shield 包一层。
+                    await asyncio.shield(enrichment_task)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -3351,8 +3532,14 @@ class GroupChatBot:
         self,
         message: Message,
         directed: bool,
+        archive_task: asyncio.Task | None = None,
     ) -> None:
-        """后台增强富媒体，并原位更新已经进入滑动窗口的那条消息。"""
+        """后台增强富媒体，并原位更新已经进入滑动窗口的那条消息。
+
+        archive_task 是这条消息的群日报归档写入任务。识别成功后要把真实
+        描述回填进归档：归档是在增强之前写的，那时只能拿到「看不清画面」
+        占位符，不回填的话日报和面板里永远是占位符。
+        """
         original_content = message.content
         conversation_context = self._build_image_conversation_context(message)
         group_image_urls = self._collect_group_image_urls(message)
@@ -3369,6 +3556,41 @@ class GroupChatBot:
                 message.content,
             )
             logger.debug("[富媒体] %s", message.content[:120])
+            await self._backfill_group_analysis_content(message, archive_task)
+
+    async def _backfill_group_analysis_content(
+        self,
+        message: Message,
+        archive_task: asyncio.Task | None = None,
+    ) -> None:
+        """识别完成后把真实画面描述回填到群日报归档正文。"""
+        if not getattr(message, "rich_type", ""):
+            return
+        storage = getattr(self, "memory_storage", None)
+        if storage is None:
+            return
+        if archive_task is not None:
+            # 必须等原始记录先落库，否则回填写不到任何行。
+            try:
+                await archive_task
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        content = (message.content or message.outer_text or "").strip()
+        if not content:
+            return
+        content = f"{content} [{message.rich_type}]".strip()
+        try:
+            await storage.update_group_analysis_message_content(
+                message.session_id,
+                str(message.message_id or ""),
+                content[:2000],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("群日报消息描述回填失败：%s", exc)
 
     def _record_media_trail(self, message: Message) -> None:
         """记录消息轨迹（时间/sender/是否纯图片/图片url+file），用于判断连续连图。
@@ -3681,16 +3903,21 @@ class GroupChatBot:
             window.restored_from_storage = False
             logger.debug("恢复近期记忆失败：%s", exc)
 
-    def _store_group_analysis_message(self, message: Message, session_id: str) -> None:
-        """保存完整群聊流水，供日报使用，不进入普通记忆链路。"""
+    def _store_group_analysis_message(
+        self, message: Message, session_id: str
+    ) -> asyncio.Task | None:
+        """保存完整群聊流水，供日报使用，不进入普通记忆链路。
+
+        返回实际写入的任务：视觉识别完成后要等它落库，才能回填真实描述。
+        """
         config = getattr(self, "_group_analysis_config", {}) or {}
         if not config.get("enabled", True) or message.message_type != "group":
-            return
+            return None
         content = (message.content or message.outer_text or "").strip()
         if message.rich_type:
             content = f"{content} [{message.rich_type}]".strip()
         if not content:
-            return
+            return None
         message_id = str(message.message_id or "").strip()
         if not message_id:
             message_id = f"{message.sender_id}-{time.time_ns()}"
@@ -3720,6 +3947,7 @@ class GroupChatBot:
         task = self._track_memory_task(_save())
         self._group_analysis_write_tasks.add(task)
         task.add_done_callback(self._group_analysis_write_tasks.discard)
+        return task
 
     def _store_group_analysis_bot_message(self, session_id: str, content: str) -> None:
         """保存 Bot 群消息到日报流水，但不把 Bot 计入群友统计。"""

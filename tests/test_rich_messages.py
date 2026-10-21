@@ -114,6 +114,50 @@ class RichMessageParsingTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 _validate_http_url(url)
 
+    def test_qq_face_does_not_claim_the_picture_is_unreadable(self):
+        """QQ 普通表情没有图片文件，不能说"看不清画面"。
+
+        那等于告诉模型图糊了，模型会顺着这个假象去猜画面内容。
+        """
+        segments = parse_message_segments([
+            {"type": "face", "data": {"id": "176"}},
+        ])
+
+        rendered = render_segments(segments)
+        self.assertEqual(rendered, "一个 QQ 表情。")
+        self.assertNotIn("看不清画面", rendered)
+        self.assertNotIn("画面是", rendered)
+
+    def test_qq_placeholder_summary_is_not_treated_as_description(self):
+        """QQ 给的占位摘要不是画面描述，不能写成"画面是[动画表情]"。"""
+        for summary in ("[动画表情]", "动画表情", "[图片]", "[表情包]", "[QQ表情]"):
+            with self.subTest(summary=summary):
+                segments = parse_message_segments([
+                    {"type": "image", "data": {"file": "a.jpg", "summary": summary}},
+                ])
+
+                rendered = render_segments(segments)
+                self.assertNotIn(summary, rendered)
+                self.assertNotIn("画面是", rendered)
+                self.assertEqual(rendered, "一张图，看不清画面。")
+
+    def test_real_summary_is_kept_as_description(self):
+        segments = parse_message_segments([
+            {"type": "image", "data": {"file": "a.jpg", "summary": "一只橘猫趴在桌上"}},
+        ])
+
+        self.assertEqual(render_segments(segments), "一张图，画面是一只橘猫趴在桌上。")
+
+    def test_face_segment_never_enters_vision_branch(self):
+        """face 段没有 url 和文件，送不了视觉模型，只能给可读文案。"""
+        segments = parse_message_segments([
+            {"type": "face", "data": {"id": "176"}},
+        ])
+
+        self.assertEqual(segments[0].type, "face")
+        self.assertEqual(segments[0].url, "")
+        self.assertEqual(segments[0].file, "")
+
 
 class RichMediaEnricherTests(unittest.IsolatedAsyncioTestCase):
     def test_vision_result_requires_structured_evidence(self):

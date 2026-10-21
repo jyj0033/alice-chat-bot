@@ -254,6 +254,14 @@ class RichMediaEnricher:
             return True
         return directed
 
+    def describes_images(self, directed: bool) -> bool:
+        """当前配置下图片是否会被视觉识别描述。
+
+        调用方用它决定要不要等识别结果：scope=all 时恒为真，scope=directed
+        时只有定向消息才识别。
+        """
+        return self._image_describe_applicable(directed)
+
     async def _expand_forward(self, segment: MessageSegment) -> bool:
         payload: Any = segment.data.get("content")
         forward_id = str(segment.data.get("id") or segment.file_id or "")
