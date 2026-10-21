@@ -32,6 +32,9 @@ except ImportError:  # pragma: no cover - requirements 默认包含 Pillow
 
 logger = logging.getLogger(__name__)
 
+# 归类相关标记定义在 meme_categorizer，这里只引用不重复定义。
+from modules.meme_categorizer import BLOCKED_TAG, PENDING_TAG  # noqa: E402
+
 SUPPORTED_FORMATS = {
     "PNG": ".png",
     "JPEG": ".jpg",
@@ -523,6 +526,30 @@ class MemeManager:
             start = (page - 1) * page_size
             return values[start:start + page_size], total
 
+    def list_pending_categorization(self, limit: int = 10) -> list[dict[str, Any]]:
+        """取出还没归类的素材：仍在「待整理」且带「待归类」标记的。
+
+        只处理带标记的——标记是自动归类功能上线后才加的，
+        所以上线前积压的旧素材不会被翻出来重整。
+        """
+        try:
+            cap = max(1, min(100, int(limit or 10)))
+        except (TypeError, ValueError):
+            cap = 10
+        default_category = self.config.get("default_category", DEFAULT_CATEGORY)
+        with self._lock:
+            result: list[dict[str, Any]] = []
+            for item in self._catalog["memes"].values():
+                if not isinstance(item, dict):
+                    continue
+                if _safe_category(item.get("category"), default_category) != default_category:
+                    continue
+                if PENDING_TAG not in (item.get("tags") or []):
+                    continue
+                result.append(_public_item(item))
+            result.sort(key=lambda entry: str(entry.get("collected_at", "")), reverse=True)
+            return result[:cap]
+
     def get(self, meme_id: str) -> dict[str, Any] | None:
         with self._lock:
             item = self._catalog["memes"].get(str(meme_id or ""))
@@ -861,8 +888,12 @@ class MemeManager:
         items, _ = self.list_memes(category=category, page=1, page_size=100)
         if not items:
             return None
+        # 分析结论是"不建议发送"的素材不进自动发送候选。
+        usable = [item for item in items if BLOCKED_TAG not in (item.get("tags") or [])]
+        if not usable:
+            return None
         recent = self._recent_by_session.get(session_id, deque())
-        available = [item for item in items if item.get("id") not in recent] or items
+        available = [item for item in usable if item.get("id") not in recent] or usable
         selected = random.choice(available)
         if session_id and remember:
             recent.append(str(selected.get("id")))
@@ -1049,18 +1080,21 @@ class MemeManager:
                 meaning = self._meaning_from_content(
                     objective_summary or getattr(segment, "summary", "")
                 )
-                outer_text = str(getattr(message, "outer_text", "") or "").strip()[:240]
-                category = self._infer_category(meaning, outer_text)
+                # 归类交给大模型：收集时只落「待整理」并打上「待归类」标记，
+                # 之后由 meme_categorizer 看图分析后定分类。
+                # 规则词表匹配不到"阴阳怪气"这类梗表达，压根也没有「委屈」
+                # 「困倦」「愤怒」这些分类的词条，命中率太低（全库 254 张里
+                # 91 张卡在待整理，85 张是关键词一个都没命中）。
                 item = await asyncio.to_thread(
                     self.add_bytes,
                     content,
-                    category=(
-                        category
-                        if category != DEFAULT_CATEGORY
-                        else self.config.get("default_category", DEFAULT_CATEGORY)
-                    ),
+                    category=self.config.get("default_category", DEFAULT_CATEGORY),
                     meaning=meaning,
-                    tags=["自动收集", "表情包" if segment.type == "mface" else "图片"],
+                    tags=[
+                        "自动收集",
+                        "表情包" if segment.type == "mface" else "图片",
+                        PENDING_TAG,
+                    ],
                     source={
                         "session_id": message.session_id,
                         "sender_id": getattr(message, "sender_id", ""),

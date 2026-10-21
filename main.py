@@ -42,6 +42,12 @@ from modules.memory.context import (
 )
 from modules.group_analysis import GroupDailyAnalysis
 from modules.meme_manager import MemeManager
+from modules.meme_categorizer import (
+    BLOCKED_TAG,
+    PENDING_TAG,
+    MemeCategorizer,
+    sniff_media_type,
+)
 
 from modules.personality.personality import Personality
 from modules.personality.emotional_state import EmotionalManager
@@ -687,16 +693,39 @@ class GroupChatBot:
 
     def _init_meme_manager(self) -> None:
         """初始化本地表情包素材库。"""
+        meme_config = self.config.get("meme_manager", {}) or {}
         self.meme_manager = MemeManager(
-            self.config.get("meme_manager", {}) or {},
+            meme_config,
             base_dir=Path(__file__).resolve().parent,
         )
+        # 自动归类（看图分析 + 选分类）相关的开关与节奏。
+        self._meme_categorize_enabled = bool(
+            meme_config.get("auto_categorize_enabled", True)
+        )
+        try:
+            self._meme_categorize_interval = max(
+                300, int(meme_config.get("categorize_interval_seconds", 3600) or 3600)
+            )
+        except (TypeError, ValueError):
+            self._meme_categorize_interval = 3600
+        try:
+            self._meme_categorize_batch = max(
+                1, min(20, int(meme_config.get("categorize_batch_size", 10) or 10))
+            )
+        except (TypeError, ValueError):
+            self._meme_categorize_batch = 10
         logger.info(
             "✓ 表情库：启用=%s，自动收集=%s，自动发送=%s，总数=%d",
             self.meme_manager.enabled,
             self.meme_manager.auto_collect_enabled,
             self.meme_manager.auto_send_enabled,
             self.meme_manager.stats().get("total", 0),
+        )
+        logger.info(
+            "✓ 表情包自动归类：启用=%s，每 %s 秒一轮，每轮最多 %s 张",
+            self._meme_categorize_enabled,
+            self._meme_categorize_interval,
+            self._meme_categorize_batch,
         )
 
     def _init_personality(self) -> None:
@@ -1673,11 +1702,160 @@ class GroupChatBot:
                 # 识别任务是共享的，收集任务被取消不能连带取消识别。
                 await asyncio.shield(enrichment_task)
             if self.meme_manager and self.qq_adapter:
-                await self.meme_manager.collect_message(message, self.qq_adapter)
+                items = await self.meme_manager.collect_message(message, self.qq_adapter)
+                if items:
+                    # 收集完立刻做看图分析 + 归类，别让素材长期停在「待整理」。
+                    await self._categorize_meme_items(items)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.debug("表情自动收集任务失败：%s", exc)
+
+    def _meme_vision_provider(self) -> Optional[Any]:
+        """表情包分析用的视觉 provider。
+
+        优先用 llm_routing 里显式指定的 meme_analyze；没指定就复用已经
+        配好的视觉 provider——那才是确定能看图的模型（主对话模型未必能看图）。
+        """
+        routed = self._get_routed_provider("meme_analyze")
+        if routed is not None:
+            return self._tagged_provider(routed, "meme_analyze")
+        enricher = getattr(
+            getattr(self, "qq_adapter", None), "rich_media_enricher", None
+        )
+        vision = getattr(enricher, "vision_provider", None)
+        if vision is not None:
+            return self._tagged_provider(vision, "meme_analyze")
+        return self._tagged_provider(self._init_vision_provider(), "meme_analyze")
+
+    def _meme_categorizer(self) -> Optional[MemeCategorizer]:
+        """构造表情包归类器：视觉模型看图分析，文本模型选分类。"""
+        manager = getattr(self, "meme_manager", None)
+        if not manager or not manager.enabled:
+            return None
+        if not getattr(self, "_meme_categorize_enabled", True):
+            return None
+        vision = self._meme_vision_provider()
+        text = self._get_provider_for_role("meme_categorize")
+        if vision is None or text is None:
+            return None
+        categories = [
+            str(item.get("name") or "").strip()
+            for item in manager.categories()
+            if str(item.get("name") or "").strip()
+            and str(item.get("name") or "").strip() != "待整理"
+        ]
+        if not categories:
+            return None
+        # 分类说明一起给模型，它才分得清「困倦」和「委屈」这类近义分类。
+        descriptions = {
+            str(item.get("name") or "").strip(): str(item.get("description") or "").strip()
+            for item in manager.categories()
+            if str(item.get("name") or "").strip()
+        }
+        return MemeCategorizer(vision, text, categories, category_descriptions=descriptions)
+
+    async def _categorize_meme_items(self, items: list[dict]) -> int:
+        """给表情包做看图分析 + 归类，返回成功归类的数量。
+
+        失败（模型报错、返回不合规、分类名不在候选里）的素材保持「待整理」
+        并保留「待归类」标记，由定时任务下一轮重试。
+        """
+        manager = getattr(self, "meme_manager", None)
+        if not manager or not items:
+            return 0
+        categorizer = self._meme_categorizer()
+        if categorizer is None:
+            return 0
+        done = 0
+        for raw_item in items:
+            item = raw_item or {}
+            meme_id = str(item.get("id") or "").strip()
+            if not meme_id:
+                continue
+            try:
+                payload = manager.get_bytes(meme_id)
+            except Exception as exc:
+                logger.debug("读取表情包文件失败 %s：%s", meme_id[:10], exc)
+                continue
+            if not payload:
+                continue
+            content = payload[1]
+            media_type = sniff_media_type(
+                content, str(item.get("filename") or "")
+            )
+            try:
+                result = await categorizer.process(content, media_type)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("表情包归类出错 %s：%s", meme_id[:10], exc)
+                continue
+            if not result:
+                continue
+            category, analysis = result
+            tags = [
+                str(tag)
+                for tag in (item.get("tags") or [])
+                if str(tag) not in (PENDING_TAG, BLOCKED_TAG)
+            ]
+            tags.append(f"情绪:{analysis.sentiment}")
+            if analysis.scene:
+                tags.append(f"场景:{analysis.scene[:20]}")
+            if analysis.should_send == "否":
+                tags.append(BLOCKED_TAG)
+            try:
+                manager.update(
+                    meme_id,
+                    category=category,
+                    meaning=analysis.core_meaning,
+                    tags=tags[:12],
+                )
+                done += 1
+                logger.info(
+                    "[表情库] 已归类 %s → %s（%s）",
+                    meme_id[:10], category, analysis.core_meaning[:30],
+                )
+            except Exception as exc:
+                logger.warning("写入表情包分类失败 %s：%s", meme_id[:10], exc)
+        return done
+
+    async def _categorize_pending_memes(self) -> int:
+        """处理「待整理」队列里带「待归类」标记的素材。"""
+        manager = getattr(self, "meme_manager", None)
+        if not manager:
+            return 0
+        try:
+            items = manager.list_pending_categorization(
+                getattr(self, "_meme_categorize_batch", 10)
+            )
+        except Exception as exc:
+            logger.warning("读取待归类素材失败：%s", exc)
+            return 0
+        if not items:
+            return 0
+        return await self._categorize_meme_items(items)
+
+    async def _meme_categorize_loop(self) -> None:
+        """定时把「待归类」的表情包用大模型分析并归类。
+
+        只处理带「待归类」标记的素材——标记是本功能上线后才加的，
+        上线前积压的旧素材不会被翻出来重整。
+        """
+        if not getattr(self, "_meme_categorize_enabled", True):
+            return
+        interval = max(300, int(getattr(self, "_meme_categorize_interval", 3600) or 3600))
+        logger.info("✓ 表情包自动归类循环已启动（每 %s 秒）", interval)
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
+                count = await self._categorize_pending_memes()
+                if count:
+                    logger.info("[表情库] 自动归类 %s 张", count)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("表情包自动归类出错：%s", exc)
 
     async def send_meme(
         self,
@@ -6728,6 +6906,9 @@ class GroupChatBot:
                 "max_images_per_message": 2,
                 "daily_collect_limit": 80,
                 "collect_cooldown_seconds": 15,
+                "auto_categorize_enabled": True,
+                "categorize_interval_seconds": 3600,
+                "categorize_batch_size": 10,
             },
             "speaking": {
                 "base_probability": 0.02,
@@ -7002,6 +7183,10 @@ async def main():
             # 所以这个循环不能只写在 run() 里。
             usage_task = asyncio.create_task(bot._token_usage_loop())
             bot._tasks.append(usage_task)
+            # 表情包自动归类循环：同样必须与消息处理跑在同一个事件循环，
+            # 否则它读写的素材状态会和消息线程打架。
+            meme_task = asyncio.create_task(bot._meme_categorize_loop())
+            bot._tasks.append(meme_task)
             try:
                 await bot.qq_adapter.connect()
             except Exception as e:

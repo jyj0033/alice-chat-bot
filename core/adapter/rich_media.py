@@ -992,6 +992,32 @@ def _bytes_to_data_url(data: bytes, media_type: str) -> str:
     return f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
+def prepare_image_for_vision(
+    data: bytes,
+    media_type: str = "image/jpeg",
+    *,
+    max_side: int = 1600,
+    quality: int = 85,
+    max_bytes: int = 2_000_000,
+) -> str:
+    """把图片压到视觉端点吃得下的大小，并转成 data URL。
+
+    给"自己拿着本地图片去问模型"的场景用（比如表情包分析），
+    免得各处重复写一遍压缩参数——端点单张媒体有 10MiB 硬上限，
+    不缩必然被 400 掉。
+    """
+    if not data:
+        return ""
+    shrunk, shrunk_type = _shrink_image_bytes(
+        data,
+        media_type,
+        max_side=max_side,
+        quality=quality,
+        max_bytes=max_bytes,
+    )
+    return _bytes_to_data_url(shrunk, shrunk_type)
+
+
 # 端点认得的静态图片格式；不在这张表里的（动图、BMP、AVIF…）一律转成 JPEG，
 # 免得端点直接 400 掉整次识别。
 _STATIC_VISION_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})

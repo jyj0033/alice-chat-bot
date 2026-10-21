@@ -13,6 +13,7 @@ from core.adapter.base import Message
 from core.adapter.rich_content import MessageSegment, parse_message_segments
 from modules.llm.base import ChatResponse
 from modules.meme_manager import MemeManager
+from modules.meme_categorizer import PENDING_TAG
 from modules.reply.generator import ReplyGenerator
 
 
@@ -387,7 +388,10 @@ class MemeManagerTests(unittest.TestCase):
 
         result = asyncio.run(manager.collect_message(message, adapter))
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["category"], "开心")
+        # 收集时不再用关键词词表猜分类：统一落「待整理」并打「待归类」标记，
+        # 之后由大模型看图分析后定分类。
+        self.assertEqual(result[0]["category"], "待整理")
+        self.assertIn(PENDING_TAG, result[0]["tags"])
         self.assertEqual(result[0]["source_session"], "group_123")
 
         message.group_id = "999"
@@ -442,7 +446,9 @@ class MemeManagerTests(unittest.TestCase):
         result = asyncio.run(manager.collect_message(message, adapter))
         self.assertEqual(len(result), 1)
         self.assertEqual(calls, 1)
-        self.assertEqual(result[0]["category"], "吐槽")
+        # 归类交给大模型，收集阶段一律落「待整理」。
+        self.assertEqual(result[0]["category"], "待整理")
+        self.assertIn(PENDING_TAG, result[0]["tags"])
 
     def test_auto_category_falls_back_when_meaning_is_unclear(self):
         self.assertEqual(MemeManager._infer_category("一张普通风景图"), "待整理")

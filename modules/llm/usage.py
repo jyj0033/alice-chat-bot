@@ -23,6 +23,8 @@ SITE_LABELS: dict[str, str] = {
     "reply_fallback": "回复备用模型",
     "reply_review": "回复语义复核",
     "meme_review": "表情复核",
+    "meme_analyze": "表情包分析",
+    "meme_categorize": "表情包归类",
     "conversation_judge": "目标判断",
     "search": "检索判断器",
     "search_answer": "带资料生成",
