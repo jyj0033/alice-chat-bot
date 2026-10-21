@@ -128,6 +128,29 @@ reply:
 也记了真实是否引用过 —— 注意 `metadata.reply_to_id` 有兜底（没引用时记的是
 触发消息），**拿它统计引用率会得到恒等于 100% 的假数字**，要用 `quoted`。
 
+### 7. 日志
+
+`docker compose up -d --force-recreate` 会重建容器，**`docker logs` 的历史会
+随旧容器一起消失**。所以应用除了 stdout 还会写一份滚动文件日志到挂载卷：
+
+```
+logs/bot.log            # 当前日志（单文件上限 20MB）
+logs/bot.log.1 ... .5   # 最多保留 5 个历史文件
+```
+
+跨重启查历史用文件日志，不要用 `docker logs --since`：
+
+```bash
+tail -f logs/bot.log
+grep '\[引用\]' logs/bot.log | tail -20
+```
+
+需要保留某个时间窗口的 stdout 日志时，重建前先手动导出一份：
+
+```bash
+docker logs alice-chat-bot > logs/docker-$(date +%Y%m%d-%H%M%S).log 2>&1
+```
+
 ---
 
 ## 带 NapCat 的完整部署
