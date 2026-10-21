@@ -12,7 +12,7 @@ import threading
 import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from typing import Optional
@@ -278,6 +278,26 @@ class MemoryStorage:
                 attempted_at TIMESTAMP NOT NULL,
                 PRIMARY KEY(sender_id, source_session)
             )
+        """)
+
+        # LLM token 消耗统计：按天 + 功能点 + 模型聚合，只保留最近几天。
+        # 这张表回答"钱花在哪了"，不需要永久留存，定期删旧行即可。
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS llm_token_usage (
+                day TEXT NOT NULL,
+                site TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                calls INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(day, site, model)
+            )
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_llm_token_usage_day
+            ON llm_token_usage(day)
         """)
 
         self.conn.commit()
@@ -1525,6 +1545,78 @@ class MemoryStorage:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    # === LLM token 用量统计 ===
+
+    @_db_locked
+    def record_llm_token_usage(
+        self,
+        day: str,
+        site: str,
+        model: str = "",
+        calls: int = 0,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+    ) -> None:
+        """累加某天某功能点的 token 消耗。"""
+        day = str(day or "").strip()
+        site = str(site or "").strip() or "default"
+        if not day:
+            return
+        self.conn.execute(
+            """
+            INSERT INTO llm_token_usage (
+                day, site, model, calls, prompt_tokens,
+                completion_tokens, total_tokens, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(day, site, model) DO UPDATE SET
+                calls = calls + excluded.calls,
+                prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                completion_tokens = completion_tokens + excluded.completion_tokens,
+                total_tokens = total_tokens + excluded.total_tokens,
+                updated_at = excluded.updated_at
+            """,
+            (
+                day,
+                site,
+                str(model or ""),
+                int(calls or 0),
+                int(prompt_tokens or 0),
+                int(completion_tokens or 0),
+                int(total_tokens or 0),
+                datetime.now().isoformat(sep=" ", timespec="seconds"),
+            ),
+        )
+        self.conn.commit()
+
+    @_db_locked
+    def get_llm_token_usage(self, days: int = 7) -> list[dict]:
+        """读取最近 N 天的用量明细（按天、功能点、模型）。"""
+        days = max(1, int(days or 7))
+        since = (datetime.now() - timedelta(days=days)).date().isoformat()
+        rows = self.conn.execute(
+            """
+            SELECT day, site, model, calls, prompt_tokens,
+                   completion_tokens, total_tokens
+            FROM llm_token_usage
+            WHERE day >= ?
+            ORDER BY day DESC, total_tokens DESC
+            """,
+            (since,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_db_locked
+    def cleanup_llm_token_usage(self, keep_days: int = 7) -> int:
+        """删掉保留期之外的旧记录，返回删除条数。"""
+        keep_days = max(1, int(keep_days or 7))
+        since = (datetime.now() - timedelta(days=keep_days)).date().isoformat()
+        cursor = self.conn.execute(
+            "DELETE FROM llm_token_usage WHERE day < ?", (since,)
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     @_db_locked
     def get_group_analysis_messages(
@@ -2838,6 +2930,38 @@ class AsyncMemoryStorage:
 
     def __init__(self, storage: MemoryStorage):
         self._storage = storage
+
+    # === LLM token 用量统计 ===
+
+    async def record_llm_token_usage(
+        self,
+        day: str,
+        site: str,
+        model: str = "",
+        calls: int = 0,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+    ) -> None:
+        """异步累加 token 用量。"""
+        await asyncio.to_thread(
+            self._storage.record_llm_token_usage,
+            day,
+            site,
+            model,
+            calls,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        )
+
+    async def get_llm_token_usage(self, days: int = 7) -> list[dict]:
+        """异步读取最近 N 天的用量明细。"""
+        return await asyncio.to_thread(self._storage.get_llm_token_usage, days)
+
+    async def cleanup_llm_token_usage(self, keep_days: int = 7) -> int:
+        """异步清理保留期之外的旧记录。"""
+        return await asyncio.to_thread(self._storage.cleanup_llm_token_usage, keep_days)
 
     async def store(self, memory: Memory) -> int:
         """异步存储，并在服务可用时生成嵌入向量"""

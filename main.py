@@ -28,6 +28,12 @@ from core.adapter.rich_media import DEFAULT_VISION_PROMPT, RichMediaEnricher
 from core.config_store import load_config as load_config_file, save_config as save_config_file
 
 from modules.llm.openai_provider import create_provider, LLMProvider
+from modules.llm.usage import (
+    DEFAULT_RETENTION_DAYS,
+    TokenUsageCollector,
+    tag_provider,
+    unwrap_provider,
+)
 from modules.memory.storage import MemoryStorage, AsyncMemoryStorage, Memory
 from modules.memory.context import (
     ContextManager,
@@ -272,6 +278,9 @@ class GroupChatBot:
         self._load_config()
         logger.info("✓ 配置已加载")
 
+        # 1.5 token 用量统计：先建好采集器，后面给各个 provider 套上功能标签。
+        self._init_token_usage()
+
         # 2. 初始化 LLM
         self._init_llm()
         logger.info("✓ 语言模型提供商已初始化")
@@ -279,6 +288,14 @@ class GroupChatBot:
         # 3. 初始化记忆系统
         self._init_memory()
         logger.info("✓ 记忆系统已初始化")
+        # 存储就绪后才把采集器接上：没存储时用量只留在内存里。
+        if self.token_usage is not None:
+            self.token_usage.attach_storage(self.memory_storage)
+            # 启动时先清掉保留期之外的旧记录。
+            try:
+                await self.token_usage.cleanup()
+            except Exception as exc:
+                logger.debug(f"token 用量清理失败：{exc}")
 
         # 3.5 初始化本地表情库；素材不进入普通记忆和 LLM 召回。
         self._init_meme_manager()
@@ -400,6 +417,41 @@ class GroupChatBot:
         """获取当前激活的 provider"""
         return self.llm_providers.get(self.active_provider_id)
 
+    def _init_token_usage(self) -> None:
+        """初始化 token 用量统计。
+
+        统计只回答"钱花在哪了"，默认保留最近 7 天，够看趋势就行。
+        """
+        usage_config = self.config.get("llm_usage", {}) or {}
+        if not isinstance(usage_config, dict):
+            usage_config = {}
+        enabled = bool(usage_config.get("enabled", True))
+        try:
+            retention_days = int(
+                usage_config.get("retention_days", DEFAULT_RETENTION_DAYS)
+                or DEFAULT_RETENTION_DAYS
+            )
+        except (TypeError, ValueError):
+            retention_days = DEFAULT_RETENTION_DAYS
+        self.token_usage = TokenUsageCollector(
+            retention_days=retention_days,
+            enabled=enabled,
+        )
+        if enabled:
+            logger.info(
+                "✓ Token 用量统计：启用=True，保留=%s 天",
+                self.token_usage.retention_days,
+            )
+        else:
+            logger.info("✓ Token 用量统计：已关闭")
+
+    def _tagged_provider(self, provider: Any, site: str) -> Any:
+        """给 provider 套上功能标签，调用消耗就记在这个功能点上。"""
+        collector = getattr(self, "token_usage", None)
+        if collector is None or not collector.enabled:
+            return provider
+        return tag_provider(provider, site, collector)
+
     def _get_routed_provider(self, role: str) -> Optional[LLMProvider]:
         """获取某个功能显式指定的 Provider。
 
@@ -427,10 +479,15 @@ class GroupChatBot:
         role: str,
         fallback: Optional[LLMProvider] = None,
     ) -> Optional[LLMProvider]:
-        """按功能选择 Provider；没有路由时沿用指定回退或当前主模型。"""
-        return self._get_routed_provider(role) or (
+        """按功能选择 Provider；没有路由时沿用指定回退或当前主模型。
+
+        返回的 provider 已经套上功能标签，这次调用的 token 消耗会记到
+        role 对应的功能点上。
+        """
+        provider = self._get_routed_provider(role) or (
             fallback if fallback is not None else self.get_active_provider()
         )
+        return self._tagged_provider(provider, role)
 
     def _reply_fallback_provider(self) -> Optional[LLMProvider]:
         """回复生成器的备用 Provider；路由回激活模型时返回 None。
@@ -442,13 +499,12 @@ class GroupChatBot:
         """
         reply_provider = self._get_provider_for_role("reply")
         active_provider = self.get_active_provider()
-        if (
-            reply_provider is None
-            or active_provider is None
-            or reply_provider is active_provider
-        ):
+        if reply_provider is None or active_provider is None:
             return None
-        return active_provider
+        # 套了计量标签之后两个实例不再相同，要比到底层 provider。
+        if unwrap_provider(reply_provider) is active_provider:
+            return None
+        return self._tagged_provider(active_provider, "reply_fallback")
 
     def _init_memory(self) -> None:
         """初始化记忆系统"""
@@ -840,6 +896,9 @@ class GroupChatBot:
         )
         if judge_provider is None:
             judge_provider = self.get_active_provider()
+        # 目标判断自己也是一个功能点：消耗要单独记，不能混进回复复核里。
+        # 后面两个角色拿它当回退时，套壳逻辑会先剥壳再按各自功能点重新套。
+        judge_provider = self._tagged_provider(judge_provider, "conversation_judge")
         review_provider = self._get_provider_for_role(
             "reply_review", fallback=judge_provider
         )
@@ -893,6 +952,7 @@ class GroupChatBot:
             taboo_topics=self.personality.taboo_topics,
             meme_manager=self.meme_manager,
             knowledge_store=self.memory_storage,
+            usage_collector=self.token_usage,
         )
         # 回退是否真的挂上了要能从启动日志一眼看出来，否则线上只能靠翻
         # generator 的 [回退] 日志反推。
@@ -917,7 +977,7 @@ class GroupChatBot:
         tool_llm = None
         routed_search_provider = self._get_routed_provider("search")
         if routed_search_provider is not None:
-            tool_llm = routed_search_provider
+            tool_llm = self._tagged_provider(routed_search_provider, "search")
             routes = self.config.get("llm_routing", {}) or {}
             if not isinstance(routes, dict):
                 routes = {}
@@ -968,7 +1028,7 @@ class GroupChatBot:
                 routes.get("vision"),
                 getattr(routed_vision_provider, "model", ""),
             )
-            return routed_vision_provider
+            return self._tagged_provider(routed_vision_provider, "vision")
         if not str(vision_config.get("api_key") or "").strip():
             logger.warning("视觉模型没有密钥，图片无法转成描述")
             return None
@@ -991,7 +1051,7 @@ class GroupChatBot:
                 f"✓ 视觉模型提供商：地址={vision_config.get('base_url')}，"
                 f"模型={vision_config.get('model')}"
             )
-            return provider
+            return self._tagged_provider(provider, "vision")
         except Exception as e:
             logger.error(f"✗ 初始化视觉模型提供商失败：{e}")
             return None
@@ -1038,6 +1098,7 @@ class GroupChatBot:
             # 不回退目标就会指向同一个实例（等于没配）或指向已经不该用的模型。
             self.reply_generator.fallback_llm = self._reply_fallback_provider()
             self.reply_generator.tool_llm = self._init_search_judge_llm()
+            self.reply_generator.usage_collector = self.token_usage
 
         # 目标/接话判断也使用独立 provider 配置；否则 Web 切换 provider、
         # 超时或开关后，当前进程仍会继续使用启动时的旧判断器。
@@ -6361,6 +6422,7 @@ class GroupChatBot:
         # 清理任务必须在连接前启动：connect() 成功后会一直阻塞服务 WebSocket，
         # 放在它后面的代码在正常运行时永远执行不到。
         self._tasks.append(asyncio.create_task(self._cleanup_loop()))
+        self._tasks.append(asyncio.create_task(self._token_usage_loop()))
 
         # 连接 QQ (可选 - 如果连接失败则继续运行用于测试)
         try:
@@ -6392,6 +6454,19 @@ class GroupChatBot:
             await self._maybe_group_analysis()
             await self._maybe_cleanup_group_analysis()
             logger.debug("已清理过期状态")
+
+    async def _token_usage_loop(self) -> None:
+        """定期把 token 用量落库，并清理保留期之外的旧记录。"""
+        while self._running:
+            await asyncio.sleep(60)
+            collector = getattr(self, "token_usage", None)
+            if collector is None or not collector.enabled:
+                continue
+            try:
+                await collector.flush()
+                await collector.maybe_cleanup()
+            except Exception as exc:
+                logger.debug(f"token 用量统计出错：{exc}")
 
     async def _maybe_decay_memories(self) -> None:
         """定期对长期记忆应用时间衰减（每6小时一次，避免频繁写库）"""
@@ -6500,6 +6575,13 @@ class GroupChatBot:
         # 记忆写入是退出前必须尽量保住的数据；先等待，超时才取消。
         memory_tasks = list(self._memory_tasks)
         await finish_tasks(memory_tasks, preserve_memory=True)
+        # token 用量还攒在内存里，退出前落库，别把今天的数据丢了。
+        collector = getattr(self, "token_usage", None)
+        if collector is not None and collector.enabled:
+            try:
+                await collector.flush()
+            except Exception as exc:
+                logger.debug(f"token 用量落库失败：{exc}")
         self._tasks.clear()
         self._reply_tasks.clear()
         self._reply_task_decisions.clear()
@@ -6598,6 +6680,13 @@ class GroupChatBot:
                 "mbti": "",
                 "slang": "",
                 "expression_learning": "",
+            },
+            # LLM token 消耗统计：按天、按功能点记，保留最近几天。
+            #   enabled=false → 完全不统计
+            #   retention_days → 保留多少天，超出的自动删掉
+            "llm_usage": {
+                "enabled": True,
+                "retention_days": DEFAULT_RETENTION_DAYS,
             },
             # 引用回复策略：这条回复要不要带上引用。
             #   enabled=false → 完全不使用引用

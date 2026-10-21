@@ -1286,6 +1286,46 @@
                 <div class="card reveal">
                     <div class="card-header">
                         <div class="card-title">
+                            <span class="card-ico"><svg class="icon-sm"><use href="#i-cpu"/></svg></span>
+                            Token 消耗
+                            <span class="hint" id="token-usage-hint" style="margin-left: 4px"></span>
+                        </div>
+                        <span class="badge gray" id="token-usage-badge">最近 7 天</span>
+                    </div>
+                    <div class="stat-band" style="margin-top: 0; border: none; border-radius: 0; background: transparent;">
+                        <div class="stat-cell">
+                            <div class="stat-icon c-violet"><svg class="icon"><use href="#i-zap"/></svg></div>
+                            <div class="stat-value" id="token-total">0</div>
+                            <div class="stat-label">总 token</div>
+                        </div>
+                        <div class="stat-cell">
+                            <div class="stat-icon c-sky"><svg class="icon"><use href="#i-send"/></svg></div>
+                            <div class="stat-value" id="token-calls">0</div>
+                            <div class="stat-label">模型调用</div>
+                        </div>
+                        <div class="stat-cell">
+                            <div class="stat-icon c-emerald"><svg class="icon"><use href="#i-download"/></svg></div>
+                            <div class="stat-value" id="token-input">0</div>
+                            <div class="stat-label">输入 token</div>
+                        </div>
+                        <div class="stat-cell">
+                            <div class="stat-icon c-amber"><svg class="icon"><use href="#i-upload"/></svg></div>
+                            <div class="stat-value" id="token-output">0</div>
+                            <div class="stat-label">输出 token</div>
+                        </div>
+                    </div>
+                    <div class="table-responsive" style="margin-top: 14px;">
+                        <table class="table" id="token-usage-table">
+                            <thead><tr><th>功能点</th><th>模型</th><th>调用</th><th>输入</th><th>输出</th><th>合计</th></tr></thead>
+                            <tbody id="token-usage-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div class="hint" id="token-usage-days" style="margin-top: 10px;"></div>
+                </div>
+
+                <div class="card reveal">
+                    <div class="card-header">
+                        <div class="card-title">
                             <span class="card-ico"><svg class="icon-sm"><use href="#i-heart"/></svg></span>
                             情感状态
                         </div>
@@ -2720,6 +2760,9 @@
 
                 // 图片识别记录
                 renderRecognition(status.recognition_history || []);
+
+                // Token 消耗统计
+                loadTokenUsage();
             } catch (e) {
                 document.getElementById('status-text').textContent = '连接失败';
                 document.getElementById('status-pill').className = 'status-pill offline';
@@ -2755,6 +2798,79 @@
                         </div>
                     </div>`;
             }).join('');
+        }
+
+        async function loadTokenUsage() {
+            try {
+                const res = await fetch(API + '/token-usage?days=7');
+                if (!res.ok) return;
+                renderTokenUsage(await res.json());
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        function formatTokens(value) {
+            const num = Number(value || 0);
+            if (num >= 1000000) return (num / 1000000).toFixed(2) + 'M';
+            if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+            return String(num);
+        }
+
+        function renderTokenUsage(data) {
+            const tbody = document.getElementById('token-usage-tbody');
+            const totals = data.totals || {};
+            document.getElementById('token-total').textContent = formatTokens(totals.total_tokens);
+            document.getElementById('token-calls').textContent = totals.calls || 0;
+            document.getElementById('token-input').textContent = formatTokens(totals.prompt_tokens);
+            document.getElementById('token-output').textContent = formatTokens(totals.completion_tokens);
+            document.getElementById('token-usage-badge').textContent = `最近 ${data.retention_days || 7} 天`;
+            document.getElementById('token-usage-hint').textContent = data.enabled ? '' : '（统计已关闭）';
+
+            const sites = data.sites || [];
+            if (!sites.length) {
+                tbody.innerHTML = '<tr><td colspan="6" class="hint" style="text-align:center;padding:16px;">暂无用量记录</td></tr>';
+                document.getElementById('token-usage-days').textContent = '';
+                return;
+            }
+
+            const rows = [];
+            sites.forEach(site => {
+                const models = Object.values(site.models || {});
+                if (!models.length) {
+                    rows.push({site, model: '未知模型', calls: site.calls, prompt: site.prompt_tokens, completion: site.completion_tokens, total: site.total_tokens});
+                    return;
+                }
+                models.forEach(m => {
+                    const share = site.total_tokens ? (m.total_tokens / site.total_tokens) : 1;
+                    rows.push({
+                        site,
+                        model: m.model,
+                        calls: m.calls,
+                        prompt: Math.round(site.prompt_tokens * share),
+                        completion: Math.round(site.completion_tokens * share),
+                        total: m.total_tokens,
+                    });
+                });
+            });
+
+            tbody.innerHTML = rows.map(r => `
+                <tr>
+                    <td><strong>${escapeHtml(r.site.label || r.site.site)}</strong></td>
+                    <td class="hint" style="font-family:monospace;font-size:12px;">${escapeHtml(r.model || '')}</td>
+                    <td>${r.calls}</td>
+                    <td>${formatTokens(r.prompt)}</td>
+                    <td>${formatTokens(r.completion)}</td>
+                    <td><strong>${formatTokens(r.total)}</strong></td>
+                </tr>`).join('');
+
+            const days = data.days || [];
+            if (days.length) {
+                document.getElementById('token-usage-days').textContent =
+                    '按天：' + days.map(d => `${d.day.slice(5)} ${formatTokens(d.total_tokens)}`).join(' · ');
+            } else {
+                document.getElementById('token-usage-days').textContent = '';
+            }
         }
 
         function updateGauge(type, value) {

@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import uvicorn
 from core.config_store import load_config as load_config_file, mask_secrets, save_config as save_config_file
+from modules.llm.usage import site_label
 
 logger = logging.getLogger(__name__)
 
@@ -753,6 +754,74 @@ async def distill_profiles():
     except Exception as e:
         logger.error(f"手动提炼用户画像失败：{e}")
         return {"success": False, "error": str(e)}
+
+
+@app.get("/api/token-usage")
+async def get_token_usage(days: int = 7):
+    """LLM token 消耗统计：按天、按功能点拆开。"""
+    if not bot_instance:
+        return {"days": [], "sites": [], "totals": {}, "enabled": False}
+    collector = getattr(bot_instance, "token_usage", None)
+    if collector is None or not collector.enabled:
+        return {"days": [], "sites": [], "totals": {}, "enabled": False}
+    try:
+        keep_days = max(1, min(int(days or 7), 30))
+        # 先把内存里还没落库的用量刷进去，面板看到的才是完整的。
+        await collector.flush()
+        rows = await bot_instance.memory_storage.get_llm_token_usage(keep_days)
+    except Exception as e:
+        logger.error(f"加载 token 用量统计失败：{e}")
+        return {"days": [], "sites": [], "totals": {}, "enabled": True, "error": str(e)}
+
+    day_totals: dict[str, dict] = {}
+    site_totals: dict[str, dict] = {}
+    grand = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for row in rows:
+        day = str(row.get("day") or "")
+        site = str(row.get("site") or "default")
+        model = str(row.get("model") or "")
+        calls = int(row.get("calls") or 0)
+        prompt = int(row.get("prompt_tokens") or 0)
+        completion = int(row.get("completion_tokens") or 0)
+        total = int(row.get("total_tokens") or 0)
+
+        day_row = day_totals.setdefault(
+            day,
+            {"day": day, "calls": 0, "prompt_tokens": 0,
+             "completion_tokens": 0, "total_tokens": 0},
+        )
+        site_row = site_totals.setdefault(
+            site,
+            {"site": site, "label": site_label(site), "calls": 0, "prompt_tokens": 0,
+             "completion_tokens": 0, "total_tokens": 0, "models": {}},
+        )
+        model_row = site_row["models"].setdefault(
+            model or "未知模型",
+            {"model": model or "未知模型", "calls": 0, "total_tokens": 0},
+        )
+        for target in (day_row, site_row):
+            target["calls"] += calls
+            target["prompt_tokens"] += prompt
+            target["completion_tokens"] += completion
+            target["total_tokens"] += total
+        model_row["calls"] += calls
+        model_row["total_tokens"] += total
+        grand["calls"] += calls
+        grand["prompt_tokens"] += prompt
+        grand["completion_tokens"] += completion
+        grand["total_tokens"] += total
+
+    days_list = sorted(day_totals.values(), key=lambda item: item["day"], reverse=True)
+    sites_list = sorted(
+        site_totals.values(), key=lambda item: item["total_tokens"], reverse=True
+    )
+    return {
+        "days": days_list,
+        "sites": sites_list,
+        "totals": grand,
+        "enabled": True,
+        "retention_days": collector.retention_days,
+    }
 
 
 @app.get("/api/group-analysis/reports")

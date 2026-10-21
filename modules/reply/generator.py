@@ -12,6 +12,7 @@ import time
 from typing import Optional, Dict, Any
 
 from modules.llm.base import ChatMessage, ChatRequest, ChatResponse
+from modules.llm.usage import tag_provider
 from modules.personality.speaking_style import SpeakingStyleManager, create_default_style
 from modules.personality.emotional_state import EmotionalState
 
@@ -224,6 +225,7 @@ class ReplyGenerator:
         taboo_topics: list[str] = None,
         meme_manager=None,
         knowledge_store=None,
+        usage_collector=None,
     ):
         """
         初始化
@@ -239,6 +241,7 @@ class ReplyGenerator:
             taboo_topics: 不主动讨论或展开的禁忌话题
             meme_manager: 可选的本地表情包管理器，用于注入内部选图标记
             knowledge_store: 全局热梗/游戏资料库（与群黑话、聊天向量记忆分开）
+            usage_collector: token 用量采集器（用于把语义复核/改写单独记账）
         """
         self.llm = llm_provider
         self.fallback_llm = fallback_llm_provider
@@ -257,6 +260,7 @@ class ReplyGenerator:
         self.tool_llm = tool_llm_provider
         self.meme_manager = meme_manager
         self.knowledge_store = knowledge_store
+        self.usage_collector = usage_collector
 
         # 统计
         self.replies_generated = 0
@@ -874,6 +878,16 @@ class ReplyGenerator:
             logger.warning("资料库检索失败：%s", exc)
             return []
 
+    def _usage_tagged(self, provider, site: str):
+        """给 provider 套上功能标签，让这次调用记到对应功能点上。
+
+        同一个底层模型被几个功能共用时，靠这里按调用点分别记账。
+        """
+        collector = getattr(self, "usage_collector", None)
+        if collector is None or not getattr(collector, "enabled", False):
+            return provider
+        return tag_provider(provider, site, collector)
+
     async def _judge_need_search(
         self,
         current_message: str,
@@ -887,7 +901,7 @@ class ReplyGenerator:
         ``{"need_search", "topic", "query", "freshness"}``。
         query 应结合最近聊天把「这个」「那角色」还原成具体主题。
         """
-        judge_llm = self.tool_llm or self.llm
+        judge_llm = self._usage_tagged(self.tool_llm or self.llm, "search")
         # 「有联网能力」= 主模型自带服务端搜索（Responses / MiniMax Server Tools）。
         # 外部搜索后端已下线，联网一律走服务端工具。
         # 能力取自主模型 self.llm —— tool_llm 只是做判断的另一个模型，不承担搜索。
@@ -1177,7 +1191,7 @@ class ReplyGenerator:
             if freshness == "current"
             else "用户问「现在/当前」时，只回答【正在进行】的内容；"
         )
-        writer = self.tool_llm or self.llm
+        writer = self._usage_tagged(self.tool_llm or self.llm, "search_answer")
         clean.messages.append(ChatMessage(
             role="user",
             content=(
