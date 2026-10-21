@@ -844,8 +844,8 @@ class GroupChatBot:
 
         self.response_filter = ResponseFilter()
 
-        # 联网搜索（LLM 判断是否需要搜索）。普通闲聊仍走主 LLM，零回归。
-        search_client, tool_llm = self._init_search()
+        # 检索判断器（LLM 判断要不要查资料）。普通闲聊仍走主 LLM，零回归。
+        tool_llm = self._init_search_judge_llm()
 
         self.reply_generator = ReplyGenerator(
             llm_provider=self._get_provider_for_role("reply"),
@@ -853,7 +853,6 @@ class GroupChatBot:
             personality_prompt=self.personality.build_persona_prompt(),
             speaking_style_manager=self.speaking_style_manager,
             tool_llm_provider=tool_llm,
-            search_client=search_client,
             bot_name=self.personality.name,
             taboo_topics=self.personality.taboo_topics,
             meme_manager=self.meme_manager,
@@ -872,59 +871,26 @@ class GroupChatBot:
                 "✓ 回复备用模型：未启用（reply 未路由到其他 Provider）"
             )
 
-    def _init_search(self):
-        """初始化联网搜索：SearchClient + 支持 function calling 的 LLM。
+    def _init_search_judge_llm(self):
+        """初始化检索判断器用的 LLM（可选）。
 
-        工具 LLM 默认复用主 LLM 的密钥/模型，但走 OpenAI 兼容端点
-        （MiniMax 的 function calling 在 OpenAI 端点上可用，Anthropic 端点上不支持）。
+        外部搜索后端（博查 / 豆包）已下线：联网一律走主模型的服务端 web_search
+        工具。这里只决定「要不要检索」的判断器和「带资料生成」用哪个模型：
+        只认 llm_routing.search 显式路由；没配就复用主 LLM（返回 None）。
         """
-        from modules.llm.openai_provider import OpenAIProvider
-        from modules.search import SearchClient
-
-        search_config = self.config.get("search", {}) or {}
-        search_client = SearchClient(search_config)
-
         tool_llm = None
-        if search_client.available and search_config.get("enabled", False):
-            routed_search_provider = self._get_routed_provider("search")
-            if routed_search_provider is not None:
-                tool_llm = routed_search_provider
-                routes = self.config.get("llm_routing", {}) or {}
-                if not isinstance(routes, dict):
-                    routes = {}
-                logger.info(
-                    "✓ 联网搜索语言模型：复用 Provider「%s」/%s",
-                    routes.get("search"),
-                    getattr(tool_llm, "model", ""),
-                )
-            else:
-                llm_cfg = _normalize_llm_provider_config(
-                    search_config.get("llm", {}) or {}
-                )
-                primary = self.get_active_provider()
-                api_key = llm_cfg.get("api_key") or getattr(primary, "api_key", "")
-                model = llm_cfg.get("model") or getattr(primary, "model", "")
-                try:
-                    tool_llm = OpenAIProvider({
-                        "provider_type": "openai_compatible",
-                        "api_key": api_key,
-                        "base_url": llm_cfg.get(
-                            "base_url", MINIMAX_OPENAI_BASE_URL
-                        ),
-                        "model": model or "MiniMax-M3",
-                        "timeout": float(llm_cfg.get("timeout", 60)),
-                    })
-                    logger.info(f"✓ 联网搜索语言模型：{tool_llm.model}")
-                except Exception as e:
-                    logger.error(f"✗ 初始化联网搜索语言模型失败：{e}")
-                    tool_llm = None
-
-        if search_client.available:
+        routed_search_provider = self._get_routed_provider("search")
+        if routed_search_provider is not None:
+            tool_llm = routed_search_provider
+            routes = self.config.get("llm_routing", {}) or {}
+            if not isinstance(routes, dict):
+                routes = {}
             logger.info(
-                f"✓ 联网搜索已启用：主后端={search_client.primary}，"
-                f"备用后端={list(search_client._backends.keys())}"
+                "✓ 检索判断语言模型：复用 Provider「%s」/%s",
+                routes.get("search"),
+                getattr(tool_llm, "model", ""),
             )
-        return search_client, tool_llm
+        return tool_llm
 
     def _init_vision_provider(self) -> Optional[Any]:
         """初始化视觉模型 Provider（图片→文字描述）。未启用/失败返回 None，不阻断启动。"""
@@ -1035,9 +1001,7 @@ class GroupChatBot:
             # 备用 Provider 也要跟着路由变：热更新把 reply 切到/切回中转时，
             # 不回退目标就会指向同一个实例（等于没配）或指向已经不该用的模型。
             self.reply_generator.fallback_llm = self._reply_fallback_provider()
-            search_client, tool_llm = self._init_search()
-            self.reply_generator.search_client = search_client
-            self.reply_generator.tool_llm = tool_llm
+            self.reply_generator.tool_llm = self._init_search_judge_llm()
 
         # 目标/接话判断也使用独立 provider 配置；否则 Web 切换 provider、
         # 超时或开关后，当前进程仍会继续使用启动时的旧判断器。
@@ -6549,41 +6513,6 @@ class GroupChatBot:
                     "context_enabled": True,
                     "context_neighbors": 2,
                     "context_max_targets": 12
-                }
-            },
-            "search": {
-                "enabled": False,
-                "primary": "doubao",
-                "min_interval_seconds": 60,
-                "result_limit": 5,
-                "trigger_keywords": [
-                    "新闻", "热搜", "最新", "今天", "现在", "天气", "温度",
-                    "价格", "多少钱", "比分", "谁赢了", "汇率", "油价",
-                    "涨幅", "跌了", "涨停", "什么情况", "怎么回事", "发生了",
-                    "结果", "发布", "官宣", "宣布", "百科", "是什么", "为什么",
-                    # 游戏类时效性意图（游戏名无法枚举，用通用意图词覆盖）
-                    "卡池", "抽卡", "UP", "复刻", "兑换码", "礼包码",
-                    "角色", "是谁", "谁up",
-                    "前瞻", "爆料", "开服", "公测", "内测", "强度",
-                    "评测", "节奏榜", "T0", "版本", "赛程", "赛事", "联动", "攻略", "阵容",
-                ],
-                "llm": {
-                    "api_key": "",
-                    "base_url": MINIMAX_OPENAI_BASE_URL,
-                    "model": "",
-                    "timeout": 60
-                },
-                "backends": {
-                    "bocha": {
-                        "api_key": "",
-                        "freshness": "noLimit",
-                        "count": 5
-                    },
-                    "doubao": {
-                        "api_key": "",
-                        "time_range": "",
-                        "count": 5
-                    }
                 }
             },
             "groups": {}

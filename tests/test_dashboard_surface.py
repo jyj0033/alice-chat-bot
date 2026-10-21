@@ -101,11 +101,6 @@ class DashboardSurfaceTests(unittest.TestCase):
             "meme-pagination",
             "meme-prev",
             "meme-next",
-            # 联网搜索（LLM 页）
-            "search-enabled",
-            "search-primary",
-            "search-bocha-api-key",
-            "search-doubao-api-key",
             "page-knowledge",
             "knowledge-name",
             "knowledge-aliases",
@@ -126,6 +121,35 @@ class DashboardSurfaceTests(unittest.TestCase):
         self.assertNotIn("style-use-emoji", self.parser.ids)
         self.assertNotIn("personality-catchphrases", self.parser.ids)
         self.assertNotIn("personality-emojis", self.parser.ids)
+
+    def test_external_search_controls_are_removed(self):
+        """外部搜索后端（博查 / 豆包）已下线，面板不再暴露对应配置项。
+
+        联网统一走主模型的服务端 web_search，没有可配置的后端与 API Key。
+        """
+        for removed_id in (
+            "search-config-card",
+            "search-enabled",
+            "search-primary",
+            "search-interval",
+            "search-result-limit",
+            "search-llm-api-key",
+            "search-llm-base-url",
+            "search-llm-model",
+            "search-llm-timeout",
+            "search-bocha-api-key",
+            "search-bocha-freshness",
+            "search-doubao-api-key",
+            "search-doubao-time-range",
+            "search-status",
+        ):
+            self.assertNotIn(removed_id, self.parser.ids)
+        self.assertNotIn("saveSearchConfig", self.html)
+        self.assertNotIn("loadSearchConfig", self.html)
+        self.assertNotIn("bocha", self.html)
+        self.assertNotIn("doubao", self.html)
+        # 功能路由里的「检索判断 / 带资料回复」仍在：判断器还需要独立的模型分工
+        self.assertIn("{key: 'search'", self.html)
 
     def test_memory_list_uses_server_pagination_and_search_debounce(self):
         self.assertIn("page_size", self.html)

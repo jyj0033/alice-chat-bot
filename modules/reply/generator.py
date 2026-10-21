@@ -67,11 +67,10 @@ SERVER_SEARCH_TEMPERATURE = 0.3
 
 # 服务端搜索路径的「时效 / 来源取舍」约束。
 #
-# 为什么需要单独加这一段：同一套约束在客户端搜索链里已经存在
-# （见 _generate_with_search 内的 writer 提示），但服务端搜索走的是 generate() 的
-# 普通分支，完全不经过那段提示——等于「模型自己搜、自己答，却没人告诉它资料过时了
-# 该怎么办」。实测后果：模型会把别的作品的资料认成本作，也会把猜出来的版本号
-# 当事实报出去。
+# 为什么需要单独加这一段：服务端搜索走的是 generate() 的普通分支，
+# 不经过本地资料注入那段 writer 提示——等于「模型自己搜、自己答，却没人告诉它
+# 资料过时了该怎么办」。实测后果：模型会把别的作品的资料认成本作，也会把猜出来的
+# 版本号当事实报出去。
 SERVER_SEARCH_GUARDRAIL = (
     "【本轮已开启联网检索】\n"
     "今天是{today}。查到资料后按下面要求回答：\n"
@@ -221,7 +220,6 @@ class ReplyGenerator:
         speaking_style_manager: SpeakingStyleManager = None,
         thinking_delay: float = 2.0,
         tool_llm_provider=None,
-        search_client=None,
         bot_name: str = "",
         taboo_topics: list[str] = None,
         meme_manager=None,
@@ -236,8 +234,7 @@ class ReplyGenerator:
             personality_prompt: 人格提示词
             speaking_style_manager: 说话风格管理器
             thinking_delay: 基础思考延迟（秒）
-            tool_llm_provider: 支持联网搜索判断/带资料生成的 LLM 提供者
-            search_client: 搜索客户端（模块 search.SearchClient）
+            tool_llm_provider: 检索判断器 / 带资料生成的 LLM 提供者（没有就复用主 LLM）
             bot_name: bot 在对话记录里的显示名（用于识别上下文中自己说的行）
             taboo_topics: 不主动讨论或展开的禁忌话题
             meme_manager: 可选的本地表情包管理器，用于注入内部选图标记
@@ -256,16 +253,14 @@ class ReplyGenerator:
         self.base_thinking_delay = thinking_delay
         self.response_filter = ResponseFilter()
 
-        # 联网搜索
+        # 检索判断器（本地资料库 + 服务端 web_search 的闸门）
         self.tool_llm = tool_llm_provider
-        self.search_client = search_client
         self.meme_manager = meme_manager
         self.knowledge_store = knowledge_store
 
         # 统计
         self.replies_generated = 0
         self.replies_filtered = 0
-        self.search_calls = 0
         self.format_invalid = 0
         self.rewrites = 0
 
@@ -386,11 +381,9 @@ class ReplyGenerator:
                 search_decision.get("query") or current_message,
                 glossary,
             )
-        has_web = bool(self.search_client and self.search_client.available)
         # 主模型自带服务端搜索（Responses / MiniMax Server Tools）时：
-        #   ① 关掉「外部搜索 + 资料注入」的联网那一路，否则同一句话会被搜两次；
-        #   ② web_search 改为**按需声明**——只在检索判断器认为这条消息需要查资料时，
-        #      才把 {"type":"web_search"} 加进本次请求的 tools。
+        #   web_search 改为**按需声明**——只在检索判断器认为这条消息需要查资料时，
+        #   才把 {"type":"web_search"} 加进本次请求的 tools。
         # 为什么不做成常驻声明：常驻会让「晚饭吃啥」这类闲聊也触发多轮服务端联网，
         # 而每轮抓回的网页正文都会留在上下文里被后续轮次反复重发，实测输入 token
         # 从 233（不搜）涨到 2 万~68 万（搜 2~6 轮）；且端点忽略 max_uses 限流字段
@@ -400,10 +393,6 @@ class ReplyGenerator:
         # getattr(mock, "supports_server_search", False) 会返回真值 mock，
         # 用布尔真值判断会把它误当成「自带服务端搜索」而关掉 web 注入。
         server_search = getattr(self.llm, "supports_server_search", False) is True
-        use_web = bool(search_decision.get("need_search") and has_web and not server_search)
-        if knowledge_hits and search_decision.get("freshness") != "current":
-            if any(item.get("confidence") == "exact" for item in knowledge_hits):
-                use_web = False
         if self._should_declare_server_search(server_search, search_decision):
             # 只影响本次请求：request 由 _build_request 每轮新建，不跨轮复用。
             request.tools.append({"type": "web_search"})
@@ -421,18 +410,17 @@ class ReplyGenerator:
         meme_id = ""
         meme_called = False
         trusted_reply = False
-        if search_decision.get("need_search") and (use_web or knowledge_hits):
+        if knowledge_hits:
             try:
-                response = await self._generate_with_search(
+                response = await self._generate_with_knowledge(
                     request,
                     session_id,
                     current_message,
                     search_decision=search_decision,
                     knowledge_hits=knowledge_hits,
-                    use_web=use_web,
                 )
             except Exception as e:
-                logger.error(f"搜索回复生成失败，回退普通回复：{e}", exc_info=True)
+                logger.error(f"资料注入回复生成失败，回退普通回复：{e}", exc_info=True)
                 response = None
             reply = response.content if (response is not None) else ""
             if response is not None and self.meme_manager:
@@ -807,7 +795,7 @@ class ReplyGenerator:
 
         ① 压温度：事实型问答在 0.8 下每次采样会落在不同的错误片段上，
            实测同题 4 次得 4 个不同答案。只压不高——配置本身更低时保留配置值。
-        ② 补约束：`_generate_with_search` 的 writer 提示里有一整套
+        ② 补约束：本地资料注入那条路的 writer 提示里有一整套
            「只答正在进行的内容 / 日期新的优先 / 不确定别编造」，但服务端搜索走的
            是普通分支，不经过那段提示。这里把要点补上，否则模型在资料过时或
            搜到别的作品时没有任何行为指导。
@@ -900,11 +888,11 @@ class ReplyGenerator:
         query 应结合最近聊天把「这个」「那角色」还原成具体主题。
         """
         judge_llm = self.tool_llm or self.llm
-        # 服务端搜索也算「有联网能力」，否则生产里 search.enabled=false 时
-        # has_web 恒为 False，判断器永远返回「不需要检索」，按需声明会把搜索彻底关死。
+        # 「有联网能力」= 主模型自带服务端搜索（Responses / MiniMax Server Tools）。
+        # 外部搜索后端已下线，联网一律走服务端工具。
         # 能力取自主模型 self.llm —— tool_llm 只是做判断的另一个模型，不承担搜索。
         server_search = getattr(self.llm, "supports_server_search", False) is True
-        has_web = bool(self.search_client and self.search_client.available) or server_search
+        has_web = server_search
         if not judge_llm:
             return self._no_search_decision()
         has_kb = await self._has_knowledge()
@@ -1144,79 +1132,36 @@ class ReplyGenerator:
             lines.append("   " + " · ".join(meta))
         return "\n".join(lines)
 
-    async def _generate_with_search(
+    async def _generate_with_knowledge(
         self,
         request: ChatRequest,
         session_id: str = "",
         current_message: str = "",
         search_decision: Dict[str, Any] = None,
         knowledge_hits: list = None,
-        use_web: bool = True,
     ) -> Optional[ChatResponse]:
-        """资料注入上下文，一次干净 LLM 调用生成回复。
+        """把本地资料库命中的资料当作普通上下文注入，一次干净 LLM 调用生成回复。
 
-        不用 function calling 工具循环：MiniMax 工具协议不稳定（内容泄漏、
-        空回复、原生 <invoke> 标记、轮数超限后还要重建请求），
-        预搜索 + 把资料当作普通上下文注入更可靠。
+        外部搜索后端（博查 / 豆包）已下线：联网一律由主模型的服务端 web_search
+        工具承担，这里只负责「本地资料（全局热梗 / 游戏资料库）」这一路注入。
         """
         decision = search_decision or {}
         knowledge_hits = [
             item for item in (knowledge_hits or []) if isinstance(item, dict)
         ]
         query = (decision.get("query") or current_message or "").strip()
-        if not query:
-            for m in reversed(request.messages):
-                if m.role == "user" and isinstance(m.content, str):
-                    query = m.content.strip()
-                    break
+        # 富媒体识别描述不注入资料，兜底防绕过。
+        if query.startswith(self.MEDIA_DESCRIPTION_PREFIXES):
+            return None
+        if not knowledge_hits:
+            return None  # 没有本地资料 → 上层回退主 LLM 正常回答
+
         freshness = str(decision.get("freshness") or "stable")
-        prefer_recent = freshness == "current"
-
-        results = []
-        if use_web and self.search_client and self.search_client.available:
-            # 富媒体识别描述不搜索，兜底防绕过。
-            if query.startswith(self.MEDIA_DESCRIPTION_PREFIXES):
-                if not knowledge_hits:
-                    return None
-            else:
-                results = await self.search_client.search(
-                    query,
-                    session_id=session_id,
-                    prefer_recent=prefer_recent,
-                )
-                self.search_calls += 1
-
-                # 用户问"现在/当前"，但搜到的全是下版本前瞻（如鸣潮全是3.6预告）：
-                # 自动推断当前版本号，补搜「游戏名+当前版本+卡池」拿正在进行的卡池。
-                if (
-                    results
-                    and self.search_client.is_time_sensitive(query)
-                    and self.search_client.all_future(results)
-                ):
-                    cur_ver = self.search_client.infer_current_version(results)
-                    game = self.search_client.extract_game_name(query)
-                    if cur_ver and game:
-                        followup = await self.search_client.search(
-                            f"{game}{cur_ver}卡池",
-                            session_id=session_id,
-                            force_backend="doubao",
-                            prefer_recent=True,
-                        )
-                        self.search_calls += 1
-                        if followup:
-                            results = followup
-
-        if not results and not knowledge_hits:
-            return None  # 没搜到 → 上层回退主 LLM 正常回答
-
         knowledge_block = self._format_knowledge_hits(knowledge_hits)
-        web_block = ""
-        if results and self.search_client:
-            web_block = self.search_client.format_results(results)
         uncertain = any(
             item.get("confidence") != "exact" for item in knowledge_hits
         ) if knowledge_hits else False
-        sources = "\n\n".join(part for part in (knowledge_block, web_block) if part)
+        sources = knowledge_block
 
         # 3. 干净请求：在原始请求副本上追加资料（无任何工具），一次生成。
         clean = copy.deepcopy(request)
@@ -1225,7 +1170,7 @@ class ReplyGenerator:
         caution = (
             "匹配不确定或对不上时，短问一句确认，或谨慎说不太确定，不要把不确定条目当成事实。"
             if uncertain or not knowledge_hits
-            else "本地资料库命中较确定时优先用它；和联网结果冲突时，时效问题看日期更新的，稳定设定看本地来源。"
+            else "本地资料库命中较确定时优先用它；没有把握的地方宁可说不确定，别硬编。"
         )
         current_rule = (
             "用户问「现在/当前」或资料标记为 current 时，只回答【正在进行】的内容；"
@@ -1256,8 +1201,8 @@ class ReplyGenerator:
         resp = await writer.chat(clean) if writer else None
         # 工具 LLM（OpenAI 兼容端点）偶发：空回复 / 只输出 <think> 思考块 /
         # 残留工具标记。一律清理思考后再判定是否可用——若可用内容为空，
-        # 改用主 LLM 对同一份资料重答，不浪费已经搜到的结果
-        # （回退无资料的主 LLM 只能凭记忆，搜索等于白做）。
+        # 改用主 LLM 对同一份资料重答，不浪费已经查到的资料
+        # （回退无资料的主 LLM 只能凭记忆，资料库这一路等于白做）。
         reply = self._clean_thinking_process(str(resp.content or "")) if resp else ""
         if not reply or self._has_tool_markup(reply):
             finish = f"finish={getattr(resp, 'finish_reason', '?')!r}" if resp else "无响应"
@@ -1276,7 +1221,7 @@ class ReplyGenerator:
                     "protocol" if self._has_tool_markup(reply) else "empty",
                     reply,
                 )
-                logger.warning("主语言模型带资料重答仍不可用，丢弃搜索结果")
+                logger.warning("主语言模型带资料重答仍不可用，丢弃资料")
                 resp = None
             else:
                 logger.warning(

@@ -328,23 +328,6 @@ async def update_config(request: Request):
                 data['image']['vision'] = new_vision
             current['image'] = deep_merge(current_image, data['image'])
 
-        # 联网搜索配置
-        if 'search' in data:
-            current_search = current.get('search', {})
-            new_search = data['search']
-            # 回填掩码过的 api_key
-            if isinstance(new_search.get('llm'), dict):
-                if str(new_search['llm'].get('api_key', '')).startswith('*'):
-                    new_search['llm']['api_key'] = (current_search.get('llm') or {}).get('api_key', '')
-            backends = new_search.get('backends') or {}
-            for name in ('bocha', 'doubao'):
-                if isinstance(backends.get(name), dict):
-                    if str(backends[name].get('api_key', '')).startswith('*'):
-                        backends[name]['api_key'] = (
-                            (current_search.get('backends') or {}).get(name, {}) or {}
-                        ).get('api_key', '')
-            current['search'] = deep_merge(current_search, new_search)
-
         strip_removed_personality_fields(current)
         save_config(current)
         runtime_reloaded = reload_bot_runtime()

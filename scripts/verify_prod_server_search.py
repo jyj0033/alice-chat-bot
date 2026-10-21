@@ -31,9 +31,18 @@ CASES = [("闲聊", "晚饭吃啥"), ("需联网", "崩铁现在up角色是谁")
 
 
 def build_provider():
+    """按生产路由取「回复链路真正在用」的那个 Provider。
+
+    这里原来固定取 llm.primary，但 llm_routing.reply 可以指向别家（线上是
+    qianyemeng）。线上回复走的是路由后的模型，探针却去测 primary，会得出
+    「provider 未开启服务端搜索 / 需联网的消息没有声明 web_search」的假结论。
+    回复链路以 llm_routing.reply 为准。
+    """
     cfg = load_config("/app/config/config.yaml")
-    primary = dict((cfg.get("llm") or {}).get("primary") or {})
-    pc = _normalize_llm_provider_config(primary)
+    routing = cfg.get("llm_routing") or {}
+    target = str(routing.get("reply") or "primary").strip() or "primary"
+    raw = dict((cfg.get("llm") or {}).get(target) or {})
+    pc = _normalize_llm_provider_config(raw)
     provider = create_provider(
         pc.get("provider_type", "openai_compatible"),
         {
@@ -104,6 +113,8 @@ def _is_judge(request) -> bool:
 async def main() -> int:
     pc, provider = build_provider()
     print("=" * 70)
+    routing = load_config("/app/config/config.yaml").get("llm_routing") or {}
+    print(f"llm_routing.reply = {routing.get('reply')!r}（回复链路实际使用的 Provider）")
     print(f"归一化后 provider_type = {pc.get('provider_type')}  web_search = {pc.get('web_search')}")
     print(f"provider = {type(provider).__name__}  supports_server_search = "
           f"{getattr(provider, 'supports_server_search', None)}")
