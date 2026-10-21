@@ -82,6 +82,96 @@ class TokenUsageCollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(written, 0)
         self.assertEqual(collector.pending_calls, 1)
 
+    async def test_flush_keeps_counters_when_write_fails(self):
+        """写库失败时不能把计数清掉，否则用量直接丢了。"""
+        storage = SimpleNamespace(
+            record_llm_token_usage=AsyncMock(side_effect=RuntimeError("db locked"))
+        )
+        collector = TokenUsageCollector(storage=storage)
+        collector.record("reply", "m1", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+
+        written = await collector.flush()
+
+        self.assertEqual(written, 0)
+        self.assertEqual(collector.pending_calls, 1)
+        self.assertEqual(len(collector._pending), 1)
+
+    async def test_flush_retries_failed_rows_on_the_next_round(self):
+        """上一轮写失败的计数，下一轮要能补写进去。"""
+        storage = SimpleNamespace(
+            record_llm_token_usage=AsyncMock(side_effect=RuntimeError("db locked"))
+        )
+        collector = TokenUsageCollector(storage=storage)
+        collector.record("reply", "m1", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+        await collector.flush()
+
+        storage.record_llm_token_usage = AsyncMock(return_value=None)
+        written = await collector.flush()
+
+        self.assertEqual(written, 1)
+        self.assertEqual(collector.pending_calls, 0)
+        kwargs = storage.record_llm_token_usage.await_args.kwargs
+        self.assertEqual(kwargs["total_tokens"], 15)
+
+    async def test_flush_does_not_write_the_same_row_twice(self):
+        """写成功之后计数要清掉，下一轮不能重复累加。"""
+        storage = SimpleNamespace(record_llm_token_usage=AsyncMock(return_value=None))
+        collector = TokenUsageCollector(storage=storage)
+        collector.record("reply", "m1", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+
+        self.assertEqual(await collector.flush(), 1)
+        self.assertEqual(await collector.flush(), 0)
+        self.assertEqual(storage.record_llm_token_usage.await_count, 1)
+
+    async def test_flush_does_not_drop_counts_recorded_while_writing(self):
+        """写库期间新记进来的用量不能被一起清掉。"""
+
+        class _SlowStorage:
+            def __init__(self, collector):
+                self.collector = collector
+                self.done = False
+
+            async def record_llm_token_usage(self, **kwargs):
+                if not self.done:
+                    self.done = True
+                    # 模拟写库那一刻又来了一次调用（面板线程手动触发）。
+                    self.collector.record(
+                        "reply", "m1",
+                        {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    )
+                return None
+
+        collector = TokenUsageCollector(storage=_SlowStorage(None))
+        collector.storage.collector = collector
+        collector.record("reply", "m1", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+
+        written = await collector.flush()
+
+        self.assertEqual(written, 1)
+        # 第一次那条已写走；写库期间新来的那条必须还在。
+        self.assertEqual(collector.pending_calls, 1)
+        key = next(iter(collector._pending))
+        self.assertEqual(collector._pending[key]["total_tokens"], 2)
+
+    def test_concurrent_records_do_not_lose_counts(self):
+        """多线程同时记账不能丢计数。"""
+        import threading
+
+        collector = TokenUsageCollector()
+        usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+
+        def worker():
+            for _ in range(200):
+                collector.record("reply", "m1", usage)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(collector.pending_calls, 800)
+
     def test_site_label_falls_back_to_raw_key(self):
         self.assertEqual(site_label("reply"), "回复生成")
         self.assertEqual(site_label("vision"), "视觉识别")
@@ -280,6 +370,33 @@ class GeneratorSiteTaggingTests(unittest.TestCase):
         gen = self._generator(TokenUsageCollector(enabled=False))
         raw = _FakeProvider()
         self.assertIs(gen._usage_tagged(raw, "search"), raw)
+
+
+class MainEntryStartsUsageLoopTests(unittest.TestCase):
+    """容器实际走的是 main()，不是 bot.run()。
+
+    用量统计的定时落库循环必须在这个入口里被创建，否则循环一次都不会跑，
+    用量只堆在内存里（要靠面板读接口顺带 flush 才落库）。
+    """
+
+    def test_main_entry_creates_the_token_usage_loop_task(self):
+        import inspect
+
+        import main as main_module
+
+        source = inspect.getsource(main_module.main)
+        self.assertIn(
+            "asyncio.create_task(bot._token_usage_loop())",
+            source,
+            "main() 入口必须创建 token 用量定时落库循环",
+        )
+
+    def test_bot_exposes_an_async_token_usage_loop(self):
+        import inspect
+
+        from main import GroupChatBot
+
+        self.assertTrue(inspect.iscoroutinefunction(GroupChatBot._token_usage_loop))
 
 
 if __name__ == "__main__":

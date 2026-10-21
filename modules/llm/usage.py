@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
@@ -72,6 +73,8 @@ class TokenUsageCollector:
         self.flush_threshold = max(1, int(flush_threshold or 20))
         # (日期, 功能点, 模型) → 计数
         self._pending: dict[tuple[str, str, str], dict[str, int]] = {}
+        # 采集器会被多个线程共用：QQ 消息线程、定时落库循环、面板线程。
+        self._lock = threading.Lock()
         self._last_cleanup_day = ""
 
     # ---------------------------------------------------------------- 记录
@@ -90,13 +93,16 @@ class TokenUsageCollector:
             str(site or "default"),
             str(model or ""),
         )
-        row = self._pending.setdefault(
-            key, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        )
-        row["calls"] += 1
-        row["prompt_tokens"] += prompt
-        row["completion_tokens"] += completion
-        row["total_tokens"] += total
+        # 三个线程都会碰这个采集器：QQ 消息线程、定时落库循环、面板线程。
+        # 加锁避免「读-改-写」丢计数。
+        with self._lock:
+            row = self._pending.setdefault(
+                key, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            )
+            row["calls"] += 1
+            row["prompt_tokens"] += prompt
+            row["completion_tokens"] += completion
+            row["total_tokens"] += total
 
     @property
     def pending_count(self) -> int:
@@ -116,9 +122,13 @@ class TokenUsageCollector:
         if storage is None:
             # 存储还没就绪：计数留在内存里，等下次再落库，不能直接丢掉。
             return 0
-        rows = list(self._pending.items())
-        self._pending.clear()
+        with self._lock:
+            # 必须复制一份：_pending 里的计数是 dict 对象本身，
+            # 直接引用的话，写库期间新记进来的计数会写进这份"快照"，
+            # 后面按差额扣就扣成 0，把新数据一起清掉了。
+            rows = [(key, dict(counters)) for key, counters in self._pending.items()]
         written = 0
+        failed: list[tuple[str, str, str]] = []
         for (day, site, model), counters in rows:
             try:
                 await storage.record_llm_token_usage(
@@ -132,7 +142,29 @@ class TokenUsageCollector:
                 )
                 written += 1
             except Exception as exc:
-                logger.debug("token 用量写入失败：%s", exc)
+                # 写失败的不能丢：留在内存里等下一轮重试。
+                failed.append((day, site, model))
+                logger.warning("token 用量写入失败（保留待重试）%s/%s：%s", site, model, exc)
+        # 扣除已写入的计数。写库期间可能又有新调用记进来（面板线程手动触发），
+        # 所以按差额扣，不能整条删掉——否则新记进来的那部分会被一起清掉。
+        with self._lock:
+            for key, snapshot in rows:
+                if key in failed:
+                    continue
+                current = self._pending.get(key)
+                if current is None:
+                    continue
+                rest = {k: current.get(k, 0) - snapshot.get(k, 0) for k in snapshot}
+                if all(v <= 0 for v in rest.values()):
+                    self._pending.pop(key, None)
+                else:
+                    self._pending[key] = rest
+        if written:
+            logger.info(
+                "token 用量已落库 %s 条（%s 次调用）",
+                written,
+                sum(counters["calls"] for key, counters in rows if key not in failed),
+            )
         return written
 
     async def maybe_flush(self) -> int:

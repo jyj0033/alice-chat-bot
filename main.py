@@ -6457,6 +6457,7 @@ class GroupChatBot:
 
     async def _token_usage_loop(self) -> None:
         """定期把 token 用量落库，并清理保留期之外的旧记录。"""
+        logger.info("✓ Token 用量统计：定时落库已启动（每 60 秒）")
         while self._running:
             await asyncio.sleep(60)
             collector = getattr(self, "token_usage", None)
@@ -6466,7 +6467,8 @@ class GroupChatBot:
                 await collector.flush()
                 await collector.maybe_cleanup()
             except Exception as exc:
-                logger.debug(f"token 用量统计出错：{exc}")
+                # 之前用 debug 级别，真出错时生产日志里完全看不到。
+                logger.warning(f"token 用量统计出错：{exc}")
 
     async def _maybe_decay_memories(self) -> None:
         """定期对长期记忆应用时间衰减（每6小时一次，避免频繁写库）"""
@@ -6994,6 +6996,12 @@ async def main():
             # 注意 connect() 成功后会一直阻塞，清理任务要在它之前创建。
             cleanup_task = asyncio.create_task(bot._cleanup_loop())
             bot._tasks.append(cleanup_task)
+            # token 用量的定时落库循环：同样必须与消息处理跑在同一个事件循环
+            # （这个 QQ 线程），否则用量计数会跨线程读写。
+            # 注意容器实际走的是 main() 这条路径，不经过 bot.run()，
+            # 所以这个循环不能只写在 run() 里。
+            usage_task = asyncio.create_task(bot._token_usage_loop())
+            bot._tasks.append(usage_task)
             try:
                 await bot.qq_adapter.connect()
             except Exception as e:
