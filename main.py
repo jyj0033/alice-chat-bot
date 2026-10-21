@@ -51,6 +51,11 @@ from modules.social.conversation_judge import ConversationJudge, ConversationJud
 from modules.social.session_awareness import SessionAwareness
 
 from modules.reply.generator import ReplyGenerator, ThinkingDelay, ResponseFilter
+from modules.reply.quote_policy import (
+    REASON_NO_TARGET,
+    collect_busy_stats,
+    decide_quote,
+)
 
 # 配置日志
 logging.basicConfig(
@@ -3083,10 +3088,12 @@ class GroupChatBot:
             from modules.reply.generator import split_reply_into_messages
 
             segments = split_reply_into_messages(reply)
-            # 对 Bot 说的话必须引用当前正在回答的那条，不能让模型把旁边的
-            # 图片或别人的消息填进 reference_message_id。普通插话仍可用动态
-            # 判断给出的引用目标。
+            # 先解析「候选引用目标」：对 Bot 说的话必须引用当前正在回答的那条，
+            # 不能让模型把旁边的图片或别人的消息填进 reference_message_id。
+            # 普通插话仍可用动态判断给出的引用目标。
             quote_id = ""
+            quote_reason = REASON_NO_TARGET
+            quote_candidate_id = ""
             if direction == "to_bot":
                 target_id = str(effective_message_id or message.message_id or "")
             else:
@@ -3096,16 +3103,17 @@ class GroupChatBot:
                     or effective_message_id
                     or ""
                 )
+            recent_window = self.context_manager.get_window(session_id).get_recent(50)
             recent_ids = {
                 str(m.message_id or "")
-                for m in self.context_manager.get_window(session_id).get_recent(50)
+                for m in recent_window
                 if m.message_id
             }
             if target_id and target_id in recent_ids and (
                 direction == "to_bot"
                 or (action_plan and not action_plan.directed)
             ):
-                quote_id = target_id
+                quote_candidate_id = target_id
             elif action_plan and not action_plan.directed and action_plan.target_message_id:
                 target_id = str(action_plan.target_message_id)
                 if any(
@@ -3114,7 +3122,45 @@ class GroupChatBot:
                     and m.timestamp > action_plan.target_timestamp
                     for m in self.context_manager.get_window(session_id).get_recent(30)
                 ):
-                    quote_id = action_plan.target_message_id
+                    quote_candidate_id = action_plan.target_message_id
+            # 「要不要引用」由策略决定，不再是「解析出目标就一定引用」：
+            # 只有对方明确在跟爱丽丝说话、或者上下文已经糊了（隔太久 / 群里
+            # 刷太快）才引用；紧邻的即时对话不引用，真人不会每条都挂引用。
+            if quote_candidate_id:
+                quote_cfg = (self.config.get("reply") or {}).get("quote") or {}
+                now = datetime.now()
+                target_age = None
+                for m in recent_window:
+                    if str(m.message_id or "") == quote_candidate_id:
+                        target_age = max(0.0, (now - m.timestamp).total_seconds())
+                        break
+                busy_count, busy_speakers = collect_busy_stats(
+                    recent_window,
+                    now=now,
+                    window_seconds=int(quote_cfg.get("busy_window_seconds", 30) or 30),
+                )
+                quote_decision = decide_quote(
+                    direction,
+                    quote_candidate_id,
+                    enabled=bool(quote_cfg.get("enabled", True)),
+                    always=bool(quote_cfg.get("always", False)),
+                    target_age_seconds=target_age,
+                    recent_message_count=busy_count,
+                    recent_speaker_count=busy_speakers,
+                    stale_seconds=int(quote_cfg.get("stale_seconds", 60) or 60),
+                    busy_message_count=int(quote_cfg.get("busy_message_count", 5) or 5),
+                    busy_speaker_count=int(quote_cfg.get("busy_speaker_count", 2) or 2),
+                )
+                quote_reason = quote_decision.reason
+                if quote_decision.quote:
+                    quote_id = quote_candidate_id
+            logger.info(
+                "[引用] %s 引用=%s 原因=%s 目标=%s",
+                self.personality.name,
+                "是" if quote_id else "否",
+                quote_reason,
+                quote_id or quote_candidate_id or "-",
+            )
             sent_segments = []
             first_sent_message_id = ""
             meme_sent = False
@@ -3225,6 +3271,8 @@ class GroupChatBot:
                         message_id=first_sent_message_id,
                         reply_to_id=(quote_id or effective_message.message_id),
                         reply_to_qq=effective_message.sender_id,
+                        quoted=bool(quote_id),
+                        quote_reason=quote_reason,
                     )
                     self._store_group_analysis_bot_message(session_id, sent_reply)
                     awareness = getattr(self, "session_awareness", None)
@@ -4120,6 +4168,8 @@ class GroupChatBot:
         message_id: str = "",
         reply_to_id: str | None = None,
         reply_to_qq: str | None = None,
+        quoted: bool = False,
+        quote_reason: str = "",
     ) -> None:
         """把 bot 自己发出的消息写入 SQLite 情景记忆（异步后台执行）。
 
@@ -4148,6 +4198,11 @@ class GroupChatBot:
                 "message_id": str(message_id or ""),
                 "reply_to_id": reply_to_id,
                 "reply_to_qq": reply_to_qq,
+                # 真实是否发了引用消息。reply_to_id 有兜底（没引用时记的是
+                # effective_message），拿它统计引用率会得到恒等于 100% 的
+                # 假数字，所以这里单独记一份。
+                "quoted": bool(quoted),
+                "quote_reason": str(quote_reason or ""),
                 # 有实义内容才能参与重启后的会话窗口恢复
                 "meaningful": len(content) >= 8
                 or any(mark in content for mark in ("?", "？", "!", "！")),
@@ -6290,6 +6345,20 @@ class GroupChatBot:
                 "mbti": "",
                 "slang": "",
                 "expression_learning": "",
+            },
+            # 引用回复策略：这条回复要不要带上引用。
+            #   enabled=false → 完全不使用引用
+            #   always=true  → 每次都引用（等价于引入策略前的行为，用于对照）
+            # 其余阈值见 modules/reply/quote_policy.py
+            "reply": {
+                "quote": {
+                    "enabled": True,
+                    "always": False,
+                    "stale_seconds": 60,
+                    "busy_window_seconds": 30,
+                    "busy_message_count": 5,
+                    "busy_speaker_count": 2,
+                }
             },
             "qq": {
                 "ws_host": "0.0.0.0",
