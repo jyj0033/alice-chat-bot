@@ -33,7 +33,11 @@ except ImportError:  # pragma: no cover - requirements 默认包含 Pillow
 logger = logging.getLogger(__name__)
 
 # 归类相关标记定义在 meme_categorizer，这里只引用不重复定义。
-from modules.meme_categorizer import BLOCKED_TAG, PENDING_TAG  # noqa: E402
+from modules.meme_categorizer import (  # noqa: E402
+    BLOCKED_TAG,
+    NON_MEME_TAG,
+    PENDING_TAG,
+)
 
 SUPPORTED_FORMATS = {
     "PNG": ".png",
@@ -888,8 +892,13 @@ class MemeManager:
         items, _ = self.list_memes(category=category, page=1, page_size=100)
         if not items:
             return None
-        # 分析结论是"不建议发送"的素材不进自动发送候选。
-        usable = [item for item in items if BLOCKED_TAG not in (item.get("tags") or [])]
+        # 分析结论是"不建议发送"或压根不是表情包的素材，不进自动发送候选。
+        usable = [
+            item
+            for item in items
+            if BLOCKED_TAG not in (item.get("tags") or [])
+            and NON_MEME_TAG not in (item.get("tags") or [])
+        ]
         if not usable:
             return None
         recent = self._recent_by_session.get(session_id, deque())

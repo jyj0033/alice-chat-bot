@@ -44,6 +44,7 @@ from modules.group_analysis import GroupDailyAnalysis
 from modules.meme_manager import MemeManager
 from modules.meme_categorizer import (
     BLOCKED_TAG,
+    NON_MEME_TAG,
     PENDING_TAG,
     MemeCategorizer,
     sniff_media_type,
@@ -1743,7 +1744,7 @@ class GroupChatBot:
             str(item.get("name") or "").strip()
             for item in manager.categories()
             if str(item.get("name") or "").strip()
-            and str(item.get("name") or "").strip() != "待整理"
+            and str(item.get("name") or "").strip() not in ("待整理", NON_MEME_TAG)
         ]
         if not categories:
             return None
@@ -1793,11 +1794,25 @@ class GroupChatBot:
                 continue
             if not result:
                 continue
-            category, analysis = result
+            analysis = result.analysis
+            if not result.is_meme:
+                # 压根不是表情包（游戏截图/聊天截图/风景照）：直接删掉。
+                # 不留在库里占位，也不参与选图。
+                try:
+                    removed = manager.delete(meme_id)
+                    done += 1
+                    logger.info(
+                        "[表情库] 已剔除非表情包 %s（%s）",
+                        meme_id[:10], analysis.core_meaning[:30],
+                    )
+                except Exception as exc:
+                    logger.warning("删除非表情包失败 %s：%s", meme_id[:10], exc)
+                continue
+            category = result.category
             tags = [
                 str(tag)
                 for tag in (item.get("tags") or [])
-                if str(tag) not in (PENDING_TAG, BLOCKED_TAG)
+                if str(tag) not in (PENDING_TAG, BLOCKED_TAG, NON_MEME_TAG)
             ]
             tags.append(f"情绪:{analysis.sentiment}")
             if analysis.scene:

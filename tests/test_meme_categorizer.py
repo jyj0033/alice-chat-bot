@@ -12,8 +12,10 @@ from modules.llm.base import ChatResponse
 from modules.meme_categorizer import (
     ANALYZE_PROMPT,
     BLOCKED_TAG,
+    NON_MEME_TAG,
     PENDING_TAG,
     MemeCategorizer,
+    normalize_is_meme,
     normalize_send_advice,
     normalize_sentiment,
     parse_analysis,
@@ -33,7 +35,16 @@ ANALYSIS_TEXT = (
     "【核心含义】阴阳怪气地嘲讽\n"
     "【情绪倾向】负面\n"
     "【适用场景】对方说废话时\n"
-    "【是否建议发送】是"
+    "【是否建议发送】是\n"
+    "【是否表情包】是"
+)
+
+NON_MEME_TEXT = (
+    "【核心含义】游戏界面截图\n"
+    "【情绪倾向】中性\n"
+    "【适用场景】无\n"
+    "【是否建议发送】否\n"
+    "【是否表情包】否"
 )
 
 
@@ -86,10 +97,32 @@ class AnalysisParsingTests(unittest.TestCase):
         self.assertEqual(normalize_send_advice("不建议发送"), "否")
         self.assertEqual(normalize_send_advice(""), "谨慎")
 
-    def test_analyze_prompt_keeps_the_required_format(self):
-        """提示词是这个功能的规格：四个字段 + 不解释画面细节。"""
+    def test_normalize_is_meme_defaults_to_yes(self):
+        """拿不准就不剔：宁可多留几张，也不要误删真表情包。"""
+        self.assertEqual(normalize_is_meme("是"), "是")
+        self.assertEqual(normalize_is_meme("否"), "否")
+        self.assertEqual(normalize_is_meme("不是表情包"), "否")
+        self.assertEqual(normalize_is_meme(""), "是")
+        self.assertEqual(normalize_is_meme("大概吧"), "是")
+
+    def test_parses_is_meme_field(self):
+        analysis = parse_analysis(NON_MEME_TEXT)
+        self.assertIsNotNone(analysis)
+        self.assertEqual(analysis.is_meme, "否")
+        self.assertEqual(parse_analysis(ANALYSIS_TEXT).is_meme, "是")
+
+    def test_missing_is_meme_field_defaults_to_yes(self):
+        legacy = "【核心含义】阴阳怪气地嘲讽\n【情绪倾向】负面"
+        analysis = parse_analysis(legacy)
+        self.assertIsNotNone(analysis)
+        self.assertEqual(analysis.is_meme, "是")
+
+    def test_analyze_prompt_asks_whether_it_is_a_meme(self):
+        """提示词是这个功能的规格：四个字段 + 不解释画面细节 + 是不是表情包。"""
         for field in ("【核心含义】", "【情绪倾向】", "【适用场景】", "【是否建议发送】"):
             self.assertIn(field, ANALYZE_PROMPT)
+        self.assertIn("【是否表情包】", ANALYZE_PROMPT)
+        self.assertIn("游戏截图", ANALYZE_PROMPT)
         self.assertIn("绝不解释画面细节", ANALYZE_PROMPT)
         self.assertIn("50字", ANALYZE_PROMPT)
 
@@ -117,18 +150,29 @@ class MemeCategorizerTests(unittest.IsolatedAsyncioTestCase):
         categorizer = MemeCategorizer(vision, text, ["开心", "无语", "吐槽", "困倦"])
         # 压缩图片依赖 PIL 和真实图片字节，这里只测流程，绕过压缩。
         categorizer._to_data_url = lambda data, media_type: "data:image/png;base64,AAAA"
+        # 重试不等待。
+        categorizer.retry_backoff = 0
         return categorizer, vision, text
 
     async def test_process_returns_category_and_analysis(self):
         categorizer, vision, text = self._categorizer()
         result = await categorizer.process(_png_bytes(), "image/png")
         self.assertIsNotNone(result)
-        category, analysis = result
-        self.assertEqual(category, "吐槽")
-        self.assertEqual(analysis.core_meaning, "阴阳怪气地嘲讽")
+        self.assertTrue(result.is_meme)
+        self.assertEqual(result.category, "吐槽")
+        self.assertEqual(result.analysis.core_meaning, "阴阳怪气地嘲讽")
         # 视觉那次必须真的把图带上了。
         content = vision.requests[0].messages[0].content
         self.assertTrue(any(part.get("type") == "image_url" for part in content))
+
+    async def test_non_meme_is_detected_and_categorize_is_skipped(self):
+        """不是表情包的（游戏截图/聊天截图）直接判定，连选分类都省了。"""
+        categorizer, _vision, text = self._categorizer(vision_content=NON_MEME_TEXT)
+        result = await categorizer.process(_png_bytes(), "image/png")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.is_meme)
+        self.assertEqual(result.category, "")
+        self.assertEqual(len(text.requests), 0)
 
     async def test_process_returns_none_when_category_is_invalid(self):
         categorizer, _vision, _text = self._categorizer(text_content="不存在的分类")
@@ -142,6 +186,26 @@ class MemeCategorizerTests(unittest.IsolatedAsyncioTestCase):
         categorizer, _vision, _text = self._categorizer()
         categorizer.vision_provider = _FakeProvider(error=RuntimeError("端点炸了"))
         self.assertIsNone(await categorizer.analyze(_png_bytes(), "image/png"))
+
+    async def test_analyze_retries_after_a_transient_error(self):
+        """端点偶尔 529（集群负载高），重试一次就该成功，不该直接放弃。"""
+        categorizer, _vision, _text = self._categorizer()
+        flaky = _FakeProvider()
+        calls = {"n": 0}
+
+        async def flaky_chat(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("HTTP 529 - 集群负载较高")
+            return ChatResponse(content=ANALYSIS_TEXT, model="fake-model", usage={})
+
+        flaky.chat = flaky_chat
+        categorizer.vision_provider = flaky
+
+        analysis = await categorizer.analyze(_png_bytes(), "image/png")
+
+        self.assertIsNotNone(analysis)
+        self.assertEqual(calls["n"], 2)
 
     async def test_categorize_prompt_carries_category_descriptions(self):
         """分类说明要带进 prompt，否则「困倦」和「委屈」分不清。"""
@@ -207,6 +271,13 @@ class PendingCategorizationQueueTests(unittest.TestCase):
         )
         self.assertIsNone(self.manager.choose(category="吐槽"))
 
+    def test_non_meme_items_are_excluded_from_auto_send(self):
+        """删除失败的非表情包素材（还留在库里）也不能被选到。"""
+        self.manager.add_bytes(
+            _png_bytes((31, 41, 51)), category="吐槽", tags=[NON_MEME_TAG]
+        )
+        self.assertIsNone(self.manager.choose(category="吐槽"))
+
     def test_update_moves_file_to_the_new_category(self):
         item = self.manager.add_bytes(
             _png_bytes((60, 70, 80)), category="待整理", tags=[PENDING_TAG]
@@ -223,6 +294,45 @@ class PendingCategorizationQueueTests(unittest.TestCase):
         self.assertTrue((Path(self.manager.root) / "吐槽" / item["filename"]).is_file())
         # 归类完成后不再留在待归类队列里。
         self.assertEqual(self.manager.list_pending_categorization(10), [])
+
+
+class NonMemeRemovalTests(unittest.IsolatedAsyncioTestCase):
+    """非表情包（游戏截图/聊天截图）要被直接删掉，不留在库里占位。"""
+
+    async def test_non_meme_item_is_deleted_from_the_library(self):
+        from main import GroupChatBot
+        from modules.meme_categorizer import MemeAnalysis, MemeCategorizeResult
+
+        temp_dir = TemporaryDirectory()
+        try:
+            manager = MemeManager(
+                {"storage_path": temp_dir.name}, base_dir=Path.cwd()
+            )
+            item = manager.add_bytes(
+                _png_bytes(), category="待整理", tags=["自动收集", PENDING_TAG]
+            )
+
+            bot = GroupChatBot.__new__(GroupChatBot)
+            bot.meme_manager = manager
+            bot._meme_categorize_enabled = True
+
+            class _Cat:
+                async def process(self, content, media_type):
+                    return MemeCategorizeResult(
+                        analysis=MemeAnalysis(core_meaning="游戏界面截图", is_meme="否"),
+                        is_meme=False,
+                        category="",
+                    )
+
+            bot._meme_categorizer = lambda: _Cat()
+
+            count = await bot._categorize_meme_items([item])
+
+            self.assertEqual(count, 1)
+            self.assertIsNone(manager.get(item["id"]))
+            self.assertEqual(manager.stats()["total"], 0)
+        finally:
+            temp_dir.cleanup()
 
 
 class MainEntryStartsCategorizeLoopTests(unittest.TestCase):

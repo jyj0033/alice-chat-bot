@@ -27,7 +27,7 @@ from modules.llm.base import ChatMessage, ChatRequest
 
 logger = logging.getLogger(__name__)
 
-# 表情包分析提示词：看图 → 固定四行结构。
+# 表情包分析提示词：看图 → 固定结构。
 ANALYZE_PROMPT = (
     "你是一个懂网络热梗的聊天助手。请分析我发给你的表情包，并严格按照以下格式输出，"
     "字数必须控制在50字以内，不要任何废话：\n"
@@ -36,8 +36,11 @@ ANALYZE_PROMPT = (
     "【情绪倾向】（正面/负面/中性）\n"
     "【适用场景】（1句话，如：对方说废话时/自嘲时/化解尴尬时）\n"
     "【是否建议发送】（是/否/谨慎）\n"
+    "【是否表情包】（是/否）\n"
     "\n"
-    "约束：只输出以上内容，绝不解释画面细节，不罗列废话。"
+    "约束：只输出以上内容，绝不解释画面细节，不罗列废话。\n"
+    "【是否表情包】的判断标准：能当作表情发出去的图才算表情包；"
+    "游戏截图、聊天记录截图、网页截图、风景照、真人照片一律填否。"
 )
 
 # 归类提示词：只看分析结果选分类，不再看图。
@@ -57,8 +60,12 @@ PENDING_TAG = "待归类"
 # 分析结论里表示"这张图不适合自动发出去"的标记。
 BLOCKED_TAG = "不建议发送"
 
+# 压根不是表情包的标记（游戏截图、聊天截图、风景照、真人照片）。
+# 它同时也是这类素材的分类名，挪进同名目录就等于移出了表情包库。
+NON_MEME_TAG = "非表情包"
+
 _ANALYSIS_FIELD_RE = re.compile(
-    r"^【\s*(核心含义|情绪倾向|适用场景|是否建议发送)\s*】\s*[:：]?\s*(.*)$"
+    r"^【\s*(核心含义|情绪倾向|适用场景|是否建议发送|是否表情包)\s*】\s*[:：]?\s*(.*)$"
 )
 
 
@@ -70,6 +77,8 @@ class MemeAnalysis:
     sentiment: str = "中性"
     scene: str = ""
     should_send: str = "谨慎"
+    # 是/否：这张图到底算不算表情包。拿不准时默认"是"，宁可多留也不要误剔。
+    is_meme: str = "是"
 
     def to_text(self) -> str:
         return (
@@ -78,6 +87,19 @@ class MemeAnalysis:
             f"【适用场景】{self.scene}\n"
             f"【是否建议发送】{self.should_send}"
         )
+
+
+@dataclass
+class MemeCategorizeResult:
+    """一次归类的结果。
+
+    is_meme=False 表示这压根不是表情包（游戏截图/聊天截图/普通照片），
+    这种情况不做分类，交给上层移出表情包库。
+    """
+
+    analysis: MemeAnalysis
+    is_meme: bool = True
+    category: str = ""
 
 
 def normalize_sentiment(value: str) -> str:
@@ -101,6 +123,20 @@ def normalize_send_advice(value: str) -> str:
     return "谨慎"
 
 
+def normalize_is_meme(value: str) -> str:
+    """判断这张图算不算表情包。
+
+    默认"是"：模型没给这个字段、或者说得含糊时都不剔，
+    宁可多留几张，也不要把真表情包误删。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "是"
+    if "否" in text or "不是" in text or "非" in text:
+        return "否"
+    return "是"
+
+
 def parse_analysis(text: str) -> Optional[MemeAnalysis]:
     """解析模型输出的四行结构。字段不全就返回 None（当失败处理）。"""
     fields: dict[str, str] = {}
@@ -116,6 +152,7 @@ def parse_analysis(text: str) -> Optional[MemeAnalysis]:
         sentiment=normalize_sentiment(fields.get("情绪倾向", "")),
         scene=fields.get("适用场景", "")[:80],
         should_send=normalize_send_advice(fields.get("是否建议发送", "")),
+        is_meme=normalize_is_meme(fields.get("是否表情包", "")),
     )
 
 
@@ -175,6 +212,7 @@ class MemeCategorizer:
         categorize_timeout: float = 30.0,
         analyze_max_tokens: int = 300,
         categorize_max_tokens: int = 60,
+        retry_backoff: float = 2.0,
     ) -> None:
         self.vision_provider = vision_provider
         self.text_provider = text_provider
@@ -191,6 +229,8 @@ class MemeCategorizer:
         self.categorize_timeout = max(5.0, float(categorize_timeout or 30.0))
         self.analyze_max_tokens = max(64, int(analyze_max_tokens or 300))
         self.categorize_max_tokens = max(16, int(categorize_max_tokens or 60))
+        # 重试间隔（秒），测试里设 0 就不用等。
+        self.retry_backoff = max(0.0, float(retry_backoff or 0))
 
     def _render_categories(self) -> str:
         lines = []
@@ -204,6 +244,36 @@ class MemeCategorizer:
         return bool(self.vision_provider and self.text_provider and self.categories)
 
     # ---------------------------------------------------------------- 步骤一
+
+    async def _chat_with_retry(
+        self,
+        provider: Any,
+        request: Any,
+        timeout: float,
+        label: str,
+        tries: int = 3,
+    ) -> Any:
+        """调模型，失败重试几次。
+
+        端点偶尔会返回 529（集群负载高），重试一次通常就好；
+        不重试的话这张素材会一直卡在「待整理」，等下一轮定时任务（1 小时后）。
+        """
+        last_error: Optional[Exception] = None
+        for attempt in range(max(1, int(tries))):
+            try:
+                return await asyncio.wait_for(provider.chat(request), timeout=timeout)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt < tries - 1:
+                    logger.warning(
+                        "%s失败（第 %s 次），%.1fs 后重试：%s",
+                        label, attempt + 1, self.retry_backoff * (attempt + 1), exc,
+                    )
+                    await asyncio.sleep(self.retry_backoff * (attempt + 1))
+        logger.warning("%s连续失败：%s", label, last_error)
+        return None
 
     async def analyze(self, image_bytes: bytes, media_type: str = "image/jpeg") -> Optional[MemeAnalysis]:
         """看图分析。失败返回 None。"""
@@ -222,14 +292,10 @@ class MemeCategorizer:
             max_tokens=self.analyze_max_tokens,
             temperature=0.4,
         )
-        try:
-            response = await asyncio.wait_for(
-                self.vision_provider.chat(request), timeout=self.analyze_timeout
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("表情包分析失败：%s", exc)
+        response = await self._chat_with_retry(
+            self.vision_provider, request, self.analyze_timeout, "表情包分析"
+        )
+        if response is None:
             return None
         analysis = parse_analysis(getattr(response, "content", "") or "")
         if analysis is None:
@@ -292,14 +358,19 @@ class MemeCategorizer:
 
     async def process(
         self, image_bytes: bytes, media_type: str = "image/jpeg"
-    ) -> Optional[tuple[str, MemeAnalysis]]:
-        """分析 + 归类。任一步失败返回 None（素材保持待整理，等下次重试）。"""
+    ) -> Optional[MemeCategorizeResult]:
+        """分析 + 归类。任一步失败返回 None（素材保持待整理，等下次重试）。
+
+        分析判定"不是表情包"时直接返回，连选分类那一步都省了。
+        """
         if not self.available:
             return None
         analysis = await self.analyze(image_bytes, media_type)
         if analysis is None:
             return None
+        if analysis.is_meme == "否":
+            return MemeCategorizeResult(analysis=analysis, is_meme=False, category="")
         category = await self.categorize(analysis)
         if not category:
             return None
-        return category, analysis
+        return MemeCategorizeResult(analysis=analysis, is_meme=True, category=category)
