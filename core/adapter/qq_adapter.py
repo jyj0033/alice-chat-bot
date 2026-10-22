@@ -613,6 +613,263 @@ class QQAdapter(PlatformAdapter):
         )
         return success
 
+# QQ 单条消息最多 9 张图，超出会被 QQ 直接拒绝。
+    QQ_MAX_IMAGES_PER_MESSAGE = 9
+
+    async def send_images(
+        self,
+        session_id: str,
+        image_bytes_list: list[bytes],
+        reply_to_id: str | None = None,
+        text: str = "",
+        mode: str = "chunks",
+        per_message: int = 9,
+        timeout: float | None = 180.0,
+    ) -> dict[str, Any]:
+        """把多张原图发到同一个会话，返回逐条发送结果。
+
+        mode="chunks"：按 QQ 上限拆成多条消息（每条最多 per_message 张）。
+        mode="forward"：合成一条合并转发消息，即真正意义上的「一条消息」。
+
+        图片按原始字节 base64 内嵌，不做转码/压缩，保持原图。
+        """
+        if not self._clients:
+            logger.error("NapCat 未连接")
+            return {
+                "success": False,
+                "error": "NapCat 未连接",
+                "sent": 0,
+                "total": 0,
+                "message_ids": [],
+                "errors": ["NapCat 未连接"],
+            }
+        session_id = str(session_id or "").strip()
+        if not session_id.startswith(("group_", "private_")):
+            return {
+                "success": False,
+                "error": "会话格式不正确",
+                "sent": 0,
+                "total": 0,
+                "message_ids": [],
+                "errors": ["会话格式不正确"],
+            }
+        payloads = [item for item in (image_bytes_list or []) if item]
+        if not payloads:
+            return {
+                "success": False,
+                "error": "没有可发送的图片",
+                "sent": 0,
+                "total": 0,
+                "message_ids": [],
+                "errors": ["没有可发送的图片"],
+            }
+        mode = str(mode or "chunks").strip().lower()
+        if mode == "forward":
+            return await self._send_forward_message(
+                session_id, payloads, text=text, timeout=timeout
+            )
+        return await self._send_chunked_messages(
+            session_id,
+            payloads,
+            reply_to_id=reply_to_id,
+            text=text,
+            per_message=per_message,
+            timeout=timeout,
+        )
+
+    async def _send_chunked_messages(
+        self,
+        session_id: str,
+        payloads: list[bytes],
+        reply_to_id: str | None = None,
+        text: str = "",
+        per_message: int = 9,
+        timeout: float | None = 180.0,
+    ) -> dict[str, Any]:
+        """按 QQ 的 9 张上限把图片拆成多条消息发送。"""
+        limit = max(1, min(int(per_message or 9), self.QQ_MAX_IMAGES_PER_MESSAGE))
+        chunks = [
+            payloads[index : index + limit]
+            for index in range(0, len(payloads), limit)
+        ]
+        message_ids: list[str] = []
+        errors: list[str] = []
+        sent = 0
+        for index, chunk in enumerate(chunks):
+            message_array: list[dict[str, Any]] = []
+            if index == 0:
+                if reply_to_id:
+                    message_array.append({"type": "reply", "data": {"id": reply_to_id}})
+                if text:
+                    message_array.append({"type": "text", "data": {"text": text}})
+            for payload in chunk:
+                message_array.append(
+                    {
+                        "type": "image",
+                        "data": {
+                            "file": f"base64://{base64.b64encode(payload).decode('ascii')}"
+                        },
+                    }
+                )
+            action, params = self._build_send_message_request(session_id, message_array)
+            try:
+                response = await self.call_api(action, params, timeout=timeout)
+            except Exception as exc:
+                logger.warning("发送第 %s 组图片失败：%s", index + 1, exc)
+                errors.append(f"第 {index + 1} 组：{exc}")
+                continue
+            message_id = self._record_outbound_message(response)
+            if message_id:
+                message_ids.append(message_id)
+            sent += len(chunk)
+        return {
+            "success": sent == len(payloads),
+            "mode": "chunks",
+            "sent": sent,
+            "total": len(payloads),
+            "message_count": len(chunks),
+            "message_ids": message_ids,
+            "errors": errors,
+        }
+
+    async def _send_forward_message(
+        self,
+        session_id: str,
+        payloads: list[bytes],
+        text: str = "",
+        timeout: float | None = 180.0,
+    ) -> dict[str, Any]:
+        """把所有图片合成一条合并转发消息。
+
+        NapCat 要求 messages 里全是 type=node 的元素，每个节点的 content
+        是标准 OneBot 消息段；这里一张图一个节点，保持发送顺序。
+        """
+        nodes: list[dict[str, Any]] = []
+        for payload in payloads:
+            nodes.append(
+                {
+                    "type": "node",
+                    "data": {
+                        "content": [
+                            {
+                                "type": "image",
+                                "data": {
+                                    "file": f"base64://{base64.b64encode(payload).decode('ascii')}"
+                                },
+                            }
+                        ]
+                    },
+                }
+            )
+        if text:
+            nodes.insert(
+                0,
+                {
+                    "type": "node",
+                    "data": {"content": [{"type": "text", "data": {"text": text}}]},
+                },
+            )
+        if session_id.startswith("group_"):
+            action = "send_group_forward_msg"
+            params = {
+                "group_id": int(session_id.replace("group_", "")),
+                "messages": nodes,
+            }
+        else:
+            action = "send_private_forward_msg"
+            params = {
+                "user_id": int(session_id.replace("private_", "")),
+                "messages": nodes,
+            }
+        try:
+            response = await self.call_api(action, params, timeout=timeout)
+        except Exception as exc:
+            logger.warning("发送合并转发消息失败：%s", exc)
+            return {
+                "success": False,
+                "mode": "forward",
+                "error": str(exc),
+                "sent": 0,
+                "total": len(payloads),
+                "message_count": 0,
+                "message_ids": [],
+                "errors": [str(exc)],
+            }
+        message_id = self._record_outbound_message(response)
+        res_id = ""
+        if isinstance(response, dict):
+            res_id = str(response.get("res_id") or response.get("forward_id") or "")
+        verified: int | None = None
+        if res_id:
+            try:
+                verified = self._count_forward_images(
+                    await self.fetch_forward_messages(res_id)
+                )
+            except Exception as exc:
+                logger.warning("校验合并转发内容失败：%s", exc)
+        return {
+            "success": True,
+            "mode": "forward",
+            "sent": len(payloads),
+            "total": len(payloads),
+            "message_count": 1,
+            "message_ids": [message_id] if message_id else [],
+            "res_id": res_id,
+            "verified_images": verified,
+            "errors": [],
+        }
+
+    async def fetch_forward_messages(self, res_id: str) -> list[Any]:
+        """读取合并转发消息的节点列表，用于核对图片是否真的带进去了。"""
+        res_id = str(res_id or "").strip()
+        if not res_id:
+            return []
+        data = await self.call_api(
+            "get_forward_msg",
+            {"id": res_id, "message_id": res_id},
+            timeout=60.0,
+        )
+        if isinstance(data, dict):
+            messages = data.get("messages") or []
+        elif isinstance(data, list):
+            messages = data
+        else:
+            messages = []
+        return list(messages)
+
+    @classmethod
+    def _count_forward_images(cls, nodes: list[Any]) -> int:
+        """统计合并转发节点里出现的图片数量（含嵌套转发）。"""
+        count = 0
+        for node in nodes or []:
+            data = node.get("data") if isinstance(node, dict) else None
+            if not isinstance(data, dict):
+                continue
+            for key in ("content", "message"):
+                segments = data.get(key) or []
+                if not isinstance(segments, list):
+                    continue
+                for segment in segments:
+                    if not isinstance(segment, dict):
+                        continue
+                    if segment.get("type") == "image":
+                        count += 1
+                    elif segment.get("type") == "node":
+                        count += cls._count_forward_images([segment])
+        return count
+
+    async def delete_message(self, message_id: str) -> bool:
+        """撤回自己发出的消息（发送结果异常时用于清场）。"""
+        message_id = str(message_id or "").strip()
+        if not message_id:
+            return False
+        try:
+            await self.call_api("delete_msg", {"message_id": message_id}, timeout=30.0)
+            return True
+        except Exception as exc:
+            logger.warning("撤回消息失败：%s", exc)
+            return False
+
     def _record_outbound_message(self, response: Any) -> str:
         """记录 NapCat 回执里的出站消息 ID，供后续回复链识别 Bot。"""
         if not isinstance(response, dict):

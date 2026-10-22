@@ -1019,6 +1019,73 @@ async def send_meme(request: Request):
         return {"success": False, "error": str(exc)}
 
 
+# 面板发图只能读取白名单目录下的文件，避免面板变成任意文件读取接口。
+SEND_MEDIA_DIR = Path(os.environ.get("ALICE_SEND_MEDIA_DIR", "/app/data/outbox"))
+MAX_SEND_IMAGE_BYTES = 32 * 1024 * 1024
+
+
+def _resolve_send_media_path(raw: str) -> Path:
+    """把面板传入的路径解析到白名单目录内；越界或非法路径直接报错。"""
+    base = SEND_MEDIA_DIR.resolve()
+    relative = str(raw or "").strip().lstrip("/")
+    if not relative:
+        raise ValueError("图片路径为空")
+    candidate = (base / relative).resolve()
+    if candidate != base and base not in candidate.parents:
+        raise ValueError(f"路径超出允许的发送目录：{raw}")
+    if not candidate.is_file():
+        raise ValueError(f"文件不存在：{raw}")
+    if candidate.stat().st_size > MAX_SEND_IMAGE_BYTES:
+        raise ValueError(f"文件过大：{raw}")
+    return candidate
+
+
+@app.post("/api/send/images")
+async def send_images(request: Request):
+    """按原图发送多张图片到指定会话。
+
+    body: {"session": "private_1021803090", "paths": ["02.jpeg"],
+           "mode": "chunks|forward", "text": "", "per_message": 9}
+    """
+    if not bot_instance:
+        return {"success": False, "error": "Bot 未初始化"}
+    try:
+        data = await request.json()
+        data = data if isinstance(data, dict) else {}
+        session_id = str(data.get("session") or "").strip()
+        if not session_id.startswith(("group_", "private_")):
+            return {"success": False, "error": "会话格式不正确"}
+        raw_paths = data.get("paths")
+        if not isinstance(raw_paths, list):
+            raw_paths = []
+        paths = [str(item) for item in raw_paths if str(item).strip()]
+        if not paths:
+            return {"success": False, "error": "没有指定图片"}
+        text = str(data.get("text") or "")
+        mode = str(data.get("mode") or "chunks")
+        try:
+            per_message = int(data.get("per_message") or 9)
+        except (TypeError, ValueError):
+            per_message = 9
+        payloads: list[bytes] = []
+        for raw in paths:
+            try:
+                resolved = _resolve_send_media_path(raw)
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}
+            payloads.append(await asyncio.to_thread(resolved.read_bytes))
+        return await bot_instance.send_images(
+            session_id,
+            payloads,
+            text=text,
+            mode=mode,
+            per_message=per_message,
+        )
+    except Exception as exc:
+        logger.error("面板发图失败：%s", exc)
+        return {"success": False, "error": str(exc)}
+
+
 @app.post("/api/memes/{meme_id}")
 async def update_meme(meme_id: str, request: Request):
     manager = _get_meme_manager()
