@@ -1957,49 +1957,51 @@ class GroupChatBot:
         }
 
     async def send_images(
-            self,
-            session_id: str,
-            images: list[bytes],
-            *,
-            text: str = "",
-            mode: str = "chunks",
-            per_message: int = 9,
-        ) -> dict[str, Any]:
-            """把多张原图发到指定会话（面板手动发图和脚本共用此链路）。
+        self,
+        session_id: str,
+        images: list[bytes],
+        *,
+        text: str = "",
+        at_users: list[str] | None = None,
+        mode: str = "chunks",
+        per_message: int = 9,
+    ) -> dict[str, Any]:
+        """把多张原图发到指定会话（面板手动发图和脚本共用此链路）。
 
-            mode="chunks"：按 QQ 上限拆成多条消息；mode="forward"：合并成一条。
-            图片按原始字节发送，不转码、不压缩。
-            """
-            if not self.qq_adapter:
-                return {"success": False, "error": "QQ 适配器未就绪"}
-            session_id = str(session_id or "").strip()
-            if not session_id.startswith(("group_", "private_")):
-                return {"success": False, "error": "会话格式不正确"}
-            payloads = [item for item in (images or []) if item]
-            if not payloads:
-                return {"success": False, "error": "没有可发送的图片"}
-            try:
-                result = await self.qq_adapter.send_images(
-                    session_id,
-                    payloads,
-                    text=text,
-                    mode=mode,
-                    per_message=per_message,
-                )
-            except Exception as exc:
-                logger.warning("[发图] 发送失败：%s", exc)
-                return {"success": False, "error": str(exc)}
-            if result.get("success"):
-                logger.info(
-                    "[发图] 发送成功：会话=%s，模式=%s，共 %s 张，消息数=%s",
-                    session_id,
-                    result.get("mode"),
-                    result.get("sent"),
-                    result.get("message_count"),
-                )
-            else:
-                logger.warning("[发图] 发送未完全成功：会话=%s，结果=%s", session_id, result)
-            return result
+        mode="chunks"：按 QQ 上限拆成多条消息；mode="forward"：合并成一条。
+        图片按原始字节发送，不转码、不压缩。
+        """
+        if not self.qq_adapter:
+            return {"success": False, "error": "QQ 适配器未就绪"}
+        session_id = str(session_id or "").strip()
+        if not session_id.startswith(("group_", "private_")):
+            return {"success": False, "error": "会话格式不正确"}
+        payloads = [item for item in (images or []) if item]
+        if not payloads:
+            return {"success": False, "error": "没有可发送的图片"}
+        try:
+            result = await self.qq_adapter.send_images(
+                session_id,
+                payloads,
+                text=text,
+                at_users=at_users,
+                mode=mode,
+                per_message=per_message,
+            )
+        except Exception as exc:
+            logger.warning("[发图] 发送失败：%s", exc)
+            return {"success": False, "error": str(exc)}
+        if result.get("success"):
+            logger.info(
+                "[发图] 发送成功：会话=%s，模式=%s，共 %s 张，消息数=%s",
+                session_id,
+                result.get("mode"),
+                result.get("sent"),
+                result.get("message_count"),
+            )
+        else:
+            logger.warning("[发图] 发送未完全成功：会话=%s，结果=%s", session_id, result)
+        return result
 
     async def _judge_conversation_message(
         self,

@@ -1045,7 +1045,8 @@ async def send_images(request: Request):
     """按原图发送多张图片到指定会话。
 
     body: {"session": "private_1021803090", "paths": ["02.jpeg"],
-           "mode": "chunks|forward", "text": "", "per_message": 9}
+           "mode": "chunks|forward", "text": "", "per_message": 9,
+           "at": ["2335864693"]}
     """
     if not bot_instance:
         return {"success": False, "error": "Bot 未初始化"}
@@ -1062,6 +1063,10 @@ async def send_images(request: Request):
         if not paths:
             return {"success": False, "error": "没有指定图片"}
         text = str(data.get("text") or "")
+        raw_at = data.get("at")
+        if not isinstance(raw_at, list):
+            raw_at = []
+        at_users = [str(item).strip() for item in raw_at if str(item).strip()]
         mode = str(data.get("mode") or "chunks")
         try:
             per_message = int(data.get("per_message") or 9)
@@ -1078,6 +1083,7 @@ async def send_images(request: Request):
             session_id,
             payloads,
             text=text,
+            at_users=at_users,
             mode=mode,
             per_message=per_message,
         )

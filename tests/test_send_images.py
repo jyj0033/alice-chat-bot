@@ -14,12 +14,22 @@ class _FakeBot:
     def __init__(self):
         self.calls = []
 
-    async def send_images(self, session_id, images, *, text="", mode="chunks", per_message=9):
+    async def send_images(
+        self,
+        session_id,
+        images,
+        *,
+        text="",
+        at_users=None,
+        mode="chunks",
+        per_message=9,
+    ):
         self.calls.append(
             {
                 "session_id": session_id,
                 "images": list(images),
                 "text": text,
+                "at_users": list(at_users or []),
                 "mode": mode,
                 "per_message": per_message,
             }
@@ -145,6 +155,35 @@ class SendImagesTests(unittest.IsolatedAsyncioTestCase):
         result = await adapter.send_images("private_1", [b"a"])
         self.assertFalse(result["success"])
         self.assertIn("NapCat", result["error"])
+
+    async def test_chunks_put_at_segment_at_head_of_first_message(self):
+        adapter = _adapter()
+        await adapter.send_images(
+            "group_333863057", [b"a"] * 10, at_users=["2335864693"]
+        )
+        first = adapter.calls[0][1]["message"]
+        self.assertEqual(first[0]["type"], "at")
+        self.assertEqual(first[0]["data"]["qq"], "2335864693")
+        self.assertTrue(
+            all(seg["type"] != "at" for seg in adapter.calls[1][1]["message"])
+        )
+
+    async def test_forward_mode_sends_mention_message_first(self):
+        adapter = _adapter(call_api_result={"message_id": 1})
+        await adapter.send_images(
+            "group_333863057",
+            [b"a"],
+            mode="forward",
+            at_users=["2335864693"],
+            text="漫画原图",
+        )
+        self.assertEqual(adapter.calls[0][0], "send_group_msg")
+        mention = adapter.calls[0][1]["message"]
+        self.assertEqual(mention[0]["type"], "at")
+        self.assertEqual(mention[0]["data"]["qq"], "2335864693")
+        self.assertEqual(mention[1]["type"], "text")
+        self.assertEqual(mention[1]["data"]["text"], "漫画原图")
+        self.assertEqual(adapter.calls[1][0], "send_group_forward_msg")
 
     def test_count_forward_images_handles_nested_nodes(self):
         nodes = [

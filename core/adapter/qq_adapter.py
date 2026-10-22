@@ -622,6 +622,7 @@ class QQAdapter(PlatformAdapter):
         image_bytes_list: list[bytes],
         reply_to_id: str | None = None,
         text: str = "",
+        at_users: list[str] | None = None,
         mode: str = "chunks",
         per_message: int = 9,
         timeout: float | None = 180.0,
@@ -664,15 +665,24 @@ class QQAdapter(PlatformAdapter):
                 "errors": ["没有可发送的图片"],
             }
         mode = str(mode or "chunks").strip().lower()
+        mentions = [str(item).strip() for item in (at_users or []) if str(item).strip()]
         if mode == "forward":
-            return await self._send_forward_message(
+            # 合并转发卡片里放不了真实 @，需要先单独发一条 @ 消息。
+            mention_ids: list[str] = []
+            if mentions:
+                mention_ids = await self._send_at_message(session_id, mentions, text)
+                text = ""
+            result = await self._send_forward_message(
                 session_id, payloads, text=text, timeout=timeout
             )
+            result["mention_message_ids"] = mention_ids
+            return result
         return await self._send_chunked_messages(
             session_id,
             payloads,
             reply_to_id=reply_to_id,
             text=text,
+            at_users=mentions,
             per_message=per_message,
             timeout=timeout,
         )
@@ -683,6 +693,7 @@ class QQAdapter(PlatformAdapter):
         payloads: list[bytes],
         reply_to_id: str | None = None,
         text: str = "",
+        at_users: list[str] | None = None,
         per_message: int = 9,
         timeout: float | None = 180.0,
     ) -> dict[str, Any]:
@@ -698,6 +709,8 @@ class QQAdapter(PlatformAdapter):
         for index, chunk in enumerate(chunks):
             message_array: list[dict[str, Any]] = []
             if index == 0:
+                for member in at_users or []:
+                    message_array.append({"type": "at", "data": {"qq": str(member)}})
                 if reply_to_id:
                     message_array.append({"type": "reply", "data": {"id": reply_to_id}})
                 if text:
@@ -731,6 +744,29 @@ class QQAdapter(PlatformAdapter):
             "message_ids": message_ids,
             "errors": errors,
         }
+
+    async def _send_at_message(
+        self,
+        session_id: str,
+        at_users: list[str],
+        text: str = "",
+    ) -> list[str]:
+        """单独发一条 @ 消息（合并转发里放不了真实 @）。"""
+        if not at_users:
+            return []
+        message_array: list[dict[str, Any]] = [
+            {"type": "at", "data": {"qq": str(member)}} for member in at_users
+        ]
+        if text:
+            message_array.append({"type": "text", "data": {"text": text}})
+        action, params = self._build_send_message_request(session_id, message_array)
+        try:
+            response = await self.call_api(action, params, timeout=60.0)
+        except Exception as exc:
+            logger.warning("发送 @ 消息失败：%s", exc)
+            return []
+        message_id = self._record_outbound_message(response)
+        return [message_id] if message_id else []
 
     async def _send_forward_message(
         self,
