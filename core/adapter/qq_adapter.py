@@ -829,6 +829,7 @@ class QQAdapter(PlatformAdapter):
             {"id": res_id, "message_id": res_id},
             timeout=60.0,
         )
+        logger.info("合并转发原始内容：%s", str(data)[:3000])
         if isinstance(data, dict):
             messages = data.get("messages") or []
         elif isinstance(data, list):
@@ -838,25 +839,20 @@ class QQAdapter(PlatformAdapter):
         return list(messages)
 
     @classmethod
-    def _count_forward_images(cls, nodes: list[Any]) -> int:
-        """统计合并转发节点里出现的图片数量（含嵌套转发）。"""
-        count = 0
-        for node in nodes or []:
-            data = node.get("data") if isinstance(node, dict) else None
-            if not isinstance(data, dict):
-                continue
-            for key in ("content", "message"):
-                segments = data.get(key) or []
-                if not isinstance(segments, list):
-                    continue
-                for segment in segments:
-                    if not isinstance(segment, dict):
-                        continue
-                    if segment.get("type") == "image":
-                        count += 1
-                    elif segment.get("type") == "node":
-                        count += cls._count_forward_images([segment])
-        return count
+    def _count_forward_images(cls, nodes: Any) -> int:
+        """递归统计转发结构里出现的图片段数量。
+
+        NapCat 不同版本返回的转发结构不一样（有的是 node+content，有的
+        是 node+message，还有的是直接给原始段数组），所以这里整棵子树
+        扫一遍，只认 type=image 的段。
+        """
+        if isinstance(nodes, dict):
+            if nodes.get("type") == "image":
+                return 1
+            return sum(cls._count_forward_images(value) for value in nodes.values())
+        if isinstance(nodes, list):
+            return sum(cls._count_forward_images(item) for item in nodes)
+        return 0
 
     async def delete_message(self, message_id: str) -> bool:
         """撤回自己发出的消息（发送结果异常时用于清场）。"""
