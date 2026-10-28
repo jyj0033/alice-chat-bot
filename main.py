@@ -1173,8 +1173,10 @@ class GroupChatBot:
         self._refresh_personality_runtime()
         self._init_llm()
 
-        if self.poke_responder:
-            self.poke_responder.provider = self._get_provider_for_role("reply")
+        if getattr(self, "poke_responder", None):
+            poke_responder = getattr(self, "poke_responder", None)
+        if poke_responder:
+            poke_responder.provider = self._get_provider_for_role("reply")
 
         if self.reply_generator:
             self.reply_generator.llm = self._get_provider_for_role("reply")
@@ -2921,7 +2923,7 @@ class GroupChatBot:
         # 判定点在这里（决定参与这条消息的那一刻），和"最后说不说话"无关 ——
         # 戳是独立的表达动作，沉默时也可以只戳不说话，所以必须在开口之前掷骰子。
         # 掷完骰子后面无论她回不回话、媒体复核会不会放弃，戳都已经算发生过了。
-        if self.poke_responder:
+        if getattr(self, "poke_responder", None):
             try:
                 await self.poke_responder.maybe_poke(session_id, message.sender_id)
             except Exception as exc:
