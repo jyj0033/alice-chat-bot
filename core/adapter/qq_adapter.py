@@ -34,11 +34,14 @@ class QQAdapter(PlatformAdapter):
         self,
         config: dict,
         on_message: Optional[Callable[[Message], Awaitable[None]]] = None,
+        on_notice: Optional[Callable[[dict], Awaitable[None]]] = None,
         vision_provider: Any | None = None,
     ):
         super().__init__(config)
         self.config = config
         self.on_message_callback = on_message
+        # 通知事件（戳一戳等）单独一个回调，消息和通知的处理节奏不一样。
+        self.on_notice_callback = on_notice
         self.self_id = config.get("self_id", "")
         self.access_token = config.get("access_token", "")
 
@@ -146,6 +149,13 @@ class QQAdapter(PlatformAdapter):
                 self._message_tasks.add(task)
                 task.add_done_callback(self._message_tasks.discard)
 
+            # 通知事件（戳一戳等）
+            elif post_type == "notice":
+                if self.on_notice_callback:
+                    task = asyncio.create_task(self._dispatch_notice(data))
+                    self._message_tasks.add(task)
+                    task.add_done_callback(self._message_tasks.discard)
+
             # 元事件
             elif post_type == "meta_event":
                 meta_type = data.get("meta_event_type", "")
@@ -166,6 +176,19 @@ class QQAdapter(PlatformAdapter):
             raise
         except Exception as exc:
             logger.error("消息回调执行失败：%s", exc, exc_info=True)
+
+    async def _dispatch_notice(self, data: dict) -> None:
+        """把通知事件交给业务层处理（戳一戳等）。
+
+        独立成任务，避免通知处理阻塞接收循环（否则会连带延迟 API 回执）。
+        """
+        try:
+            if self.on_notice_callback:
+                await self.on_notice_callback(data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("处理通知事件失败：%s", exc, exc_info=True)
 
     def _remember_message_id(self, message_id: str) -> bool:
         """记录入站消息 ID；返回 False 表示近期已经处理过。"""
@@ -949,6 +972,28 @@ class QQAdapter(PlatformAdapter):
         except Exception as exc:
             logger.debug("GIF 转 PNG 失败：%s", exc)
             return None
+
+    async def poke(self, session_id: str, target_id: str) -> bool:
+        """戳一下对方。session_id 形如 group_xxx / private_xxx。"""
+        target_id = str(target_id or "").strip()
+        if not target_id:
+            return False
+        try:
+            if session_id.startswith("group_"):
+                action = "group_poke"
+                params = {
+                    "group_id": int(session_id.replace("group_", "")),
+                    "target_id": target_id,
+                }
+            else:
+                action = "friend_poke"
+                params = {"user_id": int(session_id.replace("private_", ""))}
+            await self.call_api(action, params, timeout=15.0)
+            logger.info("已戳 %s（会话 %s）", target_id, session_id)
+            return True
+        except Exception as exc:
+            logger.warning("戳一戳失败：%s", exc)
+            return False
 
     async def send_group_message(self, group_id: str, content: str, reply_to_id: str | None = None) -> bool:
         return await self.send_message(f"group_{group_id}", content, reply_to_id=reply_to_id)

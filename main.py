@@ -42,6 +42,7 @@ from modules.memory.context import (
 )
 from modules.group_analysis import GroupDailyAnalysis
 from modules.meme_manager import MemeManager
+from modules.poke_handler import PokeResponder
 from modules.meme_categorizer import (
     BLOCKED_TAG,
     NON_MEME_TAG,
@@ -219,6 +220,7 @@ class GroupChatBot:
         self.thinking_delay: Optional[ThinkingDelay] = None
         self.response_filter: Optional[ResponseFilter] = None
         self.meme_manager: Optional[MemeManager] = None
+        self.poke_responder: Optional[PokeResponder] = None
 
         # 状态
         self._running = False
@@ -1113,14 +1115,66 @@ class GroupChatBot:
         self.qq_adapter = QQAdapter(
             config=adapter_config,
             on_message=self._handle_message,
+            on_notice=self._handle_notice,
             vision_provider=self._init_vision_provider(),
         )
+        self._init_poke_responder()
+
+    def _init_poke_responder(self) -> None:
+        """初始化戳一戳响应器。"""
+        qq_config = self.config.get("qq", {}) or {}
+        poke_config = qq_config.get("poke", {}) or {}
+        persona = ""
+        try:
+            persona = self.personality.build_persona_prompt()
+        except Exception:
+            persona = ""
+        self.poke_responder = PokeResponder(
+            poke_config,
+            self_id=str(qq_config.get("self_id") or ""),
+            provider=self._get_provider_for_role("reply"),
+            persona=persona,
+            send_text=self._send_poke_text,
+            send_poke=self._send_poke_action,
+        )
+        logger.info(
+            "✓ 戳一戳：启用=%s，回话=%s（LLM=%s），回戳=%s，冷却=%.0f秒",
+            self.poke_responder.config.enabled,
+            self.poke_responder.config.reply,
+            self.poke_responder.config.use_llm,
+            self.poke_responder.config.poke_back,
+            self.poke_responder.config.cooldown_seconds,
+        )
+
+    async def _handle_notice(self, data: dict) -> None:
+        """处理 NapCat 推的通知事件（目前只关心戳一戳）。"""
+        if not self.poke_responder:
+            return
+        try:
+            await self.poke_responder.handle(data)
+        except Exception as exc:
+            logger.warning("处理通知事件失败：%s", exc)
+
+    async def _send_poke_text(self, session_id: str, text: str) -> bool:
+        """戳一戳后的回应：直接发一条普通消息，不走完整回复链路。"""
+        if not self.qq_adapter:
+            return False
+        return await self.qq_adapter.send_message(session_id, text)
+
+    async def _send_poke_action(self, session_id: str, target_id: str) -> bool:
+        """戳回去。"""
+        if not self.qq_adapter:
+            return False
+        return await self.qq_adapter.poke(session_id, target_id)
 
     def apply_runtime_config(self) -> None:
         """重新读取 Web 配置并热更新可安全替换的运行组件。"""
         self._load_config()
         self._refresh_personality_runtime()
         self._init_llm()
+
+        if self.poke_responder:
+            self.poke_responder.provider = self._get_provider_for_role("reply")
 
         if self.reply_generator:
             self.reply_generator.llm = self._get_provider_for_role("reply")
