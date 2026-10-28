@@ -980,14 +980,17 @@ class QQAdapter(PlatformAdapter):
             return False
         try:
             if session_id.startswith("group_"):
+                # NapCat 的 group_poke 参数表里 user_id 是必填的（OneBot 标准里
+                # 它就是"被戳的群成员"），只发 group_id+target_id 会被校验拒掉。
                 action = "group_poke"
                 params = {
-                    "group_id": int(session_id.replace("group_", "")),
+                    "group_id": str(int(session_id.replace("group_", ""))),
+                    "user_id": target_id,
                     "target_id": target_id,
                 }
             else:
                 action = "friend_poke"
-                params = {"user_id": int(session_id.replace("private_", ""))}
+                params = {"user_id": str(int(session_id.replace("private_", "")))}
             await self.call_api(action, params, timeout=15.0)
             logger.info("已戳 %s（会话 %s）", target_id, session_id)
             return True

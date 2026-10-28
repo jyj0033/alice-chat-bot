@@ -117,6 +117,46 @@ class PokeConfigTests(unittest.TestCase):
         self.assertEqual(config.canned, ("自定义一句", "再一句"))
 
 
+class AdapterPokeActionTests(unittest.IsolatedAsyncioTestCase):
+    """poke 动作的参数必须满足 NapCat 的参数表（user_id 必填）。"""
+
+    def _adapter(self):
+        adapter = QQAdapter({"self_id": SELF_ID, "ws_port": 3001})
+        adapter.calls = []
+
+        async def _fake_call_api(action, params, timeout=None):
+            adapter.calls.append((action, params))
+            return {"message_id": 1}
+
+        adapter.call_api = _fake_call_api
+        return adapter
+
+    async def test_group_poke_includes_required_user_id(self):
+        adapter = self._adapter()
+        ok = await adapter.poke("group_333863057", "10001")
+        self.assertTrue(ok)
+        action, params = adapter.calls[0]
+        self.assertEqual(action, "group_poke")
+        self.assertEqual(params["group_id"], "333863057")
+        self.assertEqual(params["user_id"], "10001")
+        self.assertEqual(params["target_id"], "10001")
+
+    async def test_friend_poke_targets_the_peer(self):
+        adapter = self._adapter()
+        ok = await adapter.poke("private_10001", "10001")
+        self.assertTrue(ok)
+        action, params = adapter.calls[0]
+        self.assertEqual(action, "friend_poke")
+        self.assertEqual(params["user_id"], "10001")
+        self.assertNotIn("group_id", params)
+
+    async def test_poke_without_target_is_skipped(self):
+        adapter = self._adapter()
+        ok = await adapter.poke("group_333863057", "")
+        self.assertFalse(ok)
+        self.assertEqual(adapter.calls, [])
+
+
 class PokeResponderTests(unittest.IsolatedAsyncioTestCase):
     def _responder(self, config=None, provider=None, **kwargs):
         sent = []
