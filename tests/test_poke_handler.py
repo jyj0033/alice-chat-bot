@@ -283,6 +283,64 @@ class PokeResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["poked_back"])
 
 
+class ProactivePokeTests(unittest.IsolatedAsyncioTestCase):
+    """主动戳人：概率、冷却、护栏。"""
+
+    def _responder(self, config=None):
+        poked = []
+
+        async def send_poke(session_id, target_id):
+            poked.append((session_id, target_id))
+            return True
+
+        responder = PokeResponder(
+            config,
+            self_id=SELF_ID,
+            provider=_FakeProvider(),
+            send_text=None,
+            send_poke=send_poke,
+        )
+        return responder, poked
+
+    async def test_probability_one_always_pokes(self):
+        responder, poked = self._responder({"proactive_probability": 1.0})
+        for _ in range(5):
+            responder.config.proactive_cooldown_seconds = 0
+            await responder.maybe_poke("group_724786753", "10001")
+        self.assertEqual(len(poked), 5)
+
+    async def test_probability_zero_never_pokes(self):
+        responder, poked = self._responder({"proactive_probability": 0.0})
+        for _ in range(20):
+            await responder.maybe_poke("group_724786753", "10001")
+        self.assertEqual(poked, [])
+
+    async def test_never_poke_self(self):
+        responder, poked = self._responder({"proactive_probability": 1.0})
+        await responder.maybe_poke("group_724786753", SELF_ID)
+        self.assertEqual(poked, [])
+
+    async def test_cooldown_blocks_repeat(self):
+        responder, poked = self._responder(
+            {"proactive_probability": 1.0, "proactive_cooldown_seconds": 600}
+        )
+        await responder.maybe_poke("group_724786753", "10001")
+        await responder.maybe_poke("group_724786753", "10001")
+        self.assertEqual(len(poked), 1)
+
+    async def test_does_not_double_poke_right_after_poke_back(self):
+        responder, poked = self._responder(
+            {
+                "proactive_probability": 1.0,
+                "poke_back_cooldown_seconds": 600,
+                "proactive_cooldown_seconds": 0,
+            }
+        )
+        await responder.handle(_group_poke())          # 收到戳 -> 回戳
+        await responder.maybe_poke("group_724786753", "10001")  # 紧接着主动戳
+        self.assertEqual(len(poked), 1)
+
+
 class CleanReplyTests(unittest.TestCase):
     def test_strips_quotes_and_newlines(self):
         self.assertEqual(clean_reply('"在的在的"\n'), "在的在的")

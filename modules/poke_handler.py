@@ -64,6 +64,10 @@ class PokeConfig:
     cooldown_seconds: float = 30.0
     # 回戳冷却，比回应冷却长，避免和对方来回戳
     poke_back_cooldown_seconds: float = 60.0
+    # 主动戳人的概率：每次成功回复后判定一次，0.05 就是 5%
+    proactive_probability: float = 0.05
+    # 主动戳的冷却：同一个人在这个窗口内不会被主动戳
+    proactive_cooldown_seconds: float = 60.0
     llm_timeout: float = 8.0
     max_tokens: int = 60
     canned: tuple[str, ...] = DEFAULT_CANNED_REPLIES
@@ -194,9 +198,12 @@ class PokeResponder:
         self.persona = persona
         self._send_text = send_text
         self._send_poke = send_poke
-        # session+poker -> 上次回应/回戳的时间戳
+        # session+poker -> 上次回应的时间戳
         self._last_reply: dict[str, float] = {}
+        # session+target -> 上次回戳的时间戳
         self._last_poke_back: dict[str, float] = {}
+        # session+target -> 上次主动戳的时间戳（和回戳节奏互相独立）
+        self._last_proactive: dict[str, float] = {}
 
     async def handle(self, raw: Any) -> dict[str, Any]:
         """处理一条通知事件。返回处理结果，方便调用方看日志。"""
@@ -254,6 +261,46 @@ class PokeResponder:
             result["poked_back"],
         )
         return result
+
+    async def maybe_poke(self, session_id: str, target_id: str) -> bool:
+        """按概率主动戳一下某人（默认 5%）。
+
+        只在确实把一条回复发出去之后调用。戳失败不影响回复，
+        也不会重试——它是调味，不是任务。
+        """
+        if not self.config.enabled or not self._send_poke:
+            return False
+        probability = float(self.config.proactive_probability or 0.0)
+        if probability <= 0:
+            return False
+        target_id = str(target_id or "").strip()
+        if not target_id or target_id == self.self_id:
+            return False
+        key = f"{session_id}:{target_id}"
+        now = time.time()
+        # 刚回戳过的人，短时间内不再被主动戳（别一分钟内连戳同一人两下）
+        if (
+            now - self._last_poke_back.get(key, 0.0)
+            < self.config.poke_back_cooldown_seconds
+        ):
+            return False
+        # 主动戳自己的节奏，和回戳冷却各管各的
+        if (
+            now - self._last_proactive.get(key, 0.0)
+            < self.config.proactive_cooldown_seconds
+        ):
+            return False
+        if random.random() >= probability:
+            return False
+        self._last_proactive[key] = now
+        try:
+            ok = bool(await self._send_poke(session_id, target_id))
+        except Exception as exc:
+            logger.warning("[主动戳] 失败：%s", exc)
+            return False
+        if ok:
+            logger.info("[主动戳] 戳了 %s（会话 %s）", target_id, session_id)
+        return ok
 
     async def _build_reply(self, event: PokeEvent) -> str:
         """生成回应：优先 LLM，失败或不启用就用固定话术。"""

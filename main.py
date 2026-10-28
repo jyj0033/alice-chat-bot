@@ -3850,6 +3850,16 @@ class GroupChatBot:
                     self.attention_manager.on_no_reply(group_id, message.sender_id)
                 return
 
+            # 主动戳人：按配置概率（默认 5%）戳一下刚才说话的人。
+            # 只在确实把回复发出去之后判定，戳失败也不影响回复。
+            if self.poke_responder:
+                try:
+                    await self.poke_responder.maybe_poke(
+                        session_id, effective_message.sender_id
+                    )
+                except Exception as exc:
+                    logger.debug("[主动戳] 失败：%s", exc)
+
             # 疲劳收尾只在主回复完整发送后考虑；成功后重置，避免连续多轮重复说“先走了”。
             if (
                 len(sent_segments) == len(segments)
