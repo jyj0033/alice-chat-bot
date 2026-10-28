@@ -64,8 +64,8 @@ class PokeConfig:
     cooldown_seconds: float = 30.0
     # 回戳冷却，比回应冷却长，避免和对方来回戳
     poke_back_cooldown_seconds: float = 60.0
-    # 主动戳人的概率：每次"决定参与一条消息"时判定一次（和最后说不说话
-    # 无关，可以只戳不说话），0.05 就是 5%
+    # 主动戳人的概率：群里每条消息都判定一次（不要求 bot 参与那条消息，
+    # 也不要求和最后说不说话有关，可以只戳不说话），0.05 就是 5%
     proactive_probability: float = 0.05
     # 主动戳的冷却：同一个人在这个窗口内不会被主动戳
     proactive_cooldown_seconds: float = 60.0
@@ -266,9 +266,9 @@ class PokeResponder:
     async def maybe_poke(self, session_id: str, target_id: str) -> bool:
         """按概率主动戳一下某人（默认 5%）。
 
-        在"决定参与这条消息"的时刻调用，和最后说不说话无关 ——
-        沉默的时候也可以只戳不说话。戳失败不影响后续流程，
-        也不会重试——它是调味，不是任务。
+        在群消息进来的那一刻调用：每条群消息都掷一次骰子，不要求 bot
+        参与那条消息，也和最后说不说话无关 —— 沉默的时候也可以只戳不说话。
+        戳失败不影响后续流程，也不会重试 —— 它是调味，不是任务。
         """
         if not self.config.enabled or not self._send_poke:
             return False

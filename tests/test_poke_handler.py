@@ -5,7 +5,9 @@ import json
 import unittest
 from types import SimpleNamespace
 
+from core.adapter.base import Message
 from core.adapter.qq_adapter import QQAdapter
+from main import GroupChatBot
 from modules.poke_handler import (
     PokeConfig,
     PokeResponder,
@@ -339,6 +341,63 @@ class ProactivePokeTests(unittest.IsolatedAsyncioTestCase):
         await responder.handle(_group_poke())          # 收到戳 -> 回戳
         await responder.maybe_poke("group_724786753", "10001")  # 紧接着主动戳
         self.assertEqual(len(poked), 1)
+
+
+class WideProactivePokeTests(unittest.IsolatedAsyncioTestCase):
+    """宽版主动戳：群里每条消息都掷骰子，不要求 bot 参与那条消息。"""
+
+    class _FakeResponder:
+        def __init__(self):
+            self.calls = []
+
+        async def maybe_poke(self, session_id, target_id):
+            self.calls.append((session_id, target_id))
+            return True
+
+    def _bot(self, responder):
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.poke_responder = responder
+        bot._poke_tasks = set()
+        return bot
+
+    def _message(self, **overrides):
+        values = dict(
+            message_id="m1", message_type="group", group_id="g1",
+            sender_id="u1", sender_name="小明", content="随便说句话",
+        )
+        values.update(overrides)
+        return Message(**values)
+
+    async def test_group_message_schedules_poke(self):
+        responder = self._FakeResponder()
+        bot = self._bot(responder)
+        bot._schedule_proactive_poke(self._message())
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertEqual(responder.calls, [("group_g1", "u1")])
+
+    async def test_missing_responder_does_not_raise(self):
+        bot = GroupChatBot.__new__(GroupChatBot)
+        # 测试用 __new__ 造对象，实例上没有 poke_responder 属性
+        bot._schedule_proactive_poke(self._message())
+
+    async def test_task_set_is_created_lazily(self):
+        responder = self._FakeResponder()
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.poke_responder = responder
+        bot._schedule_proactive_poke(self._message())
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertEqual(responder.calls, [("group_g1", "u1")])
+        self.assertIsInstance(bot._poke_tasks, set)
+
+    async def test_empty_sender_is_skipped(self):
+        responder = self._FakeResponder()
+        bot = self._bot(responder)
+        bot._schedule_proactive_poke(self._message(sender_id=""))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertEqual(responder.calls, [])
 
 
 class CleanReplyTests(unittest.TestCase):

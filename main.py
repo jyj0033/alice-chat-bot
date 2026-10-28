@@ -243,6 +243,8 @@ class GroupChatBot:
         self._conversation_judge_batch_started_at: dict[str, float] = {}
         self._rich_media_tasks: set[asyncio.Task] = set()
         self._meme_collect_tasks: set[asyncio.Task] = set()
+        # 主动戳的后台任务（宽版判定，群里每条消息都掷一次骰子）
+        self._poke_tasks: set[asyncio.Task] = set()
         # 正在识别中的媒体任务。键是 (会话, 消息 id) 和 (会话, 发送者)，
         # 后者让"同一发送者紧接着追问同一张图"也能等到识别结果。
         self._media_tasks_by_message: dict[tuple[str, str], asyncio.Task] = {}
@@ -1155,6 +1157,38 @@ class GroupChatBot:
         except Exception as exc:
             logger.warning("处理通知事件失败：%s", exc)
 
+    def _poke_task_set(self) -> set:
+        """取主动戳的后台任务集合；测试用 __new__ 造对象时可能还没有，惰性建一个。"""
+        tasks = getattr(self, "_poke_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._poke_tasks = tasks
+        return tasks
+
+    def _schedule_proactive_poke(self, message: Message) -> None:
+        """掷骰子决定要不要主动戳一下刚才说话的人。
+
+        群里每条消息都算，不要求 bot 参与这条消息；私聊不主动戳
+        （一对一聊天里戳人很突兀，只有被戳才回戳）。
+        """
+        poke_responder = getattr(self, "poke_responder", None)
+        if poke_responder is None:
+            return
+        sender_id = str(message.sender_id or "").strip()
+        if not sender_id:
+            return
+        session_id = message.session_id
+        try:
+            task = asyncio.create_task(
+                poke_responder.maybe_poke(session_id, sender_id)
+            )
+        except RuntimeError:
+            # 没有运行中的事件循环（极少见），放弃这次主动戳。
+            return
+        tasks = self._poke_task_set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
     async def _send_poke_text(self, session_id: str, text: str) -> bool:
         """戳一戳后的回应：直接发一条普通消息，不走完整回复链路。"""
         if not self.qq_adapter:
@@ -1173,8 +1207,7 @@ class GroupChatBot:
         self._refresh_personality_runtime()
         self._init_llm()
 
-        if getattr(self, "poke_responder", None):
-            poke_responder = getattr(self, "poke_responder", None)
+        poke_responder = getattr(self, "poke_responder", None)
         if poke_responder:
             poke_responder.provider = self._get_provider_for_role("reply")
 
@@ -1235,6 +1268,12 @@ class GroupChatBot:
         if message.message_type == "group" and group_config.get("enabled") is False:
             logger.debug("群 %s 已在 Web 配置中停用", message.group_id)
             return
+
+        # 宽版主动戳：群里每条消息都参与掷骰子，不管 bot 参不参与这条消息。
+        # 判定放在摄入的最前面 —— 越早越不打扰后面的决策链，也不依赖
+        # "要不要说话"的任何结论。掷骰子放到后台任务，不给消息处理加延迟。
+        if message.message_type == "group":
+            self._schedule_proactive_poke(message)
 
         # 普通插话只对触发它的那一轮有效。新群消息一到就撤掉仍在等待或
         # 生成中的非定向草稿，让新消息自己的目标判断决定要不要说话；否则
@@ -2919,15 +2958,6 @@ class GroupChatBot:
         effective_context_item = None
         effective_message_id = str(message.message_id or "")
 
-        # 主动戳人：按配置概率（默认 5%）戳一下刚才说话的人。
-        # 判定点在这里（决定参与这条消息的那一刻），和"最后说不说话"无关 ——
-        # 戳是独立的表达动作，沉默时也可以只戳不说话，所以必须在开口之前掷骰子。
-        # 掷完骰子后面无论她回不回话、媒体复核会不会放弃，戳都已经算发生过了。
-        if getattr(self, "poke_responder", None):
-            try:
-                await self.poke_responder.maybe_poke(session_id, message.sender_id)
-            except Exception as exc:
-                logger.debug("[主动戳] 失败：%s", exc)
 
         try:
             enrichment_task = decision.get("enrichment_task")
