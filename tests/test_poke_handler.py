@@ -9,6 +9,7 @@ from core.adapter.base import Message
 from core.adapter.qq_adapter import QQAdapter
 from main import GroupChatBot
 from modules.memory.context import ContextManager
+from modules.memory.storage import AsyncMemoryStorage, MemoryStorage
 from modules.poke_handler import (
     PokeConfig,
     PokeResponder,
@@ -651,6 +652,138 @@ class _FakeAdapter:
     async def get_member_display_name(self, group_id, user_id):
         self.calls.append((group_id, user_id))
         return self.name
+
+
+class PokeMemoryPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    """戳一戳要落进 SQLite：重启后还能捞回上下文窗口。"""
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "memory.db")
+        self.storage = AsyncMemoryStorage(MemoryStorage(self.path))
+
+    def tearDown(self):
+        try:
+            self.storage._storage.conn.close()
+        except Exception:
+            pass
+
+    def _responder(self, config=None):
+        sent = []
+
+        async def send_text(session_id, text):
+            sent.append((session_id, text))
+            return True
+
+        async def send_poke(session_id, target_id):
+            return True
+
+        return PokeResponder(
+            config,
+            self_id=SELF_ID,
+            provider=_FakeProvider(),
+            send_text=send_text,
+            send_poke=send_poke,
+        ), sent
+
+    def _bot(self, responder, storage=None):
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.config = {"qq": {"self_id": SELF_ID}}
+        bot.personality = _FakePersonality()
+        bot.context_manager = ContextManager()
+        bot.poke_responder = responder
+        bot.qq_adapter = None
+        bot._session_message_versions = {}
+        bot.memory_storage = self.storage if storage is None else storage
+        bot.long_term_memory_enabled = True
+        bot._memory_tasks = set()
+        return bot
+
+    async def _drain(self, bot):
+        tasks = list(getattr(bot, "_memory_tasks", set()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_poke_and_reply_are_written_to_sqlite(self):
+        responder, sent = self._responder()
+        bot = self._bot(responder)
+        await bot._handle_notice(_group_poke())
+        await self._drain(bot)
+        rows = await self.storage.get_session_messages("group_724786753")
+        self.assertEqual(len(rows), 2)
+        by_content = {row.content: row for row in rows}
+        poke_row = by_content.get("10001：戳了戳爱丽丝")
+        bot_row = by_content.get("爱丽丝：在的在的，戳我干嘛")
+        self.assertIsNotNone(poke_row)
+        self.assertIsNotNone(bot_row)
+        self.assertFalse(poke_row.metadata.get("is_bot"))
+        self.assertEqual(poke_row.metadata.get("sender_id"), "10001")
+        self.assertTrue(poke_row.metadata.get("meaningful"))
+        self.assertTrue(poke_row.metadata.get("directed_to_bot"))
+        self.assertTrue(poke_row.metadata.get("poke"))
+        self.assertTrue(bot_row.metadata.get("is_bot"))
+        self.assertEqual(bot_row.metadata.get("sender_id"), SELF_ID)
+        self.assertEqual(bot_row.metadata.get("reply_to_qq"), "10001")
+
+    async def test_poke_is_restored_into_window_after_restart(self):
+        responder, sent = self._responder()
+        bot = self._bot(responder)
+        await bot._handle_notice(_group_poke())
+        await self._drain(bot)
+        # 模拟重启：新实例，同一个库
+        restarted = self._bot(responder)
+        await restarted._restore_recent_context("group_724786753")
+        msgs = restarted.context_manager.get_window("group_724786753").get_recent(10)
+        self.assertEqual(len(msgs), 2)
+        self.assertEqual(msgs[0].content, "戳了戳爱丽丝")
+        self.assertFalse(msgs[0].is_bot)
+        self.assertEqual(msgs[0].sender_id, "10001")
+        self.assertTrue(msgs[1].is_bot)
+        self.assertEqual(msgs[1].content, "在的在的，戳我干嘛")
+        self.assertEqual(msgs[1].reply_to_qq, "10001")
+
+    async def test_failed_reply_is_not_written(self):
+        async def send_text(session_id, text):
+            return False
+
+        async def send_poke(session_id, target_id):
+            return True
+
+        responder = PokeResponder(
+            None,
+            self_id=SELF_ID,
+            provider=_FakeProvider(),
+            send_text=send_text,
+            send_poke=send_poke,
+        )
+        bot = self._bot(responder)
+        await bot._handle_notice(_group_poke())
+        await self._drain(bot)
+        rows = await self.storage.get_session_messages("group_724786753")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].content, "10001：戳了戳爱丽丝")
+
+    async def test_self_poke_is_not_written(self):
+        responder, sent = self._responder()
+        bot = self._bot(responder)
+        await bot._handle_notice(_group_poke(poker=SELF_ID))
+        await self._drain(bot)
+        rows = await self.storage.get_session_messages("group_724786753")
+        self.assertEqual(rows, [])
+
+    async def test_disabled_memory_skips_database(self):
+        responder, sent = self._responder()
+        bot = self._bot(responder)
+        bot.long_term_memory_enabled = False
+        await bot._handle_notice(_group_poke())
+        await self._drain(bot)
+        rows = await self.storage.get_session_messages("group_724786753")
+        self.assertEqual(rows, [])
+        # 窗口里照旧有记录，只是没落库
+        self.assertEqual(len(bot.context_manager.get_window("group_724786753").messages), 2)
 
 
 if __name__ == "__main__":

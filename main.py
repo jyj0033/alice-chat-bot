@@ -1173,10 +1173,15 @@ class GroupChatBot:
     }
 
     async def _record_poke_context(self, result: dict) -> None:
-        """把一次戳一戳写进会话上下文。
+        """把一次戳一戳写进会话上下文，并落库。
 
         戳一戳本身是对话的一部分（"他刚戳了我"），对模型是有意义的上下文；
         连同 bot 自己那句回应一起进窗口，后面聊到时模型才知道发生过什么。
+
+        同时写进 SQLite 的 episodic 记忆：重启后 ``_restore_recent_context``
+        会把这段戳一戳捞回窗口，不然重启一次这段互动就凭空消失了。
+        **窗口里有的，库里也必须有** —— 否则重启后会只剩半截对话
+        （有戳没回应，或有回应没戳）。
 
         刻意不碰 ``_session_message_versions``：那是给"这条消息是否已被后续
         群消息覆盖"用的版本号，戳一戳插一脚会让在途的目标判断全部作废。
@@ -1201,26 +1206,46 @@ class GroupChatBot:
             poker_id,
             str(result.get("group_id") or ""),
         )
+        display_name = sender_name or poker_id
+        poke_text = f"戳了戳{bot_name}"
+        poke_message_id = f"poke-{time.time_ns()}"
         context_manager.add_message(
             session_id=session_id,
             sender_id=poker_id,
-            sender_name=sender_name or poker_id,
-            content=f"戳了戳{bot_name}",
+            sender_name=display_name,
+            content=poke_text,
             is_bot=False,
-            message_id=f"poke-{time.time_ns()}",
+            message_id=poke_message_id,
             directed_to_bot=True,
+        )
+        self._store_poke_memory(
+            session_id=session_id,
+            sender_id=poker_id,
+            sender_name=display_name,
+            content=poke_text,
+            message_id=poke_message_id,
         )
         reply = str(result.get("reply") or "").strip()
         if reply and result.get("reply_sent"):
             bot_config = getattr(self, "config", {}) or {}
             self_id = str((bot_config.get("qq", {}) or {}).get("self_id", ""))
+            reply_message_id = f"poke-reply-{time.time_ns()}"
             context_manager.add_message(
                 session_id=session_id,
                 sender_id=self_id,
                 sender_name=bot_name,
                 content=reply,
                 is_bot=True,
-                message_id=f"poke-reply-{time.time_ns()}",
+                message_id=reply_message_id,
+                reply_to_qq=poker_id,
+            )
+            self._store_poke_memory(
+                session_id=session_id,
+                sender_id=self_id,
+                sender_name=bot_name,
+                content=reply,
+                message_id=reply_message_id,
+                is_bot=True,
                 reply_to_qq=poker_id,
             )
         logger.info(
@@ -1230,6 +1255,69 @@ class GroupChatBot:
             sender_name or poker_id,
             reply if reply and result.get("reply_sent") else "（无）",
         )
+
+    def _store_poke_memory(
+        self,
+        session_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        message_id: str,
+        *,
+        is_bot: bool = False,
+        reply_to_qq: str = "",
+    ) -> None:
+        """把戳一戳（或 bot 对戳一戳的回应）写进 SQLite 情景记忆。
+
+        只写 episodic（会话消息）：重启后 ``_restore_recent_context`` 按
+        ``meaningful`` 标记把它捞回上下文窗口，戳一戳这段互动不会因为
+        重启而消失。
+
+        刻意不走 ``_store_long_term_memory``：那条链路是给"用户说过的话"做
+        重要性筛选、抽用户画像的，戳一戳不是画像素材，也不该被当成长线记忆
+        反复召回。同样不进群日报流水 —— 日报统计的是群友发言，戳一戳不是
+        发言，混进去会歪曲群活跃度。
+        """
+        if not getattr(self, "long_term_memory_enabled", True):
+            return
+        storage = getattr(self, "memory_storage", None)
+        if storage is None:
+            return
+        content = str(content or "").strip()
+        if not content:
+            return
+        name = str(sender_name or "").strip() or sender_id
+        memory = Memory(
+            content=f"{name}：{content[:200]}",
+            memory_type="episodic",
+            importance=0.45 if is_bot else 0.5,
+            source_session=session_id,
+            metadata={
+                "sender_id": sender_id,
+                "sender_name": name,
+                "is_bot": is_bot,
+                "message_id": message_id,
+                "reply_to_qq": reply_to_qq or None,
+                # 戳一戳是明确的互动，对模型有实义，要参与重启后的窗口恢复
+                "directed_to_bot": not is_bot,
+                "meaningful": True,
+                "poke": True,
+            },
+        )
+
+        async def _save():
+            try:
+                await storage.store(memory)
+            except Exception as exc:
+                logger.debug("保存戳一戳记忆失败：%s", exc)
+
+        coro = _save()
+        try:
+            self._track_memory_task(coro)
+        except RuntimeError:
+            # 没有运行中的事件循环（极少见），放弃这次落库。
+            coro.close()
+            return
 
     async def _resolve_poke_sender_name(
         self,
@@ -5020,8 +5108,13 @@ class GroupChatBot:
     def _track_memory_task(self, coroutine) -> asyncio.Task:
         """创建并跟踪轻量记忆后台任务。"""
         task = asyncio.create_task(coroutine)
-        self._memory_tasks.add(task)
-        task.add_done_callback(self._memory_tasks.discard)
+        # 测试用 __new__ 造对象时实例上没有这个属性，惰性建一个。
+        tasks = getattr(self, "_memory_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._memory_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
         return task
 
     def _maybe_schedule_digest(self, session_id: str) -> None:
