@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from core.adapter.base import Message
 from core.adapter.qq_adapter import QQAdapter
 from main import GroupChatBot
+from modules.memory.context import ContextManager
 from modules.poke_handler import (
     PokeConfig,
     PokeResponder,
@@ -438,6 +439,218 @@ class AdapterNoticeTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(3):
             await asyncio.sleep(0)
         self.assertEqual(received, [])
+
+
+class AdapterMemberNameTests(unittest.IsolatedAsyncioTestCase):
+    """查群成员显示名：优先群名片，其次昵称。"""
+
+    def _adapter(self, data=None, error=None):
+        adapter = QQAdapter({"self_id": SELF_ID, "ws_port": 3001})
+        adapter.calls = []
+
+        async def _fake_call_api(action, params, timeout=None):
+            adapter.calls.append((action, params))
+            if error:
+                raise error
+            return data
+
+        adapter.call_api = _fake_call_api
+        return adapter
+
+    async def test_card_is_preferred_over_nickname(self):
+        adapter = self._adapter({"card": "群名片", "nickname": "昵称"})
+        name = await adapter.get_member_display_name("724786753", "10001")
+        self.assertEqual(name, "群名片")
+        action, params = adapter.calls[0]
+        self.assertEqual(action, "get_group_member_info")
+        self.assertEqual(params["group_id"], "724786753")
+        self.assertEqual(params["user_id"], "10001")
+
+    async def test_nickname_is_used_when_no_card(self):
+        adapter = self._adapter({"card": "  ", "nickname": "昵称"})
+        name = await adapter.get_member_display_name("724786753", "10001")
+        self.assertEqual(name, "昵称")
+
+    async def test_api_failure_returns_empty(self):
+        adapter = self._adapter(error=RuntimeError("接口炸了"))
+        name = await adapter.get_member_display_name("724786753", "10001")
+        self.assertEqual(name, "")
+
+    async def test_invalid_id_returns_empty_without_call(self):
+        adapter = self._adapter({"card": "群名片"})
+        name = await adapter.get_member_display_name("abc", "10001")
+        self.assertEqual(name, "")
+        self.assertEqual(adapter.calls, [])
+
+
+class _FakePersonality:
+    name = "爱丽丝"
+
+
+class PokeContextTests(unittest.IsolatedAsyncioTestCase):
+    """戳一戳要写进会话上下文。"""
+
+    def _responder(self, config=None, reply_sent=True):
+        sent = []
+
+        async def send_text(session_id, text):
+            sent.append((session_id, text))
+            return reply_sent
+
+        async def send_poke(session_id, target_id):
+            return True
+
+        responder = PokeResponder(
+            config,
+            self_id=SELF_ID,
+            provider=_FakeProvider(),
+            send_text=send_text,
+            send_poke=send_poke,
+        )
+        return responder, sent
+
+    def _bot(self, responder, adapter=None):
+        bot = GroupChatBot.__new__(GroupChatBot)
+        bot.config = {"qq": {"self_id": SELF_ID}}
+        bot.personality = _FakePersonality()
+        bot.context_manager = ContextManager()
+        bot.poke_responder = responder
+        bot.qq_adapter = adapter
+        bot._session_message_versions = {}
+        return bot
+
+    def _window(self, bot, session_id="group_724786753"):
+        return bot.context_manager.get_window(session_id).get_recent(20)
+
+    async def test_group_poke_and_reply_are_recorded(self):
+        responder, sent = self._responder()
+        bot = self._bot(responder)
+        bot.context_manager.add_message(
+            session_id="group_724786753",
+            sender_id="10001",
+            sender_name="江雨衿",
+            content="在吗",
+            is_bot=False,
+        )
+        await bot._handle_notice(_group_poke())
+        msgs = self._window(bot)
+        poke_msg, bot_msg = msgs[-2], msgs[-1]
+        self.assertEqual(poke_msg.sender_id, "10001")
+        self.assertEqual(poke_msg.sender_name, "江雨衿")
+        self.assertEqual(poke_msg.content, "戳了戳爱丽丝")
+        self.assertFalse(poke_msg.is_bot)
+        self.assertTrue(poke_msg.directed_to_bot)
+        self.assertTrue(bot_msg.is_bot)
+        self.assertEqual(bot_msg.content, "在的在的，戳我干嘛")
+        self.assertEqual(bot_msg.reply_to_qq, "10001")
+
+    async def test_name_falls_back_to_group_card(self):
+        responder, sent = self._responder()
+        adapter = _FakeAdapter(name="路过的兰斯洛特")
+        bot = self._bot(responder, adapter=adapter)
+        await bot._handle_notice(_group_poke())
+        msgs = self._window(bot)
+        self.assertEqual(msgs[-2].sender_name, "路过的兰斯洛特")
+        self.assertEqual(adapter.calls, [("724786753", "10001")])
+
+    async def test_name_falls_back_to_qq_number(self):
+        responder, sent = self._responder()
+        adapter = _FakeAdapter(name="")
+        bot = self._bot(responder, adapter=adapter)
+        await bot._handle_notice(_group_poke())
+        msgs = self._window(bot)
+        self.assertEqual(msgs[-2].sender_name, "10001")
+
+    async def test_private_poke_is_recorded_in_private_session(self):
+        responder, sent = self._responder()
+        bot = self._bot(responder)
+        await bot._handle_notice(_private_poke())
+        # 私戳只进私聊窗口，不混进群窗口
+        self.assertEqual(self._window(bot), [])
+        msgs = bot.context_manager.get_window("private_10001").get_recent(20)
+        self.assertEqual(msgs[-2].content, "戳了戳爱丽丝")
+        self.assertEqual(msgs[-2].sender_id, "10001")
+        self.assertTrue(msgs[-1].is_bot)
+
+    async def test_self_poke_is_not_recorded(self):
+        responder, sent = self._responder()
+        bot = self._bot(responder)
+        await bot._handle_notice(_group_poke(poker=SELF_ID))
+        self.assertEqual(self._window(bot), [])
+
+    async def test_disabled_group_poke_is_not_recorded(self):
+        responder, sent = self._responder({"group_enabled": False})
+        bot = self._bot(responder)
+        await bot._handle_notice(_group_poke())
+        self.assertEqual(self._window(bot), [])
+
+    async def test_disabled_feature_is_not_recorded(self):
+        responder, sent = self._responder({"enabled": False})
+        bot = self._bot(responder)
+        await bot._handle_notice(_group_poke())
+        self.assertEqual(self._window(bot), [])
+
+    async def test_poke_at_other_person_is_not_recorded(self):
+        responder, sent = self._responder()
+        bot = self._bot(responder)
+        await bot._handle_notice(_group_poke(target="99999"))
+        self.assertEqual(self._window(bot), [])
+
+    async def test_cooldown_poke_is_still_recorded(self):
+        responder, sent = self._responder()
+        bot = self._bot(responder)
+        await bot._handle_notice(_group_poke())
+        await bot._handle_notice(_group_poke())
+        msgs = self._window(bot)
+        pokes = [m for m in msgs if m.content == "戳了戳爱丽丝"]
+        self.assertEqual(len(pokes), 2)
+        # 第二次被冷却挡住，没有新的回应
+        self.assertEqual(len([m for m in msgs if m.is_bot]), 1)
+
+    async def test_failed_reply_is_not_recorded_as_bot_message(self):
+        responder, sent = self._responder(reply_sent=False)
+        bot = self._bot(responder)
+        await bot._handle_notice(_group_poke())
+        msgs = self._window(bot)
+        self.assertEqual(len(msgs), 1)
+        self.assertFalse(msgs[0].is_bot)
+
+    async def test_poke_does_not_bump_message_version(self):
+        responder, sent = self._responder()
+        bot = self._bot(responder)
+        await bot._handle_notice(_group_poke())
+        # 版本号用于"这条消息是否已被后续群消息覆盖"，戳一戳不能插一脚
+        self.assertEqual(bot._session_message_versions, {})
+
+    async def test_poke_renders_as_addressed_to_bot(self):
+        responder, sent = self._responder()
+        bot = self._bot(responder)
+        bot.context_manager.add_message(
+            session_id="group_724786753",
+            sender_id="10001",
+            sender_name="江雨衿",
+            content="在吗",
+            is_bot=False,
+        )
+        await bot._handle_notice(_group_poke())
+        text = bot.context_manager.get_window("group_724786753").build_conversation_text(
+            bot_name="爱丽丝", bot_id=SELF_ID
+        )
+        self.assertIn("戳了戳爱丽丝", text)
+        self.assertIn('to="you"', text)
+        self.assertIn('self="1"', text)
+
+
+class _FakeAdapter:
+    """只提供 get_member_display_name 的假适配器。"""
+
+    def __init__(self, name=""):
+        self.name = name
+        self.calls = []
+
+    async def get_member_display_name(self, group_id, user_id):
+        self.calls.append((group_id, user_id))
+        return self.name
 
 
 if __name__ == "__main__":

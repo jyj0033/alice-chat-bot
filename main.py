@@ -1150,12 +1150,120 @@ class GroupChatBot:
 
     async def _handle_notice(self, data: dict) -> None:
         """处理 NapCat 推的通知事件（目前只关心戳一戳）。"""
-        if not self.poke_responder:
+        poke_responder = getattr(self, "poke_responder", None)
+        if not poke_responder:
             return
         try:
-            await self.poke_responder.handle(data)
+            result = await poke_responder.handle(data)
         except Exception as exc:
             logger.warning("处理通知事件失败：%s", exc)
+            return
+        try:
+            await self._record_poke_context(result)
+        except Exception as exc:
+            logger.warning("记录戳一戳上下文失败：%s", exc)
+
+    # 这些跳过原因代表"这次戳不算数"，不写进上下文。
+    _POKE_SKIPS_NOT_RECORDED = {
+        "disabled",
+        "not_me",
+        "self_poke",
+        "group_disabled",
+        "private_disabled",
+    }
+
+    async def _record_poke_context(self, result: dict) -> None:
+        """把一次戳一戳写进会话上下文。
+
+        戳一戳本身是对话的一部分（"他刚戳了我"），对模型是有意义的上下文；
+        连同 bot 自己那句回应一起进窗口，后面聊到时模型才知道发生过什么。
+
+        刻意不碰 ``_session_message_versions``：那是给"这条消息是否已被后续
+        群消息覆盖"用的版本号，戳一戳插一脚会让在途的目标判断全部作废。
+        """
+        if not isinstance(result, dict):
+            return
+        skipped = str(result.get("skipped") or "")
+        if skipped and skipped in self._POKE_SKIPS_NOT_RECORDED:
+            return
+        session_id = str(result.get("session_id") or "").strip()
+        poker_id = str(result.get("poker_id") or "").strip()
+        if not session_id or not poker_id:
+            return
+        context_manager = getattr(self, "context_manager", None)
+        if context_manager is None:
+            return
+
+        personality = getattr(self, "personality", None)
+        bot_name = str(getattr(personality, "name", "") or "爱丽丝")
+        sender_name = await self._resolve_poke_sender_name(
+            session_id,
+            poker_id,
+            str(result.get("group_id") or ""),
+        )
+        context_manager.add_message(
+            session_id=session_id,
+            sender_id=poker_id,
+            sender_name=sender_name or poker_id,
+            content=f"戳了戳{bot_name}",
+            is_bot=False,
+            message_id=f"poke-{time.time_ns()}",
+            directed_to_bot=True,
+        )
+        reply = str(result.get("reply") or "").strip()
+        if reply and result.get("reply_sent"):
+            bot_config = getattr(self, "config", {}) or {}
+            self_id = str((bot_config.get("qq", {}) or {}).get("self_id", ""))
+            context_manager.add_message(
+                session_id=session_id,
+                sender_id=self_id,
+                sender_name=bot_name,
+                content=reply,
+                is_bot=True,
+                message_id=f"poke-reply-{time.time_ns()}",
+                reply_to_qq=poker_id,
+            )
+        logger.info(
+            "[戳一戳] 已写入上下文：会话=%s 戳的人=%s 显示名=%s 回应=%s",
+            session_id,
+            poker_id,
+            sender_name or poker_id,
+            reply if reply and result.get("reply_sent") else "（无）",
+        )
+
+    async def _resolve_poke_sender_name(
+        self,
+        session_id: str,
+        user_id: str,
+        group_id: str = "",
+    ) -> str:
+        """给戳一戳找一个显示名。
+
+        戳一戳事件里只有 QQ 号。先从最近上下文窗口按 QQ 号反查（零网络开销，
+        窗口里通常有他刚说过话）；查不到再问 NapCat 要群名片；还查不到就空着，
+        由调用方退化成 QQ 号。
+        """
+        context_manager = getattr(self, "context_manager", None)
+        if context_manager is not None:
+            try:
+                window = context_manager.get_window(session_id)
+            except Exception:
+                window = None
+            if window is not None:
+                for msg in reversed(window.get_recent(50)):
+                    if msg.is_bot:
+                        continue
+                    if str(msg.sender_id or "") != str(user_id):
+                        continue
+                    if msg.sender_name:
+                        return str(msg.sender_name)
+        adapter = getattr(self, "qq_adapter", None)
+        if adapter is not None and group_id:
+            try:
+                return str(await adapter.get_member_display_name(group_id, user_id) or "")
+            except Exception as exc:
+                logger.debug("查戳一戳发起人昵称失败：%s", exc)
+        return ""
 
     def _poke_task_set(self) -> set:
         """取主动戳的后台任务集合；测试用 __new__ 造对象时可能还没有，惰性建一个。"""

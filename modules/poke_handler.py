@@ -207,40 +207,52 @@ class PokeResponder:
         self._last_proactive: dict[str, float] = {}
 
     async def handle(self, raw: Any) -> dict[str, Any]:
-        """处理一条通知事件。返回处理结果，方便调用方看日志。"""
+        """处理一条通知事件。返回处理结果，方便调用方看日志。
+
+        只要这次事件确实是"有人戳了机器人"，返回里就带 ``session_id``/
+        ``poker_id``/``is_group``/``group_id``，调用方可以据此把这次戳一戳
+        写进会话上下文；被跳过的情形用 ``skipped`` 标出原因。
+        """
         if not self.config.enabled:
             return {"skipped": "disabled"}
         event = parse_poke_event(raw, self.self_id)
         if event is None:
             return {"skipped": "not_me"}
+        result: dict[str, Any] = {
+            "session_id": event.session_id,
+            "poker_id": event.poker_id,
+            "is_group": event.is_group,
+            "group_id": event.group_id,
+            "target_id": event.target_id,
+            "skipped": None,
+            "reply": "",
+            "reply_sent": False,
+            "poked_back": False,
+        }
         if event.poker_id == self.self_id:
             # 自己戳自己（或者是自己发起的戳被回显）：不回话也不回戳，
             # 否则一次戳会把自己带成自触发循环。
+            result["skipped"] = "self_poke"
             logger.info("[戳一戳] 忽略自己发起的戳（会话=%s）", event.session_id)
-            return {"skipped": "self_poke"}
+            return result
         if event.is_group and not self.config.group_enabled:
-            return {"skipped": "group_disabled"}
+            result["skipped"] = "group_disabled"
+            return result
         if not event.is_group and not self.config.private_enabled:
-            return {"skipped": "private_disabled"}
+            result["skipped"] = "private_disabled"
+            return result
 
         key = f"{event.session_id}:{event.poker_id}"
         now = time.time()
         if now - self._last_reply.get(key, 0.0) < self.config.cooldown_seconds:
+            result["skipped"] = "cooldown"
             logger.info(
                 "[戳一戳] %s 刚戳过，忽略这次（冷却 %.0f 秒）",
                 event.poker_id,
                 self.config.cooldown_seconds,
             )
-            return {"skipped": "cooldown"}
+            return result
         self._last_reply[key] = now
-
-        result: dict[str, Any] = {
-            "session_id": event.session_id,
-            "poker_id": event.poker_id,
-            "reply": "",
-            "reply_sent": False,
-            "poked_back": False,
-        }
         if self.config.reply:
             text = await self._build_reply(event)
             result["reply"] = text

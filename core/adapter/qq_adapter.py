@@ -998,6 +998,33 @@ class QQAdapter(PlatformAdapter):
             logger.warning("戳一戳失败：%s", exc)
             return False
 
+    async def get_member_display_name(self, group_id: str, user_id: str) -> str:
+        """查群成员的显示名：优先群名片，其次昵称；查不到返回空串。
+
+        戳一戳事件里只有 QQ 号没有名字，要写进上下文得先有个能看懂的称呼。
+        """
+        group_id = str(group_id or "").strip()
+        user_id = str(user_id or "").strip()
+        if not group_id or not user_id:
+            return ""
+        try:
+            data = await self.call_api(
+                "get_group_member_info",
+                {
+                    "group_id": str(int(group_id)),
+                    "user_id": str(int(user_id)),
+                },
+                timeout=6.0,
+            )
+        except Exception as exc:
+            logger.debug("查询群成员信息失败：%s", exc)
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        card = str(data.get("card") or "").strip()
+        nickname = str(data.get("nickname") or "").strip()
+        return card or nickname
+
     async def send_group_message(self, group_id: str, content: str, reply_to_id: str | None = None) -> bool:
         return await self.send_message(f"group_{group_id}", content, reply_to_id=reply_to_id)
 
