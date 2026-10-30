@@ -660,5 +660,116 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reason, "")
 
 
+class ExplicitAddressOverrideTests(unittest.IsolatedAsyncioTestCase):
+    """明确 @ 机器人却被打上 intent=silent 时，不能整轮沉默。
+
+    生产上真实踩过：模型判 target=bot、理由写着「适合轻松回应」，却把
+    intent 标成 silent；代码里 intent=silent 会强制 should_reply=False，
+    于是明确点名的人被晾在一边。真实回放 50 条被 @ 的消息，9 条落进这个坑，
+    其中 8 条语用动作是调侃/纠正/夸赞/请求（本来就该回），只有 1 条是
+    「[无法识别的消息]」（确实不该回）。
+    """
+
+    def _message(self, **kwargs):
+        values = {
+            "message_id": "m9",
+            "message_type": "group",
+            "sender_id": "u2",
+            "sender_name": "小红",
+            "group_id": "g1",
+            "content": "我爱你",
+            "mentioned_me": True,
+            "mentioned_user_ids": ["bot"],
+            "reply_to_id": None,
+            "reply_to_qq": None,
+        }
+        values.update(kwargs)
+        return Message(**values)
+
+    def _payload(self, act, expected_reply, tone="playful"):
+        return (
+            '{"target":"bot","intent":"silent","should_reply":false,'
+            '"confidence":0.94,"target_confidence":1.0,"pragmatic_confidence":0.94,'
+            f'"pragmatic_intent":{{"act":"{act}","tone":"{tone}",'
+            f'"expected_reply":"{expected_reply}"}},'
+            '"reason":"当前消息明确@爱丽丝并表达爱意，适合轻松回应。"}'
+        )
+
+    async def _judge(self, payload, message=None, signals=None):
+        provider = _FakeProvider(payload)
+        judge = ConversationJudge(provider, bot_id="bot", bot_name="爱丽丝")
+        current = message if message is not None else self._message()
+        result = await judge.judge(
+            current,
+            [current],
+            heuristic_signals=signals if signals is not None else {"mentioned_me": True},
+        )
+        return result, provider
+
+    async def test_tease_with_reply_expected_is_not_silenced(self):
+        result, _ = await self._judge(self._payload("tease", "short_banter"))
+        self.assertTrue(result.should_reply)
+        self.assertEqual(result.intent, "react")
+        self.assertEqual(result.target, "bot")
+        self.assertTrue(result.evidence.get("explicit_address_override"))
+
+    async def test_request_with_direct_answer_expected_is_not_silenced(self):
+        result, _ = await self._judge(self._payload("request", "direct_answer", tone="neutral"))
+        self.assertTrue(result.should_reply)
+        self.assertEqual(result.intent, "react")
+
+    async def test_unrecognizable_message_stays_silent(self):
+        # act=silence、expected_reply=silent：内容都没识别出来，回了也是瞎回
+        result, _ = await self._judge(self._payload("silence", "silent", tone="uncertain"))
+        self.assertFalse(result.should_reply)
+        self.assertEqual(result.intent, "silent")
+        self.assertFalse(result.evidence.get("explicit_address_override"))
+
+    async def test_expected_reply_silent_stays_silent(self):
+        result, _ = await self._judge(self._payload("banter", "silent"))
+        self.assertFalse(result.should_reply)
+        self.assertEqual(result.intent, "silent")
+
+    async def test_third_person_mention_is_not_overridden(self):
+        # 只是正文里出现「爱丽丝」，不等于点名她
+        message = self._message(
+            mentioned_me=False,
+            mentioned_user_ids=[],
+            content="爱丽丝刚才说的那个梗挺好笑",
+        )
+        result, _ = await self._judge(
+            self._payload("tease", "short_banter"), message=message, signals={}
+        )
+        self.assertFalse(result.should_reply)
+        self.assertEqual(result.intent, "silent")
+
+    async def test_other_target_is_not_overridden(self):
+        payload = (
+            '{"target":"other","intent":"silent","should_reply":false,'
+            '"confidence":0.9,"pragmatic_intent":{"act":"tease","tone":"playful",'
+            '"expected_reply":"short_banter"},"reason":"在跟别人说话"}'
+        )
+        result, _ = await self._judge(payload)
+        self.assertFalse(result.should_reply)
+        self.assertEqual(result.target, "other")
+
+    async def test_closing_acknowledgement_is_untouched(self):
+        # intent=acknowledge、should_reply=false 是模型明确的收尾判断，不归兜底管
+        payload = (
+            '{"target":"bot","intent":"acknowledge","should_reply":false,'
+            '"confidence":0.9,"pragmatic_intent":{"act":"acknowledge","tone":"neutral",'
+            '"expected_reply":"silent"},"reason":"好，已构成收束"}'
+        )
+        result, _ = await self._judge(payload)
+        self.assertFalse(result.should_reply)
+        self.assertEqual(result.intent, "acknowledge")
+
+    async def test_system_prompt_states_explicit_requirement(self):
+        result, provider = await self._judge(self._payload("tease", "short_banter"))
+        system = provider.requests[0].messages[0].content
+        self.assertIn("intent 不许用 silent", system)
+        self.assertIn("明确 @/回复 Alice", system)
+
+
 if __name__ == "__main__":
     unittest.main()

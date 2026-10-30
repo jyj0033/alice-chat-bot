@@ -279,6 +279,13 @@ class ConversationJudge:
             "同一发言者最近一次明确@/回复的对象如果是其他群友，而当前消息没有新的"
             "@/引用 Bot，不能因为出现‘你’、问号或附近有图片就改判为对 Bot；"
             "应保持 target=other，should_reply=false。\n"
+            "【明确 @/回复 Alice 时的硬要求】"
+            "消息里明确 @了爱丽丝，或回复了爱丽丝的消息时，target=bot，"
+            "intent 不许用 silent —— 只有这条消息本身就是收尾确认"
+            "（好、嗯、收到、行、晚安、不用回）时才用 acknowledge、should_reply=false。"
+            "玩笑、调侃、示爱、夸赞、请求、追问、点名拉你一起玩，都算在对她说话，"
+            "用 react/banter/praise/request 等对应标签并 should_reply=true。"
+            "不要出现『理由里写着适合回应、却把 intent 标成 silent』这种自相矛盾。\n"
             "reference_message_id 只能填当前待判断消息的 id，不要填旁边的图片或别人的消息。\n"
             "能确定是在对某个群友说：target=other、should_reply=false。"
             "面向全群且适合随口接一句：target=group、should_reply=true。"
@@ -1018,7 +1025,49 @@ class ConversationJudge:
                 "[目标判断] 玩笑点名拉入群聊 %s，允许短反应",
                 current_id or "no-id",
             )
+
+        # 明确点名兜底：模型判 target=bot，却给这条消息打了 intent=silent，
+        # 结果整轮沉默。它自己的理由往往写着「适合回应」——标签和结论自相矛盾
+        # （intent=silent 会强制 should_reply=False，见 parse_result）。
+        # 只要这条消息在平台上确实 @/回复了机器人，就不该被一个标签按死。
+        # 例外：收尾确认（好/嗯/收到）和内容无法识别，本来就适合不接话。
+        if (
+            result.intent == "silent"
+            and not result.should_reply
+            and result.target == "bot"
+            and self._has_explicit_address(current_message, signals)
+            and not self._is_closing_acknowledgement(result)
+        ):
+            result.evidence["explicit_address_override"] = True
+            result.should_reply = True
+            result.intent = "react"
+            result.reason = "明确@/回复了机器人，不因 intent=silent 整轮沉默"
+            logger.info(
+                "[目标判断] 明确点名兜底 %s：intent=silent 改为短反应",
+                current_id or "no-id",
+            )
         return result
+
+    @staticmethod
+    def _has_explicit_address(message: Any, signals: dict[str, Any]) -> bool:
+        """平台层面的明确点名：真的 @ 了机器人，或回复了机器人的消息。
+
+        刻意不认「正文里出现机器人名字」——那是第三人称提到，不等于点名。
+        """
+        if signals.get("mentioned_me") or signals.get("reply_to_me"):
+            return True
+        return bool(getattr(message, "mentioned_me", False))
+
+    @staticmethod
+    def _is_closing_acknowledgement(result: ConversationJudgeResult) -> bool:
+        """收尾确认/内容无法识别：本来就该不接话，别被兜底规则翻过来。
+
+        语用动作是「附和/沉默」，或模型自己认为这条消息不期待回复时，保持沉默。
+        """
+        pragmatic = result.pragmatic_intent or {}
+        if str(pragmatic.get("expected_reply") or "") == "silent":
+            return True
+        return str(pragmatic.get("act") or "") in {"acknowledge", "silence"}
 
     def _is_playful_bot_inclusion(self, message: Any) -> bool:
         """识别明确把 Bot 拉进玩笑/行动的短句，避免只按普通第三人称提及处理。"""
