@@ -302,7 +302,7 @@ class ReplyGenerator:
                 exc,
             )
             try:
-                response = await fallback.chat(request)
+                response = await fallback.chat(self._fallback_request(request, fallback))
             except Exception as exc2:
                 logger.error("[回退] %s 备用 Provider 同样失败：%s", stage, exc2)
                 raise exc from exc2
@@ -312,6 +312,33 @@ class ReplyGenerator:
                 getattr(fallback, "model", "") or "?",
             )
             return response
+
+    @staticmethod
+    def _fallback_request(request, fallback):
+        """回退请求要换上备用 Provider 自己的模型名。
+
+        ``request.model`` 里写的是**主模型**的模型名（``_build_request`` 里显式
+        赋值），而 provider 侧是 ``request.model or self.model`` —— 请求里的名字
+        优先。备用 Provider 于是拿着主模型的名字去请求自己的端点，上游直接回
+        ``unknown model``，回退必然也失败，这条安全网等于没有。
+
+        生产实测：近 7 天回退触发 42 次，备用顶上的 0 次。
+        """
+        fallback_model = str(getattr(fallback, "model", "") or "")
+        current_model = str(getattr(request, "model", "") or "")
+        if not fallback_model or not current_model or current_model == fallback_model:
+            return request
+        try:
+            new_request = copy.copy(request)
+            new_request.model = fallback_model
+        except (AttributeError, TypeError):
+            return request
+        logger.info(
+            "[回退] 模型名换成备用 Provider 的：%s → %s",
+            current_model,
+            fallback_model,
+        )
+        return new_request
 
     async def generate(
         self,

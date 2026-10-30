@@ -1419,7 +1419,7 @@ async def test_embedding(request: Request):
             "api_key": api_key,
             "base_url": data.get("base_url") or "https://api.siliconflow.cn/v1",
             "embed_model": model,
-            "rerank_model": data.get("rerank_model") or "Pro/BAAI/bge-reranker-v2-m3",
+            "rerank_model": data.get("rerank_model") or "Qwen/Qwen3-Reranker-8B",
             "input_type": data.get("input_type") or None,
             "batch_size": data.get("batch_size") or 32,
         })

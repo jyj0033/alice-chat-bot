@@ -2,7 +2,7 @@
 嵌入 + 重排服务
 用于长期记忆的语义检索增强：
 - 嵌入：OpenAI 兼容 /v1/embeddings（SiliconFlow 提供 Qwen3-Embedding、bge-m3 等）
-- 重排：/v1/rerank（SiliconFlow 提供 bge-reranker 系列）
+- 重排：/v1/rerank（SiliconFlow 提供 Qwen3-Reranker、bge-reranker 系列）
 
 设计：未配置 api_key 或调用失败时返回 None，调用方自动回退到 TF-IDF。
 """
