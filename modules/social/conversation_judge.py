@@ -162,6 +162,40 @@ class ConversationJudge:
         "unsupported_assumption",
         "escalation_risk",
     }
+    # 草稿里出现这些词，说明它在向对方提问以补全信息，属于正确接话，
+    # 而不是「草稿自身指代不清」。命中这些词的澄清型反问要豁免"需要澄清"判定。
+    CLARIFICATION_QUESTION_MARKERS = (
+        "什么",
+        "啥",
+        "哪个",
+        "哪种",
+        "哪些",
+        "哪本",
+        "哪部",
+        "哪家",
+        "哪款",
+        "多少",
+        "怎么",
+        "咋",
+        "怎样",
+        "如何",
+        "叫什么",
+        "名字",
+        "关键词",
+        "书名",
+        "剧情",
+        "细节",
+        "要求",
+        "需求",
+        "想要",
+        "类型",
+        "题材",
+        "口味",
+        "地址",
+        "链接",
+        "几点",
+        "多久",
+    )
 
     def __init__(
         self,
@@ -422,7 +456,11 @@ class ConversationJudge:
             "Bot 可以顺着画面说自己的观感，但绝不能把这些身份当成确证来用："
             "摘要写‘疑似《崩坏3》的琪亚娜’，草稿就不能说‘这是琪亚娜’"
             "（说‘看着像琪亚娜’‘有点琪亚娜的感觉’可以）。\n"
-            "正常使用同一个关键词、对问题直接回答不算复读；只有主要内容等价于复述/总结原话才算。\n\n"
+            "正常使用同一个关键词、对问题直接回答不算复读；只有主要内容等价于复述/总结原话才算。\n"
+            "needs_clarification 只针对『草稿本身』：草稿里的指代对象不明、前提缺失、"
+            "导致这句话单独看没意义时才为 true。"
+            "草稿在向群友提问以补全信息（要书名、要关键词、要细节、要类型）是正确接话，"
+            "is_paraphrase 和 needs_clarification 都必须是 false。\n\n"
             f"【最近上下文】\n{history or '（无）'}\n\n"
             f"{generation_evidence}"
             f"【当前消息】\n{current}\n\n"
@@ -444,7 +482,9 @@ class ConversationJudge:
             "\"pragmatic_mismatch\":true/false,"
             "\"mismatch_types\":[\"identity_exposure\",\"literalized_banter\","
             "\"wrong_addressee\",\"tone_drift\",\"strategy_mismatch\"],"
-            "\"replacement_hint\":\"不超过30字\"}。不要输出解释或思维过程。"
+            "\"replacement_hint\":\"不超过30字\"}。"
+            "replacement_hint 写你建议替换成的说法；草稿本身没问题就写空字符串。"
+            "不要输出解释或思维过程。"
         )
         request = ChatRequest(
             model=getattr(provider, "model", "") or "",
@@ -505,6 +545,15 @@ class ConversationJudge:
             ) and "identity_exposure" not in mismatch_types:
                 mismatch_types.append("identity_exposure")
             pragmatic_mismatch = pragmatic_mismatch or bool(mismatch_types)
+            # 「向对方提问以补全信息」是正确接话，不是草稿自身的缺陷。
+            # 不豁免就会形成必然静默的死锁：用户请求本身信息不足时
+            #（如「爱丽丝，帮我找个小说」），草稿反问澄清 → 复核打回
+            # 「需要澄清」→ 重答还是反问 → 又被打回 → 整轮沉默。
+            clarification_question = self._looks_like_clarification_question(reply)
+            if clarification_question:
+                needs_clarification = False
+                is_paraphrase = False
+                adds_information = True
             quality_issue = (
                 (is_paraphrase and not adds_information)
                 or unsupported_assumption
@@ -530,6 +579,7 @@ class ConversationJudge:
                     "on_topic": on_topic,
                     "pragmatic_mismatch": pragmatic_mismatch,
                     "mismatch_types": mismatch_types,
+                    "clarification_question": clarification_question,
                 },
             )
         except asyncio.CancelledError:
@@ -537,6 +587,24 @@ class ConversationJudge:
         except Exception as exc:
             logger.debug("[复读判断] 调用失败：%s", exc)
             return ConversationJudgeResult.unavailable(str(exc))
+
+    @classmethod
+    def _looks_like_clarification_question(cls, reply: str) -> bool:
+        """草稿是不是在向对方提问以补全信息。
+
+        用户请求本身信息不足时（如「帮我找个小说」），正确的接话就是反问一句
+        要什么。这种草稿必须放行：否则复核器打回「需要澄清」，重答同样是
+        澄清问句又被打回，形成必然静默的死锁。
+
+        判定要求同时含问号和疑问词，避免把普通反问闲聊误当成澄清。
+        """
+        text = str(reply or "").strip()
+        if not text or ("？" not in text and "?" not in text):
+            return False
+        lowered = text.lower()
+        return any(
+            marker in lowered for marker in cls.CLARIFICATION_QUESTION_MARKERS
+        )
 
     @classmethod
     def _render_judgement_contract(cls, judgement: dict[str, Any]) -> str:

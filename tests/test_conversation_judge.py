@@ -230,6 +230,111 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.evidence["unsupported_assumption"])
         self.assertTrue(result.evidence["needs_clarification"])
 
+    async def test_clarification_question_is_not_flagged_as_needing_clarification(self):
+        """用户请求本身信息不足时，反问澄清是正确接话，不能被判「需要澄清」。
+
+        生产事故：@ 机器人「爱丽丝，帮我找个小说」，草稿「找哪本？书名或剧情
+        关键词给我发下」被判 needs_clarification 打回，重答还是反问又被打回，
+        整轮静默。
+        """
+        provider = _FakeProvider(
+            '{"is_paraphrase":false,"adds_information":false,'
+            '"needs_clarification":true,'
+            '"replacement_hint":"请提供书名或剧情关键词"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot")
+
+        result = await judge.review_reply(
+            self._message(content="爱丽丝，帮我找个小说"),
+            [],
+            "找哪本？书名或剧情关键词给我发下",
+            direction="to_bot",
+        )
+
+        self.assertTrue(result.available)
+        self.assertTrue(result.should_reply)
+        self.assertEqual(result.intent, "react")
+        self.assertFalse(result.evidence["needs_clarification"])
+        self.assertTrue(result.evidence["clarification_question"])
+
+    async def test_clarification_question_exempts_paraphrase_flag(self):
+        """澄清问句天然没新增信息，不能因为「复读」再被判死一次。"""
+        provider = _FakeProvider(
+            '{"is_paraphrase":true,"adds_information":false,'
+            '"needs_clarification":false,"replacement_hint":""}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot")
+
+        result = await judge.review_reply(
+            self._message(content="爱丽丝，帮我找个小说"),
+            [],
+            "书名叫啥？或者讲了啥剧情，你说说看",
+            direction="to_bot",
+        )
+
+        self.assertTrue(result.available)
+        self.assertTrue(result.should_reply)
+        self.assertFalse(result.evidence["is_paraphrase"])
+        self.assertTrue(result.evidence["adds_information"])
+
+    async def test_vague_draft_still_needs_clarification(self):
+        """含糊、没有问句的草稿仍然要被打回，豁免不能放宽成什么都放行。"""
+        provider = _FakeProvider(
+            '{"is_paraphrase":false,"adds_information":true,'
+            '"needs_clarification":true,"replacement_hint":"说清楚是哪本"}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot")
+
+        result = await judge.review_reply(
+            self._message(content="爱丽丝，帮我找个小说"),
+            [],
+            "那个东西不太行",
+            direction="to_bot",
+        )
+
+        self.assertTrue(result.available)
+        self.assertFalse(result.should_reply)
+        self.assertTrue(result.evidence["needs_clarification"])
+        self.assertFalse(result.evidence["clarification_question"])
+
+    async def test_review_prompt_scopes_needs_clarification_to_the_draft(self):
+        """提示词要写清 needs_clarification 只针对草稿自身。"""
+        provider = _FakeProvider(
+            '{"is_paraphrase":false,"adds_information":true,'
+            '"needs_clarification":false,"replacement_hint":""}'
+        )
+        judge = ConversationJudge(provider, bot_id="bot")
+
+        await judge.review_reply(
+            self._message(), [], "行", direction="group"
+        )
+
+        prompt = provider.requests[0].messages[-1].content
+        self.assertIn("needs_clarification 只针对", prompt)
+        self.assertIn("是正确接话", prompt)
+
+    def test_clarification_question_detection(self):
+        """澄清型反问的识别：必须同时含问号和疑问词。"""
+        self.assertTrue(
+            ConversationJudge._looks_like_clarification_question(
+                "找哪本？书名或剧情关键词给我发下"
+            )
+        )
+        self.assertTrue(
+            ConversationJudge._looks_like_clarification_question(
+                "想找什么类型的小说？"
+            )
+        )
+        self.assertFalse(
+            ConversationJudge._looks_like_clarification_question(
+                "这顿看着不错，人均得多少"
+            )
+        )
+        self.assertFalse(
+            ConversationJudge._looks_like_clarification_question("那就没意思了")
+        )
+        self.assertFalse(ConversationJudge._looks_like_clarification_question(""))
+
     async def test_review_prompt_forbids_turning_hedged_identity_into_fact(self):
         """视觉识别给出的身份带「疑似」，复核必须拦住把它说成确证。
 
