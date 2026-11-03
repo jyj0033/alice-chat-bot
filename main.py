@@ -356,6 +356,24 @@ class GroupChatBot:
             f"机器人名称：{self.personality.name}，昵称：{self.personality.nickname}"
         )
 
+        # 消息新鲜度：QQ 掉线恢复后 NapCat 会一次性倒灌离线期间的消息。
+        # 这些消息已经过去很久，逐条走判断/生成既没有意义，也会造成短时间内
+        # 收发密集（QQ 风控的高危行为），所以按消息自带时间戳直接丢弃。
+        freshness_config = self.config.get("freshness", {}) or {}
+        self._freshness_config = {
+            "enabled": bool(freshness_config.get("enabled", True)),
+            "group_max_age_seconds": max(
+                30.0, float(freshness_config.get("group_max_age_seconds", 300))
+            ),
+            "directed_max_age_seconds": max(
+                60.0, float(freshness_config.get("directed_max_age_seconds", 1800))
+            ),
+            "private_max_age_seconds": max(
+                60.0, float(freshness_config.get("private_max_age_seconds", 3600))
+            ),
+        }
+        self._stale_backlog_count = 0
+
     def _init_llm(self) -> None:
         """初始化 LLM providers - 支持 llm 和 providers 两个配置结构"""
         llm_config = self.config.get("llm", {})
@@ -586,16 +604,16 @@ class GroupChatBot:
 
         # 群聊日报：默认到点自动生成并发送；Dashboard 手动触发不受 auto_enabled 影响。
         analysis_cfg = memory_config.get("group_analysis", {}) or {}
-        auto_times = analysis_cfg.get("auto_times", analysis_cfg.get("auto_time", "23:50"))
+        auto_times = analysis_cfg.get("auto_times", analysis_cfg.get("auto_time", "22:30-23:30"))
         if isinstance(auto_times, str):
             auto_times = [auto_times]
         if not isinstance(auto_times, list):
-            auto_times = ["23:50"]
+            auto_times = ["22:30-23:30"]
         self._group_analysis_config = {
             "enabled": bool(analysis_cfg.get("enabled", True)),
             "auto_enabled": bool(analysis_cfg.get("auto_enabled", True)),
             "auto_times": [str(value).strip() for value in auto_times if str(value).strip()][:8]
-            or ["23:50"],
+            or ["22:30-23:30"],
             "min_messages": max(3, min(5000, int(analysis_cfg.get("min_messages", 10)))),
             "max_messages": max(20, min(5000, int(analysis_cfg.get("max_messages", 500)))),
             "max_prompt_chars": max(4000, min(60000, int(analysis_cfg.get("max_prompt_chars", 24000)))),
@@ -610,7 +628,7 @@ class GroupChatBot:
             ),
             "max_titles": max(1, min(8, int(analysis_cfg.get("max_titles", 5)))),
             "max_tokens": max(400, min(6000, int(analysis_cfg.get("max_tokens", 2400)))),
-            "max_report_chars": max(1200, min(10000, int(analysis_cfg.get("max_report_chars", 6000)))),
+            "max_report_chars": max(1200, min(10000, int(analysis_cfg.get("max_report_chars", 3000)))),
             "retention_days": max(3, min(365, int(analysis_cfg.get("retention_days", 30)))),
             "send_report": bool(analysis_cfg.get("send_report", True)),
             "retries": max(1, min(8, int(analysis_cfg.get("retries", 2)))),
@@ -1440,6 +1458,8 @@ class GroupChatBot:
 
     async def _handle_message(self, message: Message) -> None:
         """按顺序编排消息入库、参与决策和后台回复调度。"""
+        if self._is_stale_backlog(message):
+            return
         state = await self._ingest_message(message)
         if state is None:
             return
@@ -1449,6 +1469,53 @@ class GroupChatBot:
             return
 
         self._schedule_reply_task(message, decision)
+
+    def _is_stale_backlog(self, message: Message) -> bool:
+        """判断这条消息是不是「掉线恢复后倒灌的陈旧积压」。
+
+        NapCat 在 QQ 重新登录后会把离线期间的消息一次性推过来。逐条处理
+        既没有意义（那些对话早就过去了），也会在短时间内制造密集的收发行为，
+        正是 QQ 风控盯上的形态。所以按消息自带的时间戳直接丢弃。
+
+        明确 @ 机器人 / 回复机器人的消息放宽到 directed_max_age_seconds：
+        掉线后不久被点名，仍然值得回应。
+        """
+        config = getattr(self, "_freshness_config", {}) or {}
+        if not config.get("enabled", True):
+            return False
+        timestamp = getattr(message, "timestamp", None)
+        if not timestamp:
+            # 没有时间戳就不猜（模拟事件、测试替身等），宁可不过滤。
+            return False
+        try:
+            age = time.time() - float(timestamp)
+        except (TypeError, ValueError):
+            return False
+        if age < 0:
+            # 客户端时钟略快，不当成异常，放行。
+            age = 0.0
+        self_id = str((self.config.get("qq", {}) or {}).get("self_id", "") or "")
+        directed = bool(getattr(message, "mentioned_me", False)) or (
+            bool(message.reply_to_qq)
+            and bool(self_id)
+            and str(message.reply_to_qq) == self_id
+        )
+        if message.message_type == "private":
+            limit = float(config.get("private_max_age_seconds", 3600))
+        elif directed:
+            limit = float(config.get("directed_max_age_seconds", 1800))
+        else:
+            limit = float(config.get("group_max_age_seconds", 300))
+        if age <= limit:
+            return False
+        self._stale_backlog_count = int(getattr(self, "_stale_backlog_count", 0)) + 1
+        logger.info(
+            "[积压丢弃] 消息已过去 %.0f 秒（上限 %.0f 秒），本轮不处理：%s",
+            age,
+            limit,
+            message.message_id or message.sender_id,
+        )
+        return True
 
     async def _ingest_message(
         self, message: Message
@@ -4744,7 +4811,7 @@ class GroupChatBot:
             report_text = GroupDailyAnalysis.render_report(
                 report,
                 report_label=report_label,
-                max_chars=config.get("max_report_chars", 6000),
+                max_chars=config.get("max_report_chars", 3000),
             )
             if target_date is not None:
                 report_date_str = report_date
@@ -4817,14 +4884,37 @@ class GroupChatBot:
                 await self.qq_adapter.send_message(session_id, "群日报生成失败了，具体错误已记到日志里")
 
     @staticmethod
-    def _analysis_time_matches(now: datetime, value: str) -> bool:
+    def _parse_clock_minute(text: str) -> int | None:
+        """把 'HH:MM' 解析成当天第几分钟；格式不对返回 None。"""
         try:
-            hour, minute = (int(part) for part in str(value).strip().split(":", 1))
-            target = hour * 60 + minute
-            current = now.hour * 60 + now.minute
-            return 0 <= current - target <= 6 and 0 <= hour <= 23 and 0 <= minute <= 59
+            hour, minute = (int(part) for part in str(text).strip().split(":", 1))
         except (TypeError, ValueError):
-            return False
+            return None
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        return hour * 60 + minute
+
+    @classmethod
+    def _analysis_time_matches(cls, now: datetime, value: str) -> bool:
+        text = str(value or "").strip()
+        if "-" in text:
+            # 窗口写法 "HH:MM-HH:MM"：在窗口内每天随机取一个固定分钟。
+            # 每天同一时刻准时发日报是典型的机器人特征，随机化能打散这一点。
+            start_text, _, end_text = text.partition("-")
+            start = cls._parse_clock_minute(start_text)
+            end = cls._parse_clock_minute(end_text)
+            if start is None or end is None:
+                return False
+            if end < start:
+                end += 24 * 60
+            offset = random.Random(now.strftime("%Y%m%d")).randrange(0, end - start + 1)
+            target = (start + offset) % (24 * 60)
+        else:
+            target = cls._parse_clock_minute(text)
+            if target is None:
+                return False
+        current = now.hour * 60 + now.minute
+        return 0 <= current - target <= 6
 
     async def _maybe_group_analysis(self) -> None:
         """在配置时间窗口内为有素材的群自动生成日报。"""
@@ -4834,7 +4924,7 @@ class GroupChatBot:
         now = datetime.now()
         if not any(
             self._analysis_time_matches(now, value)
-            for value in config.get("auto_times", ["23:50"])
+            for value in config.get("auto_times", ["22:30-23:30"])
         ):
             return
         since = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -7415,7 +7505,7 @@ class GroupChatBot:
                 "group_analysis": {
                     "enabled": True,
                     "auto_enabled": True,
-                    "auto_times": ["23:50"],
+                    "auto_times": ["22:30-23:30"],
                     "min_messages": 10,
                     "max_messages": 500,
                     "max_prompt_chars": 24000,
@@ -7428,7 +7518,7 @@ class GroupChatBot:
                     # 1800 会在写到 unhinged_quotes 时被截断 → JSON 不闭合 →
                     # 逆天语录整块消失。实测完整输出约 2100~2200 token。
                     "max_tokens": 4000,
-                    "max_report_chars": 6000,
+                    "max_report_chars": 3000,
                     "retention_days": 30,
                     "send_report": True,
                     "avatars_enabled": True,
@@ -7468,6 +7558,14 @@ class GroupChatBot:
                     "context_neighbors": 2,
                     "context_max_targets": 12
                 }
+            },
+            # 消息新鲜度：掉线恢复后 NapCat 会一次性倒灌离线期间的消息，
+            # 按消息自带时间戳丢弃，避免短时间内密集收发（QQ 风控高危行为）。
+            "freshness": {
+                "enabled": True,
+                "group_max_age_seconds": 300,
+                "directed_max_age_seconds": 1800,
+                "private_max_age_seconds": 3600
             },
             "groups": {}
         }

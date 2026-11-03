@@ -28,6 +28,9 @@ class Message:
     outer_text: str = ""  # 仅发送者最外层输入，用于触发检测，排除转发/卡片内容
     rich_only: bool = False
     rich_type: str = ""
+    # OneBot 事件自带的发送时间（Unix 秒）。NapCat 掉线恢复后会一次性倒灌
+    # 离线期间的消息，这些消息带着原始时间戳 —— 用来识别并丢弃陈旧积压。
+    timestamp: float | None = None
 
     @property
     def session_id(self) -> str:

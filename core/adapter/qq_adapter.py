@@ -437,6 +437,13 @@ class QQAdapter(PlatformAdapter):
         sender = data.get("sender", {}) or {}
         message_type = data.get("message_type", "private") or "private"
         sender_id = str(data.get("user_id", "") or "")
+        # OneBot 事件自带的发送时间（Unix 秒）。NapCat 掉线恢复后会一次性
+        # 倒灌离线期间的消息，靠这个时间戳识别并丢弃陈旧积压。
+        event_time = data.get("time")
+        try:
+            event_timestamp = float(event_time) if event_time is not None else None
+        except (TypeError, ValueError):
+            event_timestamp = None
         message = Message(
             # OneBot 的这些字段在异常/模拟事件中可能缺失；不能把 None
             # 变成字面量 "None"，否则去重和引用关系会被污染。
@@ -469,6 +476,7 @@ class QQAdapter(PlatformAdapter):
             outer_text=outer_text,
             rich_only=is_rich_only(segments),
             rich_type=primary_rich_type(segments),
+            timestamp=event_timestamp,
         )
 
         if message.message_id:
