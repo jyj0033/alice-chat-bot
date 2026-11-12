@@ -90,15 +90,6 @@ MD5_10M_SIZE = 10002432
 # 官方群里 @ 某人写成 <@member_openid>，@全体成员写成 <@all>
 AT_PATTERN = re.compile(r"<@([^>]+)>")
 
-IMAGE_SUFFIX = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-    "image/bmp": ".bmp",
-}
-
 
 class OfficialQQAdapter(PlatformAdapter):
     """QQ 开放平台官方机器人适配器。"""
@@ -940,17 +931,17 @@ class OfficialQQAdapter(PlatformAdapter):
 
     @staticmethod
     def _guess_image_name(blob: bytes) -> str:
-        for content_type, suffix in IMAGE_SUFFIX.items():
-            if content_type == "image/png" and blob.startswith(b"\x89PNG"):
-                return f"image{suffix}"
-            if content_type == "image/jpeg" and blob.startswith(b"\xff\xd8"):
-                return f"image{suffix}"
-            if content_type == "image/gif" and blob.startswith(b"GIF8"):
-                return f"image{suffix}"
-            if content_type == "image/webp" and blob[:4] == b"RIFF":
-                return f"image{suffix}"
-            if content_type == "image/bmp" and blob.startswith(b"BM"):
-                return f"image{suffix}"
+        """按文件头猜扩展名；官方只认 png/jpg/gif/webp/bmp 这几种图片格式。"""
+        if blob.startswith(b"\x89PNG"):
+            return "image.png"
+        if blob.startswith(b"\xff\xd8"):
+            return "image.jpg"
+        if blob.startswith(b"GIF8"):
+            return "image.gif"
+        if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+            return "image.webp"
+        if blob.startswith(b"BM"):
+            return "image.bmp"
         return "image.png"
 
     async def upload_file(
@@ -1150,32 +1141,38 @@ class OfficialQQAdapter(PlatformAdapter):
         message_ids: list[str] = []
         errors: list[str] = []
         sent = 0
-        for index, payload in enumerate(payloads):
-            body_text = text if index == 0 else ""
-            reply_target = reply_to_id if index == 0 else None
+        # 文字单独发一条：富媒体消息（msg_type=7）只带 media，再塞 content 会
+        # 撞上「消息类型与内容不匹配」（错误码 22006）。
+        if text:
+            ok, text_id = await self.send_message_with_id(
+                session_id, text, reply_to_id=reply_to_id
+            )
+            if ok:
+                message_ids.append(text_id)
+            else:
+                errors.append("文字部分发送失败")
+        for payload in payloads:
             try:
                 file_info = await self.upload_file(session_id, payload)
                 body: dict[str, Any] = {
                     "msg_type": 7,
                     "media": {"file_info": file_info},
                 }
-                if body_text:
-                    body["content"] = body_text
-                self._apply_reply(body, session_id, reply_target)
+                self._apply_reply(body, session_id, reply_to_id)
                 data = await self._post_message(session_id, body, timeout=timeout or 180.0)
                 message_id = self._record_outbound(data)
                 if message_id:
                     message_ids.append(message_id)
                 sent += 1
             except Exception as exc:
-                logger.warning("发送第 %s 张图片失败：%s", index + 1, exc)
-                errors.append(f"第 {index + 1} 张：{exc}")
+                logger.warning("发送图片失败：%s", exc)
+                errors.append(str(exc))
         return {
             "success": sent == len(payloads),
             "mode": "chunks",
             "sent": sent,
             "total": len(payloads),
-            "message_count": sent,
+            "message_count": len(message_ids),
             "message_ids": message_ids,
             "errors": errors,
         }

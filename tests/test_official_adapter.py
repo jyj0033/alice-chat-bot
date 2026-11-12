@@ -442,10 +442,12 @@ class OfficialRichMediaTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["sent"], 2)
-        self.assertEqual(result["message_count"], 2)
         bodies = [c[2]["json_body"] for c in adapter.calls if c[1].endswith("/messages")]
-        self.assertEqual(len(bodies), 2)
+        # 文字单独一条 msg_type=0，富媒体各一条 msg_type=7
+        self.assertEqual(len(bodies), 3)
+        self.assertEqual(bodies[0]["msg_type"], 0)
         self.assertEqual(bodies[0]["content"], "原图")
+        self.assertEqual([body["msg_type"] for body in bodies[1:]], [7, 7])
         self.assertNotIn("content", bodies[1])
 
     async def test_send_images_forward_mode_degrades_to_chunks(self):
