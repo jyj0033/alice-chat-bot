@@ -32,6 +32,7 @@ import aiohttp
 import websockets
 
 from .base import Message, PlatformAdapter
+from .rate_limit import RateLimitedError, SendRateLimiter
 from .rich_content import (
     is_rich_only,
     parse_message_segments,
@@ -69,6 +70,38 @@ OP_HEARTBEAT_ACK = 11
 
 GROUP_EVENTS = frozenset({"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"})
 C2C_EVENTS = frozenset({"C2C_MESSAGE_CREATE"})
+
+# 官方回「被限频 / 频率超限」的错误码（见官方文档的错误码表）：
+#   1100100 安全打击:消息被限频
+#   504000~504999 消息频率相关错误
+#   40034100 / 40034105 / 40054013 主动消息不可用或被拒绝
+#   1100304 @次数鉴权失败
+RATE_LIMIT_ERR_CODES = frozenset(
+    {1100100, 1100304, 40034100, 40034105, 40054013}
+)
+
+
+def is_rate_limit_code(err_code: Any) -> bool:
+    """这个错误码是不是「被限频了」。"""
+    try:
+        code = int(err_code)
+    except (TypeError, ValueError):
+        return False
+    if code in RATE_LIMIT_ERR_CODES:
+        return True
+    return 504000 <= code <= 504999
+
+
+class OfficialAPIError(RuntimeError):
+    """官方接口返回了错误。带上 err_code，方便上层判断是不是被限频。"""
+
+    def __init__(self, message: str, err_code: Any = None):
+        super().__init__(message)
+        self.err_code = err_code
+
+    @property
+    def is_rate_limit(self) -> bool:
+        return is_rate_limit_code(self.err_code)
 
 # 被动回复窗口：群聊 5 分钟 5 次，单聊 60 分钟 4 次
 PASSIVE_WINDOW_GROUP = 300.0
@@ -174,6 +207,16 @@ class OfficialQQAdapter(PlatformAdapter):
         # 查不到成员资料时用它兜底，省得为个昵称去申请白名单。
         self._member_names: dict[str, str] = {}
         self._member_name_order: deque = deque(maxlen=4000)
+
+        # 发送端频控：官方对主动消息有 qpm 和每日条数限制，触顶直接拒收，
+        # 拒了那条消息就没了。阈值和说明见 core/adapter/rate_limit.py。
+        official_cfg = self._official_config()
+        self.rate_limiter = SendRateLimiter(
+            bot_per_minute=int(official_cfg.get("rate_limit_bot_per_minute") or 25),
+            session_per_minute=int(official_cfg.get("rate_limit_session_per_minute") or 15),
+            daily_per_session=int(official_cfg.get("rate_limit_daily_per_session") or 900),
+            wait_seconds=float(official_cfg.get("rate_limit_wait_seconds") or 5.0),
+        )
 
     # ------------------------------------------------------------------
     # 配置读取
@@ -340,13 +383,15 @@ class OfficialQQAdapter(PlatformAdapter):
             )
         if status >= 400:
             err = data.get("err_code") or data.get("code") or status
-            raise RuntimeError(
-                f"官方接口 {method} {path} 失败：{err} {str(data.get('message') or '')}".strip()
+            raise OfficialAPIError(
+                f"官方接口 {method} {path} 失败：{err} {str(data.get('message') or '')}".strip(),
+                err,
             )
         err = data.get("err_code")
         if err not in (None, 0, "0"):
-            raise RuntimeError(
-                f"官方接口 {method} {path} 失败：{err} {str(data.get('message') or '')}".strip()
+            raise OfficialAPIError(
+                f"官方接口 {method} {path} 失败：{err} {str(data.get('message') or '')}".strip(),
+                err,
             )
         return data
 
@@ -1040,9 +1085,19 @@ class OfficialQQAdapter(PlatformAdapter):
             body["message_reference"] = {"message_id": ref_idx}
 
     async def _post_message(self, session_id: str, body: dict, timeout: float = 30.0) -> dict:
-        return await self._request_json(
-            "POST", self._messages_path(session_id), json_body=body, timeout=timeout
-        )
+        # 带 msg_id 的是被动回复（有人在等），额度不够可以排队等一下；
+        # 不带的是主动消息（插话、日报、表情包），额度不够直接跳过。
+        passive = bool(body.get("msg_id"))
+        await self.rate_limiter.acquire(session_id, passive=passive)
+        try:
+            return await self._request_json(
+                "POST", self._messages_path(session_id), json_body=body, timeout=timeout
+            )
+        except OfficialAPIError as exc:
+            if exc.is_rate_limit:
+                self.rate_limiter.note_official_limit(exc.err_code, str(exc))
+                logger.warning("官方限频，这条消息被拒收：err_code=%s %s", exc.err_code, exc)
+            raise
 
     def _record_outbound(self, data: Any) -> str:
         if not isinstance(data, dict):
@@ -1080,6 +1135,9 @@ class OfficialQQAdapter(PlatformAdapter):
             message_id = self._record_outbound(data)
             self.messages_sent += 1
             return True, message_id
+        except RateLimitedError as exc:
+            logger.warning("发送被频控拦下：%s", exc)
+            return False, ""
         except Exception as exc:
             logger.exception("发送消息失败：%r", exc)
             return False, ""
@@ -1253,6 +1311,9 @@ class OfficialQQAdapter(PlatformAdapter):
             message_id = self._record_outbound(data)
             self.messages_sent += 1
             return True, message_id
+        except RateLimitedError as exc:
+            logger.warning("发送图片被频控拦下：%s", exc)
+            return False, ""
         except Exception as exc:
             logger.exception("发送图片失败：%r", exc)
             return False, ""
@@ -1372,6 +1433,9 @@ class OfficialQQAdapter(PlatformAdapter):
                 if message_id:
                     message_ids.append(message_id)
                 sent += 1
+            except RateLimitedError as exc:
+                logger.warning("发送图片被频控拦下：%s", exc)
+                errors.append(str(exc))
             except Exception as exc:
                 logger.warning("发送图片失败：%s", exc)
                 errors.append(str(exc))

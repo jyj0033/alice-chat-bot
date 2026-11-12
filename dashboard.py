@@ -401,6 +401,13 @@ async def get_status():
             "connected": bot_instance.qq_adapter.is_connected if bot_instance.qq_adapter else False,
             "messages_sent": bot_instance.qq_adapter.messages_sent if bot_instance.qq_adapter else 0,
             "messages_received": bot_instance.qq_adapter.messages_received if bot_instance.qq_adapter else 0,
+            # 发送端频控：被本地限速拦下、或被官方限频拒收的次数都在这儿，
+            # 「它怎么不回话」先看这里。
+            "rate_limit": (
+                bot_instance.qq_adapter.rate_limiter.stats()
+                if getattr(bot_instance.qq_adapter, "rate_limiter", None)
+                else {}
+            ),
         },
         "runtime": {
             "active_sessions": len(bot_instance.context_manager._windows) if bot_instance.context_manager else 0,
