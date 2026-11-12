@@ -4,6 +4,7 @@
 直接喂网关下行帧，覆盖事件解析、引用回复、富媒体上传和降级行为。
 """
 
+import asyncio
 import json
 import unittest
 
@@ -614,6 +615,84 @@ class OfficialGatewayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(adapter._last_seq, 77)
         self.assertEqual(adapter._latest_s, 77)
+
+
+class OfficialGatewayIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """真起一个本地网关，验证 websockets 用法和事件通路。"""
+
+    async def test_event_flows_through_a_real_websocket_gateway(self):
+        import websockets
+
+        adapter = _adapter()
+        received = []
+        adapter.on_message_callback = lambda message: received.append(message) or _noop()
+        identify_frames = []
+
+        async def _ensure_token():
+            return "TOKEN"
+
+        adapter._ensure_access_token = _ensure_token
+
+        async def handler(ws):
+            await ws.send(json.dumps({"op": OP_HELLO, "d": {"heartbeat_interval": 45000}}))
+            raw = await ws.recv()
+            identify_frames.append(json.loads(raw))
+            await ws.send(
+                json.dumps(
+                    {
+                        "op": OP_DISPATCH,
+                        "s": 1,
+                        "t": "READY",
+                        "d": {
+                            "version": 1,
+                            "session_id": "sess-1",
+                            "user": {"id": "BOT1", "username": "机器人", "bot": True},
+                        },
+                    }
+                )
+            )
+            await ws.send(
+                json.dumps(
+                    {
+                        "op": OP_DISPATCH,
+                        "s": 2,
+                        "t": "GROUP_AT_MESSAGE_CREATE",
+                        "d": _group_event(),
+                    }
+                )
+            )
+            await asyncio.sleep(1.0)
+
+        server = await websockets.serve(handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+
+        async def _fake_gateway_url():
+            return f"ws://127.0.0.1:{port}"
+
+        adapter._fetch_gateway_url = _fake_gateway_url
+        adapter._running = True
+        task = asyncio.create_task(adapter._gateway_loop())
+        try:
+            for _ in range(100):
+                if received:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            adapter._running = False
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            server.close()
+            await server.wait_closed()
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].sender_name, "小明")
+        self.assertTrue(received[0].mentioned_me)
+        self.assertEqual(identify_frames[0]["op"], 2)
+        self.assertEqual(identify_frames[0]["d"]["token"], "QQBot TOKEN")
+        self.assertEqual(identify_frames[0]["d"]["intents"], INTENT_GROUP_AND_C2C)
 
 
 async def _noop():
