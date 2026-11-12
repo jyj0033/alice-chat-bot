@@ -21,7 +21,7 @@
 
 - Python 3.11+
 - Docker & Docker Compose
-- NapCat (OneBot v11 QQ 机器人)
+- NapCat (OneBot v11 QQ 机器人)，或 QQ 开放平台官方机器人
 - LLM API (SiliconFlow / OpenAI / Claude 等)
 
 ### 配置
@@ -77,7 +77,8 @@ alice-chat-bot/
 │   └── reply/             # 回复生成
 ├── core/
 │   └── adapter/           # 平台适配器
-│       └── qq_adapter.py  # QQ 适配器
+│       ├── qq_adapter.py  # QQ 适配器（NapCat / OneBot v11）
+│       └── official_adapter.py  # QQ 开放平台官方机器人适配器（不登录 QQ 号）
 ├── dashboard.py           # Web 管理面板
 └── docker-compose.yml     # Docker 部署
 ```
@@ -270,6 +271,28 @@ memory:
 头像默认通过 QQ 公共头像缩略图接口获取；如果网络环境无法访问，可在 `qq.avatar_url_template` 配置自定义模板，模板支持 `{user_id}`、`{uid}` 和 `{size}` 占位符。
 
 配置保存到 `config/config.yaml`（敏感字段会单独保存到同目录的 `secrets.yaml`）。目标判断、表情库和富媒体相关设置会在支持的组件上热更新，其余设置按页面提示在重启后完全生效。
+
+## QQ 通道：NapCat 与官方机器人
+
+`qq.platform` 决定走哪条通道，两条通道对外接口一致，上层业务代码不用区分：
+
+- `napcat`（默认）：登录一个 QQ 号，走 OneBot v11 协议。账号可能被风控掐断，
+  需要人工扫码恢复。
+- `official`：QQ 开放平台官方机器人，只用 `AppID` / `AppSecret`，
+  **不登录任何 QQ 号**，因此不存在账号掉线；代价是群成员/QQ 号拿不到、
+  没有戳一戳和合并转发、主动消息受用户开关限制。
+
+```yaml
+qq:
+  platform: official
+  self_id: "<AppID>"
+  official:
+    app_id: "<AppID>"
+    app_secret: "<AppSecret>"
+```
+
+完整的 ID 体系映射、功能降级对照、部署与验收步骤见
+[docs/official-qq-platform.md](docs/official-qq-platform.md)。
 
 ## 许可
 

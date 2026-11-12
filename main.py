@@ -15,7 +15,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import yaml
 
@@ -23,6 +23,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core.adapter.qq_adapter import QQAdapter
+from core.adapter.official_adapter import OfficialQQAdapter
 from core.adapter.base import Message
 from core.adapter.rich_media import DEFAULT_VISION_PROMPT, RichMediaEnricher
 from core.config_store import load_config as load_config_file, save_config as save_config_file
@@ -194,7 +195,7 @@ class GroupChatBot:
         # 核心组件
         self.llm_providers: dict[str, LLMProvider] = {}  # 多 provider 支持
         self.active_provider_id: str = "primary"  # 当前激活的 provider
-        self.qq_adapter: Optional[QQAdapter] = None
+        self.qq_adapter: Optional[Union[QQAdapter, OfficialQQAdapter]] = None
 
         # 记忆系统
         self.memory_storage: Optional[AsyncMemoryStorage] = None
@@ -1125,19 +1126,39 @@ class GroupChatBot:
         return rich_media_config
 
     def _init_qq_adapter(self) -> None:
-        """初始化 QQ 适配器"""
+        """初始化 QQ 适配器。
+
+        ``qq.platform`` 决定走哪条通道：
+
+        * ``napcat``（默认）：登录 QQ 号 + OneBot v11 协议；
+        * ``official``：QQ 开放平台官方机器人，只用 AppID/AppSecret，不登录
+          任何 QQ 号，因此不存在账号掉线。
+
+        两条通道对外接口一致，上层业务代码不用区分。
+        """
         qq_config = self.config.get("qq", {}) or {}
         rich_media_config = self._get_rich_media_config()
         adapter_config = {
             **qq_config,
             "rich_media": rich_media_config,
         }
-        self.qq_adapter = QQAdapter(
-            config=adapter_config,
-            on_message=self._handle_message,
-            on_notice=self._handle_notice,
-            vision_provider=self._init_vision_provider(),
-        )
+        platform = str(qq_config.get("platform", "napcat") or "napcat").strip().lower()
+        if platform in ("official", "qqbot", "open"):
+            self.qq_adapter = OfficialQQAdapter(
+                config=adapter_config,
+                on_message=self._handle_message,
+                on_notice=self._handle_notice,
+                vision_provider=self._init_vision_provider(),
+            )
+            logger.info("✓ QQ 通道：官方开放平台（不登录 QQ 号，无掉线问题）")
+        else:
+            self.qq_adapter = QQAdapter(
+                config=adapter_config,
+                on_message=self._handle_message,
+                on_notice=self._handle_notice,
+                vision_provider=self._init_vision_provider(),
+            )
+            logger.info("✓ QQ 通道：NapCat / OneBot v11")
         self._init_poke_responder()
 
     def _init_poke_responder(self) -> None:
@@ -1448,7 +1469,10 @@ class GroupChatBot:
                 "rich_media": rich_media_config,
             }
             self.qq_adapter.self_id = qq_config.get("self_id", "")
-            self.qq_adapter.access_token = qq_config.get("access_token", "")
+            if isinstance(self.qq_adapter, QQAdapter):
+                # 官方通道的 Access Token 由适配器自己按需刷新，不能拿配置里
+                # 的旧字段去覆盖它。
+                self.qq_adapter.access_token = qq_config.get("access_token", "")
             self.qq_adapter.rich_media_enricher = RichMediaEnricher(
                 rich_media_config,
                 self.qq_adapter.call_api,
@@ -7333,10 +7357,19 @@ class GroupChatBot:
                 }
             },
             "qq": {
+                # platform: napcat（默认，登录 QQ 号 + OneBot v11）
+                #          official（QQ 开放平台官方机器人，不登录 QQ 号）
+                "platform": "napcat",
                 "ws_host": "0.0.0.0",
                 "ws_port": 3001,
                 "access_token": "",
-                "self_id": ""
+                "self_id": "",
+                # 官方通道配置：app_secret 会自动落到同目录 secrets.yaml
+                "official": {
+                    "app_id": "",
+                    "app_secret": "",
+                    "api_base": "https://api.bot.qq.com",
+                },
             },
             "meme_manager": {
                 "enabled": True,
