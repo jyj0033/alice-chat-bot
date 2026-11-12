@@ -386,6 +386,14 @@ async def get_status():
             "emotion": latest.current_emotion.value,
         }
 
+    llm_health = {}
+    health = getattr(bot_instance, 'llm_health', None)
+    if health is not None:
+        try:
+            llm_health = health.snapshot()
+        except Exception as e:
+            logger.warning("获取模型健康状态失败：%s", e)
+
     return {
         "status": "running" if bot_instance._running else "stopped",
         "running": bot_instance._running,
@@ -399,10 +407,31 @@ async def get_status():
             "pending_replies": len(bot_instance._reply_tasks),
             "pending_api_calls": len(bot_instance.qq_adapter._pending_api) if bot_instance.qq_adapter else 0,
         },
+        "llm": llm_health,
         "rich_media": rich_media,
         "recognition_history": recognition_history,
         "emotion": emotion,
     }
+
+
+@app.get("/api/qq/members")
+async def get_qq_members():
+    """已知群成员（openid + 显示名）。
+
+    官方通道拿不到 QQ 号，面板要 @ 某人时只能用 member_openid —— 这个
+    列表就是给调用方挑 id 用的（NapCat 通道没有这个能力，返回空）。
+    """
+    if not bot_instance or not bot_instance.qq_adapter:
+        return {"members": [], "supported": False}
+    getter = getattr(bot_instance.qq_adapter, 'known_members', None)
+    if getter is None:
+        return {"members": [], "supported": False}
+    try:
+        members = getter()
+    except Exception as e:
+        logger.error("获取群成员列表失败：%s", e)
+        return {"members": [], "supported": True, "error": str(e)}
+    return {"members": members, "supported": True}
 
 
 @app.get("/api/personality")

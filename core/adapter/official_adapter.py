@@ -94,6 +94,10 @@ AT_PATTERN = re.compile(r"<@([^>]+)>")
 class OfficialQQAdapter(PlatformAdapter):
     """QQ 开放平台官方机器人适配器。"""
 
+    # 官方开放平台没有「戳一戳」接口。上层据此跳过主动戳 —— 否则群里每条
+    # 消息都会白掷一次骰子、白起一个后台任务、白打一条日志。
+    supports_poke = False
+
     def __init__(
         self,
         config: dict,
@@ -126,6 +130,17 @@ class OfficialQQAdapter(PlatformAdapter):
         self._latest_s: int | None = None
         self._last_seq: int | None = None
 
+        # 心跳 ACK 看门狗。官方通道最阴险的掉线是「半开连接」：写得进去、
+        # 收不到包。不主动断开就永远发现不了 —— 面板一直显示「已连接」，
+        # 但平台已经不再投递事件，群里 @ 机器人只会得到「服务不可用」。
+        # 官方网关每个心跳周期回一次 op 11 ACK，连续三个周期不回即判定已死。
+        self._last_ack_at = 0.0
+        self._ack_seen = False
+        self._ack_watchdog_logged = False
+        self._last_event_at = 0.0
+        self._connected_at = 0.0
+        self._resumed_connection = False
+
         self.messages_sent = 0
         self.messages_received = 0
         self.last_sent_message_id = ""
@@ -151,6 +166,14 @@ class OfficialQQAdapter(PlatformAdapter):
         self._bot_ids: set[str] = set()
         # 已经提醒过的、官方通道不支持的 OneBot 动作
         self._warned_actions: set[str] = set()
+        # 戳一戳不支持，只提醒一次，别刷屏
+        self._poke_warned = False
+
+        # 群成员 openid -> 用户名。官方的成员接口是白名单能力（11253），
+        # 但消息事件里本来就带 author.username —— 先从收到的消息里攒一份，
+        # 查不到成员资料时用它兜底，省得为个昵称去申请白名单。
+        self._member_names: dict[str, str] = {}
+        self._member_name_order: deque = deque(maxlen=4000)
 
     # ------------------------------------------------------------------
     # 配置读取
@@ -401,7 +424,14 @@ class OfficialQQAdapter(PlatformAdapter):
             interval_ms = 45000
             if hello.get("op") == OP_HELLO:
                 interval_ms = int((hello.get("d") or {}).get("heartbeat_interval") or 45000)
+            # 恢复旧会话还是全新握手，决定了下面要不要做「假恢复」检查。
+            resuming = bool(self._gateway_session_id and self._last_seq is not None)
             await self._identify_or_resume(ws, token)
+            self._resumed_connection = resuming
+            self._connected_at = time.time()
+            self._last_event_at = time.time()
+            # 宽限期：刚连上先按「活着」算，等第一个 ACK 回来再收紧判定。
+            self._last_ack_at = time.time()
             self._heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(ws, interval_ms / 1000.0)
             )
@@ -450,10 +480,68 @@ class OfficialQQAdapter(PlatformAdapter):
             while True:
                 await asyncio.sleep(max(5.0, interval))
                 await ws.send(json.dumps({"op": OP_HEARTBEAT, "d": self._latest_s}))
+                if self._gateway_stale(interval):
+                    logger.warning(
+                        "官方网关超过 %.0f 秒没有任何回包，判定连接已失效，主动断开重连",
+                        interval * 3,
+                    )
+                    # 关掉连接，让读循环（async for）立刻结束并走重连流程。
+                    # 只抛异常没用 —— 读循环正阻塞在 recv 上，不会自己醒。
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    return
+                if self._resumed_session_is_dead(interval):
+                    logger.warning(
+                        "恢复的官方会话长时间收不到事件，放弃旧 session_id，改用全新 Identify"
+                    )
+                    self._gateway_session_id = ""
+                    self._last_seq = None
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    return
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.debug("心跳发送失败：%s", exc)
+            logger.warning("心跳发送失败：%s", exc)
+
+    def _gateway_stale(self, interval: float) -> bool:
+        """连接是不是已经半开（写得出、收不回）。
+
+        官方网关每个心跳周期回一次 op 11 ACK。连续三个周期都没回，说明这条
+        TCP 已经死了（写得进去但收不到包）—— 这种半开连接最阴险：不主动断开
+        的话，面板一直显示「已连接」，但平台不再投递任何事件，群里 @ 机器人
+        只会得到「服务不可用」。
+
+        从来没收到过 ACK 就不判死：万一台上不实现 ACK，误杀一条健康连接
+        比漏判一次更糟。这种情况下只提示一次，然后交给平台的 op 7 兜底。
+        """
+        if not self._ack_seen:
+            if (
+                self._last_ack_at
+                and not self._ack_watchdog_logged
+                and time.time() - self._last_ack_at > interval * 6
+            ):
+                self._ack_watchdog_logged = True
+                logger.info("官方网关一直不回心跳 ACK，ACK 看门狗未启用")
+            return False
+        return (time.time() - self._last_ack_at) > interval * 3 + 5
+
+    def _resumed_session_is_dead(self, interval: float) -> bool:
+        """恢复的旧会话是不是其实已经废了。
+
+        平台接受 Resume 并不代表它还会往这条连接上投递事件。之前就出现过：
+        Resume 成功、ACK 也正常，但事件始终不来，直到重新 Identify 才恢复。
+        所以「恢复后一段时间内一个事件都没有」就当作会话已废，重新握手。
+        """
+        if not self._resumed_connection:
+            return False
+        if time.time() - self._connected_at < 90:
+            return False
+        return self._last_event_at <= self._connected_at
 
     @staticmethod
     def _decode(raw: Any) -> dict:
@@ -487,6 +575,9 @@ class OfficialQQAdapter(PlatformAdapter):
                 self._last_seq = seq
             return
         if op == OP_HEARTBEAT_ACK:
+            # 收到 ACK 才说明这条连接真的还是活的 —— 看门狗全靠它判活。
+            self._last_ack_at = time.time()
+            self._ack_seen = True
             return
         if op == OP_RECONNECT:
             raise ConnectionError("官方网关要求重连")
@@ -517,9 +608,16 @@ class OfficialQQAdapter(PlatformAdapter):
         if event_type == "RESUMED":
             logger.info("官方会话已恢复")
             return
+        self._last_event_at = time.time()
         if event_type in GROUP_EVENTS:
+            if self._is_poke_scene(data):
+                await self._emit_poke_notice(data, str(data.get("group_openid") or ""))
+                return
             message = self._parse_group_message(data, event_type)
         elif event_type in C2C_EVENTS:
+            if self._is_poke_scene(data):
+                await self._emit_poke_notice(data, "")
+                return
             message = self._parse_c2c_message(data)
         else:
             logger.debug("忽略官方事件：%s", event_type)
@@ -743,6 +841,82 @@ class OfficialQQAdapter(PlatformAdapter):
             timestamp=self._parse_timestamp(data.get("timestamp")),
         )
 
+    # ------------------------------------------------------------------
+    # 戳一戳（官方只有事件，没有接口）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_poke_scene(data: dict) -> bool:
+        """这条事件是不是「戳一戳」。
+
+        官方没有戳一戳接口，但**会**把戳一戳当成一条带场景的消息推过来
+        （``message_scene.scene`` 写着「戳一戳」）。识别出来至少能用普通
+        文字回应一句，别让人以为机器人死了。
+        """
+        scene = data.get("message_scene") or {}
+        if not isinstance(scene, dict):
+            return False
+        return str(scene.get("scene") or "").strip() in ("戳一戳", "poke", "POKE")
+
+    async def _emit_poke_notice(self, data: dict, group_openid: str) -> None:
+        """把官方的戳一戳事件转成 OneBot 风格的 notice，喂给戳一戳响应器。"""
+        if not self.on_notice_callback:
+            return
+        author = data.get("author") or {}
+        member_openid = ""
+        if isinstance(author, dict):
+            member_openid = str(author.get("member_openid") or author.get("id") or "").strip()
+        notice = {
+            "notice_type": "notify",
+            "sub_type": "poke",
+            "group_id": group_openid,
+            "user_id": member_openid,
+            "sender_id": member_openid,
+            # 被戳的人就是机器人自己。官方通道下「机器人自己」在群里是
+            # member_openid，和 AppID 不是一个命名空间；这里统一填 self_id
+            # （AppID），和戳一戳响应器的判断口径保持一致。
+            "target_id": self.self_id,
+        }
+        try:
+            await self.on_notice_callback(notice)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("处理官方戳一戳事件失败：%s", exc, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # 群成员显示名
+    # ------------------------------------------------------------------
+
+    def _remember_member_name(self, member_id: str, name: str) -> None:
+        """记下 openid -> 用户名。
+
+        官方的群成员接口是白名单能力（11253），但消息事件里本来就带
+        ``author.username``，先从这儿攒一份，查不到成员资料时用它兜底。
+        """
+        member_id = str(member_id or "").strip()
+        name = str(name or "").strip()
+        if not member_id or not name:
+            return
+        if self._member_names.get(member_id) == name:
+            return
+        self._member_names[member_id] = name
+        self._member_name_order.append(member_id)
+        while len(self._member_name_order) > len(self._member_names):
+            oldest = self._member_name_order.popleft()
+            self._member_names.pop(oldest, None)
+
+    def known_members(self) -> list[dict[str, str]]:
+        """已知的群成员（openid + 用户名）。
+
+        官方拿不到 QQ 号，面板要 @ 某人时只能用 openid，这个列表就是
+        「openid -> 显示名」的对照表。
+        """
+        return [
+            {"id": member_id, "name": name}
+            for member_id, name in sorted(self._member_names.items(), key=lambda kv: kv[1])
+        ]
+
     def _parse_group_message(self, data: dict, event_type: str) -> Message | None:
         group_openid = str(data.get("group_openid") or "").strip()
         if not group_openid:
@@ -752,12 +926,14 @@ class OfficialQQAdapter(PlatformAdapter):
         sender_id = str(
             (author.get("member_openid") or author.get("id") or "") if isinstance(author, dict) else ""
         )
+        sender_name = str(author.get("username") or "") if isinstance(author, dict) else ""
+        self._remember_member_name(sender_id, sender_name)
         message = self._build_common_message(
             data,
             message_type="group",
             group_id=group_openid,
             sender_id=sender_id,
-            sender_name=str(author.get("username") or "") if isinstance(author, dict) else "",
+            sender_name=sender_name,
         )
         if event_type == "GROUP_AT_MESSAGE_CREATE":
             # 群里 @ 机器人：content 里已经去掉了 @ 前缀，但这条一定是对着
@@ -774,12 +950,14 @@ class OfficialQQAdapter(PlatformAdapter):
         sender_id = str(
             (author.get("user_openid") or author.get("id") or "") if isinstance(author, dict) else ""
         )
+        sender_name = str(author.get("username") or "") if isinstance(author, dict) else ""
+        self._remember_member_name(sender_id, sender_name)
         message = self._build_common_message(
             data,
             message_type="private",
             group_id=None,
             sender_id=sender_id,
-            sender_name=str(author.get("username") or "") if isinstance(author, dict) else "",
+            sender_name=sender_name,
         )
         self._remember_recent_event(message)
         return message
@@ -1090,6 +1268,30 @@ class OfficialQQAdapter(PlatformAdapter):
         )
         return success
 
+    def _render_at_prefix(self, at_users: list[str] | None) -> tuple[str, list[str]]:
+        """把 @ 列表渲染成官方格式的前缀。
+
+        官方群里 @ 某人写成 ``<@member_openid>``，@全体成员写成 ``<@all>``。
+        返回 (前缀, 问题列表)：认不出来的 id 不静默丢弃，而是写进问题列表，
+        由调用方决定要不要报出来。
+        """
+        prefix = ""
+        problems: list[str] = []
+        for raw in at_users or []:
+            member_id = str(raw or "").strip()
+            if not member_id:
+                continue
+            if member_id == "all":
+                prefix += "<@all> "
+                continue
+            if member_id not in self._member_names:
+                problems.append(
+                    f"@{member_id} 不是已知的 member_openid"
+                    f"（官方通道拿不到 QQ 号，无法映射），可能不会真的 @ 到人"
+                )
+            prefix += f"<@{member_id}> "
+        return prefix, problems
+
     async def send_images(
         self,
         session_id: str,
@@ -1141,11 +1343,17 @@ class OfficialQQAdapter(PlatformAdapter):
         message_ids: list[str] = []
         errors: list[str] = []
         sent = 0
+        # 官方群里 @ 某人写成 <@member_openid>。at_users 里如果塞的是 QQ 号，
+        # 官方通道根本没有 QQ 号，也就无从映射 —— 这种要明确报出来，
+        # 不能像以前那样静默丢掉，让人以为 @ 生效了。
+        at_prefix, at_problems = self._render_at_prefix(at_users)
+        errors.extend(at_problems)
         # 文字单独发一条：富媒体消息（msg_type=7）只带 media，再塞 content 会
         # 撞上「消息类型与内容不匹配」（错误码 22006）。
-        if text:
+        body_text = f"{at_prefix}{text}" if at_prefix else text
+        if body_text:
             ok, text_id = await self.send_message_with_id(
-                session_id, text, reply_to_id=reply_to_id
+                session_id, body_text, reply_to_id=reply_to_id
             )
             if ok:
                 message_ids.append(text_id)
@@ -1209,15 +1417,24 @@ class OfficialQQAdapter(PlatformAdapter):
         return ""
 
     async def poke(self, session_id: str, target_id: str) -> bool:
-        """官方通道没有戳一戳接口。"""
-        logger.info("官方通道不支持戳一戳，已跳过")
+        """官方通道没有戳一戳接口。
+
+        上层正常情况下不会走到这里（适配器 ``supports_poke=False``，根本不会
+        注册回戳回调，主动戳也会被跳过）。留着是为了兜底：万一被调到，明确
+        返回 False，而不是假装成功。
+        """
+        if not self._poke_warned:
+            self._poke_warned = True
+            logger.warning("官方通道不支持戳一戳，已忽略（后续不再重复提示）")
         return False
 
     async def get_member_display_name(self, group_id: str, user_id: str) -> str:
         """查群成员显示名。
 
-        群成员接口是白名单能力（错误码 11253），拿不到就返回空串，
-        让上层按「没有名字」处理，而不是编一个。
+        群成员接口是白名单能力（错误码 11253），拿不到就退回到「消息事件里
+        看到的那个用户名」——官方推事件时本来就带 ``author.username``，
+        所以平时根本用不着白名单接口。真拿不到才返回空串，让上层按「没有
+        名字」处理，而不是编一个。
         """
         group_id = str(group_id or "").strip()
         user_id = str(user_id or "").strip()
@@ -1231,14 +1448,15 @@ class OfficialQQAdapter(PlatformAdapter):
             )
         except Exception as exc:
             logger.debug("查询群成员信息失败（官方通道需要白名单权限）：%s", exc)
-            return ""
+            return self._member_names.get(user_id, "")
         if not isinstance(data, dict):
-            return ""
+            return self._member_names.get(user_id, "")
         for key in ("nickname", "member_name", "name"):
             value = str(data.get(key) or "").strip()
             if value:
+                self._remember_member_name(user_id, value)
                 return value
-        return ""
+        return self._member_names.get(user_id, "")
 
     async def fetch_user_avatar(self, user_id: str, *, timeout: float = 6.0) -> bytes | None:
         """官方通道拿不到 QQ 号，头像接口无从谈起。"""

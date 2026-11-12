@@ -29,6 +29,7 @@ from core.adapter.rich_media import DEFAULT_VISION_PROMPT, RichMediaEnricher
 from core.config_store import load_config as load_config_file, save_config as save_config_file
 
 from modules.llm.openai_provider import create_provider, LLMProvider
+from modules.llm.health import HealthTrackedProvider, ProviderHealth
 from modules.llm.usage import (
     DEFAULT_RETENTION_DAYS,
     TokenUsageCollector,
@@ -195,6 +196,8 @@ class GroupChatBot:
         # 核心组件
         self.llm_providers: dict[str, LLMProvider] = {}  # 多 provider 支持
         self.active_provider_id: str = "primary"  # 当前激活的 provider
+        # 各 provider 的健康状态（谁在失败、失败几次、最后一次错误）
+        self.llm_health = ProviderHealth()
         self.qq_adapter: Optional[Union[QQAdapter, OfficialQQAdapter]] = None
 
         # 记忆系统
@@ -421,6 +424,9 @@ class GroupChatBot:
                             "search_temperature": provider_config.get("search_temperature"),
                         }
                     )
+                    # 套上健康记录壳：主模型被封、被限流这类故障要能从日志和
+                    # 面板上看出来，而不是悄悄回退到备用模型、回复质量悄悄降级。
+                    provider = HealthTrackedProvider(provider, name, self.llm_health)
                     self.llm_providers[name] = provider
                     logger.info(
                         f"✓ 语言模型提供商「{name}」：地址={provider_config.get('base_url')}，"
@@ -1170,20 +1176,24 @@ class GroupChatBot:
             persona = self.personality.build_persona_prompt()
         except Exception:
             persona = ""
+        # 官方通道没有戳一戳接口（适配器 supports_poke=False）。不注册回戳
+        # 回调，响应器就会彻底跳过出站戳 —— 既不会每条群消息白掷一次骰子，
+        # 也不会刷「不支持戳一戳」的日志。
+        supports_poke = bool(getattr(getattr(self, "qq_adapter", None), "supports_poke", True))
         self.poke_responder = PokeResponder(
             poke_config,
             self_id=str(qq_config.get("self_id") or ""),
             provider=self._get_provider_for_role("reply"),
             persona=persona,
             send_text=self._send_poke_text,
-            send_poke=self._send_poke_action,
+            send_poke=self._send_poke_action if supports_poke else None,
         )
         logger.info(
             "✓ 戳一戳：启用=%s，回话=%s（LLM=%s），回戳=%s，冷却=%.0f秒",
             self.poke_responder.config.enabled,
             self.poke_responder.config.reply,
             self.poke_responder.config.use_llm,
-            self.poke_responder.config.poke_back,
+            "支持" if supports_poke else "不支持（当前通道无此接口）",
             self.poke_responder.config.cooldown_seconds,
         )
 
@@ -1406,6 +1416,11 @@ class GroupChatBot:
         群里每条消息都算，不要求 bot 参与这条消息；私聊不主动戳
         （一对一聊天里戳人很突兀，只有被戳才回戳）。
         """
+        # 通道没有戳一戳接口时直接跳过，别白掷骰子、白起后台任务。
+        # 注意用 getattr 兜底：测试里会用 __new__ 造对象，那时可能还没有适配器。
+        adapter = getattr(self, "qq_adapter", None)
+        if not getattr(adapter, "supports_poke", True):
+            return
         poke_responder = getattr(self, "poke_responder", None)
         if poke_responder is None:
             return

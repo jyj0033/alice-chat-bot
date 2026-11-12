@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 class QQAdapter(PlatformAdapter):
     """QQ 平台适配器 - NapCat/OneBot v11 (WebSocket 服务端)"""
 
+    # OneBot 有戳一戳接口（group_poke / friend_poke），上层照常启用。
+    supports_poke = True
+
     def __init__(
         self,
         config: dict,
