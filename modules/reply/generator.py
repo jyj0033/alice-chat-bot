@@ -12,8 +12,8 @@ import time
 from typing import Optional, Dict, Any
 
 from modules.llm.base import ChatMessage, ChatRequest, ChatResponse
-from modules.llm.usage import tag_provider
-from modules.personality.speaking_style import SpeakingStyleManager, create_default_style
+from modules.llm.usage import tag_provider, unwrap_provider
+from modules.personality.speaking_style import SpeakingStyle, SpeakingStyleManager, create_default_style
 from modules.personality.emotional_state import EmotionalState
 
 logger = logging.getLogger(__name__)
@@ -279,7 +279,7 @@ class ReplyGenerator:
         "[图片", "[表情包", "[表情，", "[动画表情", "[语音", "[视频",
     )
 
-    async def _chat(self, request, stage: str):
+    async def _chat(self, request, stage: str, primary=None, primary_tag: str = None):
         """调用主 LLM；失败时换备用 Provider 再试一次，两家都挂才抛错。
 
         为什么需要这一层：第三方中转会在 HTTP 200 里返回空 choices（上游报错、
@@ -287,13 +287,23 @@ class ReplyGenerator:
         抛异常时上层只会 `_give_up_reply` —— 一次中转抖动就是一条回复凭空消失、
         bot 直接沉默，日志里只留一行 ERROR。这里把「换一家再问一次」补上：
         只有主备都失败才把原始异常交给调用方，仍由它决定是否沉默。
+
+        ``primary`` / ``primary_tag``：让非正文链路（检索判断器等）也能走
+        这层回退。``primary`` 换掉默认的主 Provider；``primary_tag`` 保证
+        回退后的 token 仍记到该功能点上，而不是记成 reply。
         """
+        main = primary if primary is not None else self.llm
         try:
-            return await self.llm.chat(request)
+            return await main.chat(request)
         except Exception as exc:
             fallback = self.fallback_llm
             # 没有配备用，或备用就是主模型的同一个实例时，重试同一家没有意义。
-            if fallback is None or fallback is self.llm:
+            # 计量壳会让同一底层 provider 变成不同对象，必须剥壳再比。
+            if (
+                fallback is None
+                or fallback is main
+                or unwrap_provider(fallback) is unwrap_provider(main)
+            ):
                 raise
             logger.warning(
                 "[回退] %s 主模型调用失败（%s: %s），改用备用 Provider 重试",
@@ -301,15 +311,16 @@ class ReplyGenerator:
                 type(exc).__name__,
                 exc,
             )
+            fb = self._usage_tagged(fallback, primary_tag) if primary_tag else fallback
             try:
-                response = await fallback.chat(self._fallback_request(request, fallback))
+                response = await fb.chat(self._fallback_request(request, fb))
             except Exception as exc2:
                 logger.error("[回退] %s 备用 Provider 同样失败：%s", stage, exc2)
                 raise exc from exc2
             logger.info(
                 "[回退] %s 已由备用 Provider「%s」产出回复",
                 stage,
-                getattr(fallback, "model", "") or "?",
+                getattr(fb, "model", "") or "?",
             )
             return response
 
@@ -357,6 +368,8 @@ class ReplyGenerator:
         reply_review_hint: str = "",
         expression_patterns: list = None,
         person_aliases: list = None,
+        persona_prompt: str = "",
+        speaking_style: SpeakingStyle = None,
     ) -> Optional[dict]:
         """
         生成回复
@@ -380,6 +393,13 @@ class ReplyGenerator:
               工具调用但未指定分类时 ``meme_category`` 为空，表示全库随机选择。
         """
         # 1. 构建请求
+        # 分群说话风格：本次请求单独实例化，绝不改 self.style_manager，
+        # 否则两个群并发生成时长度/语气会互相串。
+        active_style = (
+            SpeakingStyleManager(speaking_style)
+            if speaking_style is not None
+            else self.style_manager
+        )
         request = self._build_request(
             context_prompt,
             current_message,
@@ -396,6 +416,8 @@ class ReplyGenerator:
             reply_review_hint=reply_review_hint,
             expression_patterns=expression_patterns,
             person_aliases=person_aliases,
+            persona_prompt=persona_prompt,
+            style_manager=active_style,
         )
 
         # 2. 检索：先结构化判断「要不要查、查什么」，再查全局资料库；
@@ -594,9 +616,9 @@ class ReplyGenerator:
         self.replies_generated += 1
 
         # 7. 应用说话风格
-        reply = self.style_manager.apply_style(
+        reply = active_style.apply_style(
             result,
-            max_reply_length=self._get_base_reply_max_length(direction),
+            max_reply_length=self._get_base_reply_max_length(direction, active_style),
         )
 
         # 7.5 笑声抑制：刚笑过就别再用「哈哈」起头
@@ -978,12 +1000,17 @@ class ReplyGenerator:
                 '"query":"补全后的搜索词","freshness":"stable"}</decision>\n'
                 "不需要检索时 need_search 为 false，query 可为空。"
             )
-            resp = await judge_llm.chat(ChatRequest(
-                messages=[ChatMessage(role="user", content=judge_prompt)],
-                model=getattr(judge_llm, "model", None) or "gpt-4o",
-                temperature=0.0,
-                max_tokens=512,
-            ))
+            resp = await self._chat(
+                ChatRequest(
+                    messages=[ChatMessage(role="user", content=judge_prompt)],
+                    model=getattr(judge_llm, "model", None) or "gpt-4o",
+                    temperature=0.0,
+                    max_tokens=512,
+                ),
+                "检索判断",
+                primary=judge_llm,
+                primary_tag="search",
+            )
             decision = self._parse_search_decision(
                 resp.content if resp else "",
                 fallback_query=text,
@@ -1368,14 +1395,16 @@ class ReplyGenerator:
                 calls.append({"id": "", "name": name, "arguments": {"query": query}})
         return calls
 
-    def _get_base_reply_max_length(self, direction: str) -> int:
+    def _get_base_reply_max_length(
+        self, direction: str, style_manager: SpeakingStyleManager = None
+    ) -> int:
         """按消息指向选择基础回复上限。
 
         群聊插话保持短小；明确对 bot 的问题需要留出完整回答空间。行为计划
         的更短限制由最终的 ``_limit_action_length`` 单独执行，避免先截断内部
         表情包工具标记。
         """
-        style = self.style_manager.style
+        style = (style_manager or self.style_manager).style
         try:
             group_limit = max(1, int(style.max_reply_length or 20))
         except (TypeError, ValueError):
@@ -1397,9 +1426,10 @@ class ReplyGenerator:
         self,
         direction: str,
         action_plan: Dict[str, Any] = None,
+        style_manager: SpeakingStyleManager = None,
     ) -> int:
         """取得提示词中的上限，行为计划可进一步收紧但不能放宽基础上限。"""
-        max_length = self._get_base_reply_max_length(direction)
+        max_length = self._get_base_reply_max_length(direction, style_manager)
         try:
             action_limit = int((action_plan or {}).get("max_chars", 0) or 0)
         except (TypeError, ValueError):
@@ -1425,6 +1455,8 @@ class ReplyGenerator:
         reply_review_hint: str = "",
         expression_patterns: list = None,
         person_aliases: list = None,
+        persona_prompt: str = "",
+        style_manager: SpeakingStyleManager = None,
     ) -> ChatRequest:
         """构建 LLM 请求"""
 
@@ -1478,10 +1510,14 @@ class ReplyGenerator:
             request.model = self.llm.model
 
         # 系统提示 - 人格设定
-        if self.personality_prompt:
-            request.add_system(self.personality_prompt)
+        # 分群人格：调用方传入本群专用提示词时覆盖全局人格，只影响本次请求。
+        effective_persona = (persona_prompt or "").strip() or self.personality_prompt
+        if effective_persona:
+            request.add_system(effective_persona)
 
-        max_reply_length = self._get_prompt_reply_max_length(direction, action_plan)
+        max_reply_length = self._get_prompt_reply_max_length(
+            direction, action_plan, style_manager
+        )
         emoji_guide = "不要使用 Emoji，保持纯文字。"
 
         # 回复长度硬约束 - 群聊回复必须简短才像真人
@@ -1592,7 +1628,7 @@ class ReplyGenerator:
             request.add_system(expression_guide)
 
         # 添加说话风格指导
-        style_guide = self.style_manager.get_style_guide()
+        style_guide = (style_manager or self.style_manager).get_style_guide()
         if style_guide:
             request.add_system(f"说话风格指导：{style_guide}")
 
