@@ -613,5 +613,51 @@ class GroupReportMarkdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("暂时没提炼出总结", md)
 
 
+class GroupReportCardTests(unittest.IsolatedAsyncioTestCase):
+    """图文卡片版日报（官方 msg_type=8）。
+
+    卡片的标题和描述都有字数上限，超了官方直接拒收，所以拼文案时就得裁好。
+    """
+
+    def _report(self):
+        return {
+            "bot_name": "爱丽丝",
+            "title": "今晚的群聊小剧场",
+            "subtitle": "大家从开黑聊到了配队",
+            "summary": "今晚约了开黑，大家讨论了配队。",
+            "statistics": {"message_count": 12, "participant_count": 5},
+        }
+
+    def test_card_text_respects_official_limits(self):
+        from main import GroupChatBot
+
+        title, description = GroupChatBot._daily_report_card_text(self._report(), "今日")
+
+        self.assertTrue(1 <= len(title) <= 50)
+        self.assertTrue(1 <= len(description) <= 200)
+        self.assertIn("群聊日报", title)
+        self.assertIn("消息 12 条", description)
+
+    def test_card_text_truncates_a_long_summary(self):
+        from main import GroupChatBot
+
+        report = self._report()
+        report["summary"] = "长" * 500
+
+        title, description = GroupChatBot._daily_report_card_text(report, "今日")
+
+        self.assertTrue(1 <= len(title) <= 50)
+        self.assertTrue(1 <= len(description) <= 200)
+        self.assertTrue(description.endswith("…"))
+
+    def test_card_text_survives_an_empty_report(self):
+        from main import GroupChatBot
+
+        title, description = GroupChatBot._daily_report_card_text({}, "今日")
+
+        self.assertTrue(1 <= len(title) <= 50)
+        self.assertTrue(1 <= len(description) <= 200)
+
+
 if __name__ == "__main__":
     unittest.main()

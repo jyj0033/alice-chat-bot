@@ -193,12 +193,88 @@ Markdown 是文本那条命。日报的发送格式可配：
 ```yaml
 memory:
   group_analysis:
-    report_format: image   # image（默认，发图片）／markdown（发 Markdown 文本）／both（两条都发）
+    report_format: image   # image（默认，发图片）／markdown（发 Markdown 文本）／both（两条都发）／card（图文卡片）
 ```
 
 - `image`：图片发成功就不发文本；图片失败自动回退 Markdown，再失败回退纯文本；
 - `markdown`：只发 Markdown 文本（不渲染图片）；
-- `both`：图片 + Markdown 文本各一条。
+- `both`：图片 + Markdown 文本各一条；
+- `card`：以官方图文卡片发（见 3.5）。
+
+### 3.5 图文卡片（`msg_type=8`）
+
+官方 2026-10-28 新增的消息类型，群聊和单聊都支持。body 是嵌套结构：
+
+```json
+{
+  "msg_type": 8,
+  "card": {
+    "type": "tuwen",
+    "content": {
+      "title": "iPhone 17 Pro 正式发布",
+      "description": "全新 A20 芯片 / 钛金属机身 / 支持卫星通信",
+      "url": "https://news.qq.com/rain/a/20261014A05XYZ00",
+      "pic_url": "https://inews.gtimg.com/newsapp_bt/0/xxx/1000.jpg"
+    }
+  }
+}
+```
+
+字段限制：标题 1-50 字、描述 1-200 字，`url` 和 `pic_url` 都**必须是 https**、
+不超过 1024 字。四个字段一个都不能少。
+
+适配器接口：
+
+| 方法 | 说明 |
+|---|---|
+| `send_card_with_id(session_id, *, title, description, url, pic_url, reply_to_id=None)` | 发卡片，返回 `(是否成功, 平台消息 ID)` |
+| `send_card(session_id, *, title, description, url, pic_url)` | 同上，不带引用，返回 bool |
+| `send_card_with_image(session_id, image_bytes, *, title, description, purpose="", reply_to_id=None)` | 带图发卡片：先传素材库拿 https 图片地址，再发卡片 |
+
+参数不合规直接拦下，不发请求 —— 官方拒收的消息就是白跑一趟。
+
+**图片地址只能从素材库拿**：官方富媒体接口（`/v2/groups/{gid}/files`）只给
+`file_info`，不给公网链接；唯一稳定的 https 来源是素材库的预览链接（见 3.6）。
+所以 `send_card_with_image()` 是「先传素材库 → 拿预览链接 → 再发卡片」。
+
+**接在群日报上**：面板「群聊日报 → 发送格式」新增 `card` 选项，
+日报图片传进素材库后以图文卡片发出；卡片发不出去自动回退 Markdown 文本。
+默认仍是 `image`，不改现网行为。
+
+### 3.6 素材管理（`qqbot-media://`）
+
+图片预先传到平台，拿到 `qqbot-media://image/v1/<token>` 引用，写进 Markdown
+就能显示 —— 不用每次发消息都重传一遍文件。
+
+官方三步：
+
+1. `POST /v2/media-images/prepare`（`file_name` / `file_size` / `content_type` /
+   `md5` / `sha1`）→ 拿 `upload_id` 和预签名 `presigned_url`；
+2. `PUT <presigned_url>` 直传二进制，**请求头的 Content-Type 必须和声明的完全
+   一致**，否则 COS 直接 403；
+3. `POST /v2/media-images/complete`（`upload_id` + COS 返回的 ETag）→
+   拿到 `image_id` / `url` / `ttl` / `preview_url`。
+
+限制：单张 ≤10MB，只认 png/jpeg/gif/webp，**单机器人同时最多 100 张**
+（超出 40035007），引用链接滑动过期 90 天，`upload_id` 4 小时有效。
+错误码 40035001~40035010。
+
+适配器接口：
+
+| 方法 | 作用 |
+|---|---|
+| `upload_media_image(blob, filename="", purpose="")` | 上传，返回 `image_id` / `url` / `preview_url` / `ttl` |
+| `list_media_images(cursor="")` | 列出还有效的图片 |
+| `delete_media_image(image_id)` | 删一张，释放数量配额 |
+| `markdown_image_ref(url, alt="", width=0, height=0)` | 拼官方认可的 Markdown 图片语法 |
+
+**Markdown 图片必须带尺寸**：`![说明 #宽px #高px](qqbot-media://...)`。
+不写尺寸的话安卓端只显示替代文字「[图片]」，桌面端能解析但会压成一条；
+`#0 #0` 表示按原图比例缩放。
+
+**100 张上限怎么办**：`upload_media_image` 带 `purpose` 参数（比如
+`group_report:group_xxx`），同名用途的旧图会在上传前先删掉，本地索引记在
+`data/official_media.json`。日报一天一张，不清理的话 100 天就撑爆。
 
 ---
 
@@ -227,6 +303,8 @@ memory:
 | 群历史消息 API | ✅ | ❌ | 官方没有；日报只能靠 bot 自建历史表，**切换后旧的历史查不到** |
 | 主动插话 / 群日报 | ✅ | ⚠️ | 用户可关「允许主动发送」，关了主动消息必失败（现在会提前拦下并记日志） |
 | Markdown 消息 | ❌ | ✅ | 官方 `msg_type=2`，已接（群日报用）；NapCat 侧没接 |
+| 图文卡片 | ❌ | ✅ | 官方 `msg_type=8`，已接（群日报可选格式）；NapCat 侧没接 |
+| 素材库 | ❌ | ✅ | 官方 `/v2/media-images`，已接；NapCat 侧没接 |
 
 ---
 
@@ -397,8 +475,6 @@ cd /home/ubuntu/astrbot && docker compose stop napcat   # 先停，别删
 | 内嵌键盘 | 发消息 body 的 `keyboard` | 消息下面直接挂按钮。`action.type=2` + `enter=true` 点击即自动发送，**不需要 INTERACTION intent** |
 | 单聊流式输出 | `POST /v2/users/{openid}/stream_messages` | 打字机效果，50 QPS |
 | 互动召回消息 | 发消息 body 的 `is_wakeup=true` | 用户主动说过话后 30 天内可主动推 4 条，**不受「允许主动发送」开关限制** |
-| 图文卡片 | 发消息 body `msg_type=8` | 标题+描述+图+链接 |
-| 素材管理 | 上传后拿 `qqbot-media://` | 图片存平台，Markdown 里直接引用，不用每次发都传文件 |
 | 分享链接 | `POST /v2/generate_url_link` | 带 `callback_data`，可做「扫码加好友自动带来源标记」 |
 | @全体成员 | 正文里 `<qqbot-at-everyone />` | 机器人得是群管理员，每群每天 1 次 |
 

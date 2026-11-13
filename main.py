@@ -705,10 +705,10 @@ class GroupChatBot:
         if not isinstance(auto_times, list):
             auto_times = ["22:30-23:30"]
         # 日报发送格式：image（默认，发图片）／markdown（发 Markdown 文本）／
-        # both（图片 + Markdown 文本各一条）。图片渲染依赖字体和 Pillow，
-        # 环境一变就可能挂，所以文本那条命一直留着。
+        # both（图片 + Markdown 文本各一条）／card（官方图文卡片，图走素材库）。
+        # 图片渲染依赖字体和 Pillow，环境一变就可能挂，所以文本那条命一直留着。
         report_format = str(analysis_cfg.get("report_format") or "image").strip().lower()
-        if report_format not in ("image", "markdown", "both"):
+        if report_format not in ("image", "markdown", "both", "card"):
             report_format = "image"
         self._group_analysis_config = {
             "enabled": bool(analysis_cfg.get("enabled", True)),
@@ -4944,6 +4944,30 @@ class GroupChatBot:
         task.add_done_callback(_cleanup)
         return True
 
+    @staticmethod
+    def _daily_report_card_text(report: dict, report_label: str) -> tuple[str, str]:
+        """给官方图文卡片拼标题和描述。
+
+        官方限制：标题 1-50 字、描述 1-200 字，超了官方直接拒收。
+        """
+        stats = (report or {}).get("statistics", {}) or {}
+        title = str((report or {}).get("title") or "").strip()
+        subtitle = str((report or {}).get("subtitle") or "").strip()
+        summary = str((report or {}).get("summary") or "").strip()
+        bot_name = str((report or {}).get("bot_name") or "爱丽丝").strip() or "爱丽丝"
+        head = title or "今天群里聊到了一些小事"
+        if subtitle:
+            head = f"{head}｜{subtitle}"
+        card_title = f"{bot_name}的群聊日报 · {report_label}"
+        stats_line = "消息 {} 条｜参与 {} 人".format(
+            stats.get("message_count", 0),
+            stats.get("participant_count", 0),
+        )
+        description = f"{stats_line}｜{summary or '今天没什么特别的事。'}"
+        if len(description) > 200:
+            description = description[:197].rstrip() + "…"
+        return card_title[:50], description
+
     async def _run_group_analysis(
         self,
         session_id: str,
@@ -5058,8 +5082,33 @@ class GroupChatBot:
                 report_format = str(config.get("report_format") or "image").strip().lower()
                 send_image = getattr(self.qq_adapter, "send_image", None)
                 send_markdown = getattr(self.qq_adapter, "send_markdown", None)
+                send_card = getattr(self.qq_adapter, "send_card_with_image", None)
                 sent_as_image = False
-                if report_format in ("image", "both") and callable(send_image):
+                sent_as_card = False
+                if report_format == "card" and callable(send_card):
+                    # 官方图文卡片（msg_type=8）：图片地址必须是 https，
+                    # 所以图先传进素材库拿预览链接，再拼成卡片发出去。
+                    image_bytes = GroupDailyAnalysis.render_report_image(
+                        report, report_label=report_label
+                    )
+                    if image_bytes:
+                        try:
+                            card_title, card_desc = self._daily_report_card_text(
+                                report, report_label
+                            )
+                            card_ok, _ = await send_card(
+                                session_id,
+                                image_bytes,
+                                title=card_title,
+                                description=card_desc,
+                                purpose=f"group_report:{session_id}",
+                            )
+                            sent_as_card = bool(card_ok)
+                        except Exception as card_exc:
+                            logger.warning(
+                                "[群日报] 图文卡片发送失败，回退文本：%s", card_exc
+                            )
+                elif report_format in ("image", "both") and callable(send_image):
                     image_bytes = GroupDailyAnalysis.render_report_image(
                         report, report_label=report_label
                     )
@@ -5070,7 +5119,9 @@ class GroupChatBot:
                             logger.warning("[群日报] 图片发送失败，回退文本：%s", image_exc)
                 # 图片没发出去时 Markdown 就是文本那条命；格式明确要 markdown/both
                 # 时也照发。NapCat 适配器没有 send_markdown，这里会自然落到纯文本。
-                want_markdown = report_format in ("markdown", "both") or not sent_as_image
+                want_markdown = report_format in ("markdown", "both") or not (
+                    sent_as_image or sent_as_card
+                )
                 markdown_sent = False
                 if want_markdown and callable(send_markdown):
                     markdown_text = GroupDailyAnalysis.render_report_markdown(
@@ -5082,7 +5133,9 @@ class GroupChatBot:
                         markdown_sent = bool(await send_markdown(session_id, markdown_text))
                     except Exception as md_exc:
                         logger.warning("[群日报] Markdown 发送失败，回退纯文本：%s", md_exc)
-                if sent_as_image:
+                if sent_as_card:
+                    send_mode = "card+markdown" if markdown_sent else "card"
+                elif sent_as_image:
                     send_mode = "image+markdown" if markdown_sent else "image"
                 elif markdown_sent:
                     send_mode = "markdown"

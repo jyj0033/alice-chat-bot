@@ -1496,6 +1496,68 @@ async def send_images(request: Request):
         return {"success": False, "error": str(exc)}
 
 
+@app.post("/api/send/card")
+async def send_card(request: Request):
+    """手动发一条官方图文卡片（msg_type=8）。
+
+    body: {"session": "group_xxx", "title": "标题", "description": "描述",
+           "url": "https://...", "pic_url": "https://...", "image": "01.png"}
+
+    给了 ``image`` 就先传进素材库拿一个 https 图片地址（卡片的图片地址必须是
+    https，官方富媒体接口只给 file_info、不给公网链接）；没给就得自己提供
+    ``url`` + ``pic_url``。
+    """
+    if not bot_instance:
+        return {"success": False, "error": "Bot 未初始化"}
+    try:
+        data = await request.json()
+        data = data if isinstance(data, dict) else {}
+        session_id = str(data.get("session") or "").strip()
+        if not session_id.startswith(("group_", "private_")):
+            return {"success": False, "error": "会话格式不正确"}
+        title = str(data.get("title") or "").strip()
+        description = str(data.get("description") or "").strip()
+        url = str(data.get("url") or "").strip()
+        pic_url = str(data.get("pic_url") or "").strip()
+        image = str(data.get("image") or "").strip()
+        adapter = bot_instance.qq_adapter
+        send_card = getattr(adapter, "send_card_with_id", None)
+        if not callable(send_card):
+            return {"success": False, "error": "当前通道不支持图文卡片"}
+        if image:
+            upload_media = getattr(adapter, "upload_media_image", None)
+            if not callable(upload_media):
+                return {"success": False, "error": "当前通道不支持素材库"}
+            try:
+                resolved = _resolve_send_media_path(image)
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}
+            payload = await asyncio.to_thread(resolved.read_bytes)
+            media = await upload_media(
+                payload, filename="", purpose=f"manual_card:{session_id}"
+            )
+            media_url = str(media.get("preview_url") or "")
+            url = url or media_url
+            pic_url = pic_url or media_url
+        if not url or not pic_url:
+            return {"success": False, "error": "需要 url + pic_url，或者给一张图片"}
+        ok, message_id = await send_card(
+            session_id,
+            title=title,
+            description=description,
+            url=url,
+            pic_url=pic_url,
+        )
+        return {
+            "success": bool(ok),
+            "message_id": message_id,
+            "error": "" if ok else "发送失败",
+        }
+    except Exception as exc:
+        logger.error("面板发图文卡片失败：%s", exc)
+        return {"success": False, "error": str(exc)}
+
+
 @app.post("/api/memes/{meme_id}")
 async def update_meme(meme_id: str, request: Request):
     manager = _get_meme_manager()

@@ -93,6 +93,22 @@ def is_rate_limit_code(err_code: Any) -> bool:
     return 504000 <= code <= 504999
 
 
+# 图文卡片（msg_type=8）的字段上限，官方文档写死的
+CARD_TITLE_MAX = 50
+CARD_DESCRIPTION_MAX = 200
+CARD_URL_MAX = 1024
+
+# 素材管理（qqbot-media://）的限制：单张 ≤10MB，只认 png/jpeg/gif/webp，
+# 单机器人同时最多 100 张（超出 40035007），引用链接滑动过期 90 天。
+MEDIA_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+MEDIA_IMAGE_TYPES = {
+    ".png": "image/png",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
 class OfficialAPIError(RuntimeError):
     """官方接口返回了错误。带上 err_code，方便上层判断是不是被限频。"""
 
@@ -235,6 +251,13 @@ class OfficialQQAdapter(PlatformAdapter):
         # 机器人在群里的状态缓存：allow_proactive_msg / recv_msg_setting / member_role
         self._bot_state_cache: dict[str, dict[str, Any]] = {}
 
+        # 素材管理（qqbot-media://）的本地索引。
+        # 官方单机器人同时最多 100 张，超了 prepare/complete 直接 40035007，
+        # 所以每次上传新图之前要把「同一个用途」的旧图删掉，索引就记在这。
+        self._media_registry: dict[str, dict[str, Any]] = {}
+        self._media_registry_path = self._resolve_media_registry_path()
+        self._media_registry_loaded = False
+
         # 发送端频控：官方对主动消息有 qpm 和每日条数限制，触顶直接拒收，
         # 拒了那条消息就没了。阈值和说明见 core/adapter/rate_limit.py。
         official_cfg = self._official_config()
@@ -252,6 +275,17 @@ class OfficialQQAdapter(PlatformAdapter):
     def _official_config(self) -> dict:
         raw = self.config.get("official") if isinstance(self.config, dict) else None
         return raw if isinstance(raw, dict) else {}
+
+    @staticmethod
+    def _default_data_dir() -> Path:
+        """仓库根下的 data/ 目录（容器里是挂载卷，重启不丢）。"""
+        return Path(__file__).resolve().parents[2] / "data"
+
+    def _resolve_media_registry_path(self) -> Path:
+        configured = str(self._official_config().get("media_registry_file") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        return self._default_data_dir() / "official_media.json"
 
     @property
     def _app_id(self) -> str:
@@ -422,18 +456,32 @@ class OfficialQQAdapter(PlatformAdapter):
             )
         return data
 
-    async def _put_bytes(self, url: str, blob: bytes, timeout: float = 120.0) -> None:
-        """把分片 PUT 到预签名地址（预签名 URL 自带鉴权，不加 QQBot 头）。"""
+    async def _put_bytes(
+        self,
+        url: str,
+        blob: bytes,
+        timeout: float = 120.0,
+        content_type: str = "",
+    ) -> dict[str, str]:
+        """把分片 PUT 到预签名地址（预签名 URL 自带鉴权，不加 QQBot 头）。
+
+        素材管理那边要求请求头的 ``Content-Type`` 与 prepare 时声明的
+        **完全一致**，否则 COS 直接 403，所以这里要能把 Content-Type 带出去。
+        返回响应头 —— 素材管理要从里面取 ETag。
+        """
         session = await self._ensure_http()
+        headers = {"Content-Type": content_type} if content_type else {}
         try:
             async with session.put(
                 url,
                 data=blob,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=max(1.0, float(timeout))),
             ) as response:
                 if response.status >= 400:
                     text = await response.text()
                     raise RuntimeError(f"分片上传失败：{response.status} {text[:200]}")
+                return dict(response.headers)
         except asyncio.TimeoutError as exc:
             raise RuntimeError("分片上传超时") from exc
         except aiohttp.ClientError as exc:
@@ -1354,6 +1402,343 @@ class OfficialQQAdapter(PlatformAdapter):
 
     async def send_private_message(self, user_id: str, content: str) -> bool:
         return await self.send_message(f"private_{user_id}", content)
+
+    # ------------------------------------------------------------------
+    # 素材管理（qqbot-media://）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _media_image_content_type(blob: bytes, filename: str = "") -> tuple[str, str]:
+        """素材库只认 png/jpeg/gif/webp。返回 (文件名, Content-Type)。
+
+        官方要求「扩展名与 Content-Type 一致」，所以 jpg 统一改成 jpeg，
+        文件名也跟着改，免得官方按扩展名挑格式时挑错。
+        """
+        name = str(filename or "").strip()
+        ext = Path(name).suffix.lower() if name else ""
+        if ext == ".jpg":
+            ext = ".jpeg"
+        if ext not in MEDIA_IMAGE_TYPES:
+            ext = Path(OfficialQQAdapter._guess_image_name(blob)).suffix.lower()
+            name = ""
+            if ext == ".jpg":
+                ext = ".jpeg"
+        if ext not in MEDIA_IMAGE_TYPES:
+            raise RuntimeError(
+                f"素材库只支持 png/jpeg/gif/webp，这个文件是 {ext or '未知格式'}"
+            )
+        if not name:
+            name = f"image{ext}"
+        elif Path(name).suffix.lower() != ext:
+            name = f"{Path(name).stem}{ext}"
+        return name, MEDIA_IMAGE_TYPES[ext]
+
+    def _load_media_registry(self) -> None:
+        if self._media_registry_loaded:
+            return
+        self._media_registry_loaded = True
+        try:
+            raw = self._media_registry_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("素材索引读不出来，按空处理：%s", self._media_registry_path)
+            return
+        if isinstance(data, dict):
+            self._media_registry = {
+                str(key): value
+                for key, value in data.items()
+                if isinstance(value, dict)
+            }
+
+    def _save_media_registry(self) -> None:
+        path = self._media_registry_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(self._media_registry, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("素材索引写不进去：%s", exc)
+
+    async def upload_media_image(
+        self,
+        blob: bytes,
+        filename: str = "",
+        purpose: str = "",
+    ) -> dict[str, Any]:
+        """把图片存到官方素材库，返回引用信息。
+
+        官方三步：``POST /v2/media-images/prepare`` 拿预签名 URL →
+        ``PUT`` 直传二进制（Content-Type 必须和声明的一致，否则 COS 403）→
+        ``POST /v2/media-images/complete`` 带 COS 返回的 ETag。
+
+        返回里三个东西各有各的用处：
+
+        * ``url`` —— ``qqbot-media://image/v1/<token>``，写进 Markdown 就能显示；
+        * ``preview_url`` —— 外网 COS 预签名链接，**短时效**，只适合马上用
+          （比如当图文卡片的图片地址），别存下来；
+        * ``image_id`` —— 删除时用。
+
+        ``purpose`` 是给这张图起的用途（比如某个群的日报）。同名用途的旧图
+        会先删掉 —— 官方素材库同时最多 100 张，日报一天一张很快就会撑爆。
+        """
+        if not blob:
+            raise RuntimeError("没有要上传的图片")
+        if len(blob) > MEDIA_IMAGE_MAX_BYTES:
+            raise RuntimeError(
+                f"图片超过素材库上限（{MEDIA_IMAGE_MAX_BYTES // (1024 * 1024)}MB）"
+            )
+        name, content_type = self._media_image_content_type(blob, filename)
+        md5_hex = hashlib.md5(blob).hexdigest()
+        sha1_hex = hashlib.sha1(blob).hexdigest()
+
+        self._load_media_registry()
+        if purpose:
+            old = self._media_registry.get(purpose) or {}
+            old_id = str(old.get("image_id") or "")
+            if old_id:
+                try:
+                    await self.delete_media_image(old_id)
+                except Exception as exc:
+                    logger.warning("删旧素材失败（%s）：%s", old_id, exc)
+
+        prepared = await self._request_json(
+            "POST",
+            "/v2/media-images/prepare",
+            json_body={
+                "file_name": name,
+                "file_size": len(blob),
+                "content_type": content_type,
+                "md5": md5_hex,
+                "sha1": sha1_hex,
+            },
+            timeout=30.0,
+        )
+        upload_id = str(prepared.get("upload_id") or "")
+        presigned_url = str(prepared.get("presigned_url") or "")
+        if not upload_id or not presigned_url:
+            raise RuntimeError("素材预上传没有返回 upload_id / presigned_url")
+
+        headers = await self._put_bytes(
+            presigned_url, blob, content_type=content_type, timeout=120.0
+        )
+        etag = str(headers.get("ETag") or headers.get("etag") or "").strip().strip('"')
+        done = await self._request_json(
+            "POST",
+            "/v2/media-images/complete",
+            json_body={"upload_id": upload_id, "md5": etag or md5_hex},
+            timeout=30.0,
+        )
+        result: dict[str, Any] = {
+            "image_id": str(done.get("image_id") or ""),
+            "url": str(done.get("url") or ""),
+            "preview_url": str(done.get("preview_url") or ""),
+            "ttl": int(done.get("ttl") or 0),
+            "file_name": name,
+            "md5": md5_hex,
+        }
+        if purpose:
+            self._media_registry[purpose] = {
+                "image_id": result["image_id"],
+                "url": result["url"],
+                "file_name": name,
+                "created_at": int(time.time()),
+            }
+            self._save_media_registry()
+        return result
+
+    async def list_media_images(self, cursor: str = "") -> dict[str, Any]:
+        """列出素材库里还有效的图片（按上传时间倒序）。"""
+        params = {"cursor": cursor} if cursor else None
+        return await self._request_json(
+            "GET", "/v2/media-images", params=params, timeout=20.0
+        )
+
+    async def delete_media_image(self, image_id: str) -> bool:
+        """删掉一张素材，释放数量配额。已经发出去的消息不受影响。"""
+        image_id = str(image_id or "").strip()
+        if not image_id:
+            return False
+        await self._request_json(
+            "DELETE",
+            f"/v2/media-images/{quote(image_id, safe='')}/delete",
+            timeout=20.0,
+        )
+        for purpose, item in list(self._media_registry.items()):
+            if str(item.get("image_id") or "") == image_id:
+                self._media_registry.pop(purpose, None)
+                self._save_media_registry()
+        return True
+
+    @staticmethod
+    def markdown_image_ref(
+        media_url: str,
+        alt: str = "",
+        width: int = 0,
+        height: int = 0,
+    ) -> str:
+        """拼官方认可的 Markdown 图片语法。
+
+        ``![说明 #宽px #高px](qqbot-media://image/v1/<token>)``
+
+        尺寸必须显式给 —— 不给的话安卓端只显示替代文字「[图片]」，
+        桌面端能解析但会压成一条。宽高都写 0 表示按原图比例缩放。
+        """
+        url = str(media_url or "").strip()
+        if not url:
+            return ""
+        label = str(alt or "").strip() or "图片"
+        try:
+            w = max(0, int(width))
+            h = max(0, int(height))
+        except (TypeError, ValueError):
+            w, h = 0, 0
+        return f"![{label} #{w}px #{h}px]({url})"
+
+    # ------------------------------------------------------------------
+    # 图文卡片（msg_type=8）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _card_problem(title: str, description: str, url: str, pic_url: str) -> str:
+        """检查卡片字段合不合官方规矩。返回空串表示没问题。"""
+        title = str(title or "").strip()
+        description = str(description or "").strip()
+        url = str(url or "").strip()
+        pic_url = str(pic_url or "").strip()
+        if not title or len(title) > CARD_TITLE_MAX:
+            return f"标题必须是 1-{CARD_TITLE_MAX} 字"
+        if not description or len(description) > CARD_DESCRIPTION_MAX:
+            return f"描述必须是 1-{CARD_DESCRIPTION_MAX} 字"
+        if not url.startswith("https://") or len(url) > CARD_URL_MAX:
+            return f"链接必须是 https 且不超过 {CARD_URL_MAX} 字"
+        if not pic_url.startswith("https://") or len(pic_url) > CARD_URL_MAX:
+            return f"图片链接必须是 https 且不超过 {CARD_URL_MAX} 字"
+        return ""
+
+    async def send_card_with_id(
+        self,
+        session_id: str,
+        *,
+        title: str,
+        description: str,
+        url: str,
+        pic_url: str,
+        reply_to_id: str | None = None,
+    ) -> tuple[bool, str]:
+        """发送图文卡片（官方 ``msg_type=8``），返回 (是否成功, 平台消息 ID)。
+
+        官方契约是嵌套结构：
+        ``{"msg_type": 8, "card": {"type": "tuwen", "content": {...}}}``，
+        标题 1-50 字、描述 1-200 字，链接和图片都必须是 https。
+        """
+        owner = self._foreign_owner_loop()
+        if owner is not None:
+            future = asyncio.run_coroutine_threadsafe(
+                self.send_card_with_id(
+                    session_id,
+                    title=title,
+                    description=description,
+                    url=url,
+                    pic_url=pic_url,
+                    reply_to_id=reply_to_id,
+                ),
+                owner,
+            )
+            return await asyncio.wrap_future(future)
+        if not self._connected:
+            logger.error("官方通道未连接")
+            return False, ""
+        kind, target = self._split_session(session_id)
+        if kind not in ("group", "private") or not target:
+            logger.error("会话格式不正确：%s", session_id)
+            return False, ""
+        problem = self._card_problem(title, description, url, pic_url)
+        if problem:
+            logger.error("图文卡片参数不合法：%s", problem)
+            return False, ""
+        try:
+            body: dict[str, Any] = {
+                "msg_type": 8,
+                "card": {
+                    "type": "tuwen",
+                    "content": {
+                        "title": str(title).strip(),
+                        "description": str(description).strip(),
+                        "url": str(url).strip(),
+                        "pic_url": str(pic_url).strip(),
+                    },
+                },
+            }
+            self._apply_reply(body, session_id, reply_to_id)
+            data = await self._post_message(session_id, body)
+            message_id = self._record_outbound(data)
+            self.messages_sent += 1
+            return True, message_id
+        except ProactiveBlockedError as exc:
+            logger.info("图文卡片未发送：%s", exc)
+            return False, ""
+        except RateLimitedError as exc:
+            logger.warning("发送图文卡片被频控拦下：%s", exc)
+            return False, ""
+        except Exception as exc:
+            logger.exception("发送图文卡片失败：%r", exc)
+            return False, ""
+
+    async def send_card(
+        self,
+        session_id: str,
+        *,
+        title: str,
+        description: str,
+        url: str,
+        pic_url: str,
+    ) -> bool:
+        """发图文卡片（不带引用）。"""
+        ok, _ = await self.send_card_with_id(
+            session_id, title=title, description=description, url=url, pic_url=pic_url
+        )
+        return ok
+
+    async def send_card_with_image(
+        self,
+        session_id: str,
+        image_bytes: bytes,
+        *,
+        title: str,
+        description: str,
+        purpose: str = "",
+        reply_to_id: str | None = None,
+    ) -> tuple[bool, str]:
+        """带图发图文卡片。
+
+        卡片的图片地址必须是 https，而官方富媒体接口只给 ``file_info``、
+        不给公网链接 —— 唯一稳定的 https 来源是素材库的预览链接，
+        所以这里先把图传进素材库，再拿预览链接当图片地址。
+        """
+        try:
+            media = await self.upload_media_image(
+                image_bytes, filename="", purpose=purpose
+            )
+        except Exception as exc:
+            logger.warning("素材上传失败，图文卡片发不出去：%s", exc)
+            return False, ""
+        link = str(media.get("preview_url") or "")
+        if not link:
+            logger.warning("素材库没有给预览链接，图文卡片发不出去")
+            return False, ""
+        return await self.send_card_with_id(
+            session_id,
+            title=title,
+            description=description,
+            url=link,
+            pic_url=link,
+            reply_to_id=reply_to_id,
+        )
 
     # ------------------------------------------------------------------
     # 富媒体
