@@ -1486,6 +1486,15 @@ class OfficialQQAdapter(PlatformAdapter):
         ``purpose`` 是给这张图起的用途（比如某个群的日报）。同名用途的旧图
         会先删掉 —— 官方素材库同时最多 100 张，日报一天一张很快就会撑爆。
         """
+        # 面板线程（uvicorn 自带事件循环）和 bot 主循环不是同一个 loop，
+        # 素材上传要走主循环上的 aiohttp session，和发消息一样得先切回去。
+        owner = self._foreign_owner_loop()
+        if owner is not None:
+            future = asyncio.run_coroutine_threadsafe(
+                self.upload_media_image(blob, filename=filename, purpose=purpose),
+                owner,
+            )
+            return await asyncio.wrap_future(future)
         if not blob:
             raise RuntimeError("没有要上传的图片")
         if len(blob) > MEDIA_IMAGE_MAX_BYTES:
@@ -1553,6 +1562,12 @@ class OfficialQQAdapter(PlatformAdapter):
 
     async def list_media_images(self, cursor: str = "") -> dict[str, Any]:
         """列出素材库里还有效的图片（按上传时间倒序）。"""
+        owner = self._foreign_owner_loop()
+        if owner is not None:
+            future = asyncio.run_coroutine_threadsafe(
+                self.list_media_images(cursor), owner
+            )
+            return await asyncio.wrap_future(future)
         params = {"cursor": cursor} if cursor else None
         return await self._request_json(
             "GET", "/v2/media-images", params=params, timeout=20.0
@@ -1560,6 +1575,12 @@ class OfficialQQAdapter(PlatformAdapter):
 
     async def delete_media_image(self, image_id: str) -> bool:
         """删掉一张素材，释放数量配额。已经发出去的消息不受影响。"""
+        owner = self._foreign_owner_loop()
+        if owner is not None:
+            future = asyncio.run_coroutine_threadsafe(
+                self.delete_media_image(image_id), owner
+            )
+            return await asyncio.wrap_future(future)
         image_id = str(image_id or "").strip()
         if not image_id:
             return False

@@ -16,10 +16,16 @@ aiohttp 的超时上下文管理器要求在 asyncio Task 里执行，跨 loop �
   2. 面板线程发图片 → 同样切回
   3. 在适配器自己的循环里调用 → 不切换，直接执行
   4. 未连接时 → 返回失败，不发送
+  5. 面板线程传素材 / 发图文卡片 → 同样要切回
+
+  第 5 条是 2026-11-13 下午踩的第二个坑：素材上传和图文卡片是新加的路径，
+  一开始忘了加跨循环保护，面板「手动发卡片」直接炸
+  ``RuntimeError: Timeout context manager should be used inside a task``。
 """
 import asyncio
 import threading
 import unittest
+from pathlib import Path
 
 from core.adapter.official_adapter import OfficialQQAdapter
 
@@ -40,6 +46,10 @@ class _FakeAdapter(OfficialQQAdapter):
         self._ref_idx_by_msg_id = {}
         self._msg_id_by_ref_idx = {}
         self._message_senders = {}
+        # 素材索引：不落盘，测试里只需要它别炸。
+        self._media_registry = {}
+        self._media_registry_loaded = True
+        self._media_registry_path = Path("unused")
         # self_id / _app_id 都是从 config 派生的，不能直接赋值。
         self.config = {"self_id": "bot-1", "official": {"app_id": "app-1"}}
         self.self_id = "bot-1"
@@ -52,6 +62,29 @@ class _FakeAdapter(OfficialQQAdapter):
     async def upload_file(self, session_id, image_bytes):
         self.calls.append(("upload", session_id))
         return "file-info-1"
+
+    async def _request_json(self, method, path, **kwargs):
+        self.calls.append((method, path, kwargs))
+        if path.endswith("/prepare"):
+            return {
+                "upload_id": "upload-1",
+                "presigned_url": "https://cos.example.com/put",
+            }
+        if path.endswith("/complete"):
+            return {
+                "image_id": "img-1",
+                "url": "qqbot-media://image/v1/img-1",
+                "preview_url": "https://cos.example.com/preview",
+            }
+        return {}
+
+    async def _put_bytes(self, url, blob, timeout=120.0, content_type=""):
+        self.calls.append(("put", url, content_type))
+        return {"ETag": '"abc123"'}
+
+    def _save_media_registry(self):
+        """测试里不落盘。"""
+        self.calls.append(("save_registry", "", {}))
 
 
 def _run_in_other_loop(coro_factory, other_loop):
@@ -105,6 +138,58 @@ class CrossLoopSendTests(unittest.TestCase):
             self.assertTrue(ok, "跨循环发图没有成功")
             self.assertEqual(mid, "msg-out-1")
             self.assertTrue(any(c[0] == "upload" for c in adapter.calls))
+        finally:
+            owner_loop.call_soon_threadsafe(owner_loop.stop)
+            owner_thread.join(timeout=5)
+            owner_loop.close()
+            other_loop.close()
+
+    def test_foreign_loop_media_upload_reroutes_to_owner_loop(self):
+        """面板线程传素材：aiohttp session 在主循环上，必须切回去。"""
+        owner_loop = asyncio.new_event_loop()
+        other_loop = asyncio.new_event_loop()
+        owner_thread = threading.Thread(target=owner_loop.run_forever, daemon=True)
+        owner_thread.start()
+        try:
+            adapter = _FakeAdapter(owner_loop)
+
+            media = _run_in_other_loop(
+                lambda: adapter.upload_media_image(b"\x89PNG" + b"0" * 32, "a.png"),
+                other_loop,
+            )
+
+            self.assertEqual(media["image_id"], "img-1")
+            self.assertTrue(any(c[0] == "put" for c in adapter.calls))
+        finally:
+            owner_loop.call_soon_threadsafe(owner_loop.stop)
+            owner_thread.join(timeout=5)
+            owner_loop.close()
+            other_loop.close()
+
+    def test_foreign_loop_send_card_reroutes_to_owner_loop(self):
+        owner_loop = asyncio.new_event_loop()
+        other_loop = asyncio.new_event_loop()
+        owner_thread = threading.Thread(target=owner_loop.run_forever, daemon=True)
+        owner_thread.start()
+        try:
+            adapter = _FakeAdapter(owner_loop)
+
+            ok, mid = _run_in_other_loop(
+                lambda: adapter.send_card_with_id(
+                    "group_g1",
+                    title="标题",
+                    description="描述",
+                    url="https://example.com",
+                    pic_url="https://example.com/a.png",
+                ),
+                other_loop,
+            )
+
+            self.assertTrue(ok, "跨循环发图文卡片没有成功")
+            self.assertEqual(mid, "msg-out-1")
+            body = adapter.calls[0][1]
+            self.assertEqual(body["msg_type"], 8)
+            self.assertEqual(body["card"]["type"], "tuwen")
         finally:
             owner_loop.call_soon_threadsafe(owner_loop.stop)
             owner_thread.join(timeout=5)
