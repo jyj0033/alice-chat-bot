@@ -2,6 +2,9 @@
 config/config.yaml
 config/*.yaml
 config/*.bak
+# 人格模板目录同样是运行时目录：生产机上由面板写入，
+# 仓库里保留一份示例即可，不要让 git 去接管生产上的同名文件。
+config/personas/
 
 # 数据文件
 data/
