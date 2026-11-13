@@ -146,8 +146,10 @@ class AdapterRateLimitTests(unittest.IsolatedAsyncioTestCase):
 
         ok = await adapter.send_message(SESSION, "第二条")
         self.assertFalse(ok)
-        # 被拦下的这条根本没发出去
-        self.assertEqual(len(adapter.calls), 1)
+        # 被拦下的这条根本没发出去。
+        # （主动消息前会先探一次 bot_state，那是查询不是发送，不算在内。）
+        sent_calls = [c for c in adapter.calls if c[1].endswith("/messages")]
+        self.assertEqual(len(sent_calls), 1)
 
     async def test_official_rate_limit_error_is_logged_and_counted(self):
         adapter = _adapter()

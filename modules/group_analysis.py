@@ -1113,6 +1113,122 @@ class GroupDailyAnalysis:
         return text if len(text) <= max_chars else text[: max_chars - 16].rstrip() + "\n…（已截断）"
 
     @classmethod
+    def render_report_markdown(
+        cls,
+        report: dict,
+        report_label: str = "今日",
+        max_chars: int = 3200,
+    ) -> str:
+        """把日报渲染成 Markdown。
+
+        官方通道支持 ``msg_type=2`` 的 Markdown 消息（标题/列表/引用/加粗），
+        比纯文本结构清楚得多。图片渲染依赖字体和 Pillow，环境一变就可能挂，
+        所以这条是日报的第二条命。
+
+        只用官方明确支持的基础语法：标题、加粗、引用、无序列表、有序列表。
+        """
+        stats = report.get("statistics", {}) or {}
+
+        def ui_text(value: Any, limit: int) -> str:
+            return cls.EMOJI_RE.sub("", cls._short_text(value, limit)).strip()
+
+        bot_name = ui_text(report.get("bot_name"), 30) or "我"
+        title = ui_text(report.get("title"), 40) or "今天群里聊到了一些小事"
+        subtitle = ui_text(report.get("subtitle"), 60)
+
+        lines: list[str] = [f"## {bot_name}的群聊日报 · {report_label}", ""]
+        heading = f"### {title}" + (f"｜{subtitle}" if subtitle else "")
+        lines.append(heading)
+        lines.append("")
+        lines.append(
+            "> 消息 {} 条｜参与 {} 人｜文字 {} 字｜回复 {} 条".format(
+                stats.get("message_count", 0),
+                stats.get("participant_count", 0),
+                stats.get("total_characters", 0),
+                stats.get("reply_count", 0),
+            )
+        )
+        peak_hour = stats.get("peak_hour")
+        if peak_hour is not None:
+            lines.append(
+                f"> 最活跃时段：{int(peak_hour):02d}:00-{(int(peak_hour) + 1) % 24:02d}:00"
+            )
+
+        summary = ui_text(report.get("summary"), 220) or "暂时没提炼出总结。"
+        lines.extend(["", f"**我记下的：** {summary}"])
+        if report.get("atmosphere"):
+            lines.append(f"我对这段聊天的感觉：{ui_text(report['atmosphere'], 40)}")
+
+        top_users = stats.get("top_users", []) or []
+        sender_names = stats.get("sender_names", {}) or {}
+        profiles = report.get("profiles") or report.get("titles") or []
+        if profiles:
+            lines.extend(["", "#### 我给几位群友留了个小标签"])
+            for profile in profiles[:5]:
+                sender = ui_text(
+                    cls._name_for_id(profile.get("sender_id", ""), top_users, sender_names),
+                    24,
+                )
+                badge = ui_text(profile.get("mbti"), 24)
+                suffix = f"｜{badge}" if badge else ""
+                lines.append(
+                    f"- **{sender}**：{ui_text(profile.get('title'), 24)}{suffix}"
+                    f"（{ui_text(profile.get('reason'), 140)}）"
+                )
+
+        topics = report.get("topics", []) or []
+        if topics:
+            lines.extend(["", "#### 我注意到的话题"])
+            for index, topic in enumerate(topics, 1):
+                lines.append(
+                    f"{index}. **{ui_text(topic.get('name'), 40)}**："
+                    f"{ui_text(topic.get('detail'), 220)}"
+                )
+
+        unhinged_quotes = report.get("unhinged_quotes", []) or []
+        if unhinged_quotes:
+            picked = unhinged_quotes[:MAX_UNHINGED_QUOTES]
+            lines.extend(["", f"#### 我挑出来的 {len(picked)} 句逆天现场"])
+            for index, quote in enumerate(picked, 1):
+                sender = ui_text(
+                    cls._name_for_id(quote.get("sender_id", ""), top_users, sender_names),
+                    24,
+                )
+                score = quote.get("score")
+                score_text = (
+                    f"｜逆天度 {int(score)}"
+                    if isinstance(score, (int, float)) and score
+                    else ""
+                )
+                lines.append(
+                    f"> {index}.「{ui_text(quote.get('content'), 220)}」——{sender}{score_text}"
+                )
+                lines.append(f"> {ui_text(quote.get('reason'), 80)}")
+                lines.append("")
+
+        quality = report.get("quality_review", {}) or {}
+        if quality:
+            quality_title = ui_text(quality.get("title"), 40) or "我对今天的群聊锐评"
+            quality_subtitle = ui_text(quality.get("subtitle"), 60)
+            lines.extend(["", f"#### {quality_title}"])
+            if quality_subtitle:
+                lines.append(f"*{quality_subtitle}*")
+            if quality.get("summary"):
+                lines.append(ui_text(quality["summary"], 140))
+            for dimension in quality.get("dimensions", [])[:5]:
+                lines.append(
+                    f"- **{ui_text(dimension.get('name'), 20) or '未命名'}**"
+                    f"（{dimension.get('percentage', 0)}%）："
+                    f"{ui_text(dimension.get('comment'), 120)}"
+                )
+
+        if report.get("analysis_error"):
+            lines.extend(["", "*（AI 分析暂不可用，以上是我按看到的消息做的本地统计）*"])
+
+        text = "\n".join(lines).rstrip()
+        return text if len(text) <= max_chars else text[: max_chars - 16].rstrip() + "\n…（已截断）"
+
+    @classmethod
     def render_report_image(
         cls,
         report: dict,

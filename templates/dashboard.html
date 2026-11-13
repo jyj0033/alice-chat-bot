@@ -1982,6 +1982,15 @@
                             <input type="text" id="group-analysis-times" placeholder="23:50，可填多个，用逗号分隔">
                         </div>
                         <div class="form-group">
+                            <label>发送格式</label>
+                            <select id="group-analysis-format">
+                                <option value="image">图片（默认）</option>
+                                <option value="markdown">Markdown 文本</option>
+                                <option value="both">图片 + Markdown 文本</option>
+                            </select>
+                            <div class="hint">图片渲染依赖字体，失败时自动回退 Markdown 文本</div>
+                        </div>
+                        <div class="form-group">
                             <label>最少群友消息</label>
                             <input type="number" id="group-analysis-min" min="3" max="5000" value="10">
                         </div>
@@ -3512,6 +3521,7 @@
             document.getElementById('group-analysis-times').value = analysisTimes.join(', ');
             document.getElementById('group-analysis-min').value = groupAnalysis.min_messages ?? 10;
             document.getElementById('group-analysis-retention').value = groupAnalysis.retention_days ?? 30;
+            document.getElementById('group-analysis-format').value = groupAnalysis.report_format || 'image';
             const expressionLearning = mem.expression_learning || {};
             document.getElementById('expression-learning-enabled').checked = expressionLearning.enabled !== false;
             document.getElementById('expression-learning-interval').value = expressionLearning.interval_hours ?? 24;
@@ -4686,7 +4696,8 @@
                         auto_enabled: document.getElementById('group-analysis-auto').checked,
                         auto_times: listValue('group-analysis-times'),
                         min_messages: parseInt(document.getElementById('group-analysis-min').value),
-                        retention_days: parseInt(document.getElementById('group-analysis-retention').value)
+                        retention_days: parseInt(document.getElementById('group-analysis-retention').value),
+                        report_format: document.getElementById('group-analysis-format').value
                     },
                     expression_learning: {
                         enabled: document.getElementById('expression-learning-enabled').checked,

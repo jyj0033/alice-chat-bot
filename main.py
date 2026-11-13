@@ -620,46 +620,7 @@ class GroupChatBot:
         )
 
         # 群聊日报：默认到点自动生成并发送；Dashboard 手动触发不受 auto_enabled 影响。
-        analysis_cfg = memory_config.get("group_analysis", {}) or {}
-        auto_times = analysis_cfg.get("auto_times", analysis_cfg.get("auto_time", "22:30-23:30"))
-        if isinstance(auto_times, str):
-            auto_times = [auto_times]
-        if not isinstance(auto_times, list):
-            auto_times = ["22:30-23:30"]
-        self._group_analysis_config = {
-            "enabled": bool(analysis_cfg.get("enabled", True)),
-            "auto_enabled": bool(analysis_cfg.get("auto_enabled", True)),
-            "auto_times": [str(value).strip() for value in auto_times if str(value).strip()][:8]
-            or ["22:30-23:30"],
-            "min_messages": max(3, min(5000, int(analysis_cfg.get("min_messages", 10)))),
-            "max_messages": max(20, min(5000, int(analysis_cfg.get("max_messages", 500)))),
-            "max_prompt_chars": max(4000, min(60000, int(analysis_cfg.get("max_prompt_chars", 24000)))),
-            "max_topics": max(1, min(10, int(analysis_cfg.get("max_topics", 5)))),
-            # 金句区已取消（日报只保留逆天语录），这两个值是逆天语录的条数上限和
-            # 入选门槛分：宁缺毋滥，够不上门槛的一天可以一条都没有。
-            "max_unhinged_quotes": max(
-                1, min(8, int(analysis_cfg.get("max_unhinged_quotes", 4)))
-            ),
-            "unhinged_min_score": max(
-                0, min(100, int(analysis_cfg.get("unhinged_min_score", 75)))
-            ),
-            "max_titles": max(1, min(8, int(analysis_cfg.get("max_titles", 5)))),
-            "max_tokens": max(400, min(6000, int(analysis_cfg.get("max_tokens", 2400)))),
-            "max_report_chars": max(1200, min(10000, int(analysis_cfg.get("max_report_chars", 3000)))),
-            "retention_days": max(3, min(365, int(analysis_cfg.get("retention_days", 30)))),
-            "send_report": bool(analysis_cfg.get("send_report", True)),
-            "retries": max(1, min(8, int(analysis_cfg.get("retries", 2)))),
-            "avatars_enabled": bool(analysis_cfg.get("avatars_enabled", True)),
-            "avatar_cache_days": max(1, min(365, int(analysis_cfg.get("avatar_cache_days", 7)))),
-            "avatar_max_count": max(1, min(30, int(analysis_cfg.get("avatar_max_count", 12)))),
-            "avatar_timeout": max(1.0, min(20.0, float(analysis_cfg.get("avatar_timeout", 6)))),
-        }
-        logger.info(
-            "✓ 群聊日报：启用=%s，自动生成=%s，时间=%s",
-            self._group_analysis_config["enabled"],
-            self._group_analysis_config["auto_enabled"],
-            ",".join(self._group_analysis_config["auto_times"]),
-        )
+        self._load_group_analysis_config(memory_config)
 
         # 用户画像：从情景记忆提炼爱丽丝对每个群友的第一人称印象（semantic 记忆）
         profile_cfg = memory_config.get("profile", {}) or {}
@@ -729,6 +690,61 @@ class GroupChatBot:
             self._expression_learning_config["enabled"],
             self._expression_learning_config["interval_hours"],
             self._expression_learning_config["lookback_hours"],
+        )
+
+    def _load_group_analysis_config(self, memory_config: dict) -> None:
+        """重建群聊日报配置。
+
+        单独抽成一个方法，是为了面板改完配置能热生效 —— 之前这段只写在
+        ``_init_memory`` 里，改完「群聊日报」那一栏要重启容器才生效。
+        """
+        analysis_cfg = (memory_config or {}).get("group_analysis", {}) or {}
+        auto_times = analysis_cfg.get("auto_times", analysis_cfg.get("auto_time", "22:30-23:30"))
+        if isinstance(auto_times, str):
+            auto_times = [auto_times]
+        if not isinstance(auto_times, list):
+            auto_times = ["22:30-23:30"]
+        # 日报发送格式：image（默认，发图片）／markdown（发 Markdown 文本）／
+        # both（图片 + Markdown 文本各一条）。图片渲染依赖字体和 Pillow，
+        # 环境一变就可能挂，所以文本那条命一直留着。
+        report_format = str(analysis_cfg.get("report_format") or "image").strip().lower()
+        if report_format not in ("image", "markdown", "both"):
+            report_format = "image"
+        self._group_analysis_config = {
+            "enabled": bool(analysis_cfg.get("enabled", True)),
+            "auto_enabled": bool(analysis_cfg.get("auto_enabled", True)),
+            "auto_times": [str(value).strip() for value in auto_times if str(value).strip()][:8]
+            or ["22:30-23:30"],
+            "min_messages": max(3, min(5000, int(analysis_cfg.get("min_messages", 10)))),
+            "max_messages": max(20, min(5000, int(analysis_cfg.get("max_messages", 500)))),
+            "max_prompt_chars": max(4000, min(60000, int(analysis_cfg.get("max_prompt_chars", 24000)))),
+            "max_topics": max(1, min(10, int(analysis_cfg.get("max_topics", 5)))),
+            # 金句区已取消（日报只保留逆天语录），这两个值是逆天语录的条数上限和
+            # 入选门槛分：宁缺毋滥，够不上门槛的一天可以一条都没有。
+            "max_unhinged_quotes": max(
+                1, min(8, int(analysis_cfg.get("max_unhinged_quotes", 4)))
+            ),
+            "unhinged_min_score": max(
+                0, min(100, int(analysis_cfg.get("unhinged_min_score", 75)))
+            ),
+            "max_titles": max(1, min(8, int(analysis_cfg.get("max_titles", 5)))),
+            "max_tokens": max(400, min(6000, int(analysis_cfg.get("max_tokens", 2400)))),
+            "max_report_chars": max(1200, min(10000, int(analysis_cfg.get("max_report_chars", 3000)))),
+            "retention_days": max(3, min(365, int(analysis_cfg.get("retention_days", 30)))),
+            "send_report": bool(analysis_cfg.get("send_report", True)),
+            "retries": max(1, min(8, int(analysis_cfg.get("retries", 2)))),
+            "avatars_enabled": bool(analysis_cfg.get("avatars_enabled", True)),
+            "avatar_cache_days": max(1, min(365, int(analysis_cfg.get("avatar_cache_days", 7)))),
+            "avatar_max_count": max(1, min(30, int(analysis_cfg.get("avatar_max_count", 12)))),
+            "avatar_timeout": max(1.0, min(20.0, float(analysis_cfg.get("avatar_timeout", 6)))),
+            "report_format": report_format,
+        }
+        logger.info(
+            "✓ 群聊日报：启用=%s，自动生成=%s，时间=%s，格式=%s",
+            self._group_analysis_config["enabled"],
+            self._group_analysis_config["auto_enabled"],
+            ",".join(self._group_analysis_config["auto_times"]),
+            self._group_analysis_config["report_format"],
         )
 
     def _init_meme_manager(self) -> None:
@@ -1584,6 +1600,8 @@ class GroupChatBot:
     def apply_runtime_config(self) -> None:
         """重新读取 Web 配置并热更新可安全替换的运行组件。"""
         self._load_config()
+        # 群聊日报配置要能热生效：面板改「发送格式」不用重启容器。
+        self._load_group_analysis_config(self.config.get("memory", {}) or {})
         self._refresh_personality_runtime()
         self._init_llm()
 
@@ -5037,18 +5055,37 @@ class GroupChatBot:
                         max_count=config.get("avatar_max_count", 12),
                         cache_days=config.get("avatar_cache_days", 7),
                     )
-                image_bytes = GroupDailyAnalysis.render_report_image(
-                    report, report_label="今日"
-                )
+                report_format = str(config.get("report_format") or "image").strip().lower()
                 send_image = getattr(self.qq_adapter, "send_image", None)
+                send_markdown = getattr(self.qq_adapter, "send_markdown", None)
                 sent_as_image = False
-                if image_bytes and callable(send_image):
+                if report_format in ("image", "both") and callable(send_image):
+                    image_bytes = GroupDailyAnalysis.render_report_image(
+                        report, report_label=report_label
+                    )
+                    if image_bytes:
+                        try:
+                            sent_as_image = bool(await send_image(session_id, image_bytes))
+                        except Exception as image_exc:
+                            logger.warning("[群日报] 图片发送失败，回退文本：%s", image_exc)
+                # 图片没发出去时 Markdown 就是文本那条命；格式明确要 markdown/both
+                # 时也照发。NapCat 适配器没有 send_markdown，这里会自然落到纯文本。
+                want_markdown = report_format in ("markdown", "both") or not sent_as_image
+                markdown_sent = False
+                if want_markdown and callable(send_markdown):
+                    markdown_text = GroupDailyAnalysis.render_report_markdown(
+                        report,
+                        report_label=report_label,
+                        max_chars=config.get("max_report_chars", 3000),
+                    )
                     try:
-                        sent_as_image = bool(await send_image(session_id, image_bytes))
-                    except Exception as image_exc:
-                        logger.warning("[群日报] 图片发送失败，回退文本：%s", image_exc)
+                        markdown_sent = bool(await send_markdown(session_id, markdown_text))
+                    except Exception as md_exc:
+                        logger.warning("[群日报] Markdown 发送失败，回退纯文本：%s", md_exc)
                 if sent_as_image:
-                    send_mode = "image"
+                    send_mode = "image+markdown" if markdown_sent else "image"
+                elif markdown_sent:
+                    send_mode = "markdown"
                 elif await self.qq_adapter.send_message(session_id, report_text):
                     send_mode = "text_fallback"
             logger.info(

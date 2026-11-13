@@ -104,6 +104,18 @@ class OfficialAPIError(RuntimeError):
     def is_rate_limit(self) -> bool:
         return is_rate_limit_code(self.err_code)
 
+
+class ProactiveBlockedError(RuntimeError):
+    """这个会话已经不允许主动消息了（用户/群关掉了「允许主动发送」）。
+
+    和频控不同：频控是「等一会儿还能发」，这个是「发了必被拒」。
+    所以上层应该直接跳过，不要重试也不要排队。
+    """
+
+    def __init__(self, message: str, session_id: str = ""):
+        super().__init__(message)
+        self.session_id = session_id
+
 # 被动回复窗口：群聊 5 分钟 5 次，单聊 60 分钟 4 次
 PASSIVE_WINDOW_GROUP = 300.0
 PASSIVE_WINDOW_C2C = 3600.0
@@ -210,6 +222,18 @@ class OfficialQQAdapter(PlatformAdapter):
         # 查不到成员资料时用它兜底，省得为个昵称去申请白名单。
         self._member_names: dict[str, str] = {}
         self._member_name_order: deque = deque(maxlen=4000)
+
+        # 「允许主动发送」开关的状态，session_id -> 是否还能主动推。
+        # 官方用四个事件通知变化（都在 GROUP_AND_C2C_EVENT 这个订阅位里）：
+        #   GROUP_MSG_REJECT / GROUP_MSG_RECEIVE —— 群管理员在机器人资料页
+        #     关/开消息接收，关掉后这个群整个静默；
+        #   C2C_MSG_REJECT / C2C_MSG_RECEIVE —— 用户在资料卡关/开主动消息推送。
+        # 关掉以后主动消息一律发不出去（必被拒），提前记住就不用去撞官方的拒收。
+        self._push_enabled: dict[str, bool] = {}
+        # 消息接收被关掉的群：整个群静默，不再插话、不发日报。
+        self._group_muted: set[str] = set()
+        # 机器人在群里的状态缓存：allow_proactive_msg / recv_msg_setting / member_role
+        self._bot_state_cache: dict[str, dict[str, Any]] = {}
 
         # 发送端频控：官方对主动消息有 qpm 和每日条数限制，触顶直接拒收，
         # 拒了那条消息就没了。阈值和说明见 core/adapter/rate_limit.py。
@@ -670,6 +694,43 @@ class OfficialQQAdapter(PlatformAdapter):
             gid = str(data.get("group_openid") or "")
             self._record_seen_group(gid, "del")
             logger.info("机器人被移出群：group_openid=%s", gid or "-")
+            return
+        if event_type in ("GROUP_MSG_REJECT", "GROUP_MSG_RECEIVE"):
+            # 群管理员在机器人资料页关/开了「消息接收」。
+            # 关掉后这个群的消息官方不再投递，机器人也没必要插话 —— 记下来
+            # 直接静默，别再往一个关了通知的群里主动凑。
+            gid = str(data.get("group_openid") or "")
+            closed = event_type == "GROUP_MSG_REJECT"
+            if gid:
+                if closed:
+                    self._group_muted.add(gid)
+                else:
+                    self._group_muted.discard(gid)
+                self._push_enabled[f"group_{gid}"] = not closed
+                # 状态缓存里的 allow_proactive_msg 一并改掉，省得再发一次请求。
+                state = self._bot_state_cache.get(gid)
+                if state is not None:
+                    state["allow_proactive_msg"] = not closed
+                    state["_ts"] = time.time()
+            logger.info(
+                "群 %s 的消息接收被%s（操作人=%s）",
+                gid or "-",
+                "关闭，机器人静默" if closed else "重新开启",
+                str(data.get("op_member_openid") or "-") or "-",
+            )
+            return
+        if event_type in ("C2C_MSG_REJECT", "C2C_MSG_RECEIVE"):
+            # 用户在机器人资料卡关/开了「主动消息」推送。关掉之后给这个用户
+            # 发主动消息必被拒（错误码 40034105），提前记住就别去撞墙。
+            uid = str(data.get("openid") or "")
+            enabled = event_type == "C2C_MSG_RECEIVE"
+            if uid:
+                self._push_enabled[f"private_{uid}"] = enabled
+            logger.info(
+                "单聊用户 %s 的主动消息推送被%s",
+                uid or "-",
+                "关闭" if not enabled else "重新开启",
+            )
             return
         if event_type in GROUP_EVENTS:
             gid = str(data.get("group_openid") or "")
@@ -1148,6 +1209,12 @@ class OfficialQQAdapter(PlatformAdapter):
         # 带 msg_id 的是被动回复（有人在等），额度不够可以排队等一下；
         # 不带的是主动消息（插话、日报、表情包），额度不够直接跳过。
         passive = bool(body.get("msg_id"))
+        if not passive and not await self.proactive_allowed(session_id):
+            # 用户/群把「允许主动发送」关了，主动消息发了必被拒（40034105）。
+            # 提前拦下来，省一次请求，也省得面板上刷一片官方拒收。
+            raise ProactiveBlockedError(
+                "该会话已关闭主动消息推送，主动发送已跳过", session_id
+            )
         await self.rate_limiter.acquire(session_id, passive=passive)
         try:
             return await self._request_json(
@@ -1206,12 +1273,68 @@ class OfficialQQAdapter(PlatformAdapter):
             message_id = self._record_outbound(data)
             self.messages_sent += 1
             return True, message_id
+        except ProactiveBlockedError as exc:
+            logger.info("消息未发送：%s", exc)
+            return False, ""
         except RateLimitedError as exc:
             logger.warning("发送被频控拦下：%s", exc)
             return False, ""
         except Exception as exc:
             logger.exception("发送消息失败：%r", exc)
             return False, ""
+
+    async def send_markdown_with_id(
+        self,
+        session_id: str,
+        markdown: str,
+        reply_to_id: str | None = None,
+    ) -> tuple[bool, str]:
+        """发送 Markdown 消息（官方 ``msg_type=2``），返回 (是否成功, 平台消息 ID)。
+
+        官方要求 markdown 是**嵌套对象**：``{"msg_type": 2, "markdown": {"content": ...}}``，
+        而且填了 markdown 之后 ``content`` 必须留空 —— 否则撞 22006
+        「消息类型与内容不匹配」。
+
+        官方不保证 Markdown 一定渲染得出来，所以调用方最好留着纯文本兜底。
+        """
+        owner = self._foreign_owner_loop()
+        if owner is not None:
+            future = asyncio.run_coroutine_threadsafe(
+                self.send_markdown_with_id(session_id, markdown, reply_to_id=reply_to_id),
+                owner,
+            )
+            return await asyncio.wrap_future(future)
+        if not self._connected:
+            logger.error("官方通道未连接")
+            return False, ""
+        kind, target = self._split_session(session_id)
+        if kind not in ("group", "private") or not target:
+            logger.error("会话格式不正确：%s", session_id)
+            return False, ""
+        content = str(markdown or "").strip()
+        if not content:
+            return False, ""
+        try:
+            body: dict[str, Any] = {"msg_type": 2, "markdown": {"content": content}}
+            self._apply_reply(body, session_id, reply_to_id)
+            data = await self._post_message(session_id, body)
+            message_id = self._record_outbound(data)
+            self.messages_sent += 1
+            return True, message_id
+        except ProactiveBlockedError as exc:
+            logger.info("Markdown 消息未发送：%s", exc)
+            return False, ""
+        except RateLimitedError as exc:
+            logger.warning("发送被频控拦下：%s", exc)
+            return False, ""
+        except Exception as exc:
+            logger.exception("发送 Markdown 消息失败：%r", exc)
+            return False, ""
+
+    async def send_markdown(self, session_id: str, markdown: str) -> bool:
+        """发 Markdown 消息（不带引用）。"""
+        ok, _ = await self.send_markdown_with_id(session_id, markdown)
+        return ok
 
     async def send_message(
         self,
@@ -1392,6 +1515,9 @@ class OfficialQQAdapter(PlatformAdapter):
             message_id = self._record_outbound(data)
             self.messages_sent += 1
             return True, message_id
+        except ProactiveBlockedError as exc:
+            logger.info("图片未发送：%s", exc)
+            return False, ""
         except RateLimitedError as exc:
             logger.warning("发送图片被频控拦下：%s", exc)
             return False, ""
@@ -1514,6 +1640,9 @@ class OfficialQQAdapter(PlatformAdapter):
                 if message_id:
                     message_ids.append(message_id)
                 sent += 1
+            except ProactiveBlockedError as exc:
+                logger.info("图片未发送：%s", exc)
+                errors.append(str(exc))
             except RateLimitedError as exc:
                 logger.warning("发送图片被频控拦下：%s", exc)
                 errors.append(str(exc))
@@ -1606,6 +1735,89 @@ class OfficialQQAdapter(PlatformAdapter):
     async def fetch_user_avatar(self, user_id: str, *, timeout: float = 6.0) -> bytes | None:
         """官方通道拿不到 QQ 号，头像接口无从谈起。"""
         return None
+
+    async def get_bot_state(self, group_id: str, *, force: bool = False) -> dict[str, Any]:
+        """查询机器人在某个群里的状态。
+
+        官方 ``GET /v2/groups/{group_openid}/bot_state`` 会返回：
+
+        * ``allow_proactive_msg`` —— 这个群还允不允许机器人主动推消息
+          （群管理员在机器人资料页关了「允许主动发送」就是 false）；
+        * ``recv_msg_setting`` —— 群内接收消息的设置：``all`` / ``only_mention``
+          / ``mention_and_context``；
+        * ``member_role`` —— 机器人在群里的角色：``member`` / ``admin`` / ``owner``
+          （禁言、入群审批这些接口要求是管理员）。
+
+        这个接口频控 30 QPM，所以结果缓存 5 分钟；开关变化另有事件实时推过来
+        （``GROUP_MSG_REJECT/RECEIVE``），会直接改掉缓存里的值。
+        """
+        gid = str(group_id or "").strip()
+        if not gid:
+            return {}
+        now = time.time()
+        cached = self._bot_state_cache.get(gid)
+        if not force and cached and now - float(cached.get("_ts") or 0) < 300.0:
+            return cached
+        try:
+            data = await self._request_json(
+                "GET",
+                f"/v2/groups/{quote(gid, safe='')}/bot_state",
+                timeout=10.0,
+            )
+        except Exception as exc:
+            logger.debug("查询机器人群内状态失败：%s", exc)
+            return cached or {}
+        if not isinstance(data, dict):
+            return cached or {}
+        state: dict[str, Any] = {
+            # 拿不到就留 None —— 「查不到」不等于「不允许」，误杀正常消息
+            # 比让官方拒一次糟糕得多。
+            "allow_proactive_msg": data.get("allow_proactive_msg"),
+            "recv_msg_setting": str(data.get("recv_msg_setting") or ""),
+            "member_role": str(data.get("member_role") or ""),
+            "joined_at": str(data.get("joined_at") or ""),
+            "_ts": now,
+        }
+        self._bot_state_cache[gid] = state
+        # 事件推过来的开关状态优先，不要用查询结果覆盖掉。
+        known = self._push_enabled.get(f"group_{gid}")
+        if known is not None:
+            state["allow_proactive_msg"] = known
+        return state
+
+    def is_group_muted(self, group_id: str) -> bool:
+        """群管理员是不是已经关掉了这个群的消息接收。"""
+        return str(group_id or "").strip() in self._group_muted
+
+    async def proactive_allowed(self, session_id: str) -> bool:
+        """这个会话现在还允不允许主动消息。
+
+        三个来源，优先级从高到低：
+
+        1. 事件实时推来的开关状态（``GROUP_MSG_REJECT`` / ``C2C_MSG_REJECT``）；
+        2. ``bot_state.allow_proactive_msg``（群场景，5 分钟缓存）；
+        3. 查不到就按「允许」处理 —— 宁可让官方拒一次，也不要误杀正常消息。
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return True
+        known = self._push_enabled.get(sid)
+        if known is not None:
+            return known
+        kind, target = self._split_session(sid)
+        if kind != "group" or not target:
+            # 单聊没有可查的接口，只有事件能告诉我们。
+            return True
+        if self.is_group_muted(target):
+            return False
+        state = await self.get_bot_state(target)
+        if not state:
+            return True
+        allowed = state.get("allow_proactive_msg")
+        if allowed is None:
+            # 字段没返回：按「允许」处理，让官方去拒，不在这里误杀。
+            return True
+        return bool(allowed)
 
     async def call_api(
         self,

@@ -153,6 +153,53 @@ openid 不通用。新旧记忆不会互相污染，但也不会自动接上。
 `rate_limit_session_per_minute` / `rate_limit_daily_per_session` /
 `rate_limit_wait_seconds`。
 
+### 3.3 主动消息的开关状态（`bot_state` + 四个事件）
+
+官方对「机器人能不能主动推消息」有两套机制，我们两边都接了：
+
+| 来源 | 接口 / 事件 | 语义 |
+|---|---|---|
+| 查询 | `GET /v2/groups/{gid}/bot_state` | `allow_proactive_msg`（还能不能主动推）、`recv_msg_setting`（`all` / `only_mention` / `mention_and_context`）、`member_role`（`member` / `admin` / `owner`） |
+| 事件 | `GROUP_MSG_REJECT` / `GROUP_MSG_RECEIVE` | 群管理员在机器人资料页**关/开消息接收**——关掉后这个群的消息官方不再投递，机器人整个静默 |
+| 事件 | `C2C_MSG_REJECT` / `C2C_MSG_RECEIVE` | 用户在资料卡关/开**主动消息推送**——关掉后给这个用户发主动消息必被拒（40034105） |
+
+这四个事件**都在 `GROUP_AND_C2C_EVENT (1<<25)` 里**，也就是我们本来就在订阅，
+只是早期代码只打了「收到未处理的群事件」就丢掉了。现在接上了：
+
+* 事件是实时推送，优先于 `bot_state` 的 5 分钟缓存；
+* 关掉之后，主动消息（插话、日报、表情包）在**发出去之前**就被拦下来，
+  抛 `ProactiveBlockedError`，不再去撞官方的拒收；
+* **被动回复不受影响**——群里 @ 机器人是有人等着回话的，被动回复照发。
+
+`bot_state` 的频控是 30 QPM，结果缓存 5 分钟。查不到（网络挂了、字段没返回）
+时按「允许」处理：宁可让官方拒一次，也不要误杀正常消息。
+
+### 3.4 Markdown 消息（`msg_type=2`）
+
+官方支持用 Markdown 发消息，body 是**嵌套对象**：
+
+```json
+{"msg_type": 2, "markdown": {"content": "## 标题\n\n- 一条"}}
+```
+
+填了 `markdown` 之后 `content` 必须留空，否则撞 22006「消息类型与内容不匹配」。
+
+适配器接口：`send_markdown_with_id(session_id, markdown, reply_to_id=None)` /
+`send_markdown(session_id, markdown)`，被动回复的 `msg_id` / `msg_seq` 照常带。
+
+**目前接在群日报上**。日报图片依赖字体和 Pillow，环境一变就可能挂，
+Markdown 是文本那条命。日报的发送格式可配：
+
+```yaml
+memory:
+  group_analysis:
+    report_format: image   # image（默认，发图片）／markdown（发 Markdown 文本）／both（两条都发）
+```
+
+- `image`：图片发成功就不发文本；图片失败自动回退 Markdown，再失败回退纯文本；
+- `markdown`：只发 Markdown 文本（不渲染图片）；
+- `both`：图片 + Markdown 文本各一条。
+
 ---
 
 ## 4. 功能降级对照
@@ -172,30 +219,51 @@ openid 不通用。新旧记忆不会互相污染，但也不会自动接上。
 | 群黑名单 | ✅ | ❌ | 11253 白名单（内邀中） |
 | 群禁言 | ✅ | ⚠️ | 查询/设置均可用，要求机器人是群管理员，最长 30 天、单次 10 人；代码尚未接 |
 | 群信息 / 群人数 | ✅ | ✅ | `GET /v2/groups/{openid}/info`，实测无需白名单 |
+| 群禁言 | ✅ | ⚠️ | 查询/设置均可用，要求机器人是群管理员，最长 30 天、单次 10 人；代码尚未接 |
 | 入群审批 | ✅ | ✅ | 申请列表、审批、自动审批策略实测可用 |
+| 主动消息开关状态 | ❌ | ✅ | `bot_state` + `GROUP_MSG_REJECT`/`C2C_MSG_REJECT` 事件；关掉后主动消息提前拦截，不去撞官方拒收 |
 | 成员列表 / 批量踢人 | ✅ | ❌ | 11253 白名单（内邀中） |
 | QQ 号 / 头像 | ✅ | ❌ | 官方拿不到 QQ 号；头像接口需要 QQ 号，恒为空 |
 | 群历史消息 API | ✅ | ❌ | 官方没有；日报只能靠 bot 自建历史表，**切换后旧的历史查不到** |
-| 主动插话 / 群日报 | ✅ | ⚠️ | 用户可关「允许主动发送」，关了主动消息必失败 |
-| Markdown 消息 | ❌ | ✅ | 官方 `msg_type=2` 支持，NapCat 侧没接 |
+| 主动插话 / 群日报 | ✅ | ⚠️ | 用户可关「允许主动发送」，关了主动消息必失败（现在会提前拦下并记日志） |
+| Markdown 消息 | ❌ | ✅ | 官方 `msg_type=2`，已接（群日报用）；NapCat 侧没接 |
 
 ---
 
-### 4.1 实测权限边界（2026-11-12，群「盟约」44 人，Bot 为管理员）
+### 4.1 实测权限边界（2026-11-13 复测，两个群都跑了一遍）
+
+**盟约**（44 人，Bot 是 **admin**）：
 
 | 接口 | 结果 |
 |---|---|
-| `GET /v2/groups/{gid}/info` | ✅ 返回群名、人数 |
+| `GET /v2/groups/{gid}/info` | ✅ 群名/简介/分类/标签/44 人 |
 | `GET /v2/groups/{gid}/bot_state` | ✅ `member_role=admin`、`recv_msg_setting=all`、`allow_proactive_msg=true` |
 | `GET /v2/groups/{gid}/restrict_chat_setting` | ✅ 返回全局禁言规则 |
 | `GET /v2/groups/{gid}/join_request_list` | ✅ |
 | `GET /v2/groups/join_approval_strategy` | ✅ |
+| `GET /v2/menu` | ✅（当前为空） |
+| `GET /v2/panels?scope=group` | ✅（当前为空） |
+| `POST /v2/generate_url_link` | ✅ 能出分享链接 |
 | `GET /v2/groups/{gid}/members` | ❌ 11253 |
 | `GET /v2/groups/{gid}/members/{openid}` | ❌ 11253 |
 | `GET /v2/groups/{gid}/member_blacklist` | ❌ 11253 |
 
-结论：群管理（禁言、撤回他人消息、入群审批）可用；**成员名册类接口需要白名单**，
-与机器人是否为管理员无关。
+**守护全世界最好的玲**（36 人，Bot 是 **member，不是管理员**）：
+
+| 接口 | 结果 |
+|---|---|
+| `GET /v2/groups/{gid}/info` | ✅ 分类「游戏」 |
+| `GET /v2/groups/{gid}/bot_state` | ✅ `member_role=member`、`recv_msg_setting=all`、`allow_proactive_msg=true` |
+| `GET /v2/groups/{gid}/restrict_chat_setting` | ❌ 11703 机器人不是群管理员 |
+| `GET /v2/groups/{gid}/join_request_list` | ❌ 11703 机器人不是群管理员 |
+| `GET /v2/groups/{gid}/members` | ❌ 11253 |
+
+结论：
+1. 群管理（禁言、撤回他人消息、入群审批）**要求机器人在该群是管理员**，
+   不是管理员的群一律 11703 —— 上面「盟约」和「守护玲」的差别就在这。
+2. **成员名册类接口（成员列表 / 黑名单 / 批量踢人）需要白名单**，
+   与机器人是否为管理员无关。
+3. `GET /users/me` 文档里写了但实际返回 404「不支持的调用」，别依赖它。
 
 ## 5. 部署步骤
 
@@ -307,7 +375,45 @@ cd /home/ubuntu/astrbot && docker compose stop napcat   # 先停，别删
   「收到 @ 时才回」。
 * **群历史要自建**：官方没有历史消息接口，日报得靠 bot 自己落库的消息记录。
 * **群成员信息拿不到**（除非拿到白名单）：@ 别人时无法显示对方群名片。
-* **白名单接口**：群成员列表 / 黑名单 / 禁言 / `union_user_account` 都要
+* **白名单接口**：群成员列表 / 黑名单 / 批量踢人 / `union_user_account` 都要
   另外申请，不保证给。
 * **官方机器人是独立身份**，和原来的 QQ 号机器人不是同一个账号，
   群里的历史消息、好友关系都不共享。
+
+---
+
+## 8. 官方还有、我们没接的能力（2026-11-13 盘点）
+
+读完全套 API v2 文档后列的。括号里是前置条件。
+
+**读多花不了钱、可以优先做**：
+
+| 能力 | 接口 / 事件 | 备注 |
+|---|---|---|
+| 群画像 | `GET /v2/groups/{gid}/info` | 除了群名，还有简介/分类/标签/人数，能直接喂给回复生成器 |
+| 群指令面板 | `POST /v2/panels`（`scope=group`） | 群里出现面板，按钮点了填进输入框。**前置：要先实现命令处理**（现在 `/` `!` `#` 开头的消息会被直接跳过） |
+| C2C 快捷菜单 | `PUT /v2/menu` | 仅单聊，最多 10 个按钮。`switch` 类型能在消息里带 `switch_id`，可做「允许插话」开关 |
+| 消息反馈闭环 | `INTERACTION_CREATE` type=13 | 用户对机器人消息点赞/点踩，是免费的质量反馈信号 |
+| 内嵌键盘 | 发消息 body 的 `keyboard` | 消息下面直接挂按钮。`action.type=2` + `enter=true` 点击即自动发送，**不需要 INTERACTION intent** |
+| 单聊流式输出 | `POST /v2/users/{openid}/stream_messages` | 打字机效果，50 QPS |
+| 互动召回消息 | 发消息 body 的 `is_wakeup=true` | 用户主动说过话后 30 天内可主动推 4 条，**不受「允许主动发送」开关限制** |
+| 图文卡片 | 发消息 body `msg_type=8` | 标题+描述+图+链接 |
+| 素材管理 | 上传后拿 `qqbot-media://` | 图片存平台，Markdown 里直接引用，不用每次发都传文件 |
+| 分享链接 | `POST /v2/generate_url_link` | 带 `callback_data`，可做「扫码加好友自动带来源标记」 |
+| @全体成员 | 正文里 `<qqbot-at-everyone />` | 机器人得是群管理员，每群每天 1 次 |
+
+**要权限 / 要产品决策**：
+
+| 能力 | 前置 |
+|---|---|
+| 群禁言 | `POST /v2/groups/{gid}/restrict_chat_setting`，机器人必须是管理员（盟约群可以，守护玲群不行） |
+| 入群自动审批 | `POST /v2/groups/join_approval_strategy` + `strategy_id.execute` |
+| 群成员增减事件 | 要订阅 `GROUP_MEMBER_EVENT (1<<24)`，**不在** `1<<25` 里 |
+| 主动消息审核结果 | 要订阅 `MESSAGE_AUDIT (1<<27)` |
+| 消息反馈 / 交互事件 | 要订阅 `INTERACTION (1<<26)` |
+
+> ⚠️ **加 intents 有风险**：官方文档写明「鉴权时传递了无权限的 intents，
+> websocket 会报错并直接关闭连接」。我们代码里 op 9 会清 session 重连，
+> 权限不足可能变成**重连风暴**。要么先去申请权限，要么在 Identify 失败时
+> 降级回基础 intents（`GROUP_AND_C2C_EVENT`）。
+

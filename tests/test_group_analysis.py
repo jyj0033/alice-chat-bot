@@ -531,5 +531,87 @@ class GroupAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("群聊日报", bot.qq_adapter.sent[0][1])
 
 
+class GroupReportMarkdownTests(unittest.IsolatedAsyncioTestCase):
+    """Markdown 版日报（官方 msg_type=2）。
+
+    图片渲染依赖字体和 Pillow，环境一变就可能挂；Markdown 是文本那条命，
+    格式必须和纯文本版对齐，内容不能少。
+    """
+
+    def _report(self):
+        return {
+            "bot_name": "爱丽丝",
+            "title": "今晚的群聊小剧场",
+            "subtitle": "大家从开黑聊到了配队",
+            "summary": "今晚约了开黑。",
+            "atmosphere": "挺热闹",
+            "statistics": {
+                "message_count": 12,
+                "participant_count": 5,
+                "total_characters": 480,
+                "reply_count": 8,
+                "peak_hour": 21,
+                "top_users": [{"sender_id": "u1", "name": "甲", "count": 3}],
+                "sender_names": {"u1": "甲"},
+            },
+            "topics": [{"name": "开黑安排", "detail": "讨论上线时间"}],
+            "profiles": [
+                {
+                    "sender_id": "u1",
+                    "title": "抽象配队师",
+                    "mbti": "今日观察派",
+                    "reason": "吐槽配队",
+                }
+            ],
+            "unhinged_quotes": [
+                {
+                    "content": "我可以，八点半上线",
+                    "sender_id": "u2",
+                    "score": 90,
+                    "reason": "接得太顺了",
+                }
+            ],
+            "quality_review": {
+                "title": "锐评",
+                "subtitle": "副标题",
+                "summary": "总结",
+                "dimensions": [
+                    {"name": "接话", "percentage": 70, "comment": "很稳"}
+                ],
+            },
+        }
+
+    def test_markdown_keeps_the_same_structure_as_plain_text(self):
+        md = GroupDailyAnalysis.render_report_markdown(self._report(), report_label="今日")
+        self.assertIn("## 爱丽丝的群聊日报 · 今日", md)
+        self.assertIn("### 今晚的群聊小剧场｜大家从开黑聊到了配队", md)
+        self.assertIn("> 消息 12 条", md)
+        self.assertIn("> 最活跃时段：21:00-22:00", md)
+        self.assertIn("**我记下的：**", md)
+        self.assertIn("#### 我给几位群友留了个小标签", md)
+        self.assertIn("- **甲**", md)
+        self.assertIn("#### 我注意到的话题", md)
+        self.assertIn("1. **开黑安排**", md)
+        self.assertIn("#### 我挑出来的 1 句逆天现场", md)
+        self.assertIn("「我可以，八点半上线」", md)
+        self.assertIn("#### 锐评", md)
+        self.assertIn("- **接话**（70%）", md)
+
+    def test_markdown_uses_the_report_label(self):
+        md = GroupDailyAnalysis.render_report_markdown(self._report(), report_label="11-13")
+        self.assertIn("## 爱丽丝的群聊日报 · 11-13", md)
+
+    def test_markdown_is_truncated_at_max_chars(self):
+        md = GroupDailyAnalysis.render_report_markdown(self._report(), max_chars=200)
+        self.assertLessEqual(len(md), 200)
+        self.assertIn("已截断", md)
+
+    def test_markdown_handles_missing_sections(self):
+        report = {"bot_name": "爱丽丝", "statistics": {}}
+        md = GroupDailyAnalysis.render_report_markdown(report)
+        self.assertIn("## 爱丽丝的群聊日报 · 今日", md)
+        self.assertIn("暂时没提炼出总结", md)
+
+
 if __name__ == "__main__":
     unittest.main()
