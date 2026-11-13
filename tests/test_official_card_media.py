@@ -331,6 +331,23 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
             await adapter.list_media_images("next-page")
             self.assertEqual(adapter.calls[-1][2]["params"], {"cursor": "next-page"})
 
+    async def test_delete_removes_the_registry_entry(self):
+        """删素材后索引里不能留残条目（一次性脚本里最容易踩）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = _adapter(tmp)
+            _media_responses(adapter)
+            await adapter.upload_media_image(PNG_BYTES, "a.png", purpose="group_report:x")
+
+            # 模拟另一个进程：索引还没加载过
+            fresh = _adapter(tmp)
+            ok = await fresh.delete_media_image("IMG_1")
+
+            self.assertTrue(ok)
+            saved = json.loads(
+                (Path(tmp) / "media.json").read_text(encoding="utf-8")
+            )
+            self.assertNotIn("group_report:x", saved)
+
     async def test_markdown_image_ref_always_carries_size(self):
         """安卓端不给尺寸就只显示替代文字，尺寸必须显式写。"""
         ref = OfficialQQAdapter.markdown_image_ref("qqbot-media://image/v1/tok", "日报")

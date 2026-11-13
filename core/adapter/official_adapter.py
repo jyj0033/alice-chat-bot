@@ -1608,6 +1608,8 @@ class OfficialQQAdapter(PlatformAdapter):
             f"/v2/media-images/{quote(image_id, safe='')}/delete",
             timeout=20.0,
         )
+        # 索引可能还没读过（比如在一次性脚本里调用），不加载的话删完还留着旧条目。
+        self._load_media_registry()
         for purpose, entries in list(self._media_registry.items()):
             remaining = [
                 item
