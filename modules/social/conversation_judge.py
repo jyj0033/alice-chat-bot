@@ -925,6 +925,11 @@ class ConversationJudge:
             if reply_to_qq:
                 reply_ref += f"({self._format_user_reference(reply_to_qq, known_users)})"
             annotations.append("回复=" + reply_ref)
+        # 被引用的原文单独带出来：正文只有说话人自己的话，不知道引用了什么，
+        # 就判断不出「这条是在接着谁的话说」。
+        quoted_content = str(getattr(message, "quoted_content", "") or "").strip()
+        if quoted_content:
+            annotations.append("引用原文=" + quoted_content[:80])
         mentions = getattr(message, "mentioned_user_ids", None)
         if mentions is None:
             mentions = []

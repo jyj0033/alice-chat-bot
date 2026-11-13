@@ -1787,6 +1787,7 @@ class GroupChatBot:
                 message_id=message.message_id,
                 reply_to_id=message.reply_to_id,
                 reply_to_qq=message.reply_to_qq,
+                quoted_content=message.quoted_content,
                 mentioned_user_ids=message.mentioned_user_ids,
                 directed_to_bot=directed_to_bot,
             )
@@ -3070,6 +3071,7 @@ class GroupChatBot:
             mentioned_others=mentioned_others,
             reply_to_id=getattr(item, "reply_to_id", None),
             reply_to_qq=getattr(item, "reply_to_qq", None),
+            quoted_content=str(getattr(item, "quoted_content", "") or ""),
             outer_text=content,
             rich_only=content.startswith((
                 "[链接", "[卡片", "[小程序", "[图片", "[表情包", "[动画表情",
@@ -4737,6 +4739,7 @@ class GroupChatBot:
                     message_id=message_id,
                     reply_to_id=meta.get("reply_to_id"),
                     reply_to_qq=meta.get("reply_to_qq"),
+                    quoted_content=str(meta.get("quoted_content") or ""),
                     mentioned_user_ids=meta.get("mentioned_user_ids") or [],
                     directed_to_bot=bool(meta.get("directed_to_bot")),
                     conversation_target=str(meta.get("conversation_target") or ""),
@@ -4785,6 +4788,8 @@ class GroupChatBot:
                 "is_bot": False,
                 "reply_to_id": message.reply_to_id,
                 "reply_to_qq": message.reply_to_qq,
+                # 引用的原文单独存，不混进正文
+                "quoted_content": (message.quoted_content or "")[:200],
                 "mentioned_user_ids": list(message.mentioned_user_ids or []),
                 "mentioned_others": list(message.mentioned_others or []),
             },
@@ -5241,6 +5246,10 @@ class GroupChatBot:
                 "message_id": message.message_id,  # 检索时排除当前消息自召回
                 "reply_to_id": message.reply_to_id,
                 "reply_to_qq": message.reply_to_qq,
+                # 引用的原文单独存：正文只放说话人自己说的话。
+                # 拼接会让人以为「被引用的内容」是这个人说的——尤其是
+                # 引用机器人自己时，等于把机器人的话记成群友的话。
+                "quoted_content": (message.quoted_content or "")[:200],
                 "mentioned_user_ids": message.mentioned_user_ids,
                 "directed_to_bot": message.mentioned_me
                 or (
@@ -7146,6 +7155,10 @@ class GroupChatBot:
                     quoted_content = item.content
                     quoted_sender = "you" if item.is_bot else item.sender_name
                     break
+        if not quoted_content:
+            # 被引用的那条已经不在窗口里（或者平台只给了 REFIDX、回查不到原文），
+            # 用平台直接给的引用原文兜底，别让这条消息变成看不懂的半句话。
+            quoted_content = str(getattr(message, "quoted_content", "") or "")
         own_recent = [item.content for item in recent if item.is_bot][-3:]
         nearby = [getattr(message, "content", "") or ""] + [
             item.content for item in recent[-6:]

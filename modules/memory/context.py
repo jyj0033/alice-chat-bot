@@ -134,6 +134,9 @@ class ContextMessage:
     message_id: str = ""
     reply_to_id: Optional[str] = None     # 被回复消息的 ID（平台原始字段）
     reply_to_qq: Optional[str] = None     # 被回复消息的发送者 QQ 号
+    # 被引用消息的正文（官方通道直接给）。content 只放说话人自己说的话，
+    # 引用内容单独存，渲染时才作为「引用的原话」标出来。
+    quoted_content: str = ""
     mentioned_user_ids: tuple[str, ...] = ()  # 本条消息 @ 的全部 QQ 号（不含 all）
     directed_to_bot: bool = False         # 是否明确对 bot 说
     conversation_target: str = ""         # 动态判断：bot / other / group / unknown
@@ -151,6 +154,7 @@ class ContextMessage:
             "message_id": self.message_id,
             "reply_to_id": self.reply_to_id,
             "reply_to_qq": self.reply_to_qq,
+            "quoted_content": self.quoted_content,
             "mentioned_user_ids": list(self.mentioned_user_ids),
             "directed_to_bot": self.directed_to_bot,
             "conversation_target": self.conversation_target,
@@ -319,6 +323,10 @@ class ContextWindow:
                     snippet = (
                         message_id_to_content.get(str(msg.reply_to_id), "") or ""
                     ).strip()
+            if not snippet:
+                # 被引用的那条可能已经滚出窗口（或者平台只给了 REFIDX，
+                # 回查不到原文），这时用平台直接给的引用原文兜底。
+                snippet = (msg.quoted_content or "").strip()
 
             to_you = bool(msg.directed_to_bot) or (
                 bool(bot_id)
@@ -420,6 +428,7 @@ class ContextManager:
         message_id: str = "",
         reply_to_id: Optional[str] = None,
         reply_to_qq: Optional[str] = None,
+        quoted_content: str = "",
         mentioned_user_ids: Optional[list[str] | tuple[str, ...]] = None,
         directed_to_bot: bool = False,
         conversation_target: str = "",
@@ -438,6 +447,7 @@ class ContextManager:
             message_id=message_id,
             reply_to_id=reply_to_id,
             reply_to_qq=reply_to_qq,
+            quoted_content=str(quoted_content or ""),
             mentioned_user_ids=tuple(
                 dict.fromkeys(str(item) for item in (mentioned_user_ids or []) if str(item))
             ),
@@ -459,6 +469,7 @@ class ContextManager:
         message_id: str = "",
         reply_to_id: Optional[str] = None,
         reply_to_qq: Optional[str] = None,
+        quoted_content: str = "",
         mentioned_user_ids: Optional[list[str] | tuple[str, ...]] = None,
         directed_to_bot: bool = False,
         conversation_target: str = "",
@@ -477,6 +488,7 @@ class ContextManager:
             message_id=message_id,
             reply_to_id=reply_to_id,
             reply_to_qq=reply_to_qq,
+            quoted_content=str(quoted_content or ""),
             mentioned_user_ids=tuple(
                 dict.fromkeys(str(item) for item in (mentioned_user_ids or []) if str(item))
             ),

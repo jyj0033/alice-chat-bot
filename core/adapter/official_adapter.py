@@ -865,8 +865,12 @@ class OfficialQQAdapter(PlatformAdapter):
                         quoted_author_id = self._canonical_bot_id()
                         if author.get("id"):
                             self._bot_ids.add(str(author["id"]))
-        if quoted_content:
-            segments.append({"type": "text", "data": {"text": quoted_content}})
+        # 被引用的正文单独存（Message.quoted_content），不拼进正文。
+        # 早先这里当成普通文本段拼在说话人自己的话后面，而渲染层又是
+        # 直接 "".join(...) 无分隔符拼接，结果引用内容和本人说的话黏成
+        # 一句：「爱丽丝，来点幕后黑手的小说」+「灵魂原来还有分辨率的吗……？」
+        # → 「爱丽丝，来点幕后黑手的小说灵魂原来还有分辨率的吗……？」。
+        # 引用的是机器人自己时更糟：机器人的话被记成了群友说的话。
 
         ext = self._parse_ext(data)
         own_ref_idx = str(ext.get("msg_idx") or "")
@@ -934,6 +938,7 @@ class OfficialQQAdapter(PlatformAdapter):
             mentioned_others=list(dict.fromkeys(mentioned_others)),
             reply_to_id=reply_to_id or None,
             reply_to_qq=reply_to_qq,
+            quoted_content=quoted_content.strip(),
             segments=parsed,
             outer_text=render_outer_text(parsed),
             rich_only=is_rich_only(parsed),

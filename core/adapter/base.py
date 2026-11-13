@@ -24,6 +24,10 @@ class Message:
     mentioned_others: list[str] = field(default_factory=list)  # 本条消息 @ 的其他 QQ 号（不含 bot）
     reply_to_id: Optional[str] = None
     reply_to_qq: Optional[str] = None  # 被回复消息的发送者 QQ 号（OneBot reply 段扩展字段）
+    # 被引用消息的正文。只在官方通道能直接拿到（引用内容在 msg_elements 里）。
+    # 必须和 content 分开：content 只放说话人自己说的话，否则引用内容会被
+    # 当成他的话记进记忆（机器人的话尤其糟——会变成「群友说的」）。
+    quoted_content: str = ""
     segments: list[MessageSegment] = field(default_factory=list)
     outer_text: str = ""  # 仅发送者最外层输入，用于触发检测，排除转发/卡片内容
     rich_only: bool = False
