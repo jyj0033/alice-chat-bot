@@ -1229,6 +1229,64 @@ class GroupDailyAnalysis:
         return text if len(text) <= max_chars else text[: max_chars - 16].rstrip() + "\n…（已截断）"
 
     @classmethod
+    def render_report_header(cls, report: dict, report_label: str = "今日") -> str:
+        """日报「文字 + 图」版的文字部分：标题 + 一行统计。
+
+        图片那部分由调用方用素材库引用拼上去 —— 官方 Markdown 图片必须带
+        尺寸（``![说明 #宽px #高px](qqbot-media://...)``），不写尺寸安卓端
+        只会显示替代文字。
+        """
+        stats = (report or {}).get("statistics", {}) or {}
+
+        def ui_text(value: Any, limit: int) -> str:
+            return cls.EMOJI_RE.sub("", cls._short_text(value, limit)).strip()
+
+        bot_name = ui_text((report or {}).get("bot_name"), 30) or "爱丽丝"
+        lines = [f"## {bot_name}的群聊日报 · {report_label}", ""]
+        lines.append(
+            "> 消息 {} 条｜参与 {} 人｜文字 {} 字｜回复 {} 条".format(
+                stats.get("message_count", 0),
+                stats.get("participant_count", 0),
+                stats.get("total_characters", 0),
+                stats.get("reply_count", 0),
+            )
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def image_size(image_bytes: bytes) -> tuple[int, int]:
+        """图片的像素尺寸（宽, 高）。读不出来就返回 (0, 0)。"""
+        if not image_bytes:
+            return 0, 0
+        try:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(image_bytes)) as image:
+                return int(image.width), int(image.height)
+        except Exception:
+            return 0, 0
+
+    @classmethod
+    def fit_markdown_image_size(
+        cls,
+        image_bytes: bytes,
+        target_width: int = 800,
+    ) -> tuple[int, int]:
+        """给 Markdown 图片算一个显示尺寸。
+
+        官方要求显式写宽高；日报图默认 1080 宽，手机上太宽，按比例缩到
+        ``target_width``。算不出原始尺寸就退回 (target_width, 0)（0 表示
+        按原图比例）。
+        """
+        width, height = cls.image_size(image_bytes)
+        if width <= 0:
+            return max(1, int(target_width)), 0
+        target = max(1, int(target_width))
+        if width <= target:
+            return width, height
+        return target, max(1, round(target * height / width))
+
+    @classmethod
     def render_report_image(
         cls,
         report: dict,

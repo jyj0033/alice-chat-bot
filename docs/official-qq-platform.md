@@ -193,13 +193,13 @@ Markdown 是文本那条命。日报的发送格式可配：
 ```yaml
 memory:
   group_analysis:
-    report_format: image   # image（默认，发图片）／markdown（发 Markdown 文本）／both（两条都发）／card（图文卡片）
+    report_format: image   # image（默认，发图片）／markdown（发 Markdown 文本）／both（两条都发）／markdown_image（文字 + 图）
 ```
 
 - `image`：图片发成功就不发文本；图片失败自动回退 Markdown，再失败回退纯文本；
 - `markdown`：只发 Markdown 文本（不渲染图片）；
 - `both`：图片 + Markdown 文本各一条；
-- `card`：以官方图文卡片发（见 3.5）。
+- `markdown_image`：一条 Markdown，文字部分 + 一张图（图走素材库引用，见 3.6）。
 
 ### 3.5 图文卡片（`msg_type=8`）
 
@@ -237,9 +237,18 @@ memory:
 `file_info`，不给公网链接；唯一稳定的 https 来源是素材库的预览链接（见 3.6）。
 所以 `send_card_with_image()` 是「先传素材库 → 拿预览链接 → 再发卡片」。
 
-**接在群日报上**：面板「群聊日报 → 发送格式」新增 `card` 选项，
-日报图片传进素材库后以图文卡片发出；卡片发不出去自动回退 Markdown 文本。
-默认仍是 `image`，不改现网行为。
+> ⚠️ **卡片的图只有 1 小时寿命**（2026-11-13 实测）：素材库给的
+> `preview_url` 是 COS 预签名链接，签名窗口正好 **3600 秒**。
+> 卡片底部显示的那行链接就是它，**一小时后点不动**；缩略图会不会跟着裂，
+> 取决于 QQ 有没有在发送时把图转存，接口查不出来。
+>
+> 所以卡片适合**临时/一次性**场景（发完看一眼的那种），不适合挂长。
+> 要让图长期留在群里，走 3.6 的 **Markdown + 素材库引用**。
+
+**手动发送**：面板 `POST /api/send/card`
+（`{"session": "group_xxx", "title": ..., "description": ..., "url": ..., "pic_url": ..., "image": "xx.png"}`）。
+给了 `image` 就先传素材库拿图片地址；没给就得自己提供 `url` + `pic_url`
+（都必须是 https）。
 
 ### 3.6 素材管理（`qqbot-media://`）
 
@@ -263,18 +272,26 @@ memory:
 
 | 方法 | 作用 |
 |---|---|
-| `upload_media_image(blob, filename="", purpose="")` | 上传，返回 `image_id` / `url` / `preview_url` / `ttl` |
+| `upload_media_image(blob, filename="", purpose="", keep=1)` | 上传，返回 `image_id` / `url` / `preview_url` / `ttl` |
 | `list_media_images(cursor="")` | 列出还有效的图片 |
 | `delete_media_image(image_id)` | 删一张，释放数量配额 |
 | `markdown_image_ref(url, alt="", width=0, height=0)` | 拼官方认可的 Markdown 图片语法 |
+| `send_markdown_with_image(session_id, image_bytes, markdown="", *, purpose="", alt="图片", width=800, height=0, keep=1)` | 上传素材 + 拼引用 + 发一条 Markdown |
 
 **Markdown 图片必须带尺寸**：`![说明 #宽px #高px](qqbot-media://...)`。
 不写尺寸的话安卓端只显示替代文字「[图片]」，桌面端能解析但会压成一条；
 `#0 #0` 表示按原图比例缩放。
 
+**带图长驻就靠这条路**：`qqbot-media://` 引用是 **90 天滑动过期**（每次被
+消息引用就顺延），而且官方写明「发送时平台自动转存」——
+**消息发出去以后，素材删了也不影响已经发出去的那条消息**。
+这是它比卡片强的地方：卡片的 `pic_url` 必须是 https，而素材库给的预览链接
+只有 1 小时有效期（见 3.5）。
+
 **100 张上限怎么办**：`upload_media_image` 带 `purpose` 参数（比如
-`group_report:group_xxx`），同名用途的旧图会在上传前先删掉，本地索引记在
-`data/official_media.json`。日报一天一张，不清理的话 100 天就撑爆。
+`group_report:group_xxx`）和 `keep`（保留几张，默认 1），超出的旧图会被
+删掉，本地索引记在 `data/official_media.json`。日报一天一张，不清理的话
+100 天就撑爆。群日报用 `keep=3`，留最近三天的素材。
 
 ---
 
@@ -303,8 +320,8 @@ memory:
 | 群历史消息 API | ✅ | ❌ | 官方没有；日报只能靠 bot 自建历史表，**切换后旧的历史查不到** |
 | 主动插话 / 群日报 | ✅ | ⚠️ | 用户可关「允许主动发送」，关了主动消息必失败（现在会提前拦下并记日志） |
 | Markdown 消息 | ❌ | ✅ | 官方 `msg_type=2`，已接（群日报用）；NapCat 侧没接 |
-| 图文卡片 | ❌ | ✅ | 官方 `msg_type=8`，已接（群日报可选格式）；NapCat 侧没接 |
-| 素材库 | ❌ | ✅ | 官方 `/v2/media-images`，已接；NapCat 侧没接 |
+| 图文卡片 | ❌ | ✅ | 官方 `msg_type=8`，已接；**图片只有 1 小时有效期**，只适合临时场景 |
+| 素材库 | ❌ | ✅ | 官方 `/v2/media-images`，已接；引用 90 天滑动有效，带图长驻走它 |
 
 ---
 

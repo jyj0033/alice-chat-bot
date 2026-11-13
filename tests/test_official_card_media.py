@@ -275,7 +275,38 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
             saved = json.loads(
                 (Path(tmp) / "media.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(saved["group_report:x"]["image_id"], "IMG_1")
+            entries = saved["group_report:x"]
+            self.assertIsInstance(entries, list)
+            self.assertEqual(entries[0]["image_id"], "IMG_1")
+
+    async def test_keep_retains_recent_images_of_the_same_purpose(self):
+        """日报要留最近几张，删素材时别把刚发的图也删了。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = _adapter(tmp)
+            _media_responses(adapter)
+
+            for index in range(3):
+                adapter.responses[("POST", "/v2/media-images/complete")] = {
+                    "image_id": f"IMG_{index + 1}",
+                    "url": f"qqbot-media://image/v1/IMG_{index + 1}",
+                    "ttl": 7776000,
+                    "preview_url": f"https://cos.example.com/preview/IMG_{index + 1}",
+                }
+                await adapter.upload_media_image(
+                    PNG_BYTES, "a.png", purpose="group_report:x", keep=2
+                )
+
+            deletes = [c for c in adapter.calls if c[0] == "DELETE"]
+            # 传了三张、留两张 → 只删掉最旧的那张
+            self.assertEqual(len(deletes), 1)
+            self.assertEqual(deletes[0][1], "/v2/media-images/IMG_1/delete")
+            saved = json.loads(
+                (Path(tmp) / "media.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [item["image_id"] for item in saved["group_report:x"]],
+                ["IMG_2", "IMG_3"],
+            )
 
     async def test_oversized_image_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -311,6 +342,65 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sized, "![日报 #800px #1200px](qqbot-media://image/v1/tok)")
 
         self.assertEqual(OfficialQQAdapter.markdown_image_ref(""), "")
+
+
+class MarkdownWithImageTests(unittest.IsolatedAsyncioTestCase):
+    """「文字 + 图」的 Markdown 消息（图片走素材库引用）。
+
+    这是带图长驻的正经做法：``qqbot-media://`` 引用 90 天滑动有效，
+    官方发送时会转存，已发出去的消息不受素材删除影响。
+    """
+
+    async def test_uploads_media_and_appends_the_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = _adapter(tmp)
+            _media_responses(adapter)
+
+            ok, message_id = await adapter.send_markdown_with_image(
+                f"group_{GROUP_OPENID}",
+                PNG_BYTES,
+                "## 群聊日报\n\n> 消息 12 条",
+                purpose="group_report:test",
+                alt="群聊日报",
+                width=800,
+                height=1200,
+            )
+
+            self.assertTrue(ok)
+            self.assertTrue(message_id)
+            body = adapter.calls[-1][2]["json_body"]
+            self.assertEqual(body["msg_type"], 2)
+            content = body["markdown"]["content"]
+            self.assertIn("## 群聊日报", content)
+            self.assertIn("![群聊日报 #800px #1200px]", content)
+            self.assertIn("qqbot-media://image/v1/IMG_1", content)
+
+    async def test_uses_media_reference_not_preview_url(self):
+        """预览链接只有 1 小时有效期，长驻的图必须用 qqbot-media:// 引用。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = _adapter(tmp)
+            _media_responses(adapter)
+
+            await adapter.send_markdown_with_image(
+                f"group_{GROUP_OPENID}", PNG_BYTES, "正文"
+            )
+
+            content = adapter.calls[-1][2]["json_body"]["markdown"]["content"]
+            self.assertNotIn("cos.example.com", content)
+
+    async def test_upload_failure_does_not_send(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = _adapter(tmp)
+            adapter.responses[("POST", "/v2/media-images/prepare")] = RuntimeError(
+                "网络炸了"
+            )
+
+            ok, _ = await adapter.send_markdown_with_image(
+                f"group_{GROUP_OPENID}", PNG_BYTES, "正文"
+            )
+
+            self.assertFalse(ok)
+            self.assertFalse([c for c in adapter.calls if c[1].endswith("/messages")])
 
 
 if __name__ == "__main__":

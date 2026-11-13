@@ -613,10 +613,11 @@ class GroupReportMarkdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("暂时没提炼出总结", md)
 
 
-class GroupReportCardTests(unittest.IsolatedAsyncioTestCase):
-    """图文卡片版日报（官方 msg_type=8）。
+class GroupReportHeaderTests(unittest.IsolatedAsyncioTestCase):
+    """日报「文字 + 图」版（官方 Markdown + 素材库引用）。
 
-    卡片的标题和描述都有字数上限，超了官方直接拒收，所以拼文案时就得裁好。
+    图那块由适配器拼（``![说明 #宽px #高px](qqbot-media://...)``），
+    这里只管文字部分和图片显示尺寸。
     """
 
     def _report(self):
@@ -624,39 +625,53 @@ class GroupReportCardTests(unittest.IsolatedAsyncioTestCase):
             "bot_name": "爱丽丝",
             "title": "今晚的群聊小剧场",
             "subtitle": "大家从开黑聊到了配队",
-            "summary": "今晚约了开黑，大家讨论了配队。",
-            "statistics": {"message_count": 12, "participant_count": 5},
+            "summary": "今晚约了开黑。",
+            "statistics": {
+                "message_count": 12,
+                "participant_count": 5,
+                "total_characters": 480,
+                "reply_count": 8,
+            },
         }
 
-    def test_card_text_respects_official_limits(self):
-        from main import GroupChatBot
+    def test_header_has_title_and_stats(self):
+        text = GroupDailyAnalysis.render_report_header(self._report(), "今日")
 
-        title, description = GroupChatBot._daily_report_card_text(self._report(), "今日")
+        self.assertIn("## 爱丽丝的群聊日报 · 今日", text)
+        self.assertIn("消息 12 条", text)
+        self.assertIn("参与 5 人", text)
 
-        self.assertTrue(1 <= len(title) <= 50)
-        self.assertTrue(1 <= len(description) <= 200)
-        self.assertIn("群聊日报", title)
-        self.assertIn("消息 12 条", description)
+    def test_header_handles_an_empty_report(self):
+        text = GroupDailyAnalysis.render_report_header({}, "今日")
 
-    def test_card_text_truncates_a_long_summary(self):
-        from main import GroupChatBot
+        self.assertIn("群聊日报", text)
+        self.assertIn("消息 0 条", text)
 
-        report = self._report()
-        report["summary"] = "长" * 500
+    def test_fit_image_size_scales_wide_images_down(self):
+        buf = io.BytesIO()
+        Image.new("RGB", (1080, 2160), (20, 20, 20)).save(buf, format="PNG")
 
-        title, description = GroupChatBot._daily_report_card_text(report, "今日")
+        width, height = GroupDailyAnalysis.fit_markdown_image_size(
+            buf.getvalue(), target_width=800
+        )
 
-        self.assertTrue(1 <= len(title) <= 50)
-        self.assertTrue(1 <= len(description) <= 200)
-        self.assertTrue(description.endswith("…"))
+        self.assertEqual(width, 800)
+        self.assertEqual(height, 1600)
 
-    def test_card_text_survives_an_empty_report(self):
-        from main import GroupChatBot
+    def test_fit_image_size_keeps_small_images(self):
+        buf = io.BytesIO()
+        Image.new("RGB", (400, 200), (20, 20, 20)).save(buf, format="PNG")
 
-        title, description = GroupChatBot._daily_report_card_text({}, "今日")
+        width, height = GroupDailyAnalysis.fit_markdown_image_size(
+            buf.getvalue(), target_width=800
+        )
 
-        self.assertTrue(1 <= len(title) <= 50)
-        self.assertTrue(1 <= len(description) <= 200)
+        self.assertEqual((width, height), (400, 200))
+
+    def test_fit_image_size_survives_broken_bytes(self):
+        width, height = GroupDailyAnalysis.fit_markdown_image_size(b"not-an-image")
+
+        self.assertEqual((width, height), (800, 0))
 
 
 if __name__ == "__main__":

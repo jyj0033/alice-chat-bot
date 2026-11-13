@@ -1446,12 +1446,16 @@ class OfficialQQAdapter(PlatformAdapter):
         except json.JSONDecodeError:
             logger.warning("素材索引读不出来，按空处理：%s", self._media_registry_path)
             return
-        if isinstance(data, dict):
-            self._media_registry = {
-                str(key): value
-                for key, value in data.items()
-                if isinstance(value, dict)
-            }
+        if not isinstance(data, dict):
+            return
+        registry: dict[str, list[dict[str, Any]]] = {}
+        for key, value in data.items():
+            if isinstance(value, dict):
+                # 早期版本一个用途只存一条，读的时候补成列表
+                registry[str(key)] = [value]
+            elif isinstance(value, list):
+                registry[str(key)] = [item for item in value if isinstance(item, dict)]
+        self._media_registry = registry
 
     def _save_media_registry(self) -> None:
         path = self._media_registry_path
@@ -1469,6 +1473,7 @@ class OfficialQQAdapter(PlatformAdapter):
         blob: bytes,
         filename: str = "",
         purpose: str = "",
+        keep: int = 1,
     ) -> dict[str, Any]:
         """把图片存到官方素材库，返回引用信息。
 
@@ -1478,20 +1483,25 @@ class OfficialQQAdapter(PlatformAdapter):
 
         返回里三个东西各有各的用处：
 
-        * ``url`` —— ``qqbot-media://image/v1/<token>``，写进 Markdown 就能显示；
-        * ``preview_url`` —— 外网 COS 预签名链接，**短时效**，只适合马上用
-          （比如当图文卡片的图片地址），别存下来；
+        * ``url`` —— ``qqbot-media://image/v1/<token>``，写进 Markdown 就能显示，
+          引用是**长期有效**的（90 天滑动过期，每次被引用就顺延）；
+        * ``preview_url`` —— 外网 COS 预签名链接，**只有 1 小时有效期**
+          （实测签名窗口 3600 秒），只适合马上用（比如当图文卡片的图片地址），
+          别存下来、也别指望它长期可用；
         * ``image_id`` —— 删除时用。
 
         ``purpose`` 是给这张图起的用途（比如某个群的日报）。同名用途的旧图
-        会先删掉 —— 官方素材库同时最多 100 张，日报一天一张很快就会撑爆。
+        会被清掉，只留最近 ``keep`` 张 —— 官方素材库同时最多 100 张，
+        日报一天一张很快就会撑爆。
         """
         # 面板线程（uvicorn 自带事件循环）和 bot 主循环不是同一个 loop，
         # 素材上传要走主循环上的 aiohttp session，和发消息一样得先切回去。
         owner = self._foreign_owner_loop()
         if owner is not None:
             future = asyncio.run_coroutine_threadsafe(
-                self.upload_media_image(blob, filename=filename, purpose=purpose),
+                self.upload_media_image(
+                    blob, filename=filename, purpose=purpose, keep=keep
+                ),
                 owner,
             )
             return await asyncio.wrap_future(future)
@@ -1506,14 +1516,6 @@ class OfficialQQAdapter(PlatformAdapter):
         sha1_hex = hashlib.sha1(blob).hexdigest()
 
         self._load_media_registry()
-        if purpose:
-            old = self._media_registry.get(purpose) or {}
-            old_id = str(old.get("image_id") or "")
-            if old_id:
-                try:
-                    await self.delete_media_image(old_id)
-                except Exception as exc:
-                    logger.warning("删旧素材失败（%s）：%s", old_id, exc)
 
         prepared = await self._request_json(
             "POST",
@@ -1551,12 +1553,29 @@ class OfficialQQAdapter(PlatformAdapter):
             "md5": md5_hex,
         }
         if purpose:
-            self._media_registry[purpose] = {
-                "image_id": result["image_id"],
-                "url": result["url"],
-                "file_name": name,
-                "created_at": int(time.time()),
-            }
+            entries = self._media_registry.setdefault(purpose, [])
+            entries.append(
+                {
+                    "image_id": result["image_id"],
+                    "url": result["url"],
+                    "file_name": name,
+                    "created_at": int(time.time()),
+                }
+            )
+            self._save_media_registry()
+            # 同名用途只留最近 keep 张，多出来的删掉 —— 官方素材库上限 100 张。
+            try:
+                limit = max(1, int(keep))
+            except (TypeError, ValueError):
+                limit = 1
+            while len(entries) > limit:
+                stale = entries.pop(0)
+                stale_id = str(stale.get("image_id") or "")
+                if stale_id:
+                    try:
+                        await self.delete_media_image(stale_id)
+                    except Exception as exc:
+                        logger.warning("删旧素材失败（%s）：%s", stale_id, exc)
             self._save_media_registry()
         return result
 
@@ -1589,9 +1608,17 @@ class OfficialQQAdapter(PlatformAdapter):
             f"/v2/media-images/{quote(image_id, safe='')}/delete",
             timeout=20.0,
         )
-        for purpose, item in list(self._media_registry.items()):
-            if str(item.get("image_id") or "") == image_id:
-                self._media_registry.pop(purpose, None)
+        for purpose, entries in list(self._media_registry.items()):
+            remaining = [
+                item
+                for item in entries
+                if str(item.get("image_id") or "") != image_id
+            ]
+            if len(remaining) != len(entries):
+                if remaining:
+                    self._media_registry[purpose] = remaining
+                else:
+                    self._media_registry.pop(purpose, None)
                 self._save_media_registry()
         return True
 
@@ -1619,6 +1646,47 @@ class OfficialQQAdapter(PlatformAdapter):
         except (TypeError, ValueError):
             w, h = 0, 0
         return f"![{label} #{w}px #{h}px]({url})"
+
+    async def send_markdown_with_image(
+        self,
+        session_id: str,
+        image_bytes: bytes,
+        markdown: str = "",
+        *,
+        purpose: str = "",
+        alt: str = "图片",
+        width: int = 800,
+        height: int = 0,
+        keep: int = 1,
+        reply_to_id: str | None = None,
+    ) -> tuple[bool, str]:
+        """发一条「文字 + 图」的 Markdown 消息，图走素材库引用。
+
+        为什么不用图文卡片（``msg_type=8``）：卡片要求 ``pic_url`` 必须是
+        https，而素材库给的预览链接**只有 1 小时有效期**（实测签名窗口
+        3600 秒），卡片挂久了图就裂。
+
+        Markdown 引用的是 ``qqbot-media://image/v1/<token>``，90 天滑动过期
+        （每次被引用就顺延），而且官方写明「发送时平台自动转存」——
+        消息发出去以后，素材删了也不影响已经发出去的那条消息。
+        """
+        try:
+            media = await self.upload_media_image(
+                image_bytes, filename="", purpose=purpose, keep=keep
+            )
+        except Exception as exc:
+            logger.warning("素材上传失败，Markdown 带图发不出去：%s", exc)
+            return False, ""
+        media_url = str(media.get("url") or "")
+        if not media_url:
+            logger.warning("素材库没有给引用地址，Markdown 带图发不出去")
+            return False, ""
+        ref = self.markdown_image_ref(media_url, alt=alt, width=width, height=height)
+        text = str(markdown or "").strip()
+        content = f"{text}\n\n{ref}" if text else ref
+        return await self.send_markdown_with_id(
+            session_id, content, reply_to_id=reply_to_id
+        )
 
     # ------------------------------------------------------------------
     # 图文卡片（msg_type=8）
