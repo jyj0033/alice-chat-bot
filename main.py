@@ -192,6 +192,12 @@ class GroupChatBot:
         self.config_path = config_path
         self.config = None
         self.personality = None
+        # 分群人格提示词：{group_id: persona_prompt}，空表示沿用全局人格
+        self.group_personas: dict[str, str] = {}
+        # 分群说话风格：{group_id: SpeakingStyle}
+        self.group_styles: dict = {}
+        # 人格模板缓存，随每次重建失效
+        self._persona_cache: dict[str, dict] = {}
 
         # 核心组件
         self.llm_providers: dict[str, LLMProvider] = {}  # 多 provider 支持
@@ -790,6 +796,123 @@ class GroupChatBot:
             min_message_length=typing_config.get("min_message_length", 10),
         )
 
+        # 分群人格变体（只准备提示词，运行时状态仍全局）
+        self._build_group_personas()
+
+    def _build_group_personas(self) -> None:
+        """按群构建人格提示词变体。
+
+        只覆盖提示词层面（名字、背景、性格、兴趣、禁忌）；情绪、注意力、
+        发言概率这些运行时状态仍是全局的 —— 多群并发时切换全局实例会串，
+        所以这里只准备文本，由调用方逐次传入生成请求。
+
+        配置：
+          groups.<群号>.persona_prompt     整段提示词，优先级最高
+          groups.<群号>.persona_template   config/personas/<name>.yaml 模板名
+          groups.<群号>.personality        字段覆盖，与全局人格浅合并，traits 深合并
+        """
+        base = self.personality.to_dict() if self.personality else {}
+        base_traits = dict(base.get("traits") or {})
+        self._persona_cache = {}
+        base_style = (self.config.get("personality", {}) or {}).get("speaking_style", {}) or {}
+        if not isinstance(base_style, dict):
+            base_style = {}
+        variants: dict[str, str] = {}
+        styles: dict[str, SpeakingStyle] = {}
+        groups = self.config.get("groups", {}) or {}
+        if isinstance(groups, dict):
+            for gid, group_config in groups.items():
+                if not isinstance(group_config, dict):
+                    continue
+                gid = str(gid)
+
+                # --- 人格提示词 ---
+                raw_prompt = str(group_config.get("persona_prompt") or "").strip()
+                if not raw_prompt:
+                    template = str(group_config.get("persona_template") or "").strip()
+                    if template:
+                        loaded = self._load_persona_template(template)
+                        if loaded:
+                            raw_prompt = loaded.get("persona_prompt", "").strip()
+                            # 模板自带说话风格，群内显式配置优先
+                            if not group_config.get("speaking_style"):
+                                tpl_style = loaded.get("speaking_style")
+                                if isinstance(tpl_style, dict) and tpl_style:
+                                    group_config = {**group_config, "speaking_style": tpl_style}
+                if raw_prompt:
+                    variants[gid] = raw_prompt
+                else:
+                    override = group_config.get("personality")
+                    if isinstance(override, dict) and override:
+                        merged = {**base, **override}
+                        if isinstance(override.get("traits"), dict):
+                            merged["traits"] = {**base_traits, **override["traits"]}
+                        try:
+                            variants[gid] = Personality.from_dict(merged).build_persona_prompt()
+                        except Exception as exc:
+                            logger.warning(f"群 {gid} 的人格配置无法解析，已跳过：{exc}")
+
+                # --- 说话风格（长度、标点、正式度等） ---
+                style_override = group_config.get("speaking_style")
+                if isinstance(style_override, dict) and style_override:
+                    try:
+                        styles[gid] = SpeakingStyle.from_dict(
+                            {**base_style, **style_override}
+                        )
+                    except Exception as exc:
+                        logger.warning(f"群 {gid} 的说话风格无法解析，已跳过：{exc}")
+
+        self.group_personas = variants
+        self.group_styles = styles
+        if variants or styles:
+            logger.info(
+                f"✓ 分群人格：{len(variants)} 个群独立提示词，"
+                f"{len(styles)} 个群独立说话风格"
+            )
+
+    def _load_persona_template(self, name: str) -> dict:
+        """读取 config/personas/<name>.yaml 人格模板。
+
+        模板名只允许字母数字下划线短横线，避免 ../ 之类的路径穿越。
+        读取失败只记日志返回空 dict，不阻断启动。
+        """
+        name = str(name or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            logger.warning(f"人格模板名不合法，已跳过：{name!r}")
+            return {}
+        if name in self._persona_cache:
+            return self._persona_cache[name]
+
+        path = Path(self.config_path).parent / "personas" / f"{name}.yaml"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            logger.warning(f"人格模板不存在：{path}")
+            return {}
+        except Exception as exc:
+            logger.warning(f"人格模板读取失败 {path}：{exc}")
+            return {}
+
+        if not isinstance(data, dict):
+            logger.warning(f"人格模板格式不对（应为映射）：{path}")
+            return {}
+        self._persona_cache[name] = data
+        logger.info(f"✓ 载入人格模板：{name}（{path.name}）")
+        return data
+
+    def _persona_prompt_for(self, group_id: str | None) -> str:
+        """取该群的人格提示词；没配置返回空串，表示沿用全局人格。"""
+        if not group_id:
+            return ""
+        return (getattr(self, "group_personas", None) or {}).get(str(group_id), "")
+
+    def _speaking_style_for(self, group_id: str | None) -> SpeakingStyle | None:
+        """取该群的说话风格；没配置返回 None，表示沿用全局。"""
+        if not group_id:
+            return None
+        return (getattr(self, "group_styles", None) or {}).get(str(group_id))
+
     def _refresh_personality_runtime(self) -> None:
         """热更新人格提示词和说话风格，但保留情绪/注意力等会话状态。"""
         personality_config = self.config.get("personality", {}) or {}
@@ -825,6 +948,9 @@ class GroupChatBot:
                 for topic in (self.personality.taboo_topics or [])
                 if str(topic).strip()
             ]
+
+        # 全局人格改动后，分群变体要按新基线重建
+        self._build_group_personas()
 
     def _init_social(self) -> None:
         """初始化社交感知"""
@@ -3589,6 +3715,8 @@ class GroupChatBot:
                         effective_message,
                         conversation_judgement,
                     ),
+                    persona_prompt=self._persona_prompt_for(group_id),
+                    speaking_style=self._speaking_style_for(group_id),
                 )
             except asyncio.CancelledError:
                 raise
@@ -3735,6 +3863,8 @@ class GroupChatBot:
                         ),
                         avoid_paraphrase=paraphrase_issue,
                         reply_review_hint=review_hint,
+                        persona_prompt=self._persona_prompt_for(group_id),
+                        speaking_style=self._speaking_style_for(group_id),
                     )
                     # generate() 当前返回包含表情包工具结果的 dict；兼容旧版
                     # 直接返回字符串，避免复读重答分支把 dict 当作文本继续处理。

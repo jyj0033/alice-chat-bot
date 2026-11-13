@@ -2,9 +2,11 @@
 爱丽丝 (Alice) - Web 管理面板
 """
 import asyncio
+import json
 import logging
 import os
 import secrets
+import sqlite3
 from collections import deque
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from fastapi import Depends, FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import uvicorn
+import yaml
 from core.config_store import load_config as load_config_file, mask_secrets, save_config as save_config_file
 from modules.llm.usage import site_label
 
@@ -202,6 +205,107 @@ async def get_config():
     return mask_secrets(config)
 
 
+PERSONAS_DIR = BASE_DIR / "config" / "personas"
+
+
+@app.get("/api/groups/discovered")
+async def discovered_groups():
+    """列出记忆库里出现过、但 config.yaml 里还没配置的群。
+
+    官方通道下群的标识是 group_openid，用户无法从群号反推，只能等群里
+    有消息推过来才知道。这个接口把「见过但没配」的群捞出来，面板就能
+    直接给它们配人格，不用去日志里翻 openid。
+    """
+    config = load_config()
+    configured = set((config.get("groups") or {}).keys())
+    found: dict[str, dict] = {}
+
+    # 来源一：机器人被拉进群时记下的 openid（还没人发言也能看到）
+    seen_file = BASE_DIR / "data" / "groups_seen.json"
+    if seen_file.exists():
+        try:
+            seen = json.loads(seen_file.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            seen = {}
+        if isinstance(seen, dict):
+            for gid, info in seen.items():
+                if not isinstance(info, dict) or info.get("action") == "del":
+                    continue
+                found[str(gid)] = {
+                    "group_id": str(gid),
+                    "message_count": 0,
+                    "last_seen": info.get("at"),
+                    "legacy": str(gid).isdigit(),
+                }
+
+    db_path = BASE_DIR / "data" / "memory.db"
+    if not db_path.exists():
+        return {"groups": [g for k, g in found.items() if k not in configured]}
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                "SELECT source_session, COUNT(*) AS n, MAX(created_at) AS last_at "
+                "FROM memories WHERE source_session LIKE 'group_%' "
+                "GROUP BY source_session ORDER BY last_at DESC"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(f"查询已发现的群失败：{exc}")
+        return {"groups": [g for k, g in found.items() if k not in configured]}
+
+    for sid, count, last_at in rows:
+        gid = str(sid or "")[len("group_"):]
+        if not gid:
+            continue
+        prev = found.get(gid) or {}
+        found[gid] = {
+            "group_id": gid,
+            "message_count": count,
+            "last_seen": last_at or prev.get("last_seen"),
+            "legacy": gid.isdigit(),
+        }
+
+    items = [g for k, g in found.items() if k not in configured]
+    items.sort(key=lambda g: (g["legacy"], -(g["message_count"] or 0)))
+    return {"groups": items}
+
+
+@app.get("/api/personas")
+async def list_personas():
+    """列出 config/personas/*.yaml，供面板「载入模板」使用。"""
+    items = []
+    if PERSONAS_DIR.is_dir():
+        for path in sorted(PERSONAS_DIR.glob("*.yaml")):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            prompt = str(data.get("persona_prompt") or "")
+            if not prompt.strip():
+                continue
+            # 取第一句真正的正文当预览：跳过标题行和过短的行
+            preview = ""
+            for line in prompt.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or len(line) < 8:
+                    continue
+                preview = line[:60]
+                break
+            items.append({
+                "name": path.stem,
+                "preview": preview,
+                "persona_prompt": prompt,
+                "speaking_style": data.get("speaking_style") or {},
+            })
+    return {"personas": items}
+
+
 @app.post("/api/config")
 async def update_config(request: Request):
     try:
@@ -275,9 +379,18 @@ async def update_config(request: Request):
                 current.get('personality', {}), data['personality']
             )
 
-        # 群组设置
+        # 群组设置：按群合并，避免「发言设置」保存时把该群的人格等字段整块抹掉；
+        # 提交里没出现的群视为删除。
         if 'groups' in data:
-            current['groups'] = data['groups']
+            submitted = data['groups'] or {}
+            existing = current.get('groups') or {}
+            merged_groups = {}
+            for gid, group_cfg in submitted.items():
+                base = existing.get(gid) or {}
+                merged_groups[gid] = (
+                    deep_merge(base, group_cfg) if isinstance(group_cfg, dict) else group_cfg
+                )
+            current['groups'] = merged_groups
 
         # 情感系统设置
         if 'emotion' in data:
@@ -790,6 +903,198 @@ async def distill_profiles():
     except Exception as e:
         logger.error(f"手动提炼用户画像失败：{e}")
         return {"success": False, "error": str(e)}
+
+
+IDENTITY_DB = BASE_DIR / "data" / "memory.db"
+IDENTITY_MAP = BASE_DIR / "data" / "person_id_map.json"
+
+
+def _identity_conn(readonly: bool = True) -> sqlite3.Connection:
+    if readonly:
+        conn = sqlite3.connect(f"file:{IDENTITY_DB}?mode=ro", uri=True, timeout=5)
+    else:
+        conn = sqlite3.connect(str(IDENTITY_DB), timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@app.get("/api/identity/pending")
+async def identity_pending():
+    """列出还没对上 openid 的老画像，以及昵称能匹配到的候选。"""
+    from core.identity import load_mapping, pending_candidates
+
+    def work():
+        mapping = load_mapping(IDENTITY_MAP)
+        if not IDENTITY_DB.exists():
+            return {"mapping": mapping, "pending": [], "error": "数据库不存在"}
+        conn = _identity_conn()
+        try:
+            return {"mapping": mapping, "pending": pending_candidates(conn, mapping)}
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(work)
+
+
+@app.post("/api/identity/bind")
+async def identity_bind(request: Request):
+    """把一个人的历史记忆从 QQ 号改写成 openid。"""
+    from core.identity import bind_one
+
+    data = await request.json()
+    qq = str(data.get("qq") or "").strip()
+    openid = str(data.get("openid") or "").strip()
+
+    def work():
+        conn = _identity_conn(readonly=False)
+        try:
+            return bind_one(conn, IDENTITY_MAP, qq, openid)
+        finally:
+            conn.close()
+
+    try:
+        result = await asyncio.to_thread(work)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"身份绑定失败：{exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    logger.info(f"身份已绑定：QQ {qq} -> {openid}，改写 {result['updated_memories']} 条记忆")
+    return {"success": True, **result}
+
+
+IDENTITY_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>爱丽丝 · 身份对齐</title>
+<style>
+:root{--bg:#f6f5fb;--card:#fff;--text:#1c1931;--sub:#5c5879;--muted:#9490ad;
+--border:rgba(28,25,49,.09);--primary:#7c6cff;--rose:#ec4899;--ok:#10b981;--warn:#f59e0b;
+--grad:linear-gradient(115deg,#7c6cff 0%,#c256e0 38%,#f06ba5 66%,#fbbf6c 100%);
+--radius:18px;--mono:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace}
+*{box-sizing:border-box}
+body{margin:0;padding:28px 20px 60px;background:var(--bg);color:var(--text);
+font:15px/1.6 -apple-system,'Segoe UI','Noto Sans SC',sans-serif}
+.wrap{max-width:920px;margin:0 auto}
+h1{font-size:24px;margin:0 0 6px;background:var(--grad);-webkit-background-clip:text;
+background-clip:text;color:transparent;display:inline-block}
+.lead{color:var(--sub);margin:0 0 22px;font-size:14px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+padding:18px 20px;margin-bottom:16px;box-shadow:0 6px 24px -18px rgba(28,25,49,.4)}
+.row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.person{padding:14px 0;border-bottom:1px solid var(--border)}
+.person:last-child{border-bottom:0}
+.name{font-weight:600}
+.qq{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.meta{font-size:12.5px;color:var(--sub);margin-top:3px}
+.tag{font-size:11.5px;padding:2px 9px;border-radius:99px;background:rgba(124,108,255,.1);
+color:#5b4bff;font-weight:600}
+.tag.ok{background:rgba(16,185,129,.12);color:#0b7a5b}
+.tag.warn{background:rgba(245,158,11,.14);color:#9a6408}
+button{border:0;border-radius:10px;padding:7px 14px;font-size:13px;font-weight:600;
+cursor:pointer;background:var(--primary);color:#fff}
+button:hover{filter:brightness(1.06)}
+button.ghost{background:rgba(124,108,255,.1);color:#5b4bff}
+button:disabled{opacity:.45;cursor:default}
+input{border:1px solid var(--border);border-radius:10px;padding:8px 12px;font-size:13.5px;
+font-family:var(--mono);min-width:250px;background:#fbfaff}
+.empty{color:var(--muted);font-size:14px;padding:10px 0}
+code{font-family:var(--mono);font-size:12px;background:rgba(124,108,255,.08);
+padding:1px 6px;border-radius:6px}
+#toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(20px);
+background:#1c1931;color:#fff;padding:11px 20px;border-radius:12px;font-size:13.5px;
+opacity:0;transition:.25s;pointer-events:none}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style></head><body><div class="wrap">
+<h1>身份对齐</h1>
+<p class="lead">官方通道用 openid，NapCat 时代用 QQ 号。绑定后，这个人的历史画像和聊天素材会接到新身份上，爱丽丝不会再把他当新人。</p>
+
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <strong>待认领</strong>
+    <button class="ghost" onclick="load()">刷新</button>
+  </div>
+  <div id="pending"><div class="empty">加载中…</div></div>
+</div>
+
+<div class="card">
+  <strong>手动绑定</strong>
+  <p class="meta">知道 openid 时直接填。openid 是 32 位十六进制，可从群消息日志里取。</p>
+  <div class="row" style="margin-top:10px">
+    <input id="qq" placeholder="QQ 号，如 123456789" style="min-width:170px">
+    <input id="openid" placeholder="openid，32 位十六进制">
+    <button onclick="manualBind()">绑定</button>
+  </div>
+</div>
+
+<div class="card">
+  <strong>已绑定</strong>
+  <div id="bound" class="meta">加载中…</div>
+</div>
+</div>
+<div id="toast"></div>
+<script>
+function toast(msg){const t=document.getElementById('toast');t.textContent=msg;
+t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600);}
+function esc(s){return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function load(){
+  try{
+    const r=await fetch('/api/identity/pending');const d=await r.json();
+    renderPending(d.pending||[]);renderBound(d.mapping||{});
+  }catch(e){document.getElementById('pending').innerHTML='<div class="empty">加载失败：'+esc(e.message)+'</div>';}
+}
+function renderPending(list){
+  const box=document.getElementById('pending');
+  if(!list.length){box.innerHTML='<div class="empty">全部对上了，没有待认领的人。</div>';return;}
+  box.innerHTML=list.map(p=>{
+    const names=p.names.map(esc).join(' / ');
+    const cands=(p.candidates||[]).map(c=>
+      `<button class="ghost" onclick="bind('${p.qq}','${c.openid}')">认领 → ${esc(c.name)}（${c.messages} 条）</button>`
+    ).join(' ');
+    const tag=p.confidence==='high'?'<span class="tag ok">可自动匹配</span>'
+      :(p.confidence==='low'?'<span class="tag warn">多个同名</span>':'<span class="tag">新通道未发言</span>');
+    return `<div class="person"><div class="row" style="justify-content:space-between">
+      <div><span class="name">${names||'未知'}</span> <span class="qq">${p.qq}</span> ${tag}
+      <div class="meta">素材 ${p.fact_count} 条 · 最近 ${esc((p.last_active||'').slice(0,16))} · 群 ${p.sessions.map(s=>esc(s)).join('、')||'-'}</div></div>
+      <div>${cands||''}</div></div></div>`;
+  }).join('');
+}
+function renderBound(mapping){
+  const keys=Object.keys(mapping||{});
+  const box=document.getElementById('bound');
+  if(!keys.length){box.textContent='暂无';return;}
+  box.innerHTML=keys.map(k=>`<div style="font-family:var(--mono);font-size:12.5px;padding:3px 0">
+    ${esc(k)} → ${esc(mapping[k])}</div>`).join('');
+}
+async function bind(qq,openid){
+  if(!confirm('确认这个 QQ 号就是该 openid 本人？\\n绑定后他的历史记忆会迁到新身份。')) return;
+  await post({qq,openid});
+}
+async function manualBind(){
+  const qq=document.getElementById('qq').value.trim();
+  const openid=document.getElementById('openid').value.trim();
+  if(!qq||!openid){toast('两个都要填');return;}
+  await post({qq,openid});
+}
+async function post(payload){
+  try{
+    const r=await fetch('/api/identity/bind',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.detail||'绑定失败');
+    toast(`已绑定，改写 ${d.updated_memories} 条记忆，合并 ${d.merged_profiles} 组画像`);
+    document.getElementById('qq').value='';document.getElementById('openid').value='';
+    load();
+  }catch(e){toast(e.message);}
+}
+load();
+</script></body></html>"""
+
+
+@app.get("/identity")
+async def identity_page():
+    return HTMLResponse(content=IDENTITY_PAGE)
 
 
 @app.get("/api/token-usage")

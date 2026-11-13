@@ -1179,6 +1179,7 @@
                 <div class="nav-item" data-page="memory"><svg class="icon"><use href="#i-layers"/></svg> 记忆设置</div>
                 <div class="nav-item" data-page="memes"><svg class="icon"><use href="#i-image"/></svg> 表情包</div>
                 <div class="nav-item" data-page="profiles"><svg class="icon"><use href="#i-users"/></svg> 用户画像</div>
+                <a class="nav-item" href="/identity" style="text-decoration:none"><svg class="icon"><use href="#i-users"/></svg> 身份对齐</a>
                 <div class="nav-item" data-page="slang"><svg class="icon"><use href="#i-archive"/></svg> 群聊黑话</div>
                 <div class="nav-item" data-page="knowledge"><svg class="icon"><use href="#i-layers"/></svg> 资料库</div>
                 <div class="nav-item" data-page="behavior"><svg class="icon"><use href="#i-puzzle"/></svg> 高级行为</div>
@@ -1908,7 +1909,7 @@
                     </div>
                     <div class="table-responsive">
                         <table class="table" id="group-table">
-                            <thead><tr><th>群号</th><th>启用</th><th>发言概率</th><th>操作</th></tr></thead>
+                            <thead><tr><th>群号</th><th>启用</th><th>发言概率</th><th>人格</th><th>操作</th></tr></thead>
                             <tbody id="group-tbody"></tbody>
                         </table>
                     </div>
@@ -3287,6 +3288,114 @@
                 });
         }
 
+        // 分群人格：编辑结果先存内存，随「保存设置」一起提交
+        const groupPersonaStore = {};
+        const groupStyleStore = {};
+        // 群引用的是模板文件时，记下模板名，表格里显示「模板 xxx」而不是「跟随全局」
+        const groupTemplateStore = {};
+        // 记忆库里见过、但 config 里还没写的群，记下用户动过哪些
+        const touchedGroups = new Set();
+        function markGroupTouched(el) {
+            const row = el.closest('tr');
+            if (row) touchedGroups.add(row.dataset.groupId);
+        }
+        function groupRowHtml(id, cfg, opts) {
+            const o = opts || {};
+            const enabled = cfg.enabled !== false;
+            const prob = cfg.speaking_probability ?? 0.02;
+            const badge = o.discovered
+                ? `<div style="font-size:11px;color:#b18b2e;margin-top:2px">未配置 · 见过 ${o.count || 0} 条消息</div>`
+                : '';
+            return `<tr data-group-id="${escapeAttr(id)}"${o.discovered ? ' data-discovered="1"' : ''}>`
+                + `<td style="font-family: monospace; font-weight: 600;">${escapeHtml(id)}${badge}</td>`
+                + `<td><input class="group-enabled" type="checkbox" ${enabled ? 'checked' : ''} onchange="markGroupTouched(this)"></td>`
+                + `<td><input class="group-prob" type="number" min="0" max="1" step="0.01" value="${prob}" onchange="markGroupTouched(this)"></td>`
+                + `<td>${personaCell(id)}</td>`
+                + `<td><button class="btn-icon danger" title="删除" onclick="removeGroup(this)"><svg class="icon-sm"><use href="#i-trash"/></svg></button></td>`
+                + `</tr>`;
+        }
+        // 拉取「见过但没配置」的群，追加到表格；这类行只有用户动过才参与保存
+        async function renderDiscoveredGroups(tbody) {
+            try {
+                const res = await fetch(API + '/groups/discovered');
+                const data = await res.json();
+                for (const g of (data.groups || [])) {
+                    if (g.legacy) continue;                       // NapCat 时代的纯数字群号，官方通道用不上
+                    if (tbody.querySelector(`tr[data-group-id="${g.group_id}"]`)) continue;
+                    tbody.innerHTML += groupRowHtml(g.group_id, { enabled: true }, { discovered: true, count: g.message_count });
+                }
+            } catch (e) { /* 接口不可用时静默跳过 */ }
+        }
+        function personaCell(id) {
+            const tpl = groupTemplateStore[id] || '';
+            const has = !!(groupPersonaStore[id] || '').trim();
+            const label = has ? '独立人格' : (tpl ? '模板 ' + tpl : '跟随全局');
+            return `<button class="btn btn-secondary btn-sm" onclick="editGroupPersona('${escapeAttr(id)}')">${escapeHtml(label)}</button>`;
+        }
+        function editGroupPersona(id) {
+            document.getElementById('persona-modal-group').value = id;
+            document.getElementById('persona-modal-title').textContent = '分群人格 · ' + id;
+            document.getElementById('persona-modal-text').value = groupPersonaStore[id] || '';
+            const st = groupStyleStore[id] || {};
+            document.getElementById('persona-maxlen').value = st.max_reply_length ?? '';
+            document.getElementById('persona-directlen').value = st.direct_max_reply_length ?? '';
+            document.getElementById('persona-modal').style.display = 'flex';
+            loadPersonaTemplates();
+        }
+        function closePersonaModal() {
+            document.getElementById('persona-modal').style.display = 'none';
+        }
+        // 人格模板：从 config/personas/*.yaml 拉取，填进文本框后仍按 persona_prompt 保存
+        let personaTemplates = null;
+        async function loadPersonaTemplates() {
+            if (personaTemplates) return personaTemplates;
+            try {
+                const res = await fetch(API + '/personas');
+                const data = await res.json();
+                personaTemplates = data.personas || [];
+            } catch (e) {
+                personaTemplates = [];
+            }
+            const sel = document.getElementById('persona-template');
+            if (sel && personaTemplates.length) {
+                sel.innerHTML = '<option value="">载入现成模板…</option>' + personaTemplates
+                    .map(p => `<option value="${escapeAttr(p.name)}">${escapeHtml(p.name)} · ${escapeHtml(p.preview || '')}</option>`)
+                    .join('');
+            }
+            return personaTemplates;
+        }
+        async function applyPersonaTemplate() {
+            const sel = document.getElementById('persona-template');
+            const name = sel && sel.value;
+            if (!name) { showToast('先选一个模板', 'error'); return; }
+            const list = await loadPersonaTemplates();
+            const tpl = list.find(p => p.name === name);
+            if (!tpl) return;
+            const ok = !document.getElementById('persona-modal-text').value.trim()
+                || confirm('会覆盖当前文本框内容，继续？');
+            if (!ok) return;
+            document.getElementById('persona-modal-text').value = tpl.persona_prompt;
+            const st = tpl.speaking_style || {};
+            if (st.max_reply_length) document.getElementById('persona-maxlen').value = st.max_reply_length;
+            if (st.direct_max_reply_length) document.getElementById('persona-directlen').value = st.direct_max_reply_length;
+            showToast('已填入模板 ' + name, 'success');
+        }
+        function savePersonaModal() {
+            const id = document.getElementById('persona-modal-group').value;
+            groupPersonaStore[id] = document.getElementById('persona-modal-text').value;
+            const style = {};
+            const maxLen = parseInt(document.getElementById('persona-maxlen').value, 10);
+            const directLen = parseInt(document.getElementById('persona-directlen').value, 10);
+            if (!isNaN(maxLen) && maxLen > 0) style.max_reply_length = maxLen;
+            if (!isNaN(directLen) && directLen > 0) style.direct_max_reply_length = directLen;
+            groupStyleStore[id] = style;
+            touchedGroups.add(id);
+            const row = document.querySelector(`#group-tbody tr[data-group-id="${id}"]`);
+            if (row && row.children[3]) row.children[3].innerHTML = personaCell(id);
+            closePersonaModal();
+            showToast('已记录，点「保存设置」后生效', 'success');
+        }
+
         // 加载发言设置
         async function loadSpeakingConfig() {
             const config = await fetch(API + '/config').then(r => r.json());
@@ -3307,34 +3416,50 @@
             const tbody = document.getElementById('group-tbody');
             tbody.innerHTML = '';
             for (const [id, cfg] of Object.entries(groups)) {
-                tbody.innerHTML += `<tr data-group-id="${escapeAttr(id)}"><td style="font-family: monospace; font-weight: 600;">${escapeHtml(id)}</td><td><input class="group-enabled" type="checkbox" ${cfg.enabled !== false ? 'checked' : ''}></td><td><input class="group-prob" type="number" min="0" max="1" step="0.01" value="${cfg.speaking_probability ?? 0.02}"></td><td><button class="btn-icon danger" title="删除" onclick="removeGroup(this)"><svg class="icon-sm"><use href="#i-trash"/></svg></button></td></tr>`;
+                groupPersonaStore[id] = cfg.persona_prompt || '';
+                groupStyleStore[id] = cfg.speaking_style || {};
+                groupTemplateStore[id] = cfg.persona_template || '';
+                tbody.innerHTML += groupRowHtml(id, cfg, {});
             }
+            renderDiscoveredGroups(tbody);
         }
 
         function addGroup() {
-            const id = prompt('输入群号:');
+            const id = prompt('输入群号（官方通道填 group_openid）:');
             if (!id) return;
-            if (!/^\d+$/.test(id)) { showToast('群号只能包含数字', 'error'); return; }
+            if (!/^[A-Za-z0-9_-]+$/.test(id)) { showToast('群号只能包含字母、数字、下划线和短横线', 'error'); return; }
             const tbody = document.getElementById('group-tbody');
             if ([...tbody.querySelectorAll('tr')].some(row => row.dataset.groupId === id)) {
                 showToast('这个群已经存在', 'error');
                 return;
             }
-            tbody.innerHTML += `<tr data-group-id="${escapeAttr(id)}"><td style="font-family: monospace; font-weight: 600;">${escapeHtml(id)}</td><td><input class="group-enabled" type="checkbox" checked></td><td><input class="group-prob" type="number" min="0" max="1" step="0.01" value="0.02"></td><td><button class="btn-icon danger" title="删除" onclick="removeGroup(this)"><svg class="icon-sm"><use href="#i-trash"/></svg></button></td></tr>`;
+            groupPersonaStore[id] = groupPersonaStore[id] || '';
+            touchedGroups.add(id);
+            tbody.innerHTML += groupRowHtml(id, { enabled: true }, {});
         }
 
         function removeGroup(button) {
-            button.closest('tr').remove();
+            const row = button.closest('tr');
+            if (row) touchedGroups.delete(row.dataset.groupId);
+            row.remove();
         }
 
         async function saveSpeaking() {
             const keywords = document.getElementById('speaking-keywords').value.split(',').map(k => k.trim()).filter(k => k);
             const groups = {};
             document.querySelectorAll('#group-tbody tr').forEach(row => {
-                groups[row.dataset.groupId] = {
+                const gid = row.dataset.groupId;
+                // 自动发现但没动过的群不写进配置，否则会凭空多出一堆 0.02 概率
+                if (row.dataset.discovered === '1' && !touchedGroups.has(gid)) return;
+                const entry = {
                     enabled: row.querySelector('.group-enabled').checked,
                     speaking_probability: parseFloat(row.querySelector('.group-prob').value)
                 };
+                // 人格提示词随表单一并提交，空串表示恢复全局人格
+                entry.persona_prompt = groupPersonaStore[gid] || '';
+                const st = groupStyleStore[gid];
+                if (st && Object.keys(st).length) entry.speaking_style = st;
+                groups[gid] = entry;
             });
             const config = {
                 speaking: {
@@ -5218,5 +5343,32 @@
             document.querySelectorAll('.reveal').forEach(function (el) { io.observe(el); });
         })();
     </script>
+    <div id="persona-modal" style="display:none;position:fixed;inset:0;background:rgba(28,25,49,.45);align-items:center;justify-content:center;z-index:999">
+        <div style="background:#fff;border-radius:18px;padding:22px;width:min(640px,92vw);box-shadow:0 24px 60px -24px rgba(124,108,255,.4)">
+            <div id="persona-modal-title" style="font-weight:700;margin-bottom:6px"></div>
+            <p style="font-size:12.5px;color:#9490ad;margin:0 0 12px">留空表示跟随全局人格。填写后，这个群的回复只使用这段设定；情绪、注意力仍与其他群共用。</p>
+            <div style="display:flex;gap:8px;margin-bottom:10px">
+                <select id="persona-template" style="flex:1;border:1px solid rgba(28,25,49,.18);border-radius:10px;padding:8px 10px;font-size:13px;background:#fff;color:#1c1931">
+                    <option value="">载入现成模板…</option>
+                </select>
+                <button class="btn btn-secondary btn-sm" onclick="applyPersonaTemplate()">填入</button>
+            </div>
+            <textarea id="persona-modal-text" placeholder="例如：你叫阿蓝，是这群的技术顾问。说话克制，不主动卖萌，回答偏短。" style="width:100%;height:200px;border:1px solid rgba(28,25,49,.18);border-radius:12px;padding:12px;font-size:13.5px;line-height:1.6;resize:vertical;font-family:inherit"></textarea>
+            <div style="display:flex;gap:14px;margin-top:12px">
+                <label style="font-size:12.5px;color:#5c5879;display:flex;align-items:center;gap:6px">插话上限
+                    <input type="number" id="persona-maxlen" min="1" max="200" placeholder="20" style="width:80px;border:1px solid rgba(28,25,49,.18);border-radius:9px;padding:6px 9px;font-size:13px">
+                </label>
+                <label style="font-size:12.5px;color:#5c5879;display:flex;align-items:center;gap:6px">问答上限
+                    <input type="number" id="persona-directlen" min="1" max="500" placeholder="80" style="width:80px;border:1px solid rgba(28,25,49,.18);border-radius:9px;padding:6px 9px;font-size:13px">
+                </label>
+                <span style="font-size:12px;color:#9490ad;align-self:center">留空 = 沿用全局</span>
+            </div>
+            <input type="hidden" id="persona-modal-group">
+            <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px">
+                <button class="btn btn-secondary" onclick="closePersonaModal()">取消</button>
+                <button class="btn btn-primary" onclick="savePersonaModal()">确定</button>
+            </div>
+        </div>
+    </div>
 </body>
 </html>

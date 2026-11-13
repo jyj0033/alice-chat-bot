@@ -122,6 +122,115 @@ llm_routing:
 
 功能路由只引用已有 Provider，不会复制 API Key 或模型参数；搜索和视觉模型原有的独立配置仍可继续使用，显式选择功能路由后才会覆盖对应入口。
 
+### 分群人格
+
+同一个 Bot 可以在不同群扮演不同角色。三种写法，任选：
+
+```yaml
+groups:
+  "<群号或 group_openid>":
+    enabled: true
+    speaking_probability: 0.05
+    # 写法一：引用模板文件 config/personas/<名字>.yaml（最省事）
+    persona_template: suomi
+    # 写法二：整段提示词，优先级最高
+    persona_prompt: |
+      你叫阿蓝，是这群的技术顾问。说话克制，不主动卖萌，回答偏短。
+    # 写法三：字段覆盖，与全局 personality 浅合并（traits 深合并）
+    personality:
+      name: 阿蓝
+      background: 你是这群的技术顾问，说话克制。
+      traits:
+        agreeableness: 0.3
+    # 说话风格也能按群覆盖，字段同全局 personality.speaking_style
+    speaking_style:
+      max_reply_length: 40          # 插话时的单条上限
+      direct_max_reply_length: 120  # 明确问 bot 时的上限
+```
+
+`persona_template` 会在 `config/personas/` 下找同名 yaml，读 `persona_prompt` 和
+`speaking_style`；群内写了 `persona_prompt` 或 `speaking_style` 时以群内为准。
+模板名只允许字母、数字、下划线、短横线，防止路径穿越。
+
+没配 `persona_prompt`、`persona_template` 也没配 `personality` 的群，继续使用全局人格。
+管理面板「发言设置 → 群组设置」里的「人格」按钮可以直接编辑 `persona_prompt`
+和两个长度上限，也能从下拉里载入 `config/personas/` 下的现成模板；空着表示跟随全局。
+
+**新群怎么配**：官方通道下群标识是 `group_openid`，没法从 QQ 群号反推，只能等群里
+有消息推过来。所以流程是「把 Bot 拉进群 → 群里 @ 它一句 → 打开面板刷新」，这个群会以
+「未配置 · 见过 N 条消息」的形式自动出现在群组列表里，点「人格」载入模板保存即可。
+没动过的自动发现行不会写进配置，不会偷偷改动它们的发言概率。
+
+**隔离范围**：
+
+| 维度 | 隔离方式 |
+|---|---|
+| 对话上下文 / 记忆 | 按 session（`group_xxx`） |
+| 用户画像 | 按 `(sender_id, 群)` |
+| 情绪 | 按 session，`EmotionalManager._states` |
+| 注意力 | 按群，`AttentionManager._group_states` |
+| 疲劳 | 按 session，`FatigueManager._session_states` |
+| 发言权 | 无状态，按本群最近消息实时算 |
+| 发言概率 | 按群配置 `speaking_probability` |
+| 人格提示词 | 按群 `persona_prompt` / `persona_template` / `personality` |
+| 说话风格 | 按群 `speaking_style` |
+
+官方通道下群号是 32 位 `group_openid`，不是 QQ 群号。
+
+### 新群接老数据
+
+把人拉进新群之后，人和历史都在，但「画像」是按群存的，所以新群里对同一个人
+一无所知。用 `scripts/match_group_people.py` 补上：
+
+```bash
+# 1) 先看能认出谁（默认 dry-run，不改数据）
+docker exec alice-chat-bot python /app/scripts/match_group_people.py \
+    --group 0EED38B0F55E000F60E601F536A71116
+
+# 2) 认人 + 绑定 openid + 把画像复制到新群
+docker exec alice-chat-bot python /app/scripts/match_group_people.py \
+    --group 0EED38B0F55E000F60E601F536A71116 --apply
+
+# 3) 顺便带一部分原始历史过去（每人最近 N 条）
+docker exec alice-chat-bot python /app/scripts/match_group_people.py \
+    --group 0EED38B0F55E000F60E601F536A71116 --apply --copy-history 30
+```
+
+它做三件事：
+
+| 步骤 | 行为 |
+|---|---|
+| 认人 | 用群昵称比对别处的画像和 `person_aliases` 别名表，只认「唯一候选」 |
+| 绑定 | 把 QQ 号的历史记忆改写到 openid，写回 `data/person_id_map.json` |
+| 移植画像 | 把别处的画像**复制**一份到目标群，原件保留（只复制不搬走） |
+
+没匹配上的（昵称改过、或者从没在别的群发过言）会跳过，等他再说话重跑一次即可。
+多人同名会有多候选，脚本不猜，需要人工在面板里指定。
+
+### 群会话映射（NapCat 数字群号 → group_openid）
+
+一个人的 openid 在同一个 AppID 下是固定的，但**群**的标识从数字群号换成了
+`group_openid`，两者无法互相推导，只能按成员构成人工对一次。对错了会把历史
+挂到别的群名下，表现是「群里的人它一个都不认识」。
+
+对的办法是看**独有成员**：只在某个老群里出现过的人，如果开始在新群发言，就能
+确定这个新群对应哪个老群。`scripts/fix_group_mapping.py` 是纠错用的，里面写死
+了本项目当前的对应关系：
+
+```python
+MENGYUE   = "group_2E654444..."   # 盟约（官方）
+SHOUHU    = "group_0EED38B0..."   # 守护全世界最好的玲（官方）
+OLD_724   = "group_724786753"     # → 守护玲
+OLD_333   = "group_333863057"     # → 盟约
+```
+
+默认 dry-run，`--apply` 会先整库备份。当前核对结果：
+
+| 官方群 | 群名 | 成员数 | 对应 NapCat 群号 | 记忆条数 |
+|---|---|---|---|---|
+| `2E654444…` | 盟约 | 44 | 333863057 | 5638 |
+| `0EED38B0…` | 守护全世界最好的玲 | 36 | 724786753 | 18205 |
+
 ### 群聊目标判断
 
 群聊消息会先由一个短 JSON 判断调用结合发送者、@、引用和最近上下文判断“主要在对谁说、Bot 是否应该接话”。这不是思维链，也不会让模型生成隐藏推理；判断失败时会保守回退到旧规则。

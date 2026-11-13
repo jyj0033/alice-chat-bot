@@ -146,14 +146,34 @@ openid 不通用。新旧记忆不会互相污染，但也不会自动接上。
 | 合并转发 | ✅ | ❌ | 官方无此接口，`mode="forward"` 自动降级为逐张发送 |
 | 戳一戳 | ✅ | ❌ | 官方无戳一戳接口，`poke()` 返回 False |
 | 撤回自己发的消息 | ✅ | ✅ | 官方限制 2 分钟内 |
-| 群成员昵称 | ✅ | ⚠️ | 群成员接口是白名单能力（错误码 11253），拿不到就返回空串 |
-| 群黑名单 / 禁言 | ✅ | ❌ | 官方侧未开放（内邀中） |
+| 群成员昵称 | ✅ | ⚠️ | 消息事件自带 `author.username` 可用；成员列表接口是白名单（11253） |
+| 群黑名单 | ✅ | ❌ | 11253 白名单（内邀中） |
+| 群禁言 | ✅ | ⚠️ | 查询/设置均可用，要求机器人是群管理员，最长 30 天、单次 10 人；代码尚未接 |
+| 群信息 / 群人数 | ✅ | ✅ | `GET /v2/groups/{openid}/info`，实测无需白名单 |
+| 入群审批 | ✅ | ✅ | 申请列表、审批、自动审批策略实测可用 |
+| 成员列表 / 批量踢人 | ✅ | ❌ | 11253 白名单（内邀中） |
 | QQ 号 / 头像 | ✅ | ❌ | 官方拿不到 QQ 号；头像接口需要 QQ 号，恒为空 |
 | 群历史消息 API | ✅ | ❌ | 官方没有；日报只能靠 bot 自建历史表，**切换后旧的历史查不到** |
 | 主动插话 / 群日报 | ✅ | ⚠️ | 用户可关「允许主动发送」，关了主动消息必失败 |
 | Markdown 消息 | ❌ | ✅ | 官方 `msg_type=2` 支持，NapCat 侧没接 |
 
 ---
+
+### 4.1 实测权限边界（2026-11-12，群「盟约」44 人，Bot 为管理员）
+
+| 接口 | 结果 |
+|---|---|
+| `GET /v2/groups/{gid}/info` | ✅ 返回群名、人数 |
+| `GET /v2/groups/{gid}/bot_state` | ✅ `member_role=admin`、`recv_msg_setting=all`、`allow_proactive_msg=true` |
+| `GET /v2/groups/{gid}/restrict_chat_setting` | ✅ 返回全局禁言规则 |
+| `GET /v2/groups/{gid}/join_request_list` | ✅ |
+| `GET /v2/groups/join_approval_strategy` | ✅ |
+| `GET /v2/groups/{gid}/members` | ❌ 11253 |
+| `GET /v2/groups/{gid}/members/{openid}` | ❌ 11253 |
+| `GET /v2/groups/{gid}/member_blacklist` | ❌ 11253 |
+
+结论：群管理（禁言、撤回他人消息、入群审批）可用；**成员名册类接口需要白名单**，
+与机器人是否为管理员无关。
 
 ## 5. 部署步骤
 
@@ -191,8 +211,45 @@ docker restart alice-chat-bot
 docker logs alice-chat-bot 2>&1 | grep -E '官方|access_token|网关|就绪'
 ```
 
-### 5.3 NapCat 下线（可选）
+### 5.3 身份迁移：让老画像接上新身份
 
+官方通道的 `sender_id` 是 openid，NapCat 时代是 QQ 号。两者的记忆都在同一个
+`memory.db` 里，只是主键对不上——不改写的话，同一个人会攒出两份互不相干的画像。
+
+映射文件：`data/person_id_map.json`
+
+```json
+{
+  "note": "NapCat 时代的 QQ 号 -> 官方 openid 映射。",
+  "mapping": {
+    "2399634605": "4B4CF9FDD307941C394E121A5786B274"
+  }
+}
+```
+
+```bash
+# 预演：只看会改多少条，不写库
+docker exec alice-chat-bot python3 /app/scripts/migrate_official_ids.py --dry-run --auto-match
+
+# 执行（自动整库备份到 data/memory.db.bak.identity-<时间>）
+docker exec alice-chat-bot python3 /app/scripts/migrate_official_ids.py --apply
+```
+
+改写的范围：`memories.metadata.sender_id`、`person_aliases.qq_id`、
+`profile_suppressions.sender_id`、`profile_attempts.sender_id`。只改 ID，
+记忆内容和画像文本一字不动，可重复执行。
+
+**日常用面板，不用手改 JSON**：管理面板侧栏「用户画像 → 身份对齐」
+（`/identity`）会列出所有还没对上号的老画像，昵称能唯一命中的标「可自动匹配」，
+点一下即完成绑定；同名多人或没在官方通道发过言的会标成对应状态，等他们开口后刷新即可。
+
+`--auto-match` 只读，它拿老画像的昵称去官方通道已出现的 openid 里找同名候选，
+不会自动写库——重名和改昵称都必须人来确认。
+
+> 注意：官方通道拿不到 QQ 号（`union_user_account` 需单独申请且默认空），
+> 所以不存在"自动全量对齐"，只能逐人确认一次。确认过的不会再问。
+
+### 5.4 NapCat 下线（可选）
 官方通道跑通后，NapCat 容器可以停掉：
 
 ```bash

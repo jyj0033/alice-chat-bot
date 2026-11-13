@@ -25,6 +25,7 @@ import re
 import time
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import quote
 
@@ -186,6 +187,8 @@ class OfficialQQAdapter(PlatformAdapter):
         # 同一条消息可能重复推送（官方明确说要用 msg_seq 去重）
         self._seen_message_ids: set[str] = set()
         self._seen_message_order = deque(maxlen=4000)
+        # 已经打过招呼的群：首次收到某群消息时记一条 INFO，方便拿到 group_openid
+        self._announced_groups: set[str] = set()
 
         # message_id ↔ REFIDX 双向索引：官方通道的引用回复只认 REFIDX
         self._ref_idx_by_msg_id: dict[str, str] = {}
@@ -654,7 +657,28 @@ class OfficialQQAdapter(PlatformAdapter):
             logger.info("官方会话已恢复")
             return
         self._last_event_at = time.time()
+        if event_type == "GROUP_ADD_ROBOT":
+            gid = str(data.get("group_openid") or "")
+            self._record_seen_group(gid, "add")
+            logger.info(
+                "机器人被添加到新群：group_openid=%s —— 可在面板「发言设置 → 群组设置」"
+                "给这个群单独配人格",
+                gid or "-",
+            )
+            return
+        if event_type == "GROUP_DEL_ROBOT":
+            gid = str(data.get("group_openid") or "")
+            self._record_seen_group(gid, "del")
+            logger.info("机器人被移出群：group_openid=%s", gid or "-")
+            return
         if event_type in GROUP_EVENTS:
+            gid = str(data.get("group_openid") or "")
+            if gid and gid not in self._announced_groups:
+                self._announced_groups.add(gid)
+                self._record_seen_group(gid, "message")
+                logger.info(
+                    "首次收到群消息：group_openid=%s（会话标识 group_%s）", gid, gid
+                )
             if self._is_poke_scene(data):
                 await self._emit_poke_notice(data, str(data.get("group_openid") or ""))
                 return
@@ -665,7 +689,11 @@ class OfficialQQAdapter(PlatformAdapter):
                 return
             message = self._parse_c2c_message(data)
         else:
-            logger.debug("忽略官方事件：%s", event_type)
+            if event_type.startswith("GROUP_"):
+                # 群成员变动、消息审核这些暂时没有业务，但打出来能拿到 group_openid
+                logger.info("收到未处理的群事件：%s", event_type)
+            else:
+                logger.debug("忽略官方事件：%s", event_type)
             return
         if message is None:
             return
@@ -680,6 +708,33 @@ class OfficialQQAdapter(PlatformAdapter):
                 raise
             except Exception as exc:
                 logger.error("消息回调执行失败：%s", exc, exc_info=True)
+
+    def _record_seen_group(self, group_openid: str, action: str) -> None:
+        """记录「机器人被拉进/移出群」的 group_openid。
+
+        开放平台没有「查询机器人所在群列表」的接口，群 openid 只能从事件里
+        拿。落到 data/groups_seen.json，管理面板在没人发言时也能看到新群。
+        """
+        gid = str(group_openid or "").strip()
+        if not gid:
+            return
+        path = Path("data") / "groups_seen.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            items: dict[str, Any] = {}
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8") or "{}")
+                if isinstance(loaded, dict):
+                    items = loaded
+            items[gid] = {
+                "action": action,
+                "at": datetime.now().isoformat(timespec="seconds"),
+            }
+            path.write_text(
+                json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception as exc:
+            logger.warning("记录群 %s 失败：%s", gid, exc)
 
     def _remember_message_id(self, message_id: str) -> bool:
         message_id = str(message_id or "").strip()
