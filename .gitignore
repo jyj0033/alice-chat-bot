@@ -35,6 +35,7 @@ logs/
 # 临时文件
 *.tmp
 *.cache
+_after.txt
 .playwright-mcp/
 
 # 本地智能体工作目录（记忆/会话数据，属本机状态）
