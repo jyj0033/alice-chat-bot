@@ -1176,6 +1176,17 @@ class OfficialQQAdapter(PlatformAdapter):
         reply_to_id: str | None = None,
     ) -> tuple[bool, str]:
         """发送文本消息，返回 (是否成功, 平台消息 ID)。"""
+        # 面板线程（uvicorn 自带事件循环）和 bot 主循环不是同一个 loop，
+        # 直接用主循环创建的 aiohttp session 会抛
+        # "Timeout context manager should be used inside a task"。
+        # 这里先切回适配器所属的循环再发，和 disconnect() 用同一套办法。
+        owner = self._foreign_owner_loop()
+        if owner is not None:
+            future = asyncio.run_coroutine_threadsafe(
+                self.send_message_with_id(session_id, content, reply_to_id=reply_to_id),
+                owner,
+            )
+            return await asyncio.wrap_future(future)
         if not self._connected:
             logger.error("官方通道未连接")
             return False, ""
@@ -1350,6 +1361,16 @@ class OfficialQQAdapter(PlatformAdapter):
         reply_to_id: str | None = None,
     ) -> tuple[bool, str]:
         """上传图片后按富媒体消息发出。"""
+        # 同 send_message_with_id：面板线程要切回适配器所属的事件循环。
+        owner = self._foreign_owner_loop()
+        if owner is not None:
+            future = asyncio.run_coroutine_threadsafe(
+                self.send_image_with_id(
+                    session_id, image_bytes, reply_to_id=reply_to_id
+                ),
+                owner,
+            )
+            return await asyncio.wrap_future(future)
         if not self._connected:
             logger.error("官方通道未连接")
             return False, ""
