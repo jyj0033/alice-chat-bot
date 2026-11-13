@@ -1360,6 +1360,69 @@ async def send_meme(request: Request):
         return {"success": False, "error": str(exc)}
 
 
+@app.post("/api/send/reply")
+async def send_reply(request: Request):
+    """以机器人的身份补发一条群回复（走真实生成链路）。
+
+    用途：机器人在某条消息上没能给出回复（例如上游工具冲突导致整轮沉默），
+    事后从面板补一条。此时不重放入站事件——那条消息早已过期，走了会撞
+    陈旧积压过滤——而是直接用群里那一轮的输入重新生成，保留该群的人格、
+    说话风格、记忆检索和联网能力，再按引用回复发出去。
+
+    参数：group_id（群 openid）、message（群友原话）、reply_to_id（可选，
+    引用回复的消息 id）、direction（to_bot / group）、context（可选，上下文说明）。
+    """
+    if not bot_instance:
+        return {"success": False, "error": "Bot 未初始化"}
+    try:
+        data = await request.json()
+        data = data if isinstance(data, dict) else {}
+        group_id = str(data.get("group_id") or "").strip()
+        message = str(data.get("message") or "").strip()
+        if not group_id or not message:
+            return {"success": False, "error": "group_id 和 message 必填"}
+
+        session_id = f"group_{group_id}"
+        direction = str(data.get("direction") or "to_bot").strip()
+        reply_to_id = str(data.get("reply_to_id") or "").strip() or None
+        context_prompt = str(data.get("context") or "").strip() or (
+            "[刚刚] 群友(对你说)：" + message
+        )
+
+        gen_result = await bot_instance.reply_generator.generate(
+            context_prompt=context_prompt,
+            current_message=message,
+            emotional_state=(
+                bot_instance.emotional_manager.get_state(session_id)
+                if getattr(bot_instance, "emotional_manager", None)
+                and bot_instance.emotional_manager.enabled
+                else None
+            ),
+            direction=direction,
+            session_id=session_id,
+            persona_prompt=bot_instance._persona_prompt_for(group_id),
+            speaking_style=bot_instance._speaking_style_for(group_id),
+        )
+        if not gen_result:
+            return {"success": False, "error": "生成器选择沉默，未发送"}
+        reply_text = str(gen_result.get("reply") or "").strip()
+        if not reply_text:
+            return {"success": False, "error": "生成内容为空，未发送"}
+
+        ok, message_id = await bot_instance.qq_adapter.send_message_with_id(
+            session_id, reply_text, reply_to_id=reply_to_id
+        )
+        return {
+            "success": bool(ok),
+            "reply": reply_text,
+            "message_id": message_id,
+            "error": "" if ok else "发送失败",
+        }
+    except Exception as exc:
+        logger.error("手动补发回复失败：%s", exc, exc_info=True)
+        return {"success": False, "error": str(exc)}
+
+
 # 面板发图只能读取白名单目录下的文件，避免面板变成任意文件读取接口。
 SEND_MEDIA_DIR = Path(os.environ.get("ALICE_SEND_MEDIA_DIR", "/app/data/outbox"))
 MAX_SEND_IMAGE_BYTES = 32 * 1024 * 1024
