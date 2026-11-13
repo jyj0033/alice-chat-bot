@@ -152,12 +152,15 @@ class ResponsesProvider(LLMProvider):
         item["content"] = parts or ""
         return item
 
-    def _build_tools(self, tools) -> list[dict]:
+    def _build_tools(self, tools, *, drop_server_tools: bool = False) -> list[dict]:
         """OpenAI Chat 工具定义 → Responses 扁平结构；服务端工具按能力放行。
 
         服务端 web_search **不在这里主动声明**——由上层按需塞进 request.tools
         （判断器认为这条消息需要查资料时才加）。这里只做闸门：能力打开时放行，
         关闭时剔除，防止配置与调用不一致时误开联网。
+
+        ``drop_server_tools=True`` 时无条件剔除服务端工具，用于「上游拒绝内置工具
+        与 function 调用共存」时的降级重发（那一轮放弃联网，保证回复发得出去）。
         """
         out: list[dict] = []
         for tool in tools or []:
@@ -166,7 +169,11 @@ class ResponsesProvider(LLMProvider):
             ttype = str(tool.get("type") or "")
             # 服务端工具（web_search）：按能力开关放行，不主动追加
             if ttype in _SERVER_TOOL_TYPES:
-                if self.web_search:
+                if drop_server_tools:
+                    logger.warning(
+                        "[Responses] 降级重发，剔除服务端工具 %s（本轮不联网）", ttype
+                    )
+                elif self.web_search:
                     out.append(tool)
                 else:
                     logger.warning(
@@ -193,7 +200,7 @@ class ResponsesProvider(LLMProvider):
                 out.append(item)
         return out
 
-    def _build_body(self, request: ChatRequest) -> dict:
+    def _build_body(self, request: ChatRequest, *, drop_server_tools: bool = False) -> dict:
         """组装 Responses 请求体（独立出来便于离线断言字段）。
 
         `reasoning.effort` 是这里的保命参数：不传时模型会自行决定推理长度，
@@ -202,6 +209,8 @@ class ResponsesProvider(LLMProvider):
         一条 message 都不产出（线上辅助任务约 71% 失败）。传 effort=low 后
         同等任务 output 降到 188、正常产出。effort=none 会被端点拒绝
         （该模型要求 adaptive thinking）。
+
+        ``drop_server_tools=True`` 时剔除服务端工具，用于降级重发。
         """
         instructions, items = self._split_system(request.messages)
         body: dict = {
@@ -219,7 +228,7 @@ class ResponsesProvider(LLMProvider):
             body["temperature"] = request.temperature
         if request.top_p is not None:
             body["top_p"] = request.top_p
-        tools = self._build_tools(request.tools)
+        tools = self._build_tools(request.tools, drop_server_tools=drop_server_tools)
         if tools:
             body["tools"] = tools
             # 观测用：明确标出本轮是否声明了服务端搜索，方便对照 prompt_tokens 分布。
@@ -255,18 +264,63 @@ class ResponsesProvider(LLMProvider):
                 ) as resp:
                     raw = await resp.text()
                     if resp.status != 200:
-                        logger.error(
-                            "[Responses] HTTP %s - %s", resp.status, raw[:500]
-                        )
-                        raise RuntimeError(
-                            f"Responses API error: {resp.status} - {raw[:500]}"
-                        )
+                        # 兜底自愈：上游不允许「服务端内置工具 + function 调用」共存时
+                        # 返回 400（Gemini 系中转的固定报错），去掉 web_search 重发一次。
+                        # 这样至少把回复发出去，代价是这一轮没有联网。
+                        if self._is_mixed_tools_error(resp.status, raw):
+                            retry_body = self._build_body(request, drop_server_tools=True)
+                            if retry_body != body:
+                                logger.warning(
+                                    "[Responses] 上游拒绝「服务端工具 + function 调用」共存"
+                                    "（HTTP %s），去掉服务端工具重发一次，本轮降级为不联网",
+                                    resp.status,
+                                )
+                                async with session.post(
+                                    self.url, headers=headers, json=retry_body,
+                                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                                ) as retry_resp:
+                                    retry_raw = await retry_resp.text()
+                                    if retry_resp.status == 200:
+                                        raw = retry_raw
+                                    else:
+                                        logger.error(
+                                            "[Responses] 去掉服务端工具后仍然失败 HTTP %s - %s",
+                                            retry_resp.status, retry_raw[:500],
+                                        )
+                                        raise RuntimeError(
+                                            f"Responses API error: {retry_resp.status} - {retry_raw[:500]}"
+                                        )
+                            else:
+                                logger.error(
+                                    "[Responses] HTTP %s - %s", resp.status, raw[:500]
+                                )
+                                raise RuntimeError(
+                                    f"Responses API error: {resp.status} - {raw[:500]}"
+                                )
+                        else:
+                            logger.error(
+                                "[Responses] HTTP %s - %s", resp.status, raw[:500]
+                            )
+                            raise RuntimeError(
+                                f"Responses API error: {resp.status} - {raw[:500]}"
+                            )
             payload = json.loads(raw)
         except aiohttp.ClientError as exc:
             logger.error("[Responses] 客户端请求出错：%s", exc)
             raise
 
         return self._parse(payload)
+
+    @staticmethod
+    def _is_mixed_tools_error(status: int, raw: str) -> bool:
+        """判断这个错误是不是「服务端内置工具 + function 调用」共存被拒。
+
+        上游（Gemini 系 Responses 中转）不转发 tool_config，客户端改不动，
+        只能靠识别报错后降级重试。只认这一条固定文案，避免误伤别的 400。
+        """
+        if status != 400:
+            return False
+        return "include_server_side_tool_invocations" in str(raw or "")
 
     def _parse(self, payload: dict) -> ChatResponse:
         """解析 output 数组：取 output_text、抽 function_call、忽略 reasoning。"""

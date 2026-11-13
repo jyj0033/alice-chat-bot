@@ -400,6 +400,39 @@ class ReplyGenerator:
             if speaking_style is not None
             else self.style_manager
         )
+        # 1. 检索判断先做：本轮是否声明服务端 web_search，决定了请求里能不能
+        #    注册 send_meme（上游不允许「服务端内置工具 + function 调用」共存，
+        #    混用必然 400）。所以必须先算出结论，再据此构建请求。
+        search_decision = await self._judge_need_search(
+            current_message,
+            context_prompt,
+            direction=direction,
+            action_plan=action_plan,
+        )
+        # 主模型自带服务端搜索（Responses / MiniMax Server Tools）时：
+        #   web_search 改为**按需声明**——只在检索判断器认为这条消息需要查资料时，
+        #   才把 {"type":"web_search"} 加进本次请求的 tools。
+        # 为什么不做成常驻声明：常驻会让「晚饭吃啥」这类闲聊也触发多轮服务端联网，
+        # 而每轮抓回的网页正文都会留在上下文里被后续轮次反复重发，实测输入 token
+        # 从 233（不搜）涨到 2 万~68 万（搜 2~6 轮）；且端点忽略 max_uses 限流字段
+        # （加 max_uses=1 反而搜了 6 次），客户端无从限轮，只能从源头少发。
+        # 判断器仍保留：它现在还承担本地资料库（梗库/黑话）的检索。
+        # 严格用 `is True` 判定：测试里 self.llm 常是 MagicMock，
+        # getattr(mock, "supports_server_search", False) 会返回真值 mock，
+        # 用布尔真值判断会把它误当成「自带服务端搜索」而关掉 web 注入。
+        server_search = getattr(self.llm, "supports_server_search", False) is True
+        declare_server_search = self._should_declare_server_search(
+            server_search, search_decision
+        )
+
+        # 2. 构建请求
+        # 分群说话风格：本次请求单独实例化，绝不改 self.style_manager，
+        # 否则两个群并发生成时长度/语气会互相串。
+        active_style = (
+            SpeakingStyleManager(speaking_style)
+            if speaking_style is not None
+            else self.style_manager
+        )
         request = self._build_request(
             context_prompt,
             current_message,
@@ -418,41 +451,22 @@ class ReplyGenerator:
             person_aliases=person_aliases,
             persona_prompt=persona_prompt,
             style_manager=active_style,
+            server_search_declared=declare_server_search,
         )
 
-        # 2. 检索：先结构化判断「要不要查、查什么」，再查全局资料库；
-        #    稳定事实若本地已命中就不必联网，时效问题或本地不确定时再搜网页。
-        search_decision = await self._judge_need_search(
-            current_message,
-            context_prompt,
-            direction=direction,
-            action_plan=action_plan,
-        )
         knowledge_hits = []
         if search_decision.get("need_search"):
             knowledge_hits = await self._lookup_knowledge(
                 search_decision.get("query") or current_message,
                 glossary,
             )
-        # 主模型自带服务端搜索（Responses / MiniMax Server Tools）时：
-        #   web_search 改为**按需声明**——只在检索判断器认为这条消息需要查资料时，
-        #   才把 {"type":"web_search"} 加进本次请求的 tools。
-        # 为什么不做成常驻声明：常驻会让「晚饭吃啥」这类闲聊也触发多轮服务端联网，
-        # 而每轮抓回的网页正文都会留在上下文里被后续轮次反复重发，实测输入 token
-        # 从 233（不搜）涨到 2 万~68 万（搜 2~6 轮）；且端点忽略 max_uses 限流字段
-        # （加 max_uses=1 反而搜了 6 次），客户端无从限轮，只能从源头少发。
-        # 判断器仍保留：它现在还承担本地资料库（梗库/黑话）的检索。
-        # 严格用 `is True` 判定：测试里 self.llm 常是 MagicMock，
-        # getattr(mock, "supports_server_search", False) 会返回真值 mock，
-        # 用布尔真值判断会把它误当成「自带服务端搜索」而关掉 web 注入。
-        server_search = getattr(self.llm, "supports_server_search", False) is True
-        if self._should_declare_server_search(server_search, search_decision):
+        if declare_server_search:
             # 只影响本次请求：request 由 _build_request 每轮新建，不跨轮复用。
             request.tools.append({"type": "web_search"})
             search_temperature = self._apply_server_search_guardrails(request)
             logger.info(
                 "[搜索判断] 本次请求按需声明服务端 web_search（温度压至 %.2f，"
-                "已追加时效取舍约束）",
+                "已追加时效取舍约束；本轮不注册发图工具以避免与内置工具混用）",
                 search_temperature,
             )
         # 工具调用：send_meme 是结构化输出，正常路径走原生 tool_use，
@@ -779,7 +793,12 @@ class ReplyGenerator:
         self._note_invalid_draft("missing_say", text)
         self._note_rewrite("missing_say")
         try:
-            response = await self.llm.chat(self._format_retry_request(request))
+            # 走 _chat() 而不是 self.llm.chat()：格式重写同样要能回退到备用
+            # Provider。直连主模型时，主模型一挂（超时/400/空 choices），
+            # 重写就必然失败，整轮回复直接消失——线上「被@了没回复」就是这么来的。
+            response = await self._chat(
+                self._format_retry_request(request), "格式重写"
+            )
             retry_text = self._clean_thinking_process((response.content or "").strip())
         except Exception as exc:
             logger.warning("[格式] 重包 <say> 失败：%s", exc)
@@ -1457,8 +1476,12 @@ class ReplyGenerator:
         person_aliases: list = None,
         persona_prompt: str = "",
         style_manager: SpeakingStyleManager = None,
+        server_search_declared: bool = False,
     ) -> ChatRequest:
-        """构建 LLM 请求"""
+        """构建 LLM 请求
+
+        ``server_search_declared=True`` 表示本轮会声明服务端 web_search。
+        """
 
         # 读取当前 Provider 配置。Provider 在 Web 热更新时会被替换，因此每次
         # 构建请求都从当前实例读取，不能在 ReplyGenerator 初始化时复制一份旧值。
@@ -1529,7 +1552,20 @@ class ReplyGenerator:
         meme_auto_enabled = bool(
             self.meme_manager and self.meme_manager.auto_send_enabled
         )
-        if meme_auto_enabled:
+        # 本轮声明了服务端 web_search 时**不注册** send_meme：上游（Gemini 系
+        # Responses 中转）不允许「服务端内置工具 + function calling」同轮共存，
+        # 混用必然 HTTP 400（Please enable tool_config.include_server_side_tool_invocations）。
+        # 中转不转发 tool_config，客户端改不动，所以只能从源头不混用。
+        # 代价：需要联网的那一轮不能发图——这类消息本来也极少配图，
+        # 而「回复凭空消失」的代价大得多。
+        meme_tool_blocked_by_search = bool(server_search_declared and meme_auto_enabled)
+        if meme_tool_blocked_by_search:
+            meme_capability = (
+                "本轮不支持发图（需要联网查资料），只用文字回复，"
+                "不要调用 send_meme，也不要输出任何表情包标记。"
+            )
+            meme_auto_enabled = False
+        elif meme_auto_enabled:
             try:
                 meme_guide = self.meme_manager.build_prompt_guide()
             except Exception:
