@@ -13,7 +13,8 @@
 因为出现「你」或问号就改判为对 Bot；对 Bot 的引用目标只能是当前消息。
 面向全群的打招呼、开放提问和闲聊吐槽允许参与；互聊仍保持沉默。
 明确把 Alice 拉进玩笑或行动的点名允许短反应，普通第三人称提及仍按上下文判断。
-模型没点头时，group/unknown 还可以交给低概率随机插话，other 不行。
+模型没点头就不插话——判定器的结论是最终结论，不再叠一层概率插话。
+只有判定器本身不可用（超时/限频/禁用）时，才交给旧概率层兜底。
 """
 
 from __future__ import annotations
@@ -275,32 +276,24 @@ class ConversationJudge:
     @staticmethod
     def allows_probabilistic_interjection(
         judgement: dict[str, Any] | ConversationJudgeResult | None,
-        *,
-        mentioned_others: bool = False,
-        reply_to_other: bool = False,
     ) -> bool:
-        """Judge 未强制参与时，是否还允许走低概率随机插话。
+        """判定器可用时，它的结论就是最终结论：说「不参与」就不插话。
 
-        互聊（target=other）、对 Bot 但判定沉默、以及「刚在对别人说」的延续否决
-        一律不准。面向全群或目标不明、且当前没有 @/回复其他人时可以交给旧概率。
+        以前这里还放过一层低概率随机插话（target=group/unknown 时交给旧概率
+        掷骰子），于是会出现「判定器判定该沉默、机器人还是插了一句」的自相矛盾。
+        线上实测那道概率层给到的插话概率高达 0.37~0.46（基础值只有 0.02，
+        被「可自然接话」「独聊更积极」等修正项抬上去），不是小概率事件。
+
+        现在只有判定器本身不可用（超时/限频/禁用）时才放行旧概率兜底，
+        避免机器人因为判断服务故障而彻底失声。判定器可用时，无论它判
+        target=group 还是 unknown、只要 should_reply=false 就不插话。
         """
         if isinstance(judgement, ConversationJudgeResult):
             data = judgement.to_dict()
         else:
             data = dict(judgement or {})
-        if not data.get("available"):
-            return True
-        if data.get("should_reply"):
-            return False
-        target = str(data.get("target") or "")
-        if target in {"other", "bot"}:
-            return False
-        evidence = data.get("evidence") or {}
-        if evidence.get("continuity_veto"):
-            return False
-        if mentioned_others or reply_to_other:
-            return False
-        return target in {"group", "unknown"}
+        # available=False 表示判定服务不可用，此时交给旧概率层兜底。
+        return not data.get("available")
 
     async def judge(
         self,

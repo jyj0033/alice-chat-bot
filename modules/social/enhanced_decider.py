@@ -120,15 +120,11 @@ class EnhancedSpeakingDecider:
             and dynamic_should_reply
         )
 
-        # 动态目标判断负责“这句话是不是在对 Bot / 别人说”。
-        # 互聊（other）或对 Bot 但判定沉默时硬跳过；面向全群/目标不明时
-        # 仍走旧的低概率随机插话，避免没被点名就完全闭嘴。
+        # 动态目标判断负责“这句话是不是在对 Bot / 别人说”，也是最终结论：
+        # 它说「不参与」就整轮跳过，不再叠一层随机插话。只有判定器不可用时
+        # 才交给旧概率兜底，避免判断服务故障时机器人彻底失声。
         if judgement_available and not dynamic_should_reply:
-            if not ConversationJudge.allows_probabilistic_interjection(
-                judgement,
-                mentioned_others=bool(context.extra.get("mentioned_others")),
-                reply_to_other=bool(context.extra.get("reply_to_other")),
-            ):
+            if not ConversationJudge.allows_probabilistic_interjection(judgement):
                 return SpeakingDecision(
                     should_speak=False,
                     probability=0.0,

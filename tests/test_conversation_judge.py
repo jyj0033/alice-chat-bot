@@ -658,7 +658,8 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("名字", reason)
 
-    def test_allows_probabilistic_interjection_for_group_and_unknown(self):
+    def test_probabilistic_interjection_blocked_for_every_available_judgement(self):
+        """判定器可用时，它说「不参与」就不插话——不再叠概率层。"""
         group = {
             "available": True,
             "target": "group",
@@ -671,13 +672,15 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
             "should_reply": False,
             "evidence": {},
         }
-        self.assertTrue(ConversationJudge.allows_probabilistic_interjection(group))
-        self.assertTrue(ConversationJudge.allows_probabilistic_interjection(unknown))
-
-    def test_allows_probabilistic_interjection_blocks_other_and_veto(self):
         other = {
             "available": True,
             "target": "other",
+            "should_reply": False,
+            "evidence": {},
+        }
+        bot_silent = {
+            "available": True,
+            "target": "bot",
             "should_reply": False,
             "evidence": {},
         }
@@ -687,30 +690,34 @@ class ConversationJudgeTests(unittest.IsolatedAsyncioTestCase):
             "should_reply": False,
             "evidence": {"continuity_veto": True},
         }
-        bot_silent = {
+        for judgement in (group, unknown, other, bot_silent, vetoed):
+            self.assertFalse(
+                ConversationJudge.allows_probabilistic_interjection(judgement),
+                f"{judgement.get('target')} 不该再走概率插话",
+            )
+
+    def test_probabilistic_interjection_allowed_only_when_judge_unavailable(self):
+        """判定器不可用（超时/限频/禁用）时才放行旧概率兜底。"""
+        unavailable = {
+            "available": False,
+            "target": "unknown",
+            "should_reply": False,
+            "error": "timeout",
+        }
+        self.assertTrue(ConversationJudge.allows_probabilistic_interjection(unavailable))
+        self.assertTrue(ConversationJudge.allows_probabilistic_interjection(None))
+        self.assertTrue(ConversationJudge.allows_probabilistic_interjection({}))
+
+    def test_probabilistic_interjection_blocked_when_judge_forces_reply(self):
+        """判定器点头时本来就不走概率层，这里只是保证返回值为 False。"""
+        should_reply = {
             "available": True,
             "target": "bot",
-            "should_reply": False,
+            "should_reply": True,
             "evidence": {},
         }
-        replied_other = {
-            "available": True,
-            "target": "group",
-            "should_reply": False,
-            "evidence": {},
-        }
-        self.assertFalse(ConversationJudge.allows_probabilistic_interjection(other))
-        self.assertFalse(ConversationJudge.allows_probabilistic_interjection(vetoed))
-        self.assertFalse(ConversationJudge.allows_probabilistic_interjection(bot_silent))
         self.assertFalse(
-            ConversationJudge.allows_probabilistic_interjection(
-                replied_other, reply_to_other=True
-            )
-        )
-        self.assertFalse(
-            ConversationJudge.allows_probabilistic_interjection(
-                replied_other, mentioned_others=True
-            )
+            ConversationJudge.allows_probabilistic_interjection(should_reply)
         )
 
     async def test_system_prompt_allows_group_chime_in(self):

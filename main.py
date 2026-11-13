@@ -2639,19 +2639,16 @@ class GroupChatBot:
             or (bool(message.reply_to_qq) and not quoted_bot)
         )
         if judge_available:
-            # 动态判断是“对谁说”的依据；没点头时，只有互聊才整轮跳过。
+            # 动态判断是「对谁说」的依据，也是最终结论：它点头才回，
+            # 判定沉默就不插话。旧概率层只在判定器不可用时兜底接管。
             talking_to_others = judge_target == "other" or heuristic_talking_to_others
             continuing = (
                 judge_target == "bot"
                 and judge_should_reply
                 and judge_intent in {"follow_up", "acknowledge", "answer"}
             )
-            allow_chance = ConversationJudge.allows_probabilistic_interjection(
-                judge,
-                mentioned_others=bool(message.mentioned_others),
-                reply_to_other=heuristic_talking_to_others,
-            )
-            if not judge_should_reply and not allow_chance:
+            allow_probabilistic = ConversationJudge.allows_probabilistic_interjection(judge)
+            if not judge_should_reply and not allow_probabilistic:
                 logger.info(
                     "[目标判断] 本轮不参与：目标=%s，意图=%s，理由=%s",
                     judge_target,
@@ -2659,13 +2656,6 @@ class GroupChatBot:
                     judge.get("reason", ""),
                 )
                 return None
-            if not judge_should_reply and allow_chance:
-                logger.info(
-                    "[目标判断] 不强制参与，交给随机插话：目标=%s，意图=%s，理由=%s",
-                    judge_target,
-                    judge_intent,
-                    judge.get("reason", ""),
-                )
         else:
             # 判断服务不可用时保守降级：显式信号仍可回复，但不自动续接。
             talking_to_others = heuristic_talking_to_others

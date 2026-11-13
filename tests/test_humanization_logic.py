@@ -263,9 +263,8 @@ class HumanizationLogicTests(unittest.TestCase):
         self.assertFalse(decision.should_speak)
         self.assertEqual(decision.reason, "动态判断不参与")
 
-    def test_group_target_without_should_reply_uses_probability(self):
-        from unittest.mock import patch
-
+    def test_group_target_without_should_reply_is_hard_skip(self):
+        """判定器说「不参与」就不插话——不再落到概率层掷骰子。"""
         decider = EnhancedSpeakingDecider(base_probability=1.0)
         context = self._judgement_context(
             {
@@ -281,12 +280,11 @@ class HumanizationLogicTests(unittest.TestCase):
             "modules.social.enhanced_decider.random.uniform", return_value=0.0
         ):
             decision = decider.decide(context)
-        self.assertTrue(decision.should_speak)
-        self.assertNotEqual(decision.reason, "动态判断不参与")
+        self.assertFalse(decision.should_speak)
+        self.assertEqual(decision.reason, "动态判断不参与")
 
-    def test_unknown_target_without_should_reply_uses_probability(self):
-        from unittest.mock import patch
-
+    def test_unknown_target_without_should_reply_is_hard_skip(self):
+        """线上实案：判定「转发群聊记录、未提及爱丽丝」后仍被概率层插话。"""
         decider = EnhancedSpeakingDecider(base_probability=1.0)
         context = self._judgement_context(
             {
@@ -295,6 +293,27 @@ class HumanizationLogicTests(unittest.TestCase):
                 "should_reply": False,
                 "intent": "silent",
                 "confidence": 0.85,
+                "evidence": {},
+            }
+        )
+        with patch("modules.social.enhanced_decider.random.random", return_value=0.0), patch(
+            "modules.social.enhanced_decider.random.uniform", return_value=0.0
+        ):
+            decision = decider.decide(context)
+        self.assertFalse(decision.should_speak)
+        self.assertEqual(decision.reason, "动态判断不参与")
+
+    def test_judge_unavailable_still_falls_back_to_probability(self):
+        """判定器不可用时，旧概率层必须还能接管，否则机器人会彻底失声。"""
+        from unittest.mock import patch
+
+        decider = EnhancedSpeakingDecider(base_probability=1.0)
+        context = self._judgement_context(
+            {
+                "available": False,
+                "target": "unknown",
+                "should_reply": False,
+                "error": "timeout",
                 "evidence": {},
             }
         )
