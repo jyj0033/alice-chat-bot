@@ -33,6 +33,22 @@ logger = logging.getLogger(__name__)
 _VOCATIVE_RE = re.compile(
     r"(?:了|吧|啊|呀|呢|哦|哈|嘛)([\u4e00-\u9fff]{2,4})$"
 )
+# 复核器给出的「明确错误」类型：身份暴露、称呼对象错位、把玩笑当真、语气偏离。
+# 这四类草稿一定要拦。
+#
+# strategy_mismatch（策略方向不对）不在其中：它是最宽松的一类，而且复核器在
+# 这一项上并不稳定——线上 2026-11-13 13:32 那条被 @ 就是被它误杀的（同一草稿
+# 连跑三次，第 1 次 False、第 2/3 次 True）。向群友提问补全信息（要书名、要关键词、
+# 要类型）恰恰是正确的接话，复核提示词里也写着这种草稿不该被判不匹配，
+# 所以它只能记日志，不能一票否决。
+HARD_PRAGMATIC_TYPES = frozenset(
+    {
+        "identity_exposure",
+        "wrong_addressee",
+        "literalized_banter",
+        "tone_drift",
+    }
+)
 _OTHER_TITLES = frozenset(
     {
         "团长",
@@ -53,6 +69,26 @@ _OTHER_TITLES = frozenset(
         "学姐",
     }
 )
+
+
+def pragmatic_mismatch_verdict(evidence: dict | None) -> tuple[bool, bool]:
+    """把复核器的语用结论翻译成「拦 / 不拦」。
+
+    返回 ``(是否拦截, 是否只是软标记)``。
+
+    只有 identity_exposure / wrong_addressee / literalized_banter / tone_drift
+    这四种「明确错误」才拦截；strategy_mismatch 以及没给出任何类型的情况
+    只记日志。两道闸（首轮复核、重答复核）共用这一份策略。
+    """
+    evidence = evidence or {}
+    if not evidence.get("pragmatic_mismatch"):
+        return False, False
+    raw_types = evidence.get("mismatch_types") or []
+    if isinstance(raw_types, str):
+        raw_types = [raw_types]
+    hard_types = {str(item) for item in raw_types} & HARD_PRAGMATIC_TYPES
+    blocked = bool(hard_types) or bool(evidence.get("pragmatic_hard_mismatch"))
+    return blocked, not blocked
 
 
 @dataclass
@@ -545,6 +581,18 @@ class ConversationJudge:
             ) and "identity_exposure" not in mismatch_types:
                 mismatch_types.append("identity_exposure")
             pragmatic_mismatch = pragmatic_mismatch or bool(mismatch_types)
+            # 只认「明确错误」的类型才构成质量缺陷；strategy_mismatch 只记日志。
+            # 没有给出任何明确类型时同样不拦：复核器的总体布尔值在这条上不可靠，
+            # 拦下去就变成「被 @ 了没回复」。
+            hard_pragmatic_types = [
+                item for item in mismatch_types if item in HARD_PRAGMATIC_TYPES
+            ]
+            pragmatic_hard_mismatch = bool(pragmatic_mismatch and hard_pragmatic_types)
+            if pragmatic_mismatch and not pragmatic_hard_mismatch:
+                logger.info(
+                    "[复读判断] 复核器标记了 %s，但不属于明确错误类型，本次不拦",
+                    sorted(mismatch_types) or ["(未给出类型)"],
+                )
             # 「向对方提问以补全信息」是正确接话，不是草稿自身的缺陷。
             # 不豁免就会形成必然静默的死锁：用户请求本身信息不足时
             #（如「爱丽丝，帮我找个小说」），草稿反问澄清 → 复核打回
@@ -561,7 +609,7 @@ class ConversationJudge:
                 or incomplete
                 or meta_commentary
                 or not on_topic
-                or pragmatic_mismatch
+                or pragmatic_hard_mismatch
             )
             return ConversationJudgeResult(
                 intent="silent" if quality_issue else "react",
@@ -578,6 +626,7 @@ class ConversationJudge:
                     "meta_commentary": meta_commentary,
                     "on_topic": on_topic,
                     "pragmatic_mismatch": pragmatic_mismatch,
+                    "pragmatic_hard_mismatch": pragmatic_hard_mismatch,
                     "mismatch_types": mismatch_types,
                     "clarification_question": clarification_question,
                 },

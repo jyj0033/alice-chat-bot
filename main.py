@@ -63,7 +63,11 @@ from modules.social.attention import AttentionManager, AttentionKeywordsDetector
 from modules.social.fatigue import FatigueManager
 from modules.social.enhanced_decider import EnhancedSpeakingDecider
 from modules.social.conversation_floor import ActionType, ConversationFloorManager
-from modules.social.conversation_judge import ConversationJudge, ConversationJudgeResult
+from modules.social.conversation_judge import (
+    ConversationJudge,
+    ConversationJudgeResult,
+    pragmatic_mismatch_verdict,
+)
 from modules.social.session_awareness import SessionAwareness
 
 from modules.reply.generator import ReplyGenerator, ThinkingDelay, ResponseFilter
@@ -3796,9 +3800,28 @@ class GroupChatBot:
                     review_evidence.get("meta_commentary")
                 )
                 off_topic_issue = review_evidence.get("on_topic") is False
-                pragmatic_issue = bool(
-                    review_evidence.get("pragmatic_mismatch")
+                raw_mismatch_types = review_evidence.get("mismatch_types") or []
+                if isinstance(raw_mismatch_types, str):
+                    raw_mismatch_types = [raw_mismatch_types]
+                mismatch_types = set(raw_mismatch_types)
+                # pragmatic_mismatch 不能一票否决：它只是复核器的总体判断，
+                # 而复核器在这条上并不稳定——同一个草稿连跑三次，实测出现过
+                # 第1次 False、第2/3次 True（线上 13:32 那条被误杀的就是它）。
+                #
+                # 只认「明确错误」的类型：身份暴露、称呼对象错位、把玩笑当真、
+                # 语气偏离。这四类都要拦。
+                # strategy_mismatch（策略方向不对）不拦：它最宽松，而向群友
+                # 提问补全信息（要书名/要关键词/要细节/要类型）恰恰是正确的
+                # 接话方式，复核提示词里也写着这种草稿不该被判不匹配。
+                pragmatic_issue, soft_pragmatic_note = pragmatic_mismatch_verdict(
+                    review_evidence
                 )
+                if soft_pragmatic_note:
+                    # 只记日志不拦：判定不可靠，拦下去就是「被@了没回复」。
+                    logger.info(
+                        "[语义复核] 复核器标记了 %s，但不属于明确错误类型，本次不拦截",
+                        sorted(mismatch_types) or ["(未给出类型)"],
+                    )
                 if review.available and (
                     paraphrase_issue
                     or unsupported_issue
@@ -3808,10 +3831,6 @@ class GroupChatBot:
                     or off_topic_issue
                     or pragmatic_issue
                 ):
-                    raw_mismatch_types = review_evidence.get("mismatch_types") or []
-                    if isinstance(raw_mismatch_types, str):
-                        raw_mismatch_types = [raw_mismatch_types]
-                    mismatch_types = set(raw_mismatch_types)
                     if "identity_exposure" in mismatch_types:
                         review_label = "暴露身份设定"
                     elif "wrong_addressee" in mismatch_types:
