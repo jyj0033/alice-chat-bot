@@ -132,6 +132,20 @@ class EnhancedSpeakingDecider:
                     modifiers={"target": dynamic_target},
                 )
 
+        # 主模型故障期间只回应明确对 Bot 说的话：此时全部回复都由备用模型
+        # 生成，它接不住上下文，主动插话基本都是答非所问，宁可沉默。
+        if (
+            context.extra.get("primary_model_down")
+            and not context.extra.get("is_private", False)
+            and not (context.mentioned_me or context.reply_to_me)
+        ):
+            return SpeakingDecision(
+                should_speak=False,
+                probability=0.0,
+                reason="主模型不可用，仅回应直接@",
+                modifiers={"primary_model_down": True},
+            )
+
         # === 1. 检查冷却（@ / 引用 / 当前正延续对话时跳过）===
         # 冷却用于限制“低概率随机插话”刷屏；明确对我说或 bot 刚回复过对方、
         # 对方正自然延续对话时，不应被冷却挡住，否则会错过真人之间 30-60s 的接话。
@@ -167,6 +181,39 @@ class EnhancedSpeakingDecider:
         # 参与改回沉默；这些规则只在判断器不可用时作为降级策略。
         if judgement_available and dynamic_should_reply:
             confidence = float(judgement.get("confidence") or 0.0)
+            intent = str(judgement.get("intent") or "")
+            floor = context.extra.get("floor")
+            # 判断器说“可回”只是许可，不是指令：随口接话（react）把握不大，
+            # 或者正撞上两人对聊 / 消息爆发时，不插话，避免莫名其妙的接梗。
+            # 例外：群友明确把 Alice 拉进玩笑（"把小艾也算上"）是硬由头，
+            # 这种吐槽要保留，不能被置信度门槛误杀。
+            playful_hook = bool(
+                (judgement.get("evidence") or {}).get("playful_bot_inclusion")
+            )
+            if dynamic_target != "bot" and intent == "react" and not playful_hook:
+                crowded = bool(
+                    floor is not None
+                    and (
+                        floor.two_person_thread
+                        or floor.fast_burst
+                        or floor.interruption_cost >= 0.82
+                    )
+                )
+                if confidence < 0.8 or crowded:
+                    return SpeakingDecision(
+                        should_speak=False,
+                        probability=0.0,
+                        reason=(
+                            "两人对聊/消息爆发，不接梗"
+                            if crowded
+                            else "低置信度随口接话，不接"
+                        ),
+                        modifiers={
+                            "dynamic_target": dynamic_target,
+                            "intent": intent,
+                            "dynamic_confidence": confidence,
+                        },
+                    )
             probability = max(0.7, min(0.99, confidence or 0.7))
             target_text = {
                 "bot": "主要对 Bot 说",

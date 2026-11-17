@@ -10,8 +10,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -23,8 +26,12 @@ _ALERT_INTERVAL = 60.0
 class ProviderHealth:
     """按 provider 记录调用成功 / 失败。"""
 
-    def __init__(self) -> None:
+    def __init__(self, state_path: str | Path | None = None) -> None:
         self._states: dict[str, dict[str, Any]] = {}
+        # 落盘路径：重启后仍要知道主模型是不是还挂着，否则每次重启都会先
+        # 用回退模型主动接一句，然后又沉默。
+        self._state_path = str(state_path) if state_path else ""
+        self._load()
 
     # ------------------------------------------------------------------
     # 记录
@@ -40,6 +47,7 @@ class ProviderHealth:
         state["degraded"] = False
         state.pop("last_error", None)
         state.pop("last_error_at", None)
+        self._save()
 
     def record_failure(self, provider_id: str, error: Any, model: str = "") -> None:
         state = self._state(provider_id)
@@ -60,6 +68,51 @@ class ProviderHealth:
                 state["failures"],
                 message[:200],
             )
+        self._save()
+
+    # ------------------------------------------------------------------
+    # 落盘 / 读取
+    # ------------------------------------------------------------------
+
+    def _load(self) -> None:
+        if not self._state_path or not os.path.exists(self._state_path):
+            return
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                self._states = {
+                    str(key): value
+                    for key, value in data.items()
+                    if isinstance(value, dict)
+                }
+                if self._states:
+                    logger.info(
+                        "✓ 语言模型健康状态已恢复：%s",
+                        ", ".join(
+                            "%s(%s)"
+                            % (
+                                name,
+                                "降级" if s.get("degraded") else "正常",
+                            )
+                            for name, s in sorted(self._states.items())
+                        ),
+                    )
+        except Exception as exc:  # 状态文件坏了不该影响启动
+            logger.warning("语言模型健康状态读取失败（忽略）：%s", exc)
+
+    def _save(self) -> None:
+        if not self._state_path:
+            return
+        try:
+            path = Path(self._state_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._states, fh, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.debug("语言模型健康状态写入失败（忽略）：%s", exc)
 
     def _state(self, provider_id: str) -> dict[str, Any]:
         key = str(provider_id or "default")

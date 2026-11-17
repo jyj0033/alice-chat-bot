@@ -207,7 +207,8 @@ class GroupChatBot:
         self.llm_providers: dict[str, LLMProvider] = {}  # 多 provider 支持
         self.active_provider_id: str = "primary"  # 当前激活的 provider
         # 各 provider 的健康状态（谁在失败、失败几次、最后一次错误）
-        self.llm_health = ProviderHealth()
+        # 落盘到 data/，重启后仍能知道主模型是不是还挂着。
+        self.llm_health = ProviderHealth("data/llm_health.json")
         self.qq_adapter: Optional[Union[QQAdapter, OfficialQQAdapter]] = None
 
         # 记忆系统
@@ -458,6 +459,19 @@ class GroupChatBot:
 
         if not self.llm_providers:
             logger.error("没有可用的语言模型提供商！")
+        else:
+            routes = self.config.get("llm_routing", {}) or {}
+            reply_id = str(routes.get("reply") or "").strip() or str(
+                self.active_provider_id or ""
+            )
+            if self._reply_model_degraded():
+                logger.warning(
+                    "⚠️ 回复主模型「%s」处于降级状态：本轮只回应直接 @/引用，"
+                    "其余群聊消息一律沉默（恢复后自动解除）",
+                    reply_id,
+                )
+            elif reply_id:
+                logger.info("✓ 回复主模型「%s」状态正常", reply_id)
 
     def get_active_provider(self) -> Optional[LLMProvider]:
         """获取当前激活的 provider"""
@@ -551,6 +565,23 @@ class GroupChatBot:
         if unwrap_provider(reply_provider) is active_provider:
             return None
         return self._tagged_provider(active_provider, "reply_fallback")
+
+    def _reply_model_degraded(self) -> bool:
+        """回复用的主模型是否处于故障降级（最近一次调用失败）。
+
+        主模型挂掉后所有回复都会回退到备用模型，备用模型接不住上下文，主动
+        接话基本都是答非所问；降级期间只回应明确对 Bot 说的话。
+        """
+        try:
+            routes = self.config.get("llm_routing", {}) or {}
+            provider_id = str(routes.get("reply") or "").strip()
+            if not provider_id:
+                provider_id = str(self.active_provider_id or "")
+            if not provider_id:
+                return False
+            return provider_id in set(self.llm_health.degraded_providers())
+        except Exception:
+            return False
 
     def _init_memory(self) -> None:
         """初始化记忆系统"""
@@ -2712,6 +2743,8 @@ class GroupChatBot:
         context.extra["group_base_probability"] = group_config.get(
             "speaking_probability"
         )
+        # 回复主模型故障降级时，除明确对 Bot 说的话外一律沉默（见决策器）。
+        context.extra["primary_model_down"] = self._reply_model_degraded()
         # 话题兴趣可以参考安全渲染后的富媒体摘要，但强制触发结果已经在上面锁定。
         context.message_content = message.content
         context = self.social_awareness.analyze(context)
@@ -2731,6 +2764,23 @@ class GroupChatBot:
             logger.info(
                 f"[静默] 无法识别的消息，跳过机器人决策：{message.content}"
             )
+            return
+
+        # 图片/视频没有可用画面摘要时的最终拦截在发送前（媒体复核）完成：
+        # 视觉识别是异步的，这里内容可能还是占位符，不能提前判死。
+
+        # 极短消息（≤4 字，如「神了」「666」「乐」）没有足够上下文，生成正文
+        # 必然对不上现场；除明确 @ / 引用 Bot 外一律不接。
+        short_text = self._plain_short_text(message.content)
+        if (
+            message.message_type == "group"
+            and not message.mentioned_me
+            and not is_reply_to_bot
+            and not quoted_bot
+            and judge_target != "bot"
+            and 0 < len(short_text) <= 4
+        ):
+            logger.info("[静默] 极短消息不接话：%s", short_text)
             return
 
         window = self.context_manager.get_window(session_id)
@@ -3176,6 +3226,14 @@ class GroupChatBot:
         return candidate, review.reason or "语境匹配"
 
     @staticmethod
+    def _plain_short_text(content: str) -> str:
+        """去掉表情码、富媒体标记后的纯文本，用于判断消息是否只有几个字。"""
+        text = str(content or "")
+        text = re.sub(r"<faceType=[^>]*>", "", text)
+        text = re.sub(r"\[[^\]]{0,20}\]", " ", text)
+        return text.strip()
+
+    @staticmethod
     def _has_objective_media_evidence(message: Message) -> bool:
         """判断纯图片消息是否已有可供生成使用的客观画面摘要。"""
         content = str(getattr(message, "content", "") or "").strip()
@@ -3422,7 +3480,7 @@ class GroupChatBot:
                 and direction == "group"
                 and not explicit_directed
                 and message.rich_only
-                and message.rich_type in {"image", "mface", "face"}
+                and message.rich_type in {"image", "mface", "face", "video"}
                 and not self._has_objective_media_evidence(message)
             ):
                 logger.info(
@@ -7318,6 +7376,7 @@ class GroupChatBot:
         # 放在它后面的代码在正常运行时永远执行不到。
         self._tasks.append(asyncio.create_task(self._cleanup_loop()))
         self._tasks.append(asyncio.create_task(self._token_usage_loop()))
+        self._tasks.append(asyncio.create_task(self._health_probe_loop()))
 
         # 连接 QQ (可选 - 如果连接失败则继续运行用于测试)
         try:
@@ -7333,6 +7392,44 @@ class GroupChatBot:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             pass
+
+    async def _health_probe_loop(self) -> None:
+        """主模型降级时定期探活。
+
+        降级期间只回应 @/引用，等于不再调用主模型；如果只靠"调用成功才恢复"，
+        状态会永远卡在降级。这里每 10 分钟用一次极小的请求探一次，成功了
+        HealthTrackedProvider 会自动记成功并解除降级。
+        """
+        await asyncio.sleep(20)
+        while self._running:
+            try:
+                if self._reply_model_degraded():
+                    await self._probe_reply_model()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("回复主模型探活失败（忽略）：%s", exc)
+            await asyncio.sleep(600)
+
+    async def _probe_reply_model(self) -> None:
+        """发一个最小请求探活回复主模型；健康状态由 provider 壳自动记录。"""
+        from modules.llm.base import ChatRequest
+
+        provider = self._get_provider_for_role("reply")
+        if provider is None:
+            return
+        request = ChatRequest(
+            model=getattr(provider, "model", "") or "",
+            temperature=0.0,
+            max_tokens=8,
+            top_p=0.1,
+        )
+        request.add_user("回复两个字：在")
+        await asyncio.wait_for(provider.chat(request), timeout=30)
+        if not self._reply_model_degraded():
+            logger.info(
+                "✓ 回复主模型已恢复，解除“只回应直接 @/引用”的限制，群聊接话恢复"
+            )
 
     async def _cleanup_loop(self) -> None:
         """定期清理过期状态"""
@@ -7917,6 +8014,10 @@ async def main():
             # 所以这个循环不能只写在 run() 里。
             usage_task = asyncio.create_task(bot._token_usage_loop())
             bot._tasks.append(usage_task)
+            # 主模型降级时定期探活：降级期间只回 @/引用，等于不再调用主模型，
+            # 必须自己探活，否则状态永远卡在降级。
+            probe_task = asyncio.create_task(bot._health_probe_loop())
+            bot._tasks.append(probe_task)
             # 表情包自动归类循环：同样必须与消息处理跑在同一个事件循环，
             # 否则它读写的素材状态会和消息线程打架。
             meme_task = asyncio.create_task(bot._meme_categorize_loop())
