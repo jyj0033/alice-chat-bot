@@ -56,6 +56,18 @@ from modules.meme_categorizer import (
 from modules.personality.personality import Personality
 from modules.personality.emotional_state import EmotionalManager
 from modules.personality.speaking_style import SpeakingStyleManager, SpeakingStyle
+from modules.personality.group_learning import (
+    clean_message_text,
+    compute_style_stats,
+    filter_catchphrases,
+    load_all_learned,
+    recent_messages_by_session,
+    recent_text_by_session,
+    sanitize_nicknames,
+    save_learned,
+    style_from_stats,
+    verify_candidates,
+)
 from modules.personality.typo import TypoGenerator
 
 from modules.social.awareness import SocialAwarenessManager, SocialContext, TriggerDetector
@@ -723,6 +735,37 @@ class GroupChatBot:
             self._expression_learning_config["lookback_hours"],
         )
 
+        self._load_style_learning_config(memory_config)
+
+    def _load_style_learning_config(self, memory_config: dict | None = None) -> None:
+        """重建「按群学说话风格」的配置，面板改完能热生效。"""
+        memory_config = (
+            memory_config
+            if isinstance(memory_config, dict)
+            else (self.config.get("memory", {}) or {})
+        )
+        style_cfg = memory_config.get("style_learning", {}) or {}
+        if not isinstance(style_cfg, dict):
+            style_cfg = {}
+        self._style_learning_config = {
+            "enabled": bool(style_cfg.get("enabled", True)),
+            # 风格是慢变量，按天学就够；学太勤容易跟着一时的情绪跑。
+            "interval_hours": max(1, int(style_cfg.get("interval_hours", 24))),
+            "lookback_hours": max(24, int(style_cfg.get("lookback_hours", 168))),
+            # 少于这个条数不学：样本太少时中位句长抖得厉害。
+            "min_samples": max(20, int(style_cfg.get("min_samples", 40))),
+        }
+        self._last_style_learn = float(getattr(self, "_last_style_learn", 0.0) or 0.0)
+        if not hasattr(self, "_style_learning_guard"):
+            self._style_learning_guard = threading.Lock()
+        logger.info(
+            "✓ 群聊说话风格学习：启用=%s，每%s小时一次，回看%s小时，样本门槛%s条",
+            self._style_learning_config["enabled"],
+            self._style_learning_config["interval_hours"],
+            self._style_learning_config["lookback_hours"],
+            self._style_learning_config["min_samples"],
+        )
+
     def _load_group_analysis_config(self, memory_config: dict) -> None:
         """重建群聊日报配置。
 
@@ -866,6 +909,8 @@ class GroupChatBot:
         base = self.personality.to_dict() if self.personality else {}
         base_traits = dict(base.get("traits") or {})
         self._persona_cache = {}
+        # 每次重建都重读一遍学习结果，学到新东西热重载后立即生效。
+        self._reload_learned()
         base_style = (self.config.get("personality", {}) or {}).get("speaking_style", {}) or {}
         if not isinstance(base_style, dict):
             base_style = {}
@@ -905,14 +950,40 @@ class GroupChatBot:
                             logger.warning(f"群 {gid} 的人格配置无法解析，已跳过：{exc}")
 
                 # --- 说话风格（长度、标点、正式度等） ---
+                # 优先级：群内显式配置 > 群内学到的统计值 > 全局配置。
+                # 学到的值只补字段，不覆盖人手动写死的字段。
                 style_override = group_config.get("speaking_style")
-                if isinstance(style_override, dict) and style_override:
+                learned_style = (
+                    (self._learned.get(str(gid)) or {}).get("style") or {}
+                )
+                if (
+                    isinstance(style_override, dict) and style_override
+                ) or learned_style:
+                    merged_style = {**base_style}
+                    if isinstance(learned_style, dict) and learned_style:
+                        merged_style.update(learned_style)
+                    if isinstance(style_override, dict) and style_override:
+                        merged_style.update(style_override)
                     try:
-                        styles[gid] = SpeakingStyle.from_dict(
-                            {**base_style, **style_override}
-                        )
+                        styles[gid] = SpeakingStyle.from_dict(merged_style)
                     except Exception as exc:
                         logger.warning(f"群 {gid} 的说话风格无法解析，已跳过：{exc}")
+
+        # 只配了学习结果、没写在 groups 里的群（比如没进管理的群）也应用
+        # 学到的风格，否则"按群学习"对它们等于没生效。
+        for gid, learned in (self._learned or {}).items():
+            gid = str(gid)
+            if gid in styles:
+                continue
+            learned_style = (learned or {}).get("style") or {}
+            if not isinstance(learned_style, dict) or not learned_style:
+                continue
+            try:
+                styles[gid] = SpeakingStyle.from_dict(
+                    {**base_style, **learned_style}
+                )
+            except Exception as exc:
+                logger.warning(f"群 {gid} 的学习风格无法应用，已跳过：{exc}")
 
         self.group_personas = variants
         self.group_styles = styles
@@ -964,6 +1035,83 @@ class GroupChatBot:
         if not group_id:
             return None
         return (getattr(self, "group_styles", None) or {}).get(str(group_id))
+
+    def _reload_learned(self) -> None:
+        """重读各群的学习结果（称呼 / 口头禅 / 群内梗 / 说话风格数值）。
+
+        文件都很小（每个群一两 KB），重建人格时全量读一遍最省事；读坏了
+        就当没学过，绝不能因为一个群的 JSON 写崩就起不来。
+        """
+        try:
+            self._learned = load_all_learned(self.config_path)
+        except Exception as exc:
+            logger.warning("读取群聊学习结果失败，本轮按未学习处理：%s", exc)
+            self._learned = {}
+
+    def _base_style_dict_for(self, group_id: str) -> dict:
+        """取「还没叠加学习值」的风格基线。
+
+        学习是拿基线算的，算出来的值再写回群里。如果下一轮把上一轮的学习
+        结果又当基线，限幅就会一轮轮往外推，最后跑成话痨或冷脸。
+        """
+        base = (self.config.get("personality", {}) or {}).get("speaking_style", {}) or {}
+        base = dict(base) if isinstance(base, dict) else {}
+        group_config = (self.config.get("groups", {}) or {}).get(str(group_id)) or {}
+        override = (
+            group_config.get("speaking_style")
+            if isinstance(group_config, dict) else None
+        )
+        if isinstance(override, dict) and override:
+            base.update(override)
+        return base
+
+    def _group_flavor_for(self, group_id: str | None) -> dict:
+        """取该群学到的称呼 / 口头禅 / 梗，用来补一句提示词。
+
+        只影响「怎么说」，不参与人格自述 —— 学到的永远进不了
+        ``build_persona_prompt()``。
+        """
+        if not group_id:
+            return {}
+        learned = (self._learned or {}).get(str(group_id)) or {}
+        flavor = learned.get("flavor") or {}
+        if not isinstance(flavor, dict):
+            return {}
+        result = {}
+        for key in ("bot_nicknames", "catchphrases", "memes"):
+            values = [
+                str(item).strip()
+                for item in (flavor.get(key) or [])
+                if str(item).strip()
+            ]
+            if key == "catchphrases":
+                # 老文件里可能留着"你好""哈哈"这类零区分度的词，注入前再洗一遍。
+                values = filter_catchphrases(values)
+            if values:
+                result[key] = values
+        return result
+
+    def _bot_known_names(self) -> list[str]:
+        """Bot 本来就被叫的名字（人格名 + 昵称 + 配置里的 bot 名）。"""
+        names: list[str] = []
+        try:
+            if self.personality:
+                for value in (
+                    getattr(self.personality, "name", ""),
+                    getattr(self.personality, "nickname", ""),
+                ):
+                    value = str(value or "").strip()
+                    if value:
+                        names.append(value)
+        except Exception:
+            pass
+        bot_config = self.config.get("bot", {}) or {}
+        if isinstance(bot_config, dict):
+            for key in ("name", "nickname"):
+                value = str(bot_config.get(key) or "").strip()
+                if value:
+                    names.append(value)
+        return list(dict.fromkeys(names))
 
     def _refresh_personality_runtime(self) -> None:
         """热更新人格提示词和说话风格，但保留情绪/注意力等会话状态。"""
@@ -3790,6 +3938,7 @@ class GroupChatBot:
                     ),
                     persona_prompt=self._persona_prompt_for(group_id),
                     speaking_style=self._speaking_style_for(group_id),
+                    group_flavor=self._group_flavor_for(group_id),
                 )
             except asyncio.CancelledError:
                 raise
@@ -3953,6 +4102,7 @@ class GroupChatBot:
                         reply_review_hint=review_hint,
                         persona_prompt=self._persona_prompt_for(group_id),
                         speaking_style=self._speaking_style_for(group_id),
+                        group_flavor=self._group_flavor_for(group_id),
                     )
                     # generate() 当前返回包含表情包工具结果的 dict；兼容旧版
                     # 直接返回字符串，避免复读重答分支把 dict 当作文本继续处理。
@@ -7085,6 +7235,295 @@ class GroupChatBot:
                 f"；错误 {len(result['errors'])} 个" if result["errors"] else "",
             )
 
+    # ------------------------------------------------------------------
+    # 按群学「说话方式」：风格数值靠统计，称呼/口头禅靠模型提炼 + 字面校验
+    #
+    # 边界：只学怎么说，不学「我是谁」。人格自述始终来自 config.yaml 里的
+    # personality，学习结果没有任何路径能改到它。
+    # ------------------------------------------------------------------
+
+    async def _maybe_learn_group_style(self) -> None:
+        """按配置间隔学习各群的说话风格数值与群内习惯。"""
+        cfg = getattr(self, "_style_learning_config", {}) or {}
+        if not getattr(self, "long_term_memory_enabled", True) or not cfg.get("enabled", True):
+            return
+        interval = max(1, int(cfg.get("interval_hours", 24)))
+        now = time.time()
+        if self._last_style_learn and now - self._last_style_learn < interval * 3600:
+            return
+        self._last_style_learn = now
+        try:
+            result = await self.learn_group_style_all(
+                hours=int(cfg.get("lookback_hours", 168))
+            )
+        except Exception as exc:
+            logger.error("[群风格] 定时学习失败：%s", exc, exc_info=True)
+            return
+        if result["style"] or result["flavor"] or result["errors"]:
+            logger.info(
+                "[群风格] 检查 %d 个群：更新风格 %d 个、更新习惯 %d 个%s",
+                result["sessions"], result["style"], result["flavor"],
+                f"；错误 {len(result['errors'])} 个" if result["errors"] else "",
+            )
+
+    async def learn_group_style_all(self, hours: int = 168) -> dict:
+        """学习近期活跃群的说话风格与群内习惯（定时任务和面板手动触发共用）。"""
+        summary = {"sessions": 0, "style": 0, "flavor": 0, "errors": []}
+        if not getattr(self, "long_term_memory_enabled", True):
+            summary["errors"].append("长期记忆未启用")
+            return summary
+        if not self._style_learning_guard.acquire(blocking=False):
+            summary["errors"].append("群风格学习任务正在运行")
+            return summary
+        try:
+            episodes = await self.memory_storage.get_recent("episodic", limit=5000)
+            since = datetime.now() - timedelta(hours=max(1, int(hours)))
+            sessions = {
+                memory.source_session for memory in episodes
+                if memory.source_session
+                and str(memory.source_session).startswith("group_")
+                and memory.created_at > since
+            }
+            # 只在内存窗口里活跃、还没落库的群也要算上，否则新进的群要等
+            # 第一次落库之后才可能被学到。
+            sessions.update(
+                session for session in self.context_manager._windows
+                if str(session).startswith("group_")
+            )
+            for session_id in sorted(sessions):
+                result = await self._learn_group_style(
+                    session_id, hours=hours, episodes=episodes
+                )
+                summary["sessions"] += 1
+                if result["style"]:
+                    summary["style"] += 1
+                if result["flavor"]:
+                    summary["flavor"] += 1
+                if result["error"] and not result["error"].startswith("素材不足"):
+                    summary["errors"].append(f"{session_id}: {result['error']}")
+            # 学完立刻重建，不用等下一次热重载
+            if summary["style"] or summary["flavor"]:
+                self._build_group_personas()
+            return summary
+        except Exception as exc:
+            logger.error("[群风格] 全局学习失败：%s", exc, exc_info=True)
+            summary["errors"].append(str(exc))
+            return summary
+        finally:
+            self._style_learning_guard.release()
+
+    async def _learn_group_style(
+        self, session_id: str, hours: int = 168, episodes: list | None = None
+    ) -> dict:
+        """学一个群：先算风格数值（纯统计），再提炼称呼和口头禅。"""
+        result = {"session": session_id, "style": {}, "flavor": {}, "error": ""}
+        session_id = str(session_id or "")
+        if not session_id.startswith("group_"):
+            result["error"] = "说话风格只从群聊学习"
+            return result
+        group_id = session_id[len("group_"):]
+        if not group_id:
+            result["error"] = "群号为空"
+            return result
+
+        try:
+            if episodes is None:
+                episodes = await self.memory_storage.get_recent("episodic", limit=5000)
+            rows = recent_messages_by_session(
+                episodes, session_id, hours=hours, limit=800
+            )
+            cfg = getattr(self, "_style_learning_config", {}) or {}
+            min_samples = int(cfg.get("min_samples", 40))
+
+            # --- 说话风格：只看长度和标点，不调模型 ---
+            texts = [row["content"] for row in rows]
+            if len(texts) >= min_samples:
+                stats = compute_style_stats(texts)
+                style = style_from_stats(stats, self._base_style_dict_for(group_id))
+                if style:
+                    save_learned(
+                        self.config_path,
+                        group_id,
+                        {"style": style, "stats": stats},
+                        replace=True,
+                    )
+                    result["style"] = style
+
+            # --- 称呼 / 口头禅 / 梗 ---
+            flavor: dict[str, list[str]] = {}
+            if rows:
+                member_names = {
+                    row["name"] for row in rows
+                    if row["name"] and row["name"].casefold() not in {"群友", "未知", "unknown", "user"}
+                }
+                extracted = await self._extract_group_flavor(
+                    group_id, rows, member_names, min_samples=min_samples
+                )
+                flavor.update(extracted)
+            memes = await self._learned_memes(session_id)
+            if memes:
+                flavor["memes"] = memes
+            # 模型这一轮没给称呼/口头禅，不等于群里没人这么说了（更可能是
+            # 这次没提炼出来）。空结果不覆盖上一轮的，避免数据在一轮轮之间
+            # 来回丢。读到垃圾词由 _group_flavor_for 再兜一层。
+            previous = ((self._learned.get(group_id) or {}).get("flavor") or {})
+            for key in ("bot_nicknames", "catchphrases"):
+                if not flavor.get(key) and isinstance(previous.get(key), list):
+                    if previous[key]:
+                        flavor[key] = list(previous[key])
+            if flavor:
+                save_learned(
+                    self.config_path, group_id, {"flavor": flavor}, replace=True
+                )
+                result["flavor"] = flavor
+
+            if result["style"] or result["flavor"]:
+                logger.info(
+                    "[群风格] %s：风格=%s，称呼=%s，口头禅=%s，梗=%s",
+                    group_id,
+                    (
+                        f"长度{result['style'].get('max_reply_length')}/"
+                        f"热情{result['style'].get('enthusiasm')}"
+                        if result["style"] else "无"
+                    ),
+                    "、".join(result["flavor"].get("bot_nicknames") or []) or "无",
+                    "、".join(result["flavor"].get("catchphrases") or []) or "无",
+                    "、".join(result["flavor"].get("memes") or []) or "无",
+                )
+            elif len(texts) < min_samples:
+                result["error"] = f"素材不足（{len(texts)} 条，需要 {min_samples} 条）"
+        except Exception as exc:
+            logger.error("[群风格] 学习失败（%s）：%s", session_id, exc, exc_info=True)
+            result["error"] = str(exc)
+        return result
+
+    async def _extract_group_flavor(
+        self,
+        group_id: str,
+        rows: list[dict[str, str]],
+        member_names: set[str],
+        min_samples: int = 40,
+    ) -> dict:
+        """让模型提炼「大家怎么叫 Bot」和「口头禅」，再逐条字面校验。
+
+        模型很爱顺手编一个像模像样的口头禅出来，所以候选词必须真的在聊天
+        记录里出现过至少两次才留下。
+        """
+        texts = [row["content"] for row in rows]
+        if len(texts) < max(20, min_samples // 2):
+            return {}
+        provider = self._get_provider_for_role("expression_learning")
+        if not provider:
+            return {}
+
+        lines = []
+        for row in rows[-300:]:
+            name = row["name"] or "群友"
+            content = clean_message_text(row["content"])[:100]
+            if len(content) < 1:
+                continue
+            lines.append(f"{name}：{content}")
+        if len(lines) < 20:
+            return {}
+
+        bot_names = self._bot_known_names() or ["这个 Bot"]
+        from modules.llm.base import ChatRequest
+        request = ChatRequest(temperature=0.2, max_tokens=600, top_p=0.9)
+        request.add_system(
+            "你是群聊习惯整理助手。你要从聊天记录里找出两样东西：\n"
+            "1）称呼：群友平时怎么叫这个 Bot（含外号、简称、谐音叫法）。"
+            "只收确实是在叫 Bot 的叫法，不要收群友之间的称呼。\n"
+            "2）口头禅：群友反复挂在嘴边的短句、口头语、语气词（2-8 个字）。"
+            "必须是记录里原样出现过的字，不要总结、不要改写、不要自己编。\n"
+            "不要收全网通用的网络用语，不要收人名，不要收带隐私的内容。\n"
+            "只输出严格 JSON："
+            "{\"bot_nicknames\":[\"叫法\"],\"catchphrases\":[\"口头禅\"]}。"
+            "各自最多 5 个；找不到就给空数组。不要输出任何解释。"
+        )
+        request.add_user(
+            f"【这个 Bot 现在的名字】{'、'.join(bot_names)}\n"
+            f"【群聊记录】\n" + "\n".join(lines)
+        )
+        try:
+            response = await provider.chat(request)
+            data = self._parse_flavor_json(response.content if response else "")
+        except Exception as exc:
+            logger.warning("[群风格] %s 提炼称呼/口头禅失败：%s", group_id, exc)
+            return {}
+
+        flavor: dict[str, list[str]] = {}
+        nicknames = sanitize_nicknames(
+            data.get("bot_nicknames") or [],
+            texts,
+            known_names=bot_names,
+            member_names=member_names,
+            min_hits=2,
+        )
+        if nicknames:
+            flavor["bot_nicknames"] = nicknames
+        catchphrases = filter_catchphrases(
+            verify_candidates(data.get("catchphrases") or [], texts, min_hits=2),
+            ban=list(nicknames) + list(member_names),
+        )
+        catchphrases = [term for term in catchphrases if len(term) >= 2][:6]
+        if catchphrases:
+            flavor["catchphrases"] = catchphrases
+        logger.debug(
+            "[群风格] %s 模型候选：称呼=%s→%s，口头禅=%s→%s",
+            group_id,
+            data.get("bot_nicknames"), nicknames,
+            data.get("catchphrases"), catchphrases,
+        )
+        return flavor
+
+    @staticmethod
+    def _parse_flavor_json(raw: str) -> dict:
+        """从模型回复里抠出 JSON；抠不出来就当没提炼到。"""
+        import json as _json
+
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return {}
+        try:
+            data = _json.loads(text[start:end + 1])
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    async def _learned_memes(self, session_id: str, limit: int = 5) -> list[str]:
+        """群内梗直接复用已有的黑话词表，不重复造一遍。
+
+        黑话是"字面看不懂"的词，正好就是群梗；这里只把出现次数最高的几条
+        摘成 ``词（含义）``，当作背景知识常驻，和"命中才注入"分开。
+        """
+        try:
+            rows = await self.memory_storage.list_slang(
+                session=session_id, enabled_only=True
+            )
+        except Exception as exc:
+            logger.warning("[群风格] 读取黑话失败：%s", exc)
+            return []
+        # 「爱丽丝（bot自己）」这种指向 Bot 自己的词条对"融入群聊"毫无用处，
+        # 还会让提示词里出现"群里管你叫你自己"的废话。
+        bot_names = {name.casefold() for name in self._bot_known_names()}
+        self_words = ("bot", "机器人", "自己", "本机", "小助手")
+        memes: list[str] = []
+        for row in rows:
+            term = str(row.get("term") or "").strip()
+            if not term or len(term) > 10 or term.casefold() in bot_names:
+                continue
+            meaning = str(row.get("meaning") or "").strip()
+            if any(word in meaning.casefold() for word in self_words):
+                continue
+            memes.append(f"{term}（{meaning[:14]}）" if meaning else term)
+            if len(memes) >= limit:
+                break
+        return memes
+
     async def _retrieve_memories(self, query: str, session_id: str, limit: int = None,
                                  exclude_id: str = "",
                                  target_user_ids: list[str] | tuple[str, ...] | None = None) -> list:
@@ -7442,6 +7881,7 @@ class GroupChatBot:
             await self._maybe_distill_profiles()
             await self._maybe_extract_slang()
             await self._maybe_learn_expressions()
+            await self._maybe_learn_group_style()
             await self._maybe_cleanup_slang()
             await self._maybe_group_analysis()
             await self._maybe_cleanup_group_analysis()

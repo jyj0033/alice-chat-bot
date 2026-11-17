@@ -370,6 +370,7 @@ class ReplyGenerator:
         person_aliases: list = None,
         persona_prompt: str = "",
         speaking_style: SpeakingStyle = None,
+        group_flavor: Dict[str, Any] = None,
     ) -> Optional[dict]:
         """
         生成回复
@@ -452,6 +453,7 @@ class ReplyGenerator:
             persona_prompt=persona_prompt,
             style_manager=active_style,
             server_search_declared=declare_server_search,
+            group_flavor=group_flavor,
         )
 
         knowledge_hits = []
@@ -1477,6 +1479,7 @@ class ReplyGenerator:
         persona_prompt: str = "",
         style_manager: SpeakingStyleManager = None,
         server_search_declared: bool = False,
+        group_flavor: Dict[str, Any] = None,
     ) -> ChatRequest:
         """构建 LLM 请求
 
@@ -1662,6 +1665,11 @@ class ReplyGenerator:
         expression_guide = self._build_expression_patterns_guide(expression_patterns)
         if expression_guide:
             request.add_system(expression_guide)
+
+        # 群里自己的叫法、口头禅、近期梗：只提示"知道就行"，不要求它用
+        flavor_guide = self._build_group_flavor_guide(group_flavor)
+        if flavor_guide:
+            request.add_system(flavor_guide)
 
         # 添加说话风格指导
         style_guide = (style_manager or self.style_manager).get_style_guide()
@@ -1898,6 +1906,48 @@ class ReplyGenerator:
             "这个群的黑话（当前对话里出现了这些词，按这里的意思理解，不要按字面理解）：\n"
             + "；".join(entries)
             + "。\n知道意思就行，回复时不用刻意去用这些词，也不要解释它们。"
+        )
+
+    @staticmethod
+    def _build_group_flavor_guide(group_flavor: Dict[str, Any] | None) -> str:
+        """把学到的群内称呼与口头禅压缩成一两句提示。
+
+        刻意写成"知道就行、不用刻意用"：这类东西一旦被要求"多用点"，
+        模型就会每句都塞梗，反而比不知道还假。
+        """
+        if not isinstance(group_flavor, dict):
+            return ""
+        lines = []
+        nicknames = [
+            str(item).strip()
+            for item in (group_flavor.get("bot_nicknames") or [])[:4]
+            if str(item).strip()
+        ]
+        if nicknames:
+            lines.append("这个群平时叫你：" + "、".join(nicknames))
+        catchphrases = [
+            str(item).strip()
+            for item in (group_flavor.get("catchphrases") or [])[:6]
+            if str(item).strip()
+        ]
+        if catchphrases:
+            lines.append(
+                "群友常挂在嘴边的：" + "、".join(catchphrases)
+            )
+        memes = [
+            str(item).strip()
+            for item in (group_flavor.get("memes") or [])[:5]
+            if str(item).strip()
+        ]
+        if memes:
+            lines.append("群里最近的梗：" + "、".join(memes))
+        if not lines:
+            return ""
+        return (
+            "【这个群的习惯】\n"
+            + "\n".join(lines)
+            + "\n这些只是让你听懂大家在说什么，不用为了显得熟而硬塞；"
+            "一次回复最多带一个，宁可不带。"
         )
 
     @staticmethod
