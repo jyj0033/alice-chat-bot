@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from datetime import datetime
@@ -13,11 +14,14 @@ from modules.personality.group_learning import (
     learned_path,
     load_all_learned,
     load_learned,
+    load_universal_style,
     recent_messages_by_session,
     recent_text_by_session,
     sanitize_nicknames,
     save_learned,
+    save_universal_style,
     style_from_stats,
+    universal_style_path,
     verify_candidates,
 )
 
@@ -45,31 +49,41 @@ class StyleStatsTests(unittest.TestCase):
     def test_needs_enough_samples(self):
         stats = compute_style_stats(self._texts(5, "短句"))
         self.assertEqual(stats["sample_size"], 5)
-        # 样本不足时宁可不给值，也不要让一次抖动改掉整个群的风格。
-        self.assertEqual(style_from_stats(stats, {}), {})
+        # 样本不足时宁可不给值，也不要让一次抖动改掉整套风格。
+        self.assertEqual(style_from_stats(stats), {})
 
     def test_length_follows_group_median(self):
         stats = compute_style_stats(self._texts(40, "一二三四五六七八九十"))
-        style = style_from_stats(stats, {"max_reply_length": 20})
+        style = style_from_stats(stats)
         self.assertIn("max_reply_length", style)
-        self.assertGreaterEqual(style["max_reply_length"], 12)
-        self.assertLessEqual(style["max_reply_length"], 28)
+        self.assertGreaterEqual(style["max_reply_length"], 14)
+        self.assertLessEqual(style["max_reply_length"], 45)
 
-    def test_clamped_against_base(self):
+    def test_length_is_absolutely_bounded(self):
         # 群里全是超长句也不该把回复长度直接放开到 45 以上。
         long_text = "这是一句话" * 10
         stats = compute_style_stats(self._texts(40, long_text))
-        style = style_from_stats(stats, {"max_reply_length": 20})
-        self.assertLessEqual(style["max_reply_length"], 28)
-        self.assertGreaterEqual(style["max_reply_length"], 14)
+        style = style_from_stats(stats)
+        self.assertEqual(style["max_reply_length"], 45)
+
+        short = compute_style_stats(self._texts(40, "好耶"))
+        self.assertEqual(style_from_stats(short)["max_reply_length"], 14)
+
+    def test_not_derived_from_persona(self):
+        # 风格数值只认统计，不接受人格那条链路的任何输入：同样的语料
+        # 必须得到同样的结果，换人格也一样。
+        stats = compute_style_stats(self._texts(40, "太离谱了吧"))
+        first = style_from_stats(stats)
+        second = style_from_stats(dict(stats))
+        self.assertEqual(first, second)
 
     def test_ellipsis_and_exclaim_rates(self):
         texts = ["好耶！"] * 5 + ["嗯…"] * 5 + ["随便"] * 10
         stats = compute_style_stats(texts)
         self.assertGreater(stats["exclaim_rate"], 0.0)
-        style = style_from_stats(stats, {"enthusiasm": 0.6, "formality": 0.3})
-        self.assertLessEqual(style["enthusiasm"], 0.75)
-        self.assertGreaterEqual(style["formality"], 0.15)
+        style = style_from_stats(stats)
+        self.assertLessEqual(style["enthusiasm"], 0.85)
+        self.assertGreaterEqual(style["formality"], 0.05)
 
 
 class VerifyCandidateTests(unittest.TestCase):
@@ -95,6 +109,15 @@ class CatchphraseFilterTests(unittest.TestCase):
 
     def test_dedupes_and_drops_empty(self):
         self.assertEqual(filter_catchphrases(["离谱", "离谱", "", "  "]), ["离谱"])
+
+    def test_drops_punctuation_only(self):
+        # 「？？？」只在标点层面有信息，学进去等于没学。
+        self.assertEqual(filter_catchphrases(["，……"], ["？？？"]), [])
+
+    def test_drops_system_action_labels(self):
+        self.assertEqual(
+            filter_catchphrases(["戳一戳", "撤回了一条消息"], ["拍了拍你"]), []
+        )
 
 
 class SanitizeNicknameTests(unittest.TestCase):
@@ -125,6 +148,11 @@ class SanitizeNicknameTests(unittest.TestCase):
             [],
         )
 
+    def test_drops_punctuation(self):
+        self.assertEqual(
+            sanitize_nicknames(["？？？"], ["？？？", "？？？"], min_hits=2), []
+        )
+
 
 class MemorySelectionTests(unittest.TestCase):
     class _Memory:
@@ -149,9 +177,11 @@ class MemorySelectionTests(unittest.TestCase):
 
 class LearnedFileTests(unittest.TestCase):
     def setUp(self):
-        fd, self.path = tempfile.mkstemp(suffix=".yaml")
-        os.close(fd)
-        self.addCleanup(lambda: os.path.exists(self.path) and os.remove(self.path))
+        # 每个用例独占一个配置目录：学习文件落在 config 旁边的 learned/ 里，
+        # 共用系统临时目录的话用例之间会互相串数据。
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.path = os.path.join(self.tmpdir, "config.yaml")
 
     def test_roundtrip_and_merge(self):
         save_learned(self.path, "123", {"style": {"max_reply_length": 22}})
@@ -191,6 +221,41 @@ class LearnedFileTests(unittest.TestCase):
         path.write_text("{ 这不是 json", encoding="utf-8")
         self.assertEqual(load_learned(self.path, "999"), {})
         self.assertNotIn("999", load_all_learned(self.path))
+
+
+class UniversalStyleFileTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.path = os.path.join(self.tmpdir, "config.yaml")
+
+    def test_roundtrip(self):
+        save_universal_style(
+            self.path, {"max_reply_length": 26, "enthusiasm": 0.62}, {"sample_size": 90}
+        )
+        self.assertEqual(
+            load_universal_style(self.path),
+            {"max_reply_length": 26, "enthusiasm": 0.62},
+        )
+
+    def test_overwrites_previous_snapshot(self):
+        save_universal_style(self.path, {"max_reply_length": 26})
+        save_universal_style(self.path, {"enthusiasm": 0.5})
+        self.assertEqual(load_universal_style(self.path), {"enthusiasm": 0.5})
+
+    def test_not_treated_as_a_group(self):
+        # 通用风格文件和群目录放在一起，读全量时不能把它当成一个群。
+        save_learned(self.path, "111", {"flavor": {"catchphrases": ["离谱"]}})
+        save_universal_style(self.path, {"max_reply_length": 26})
+        all_data = load_all_learned(self.path)
+        self.assertEqual(list(all_data), ["111"])
+
+    def test_missing_or_broken_returns_empty(self):
+        self.assertEqual(load_universal_style(self.path), {})
+        path = universal_style_path(self.path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{ 坏掉的", encoding="utf-8")
+        self.assertEqual(load_universal_style(self.path), {})
 
 
 if __name__ == "__main__":
