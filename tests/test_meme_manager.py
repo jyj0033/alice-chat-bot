@@ -128,6 +128,31 @@ class MemeManagerTests(unittest.TestCase):
         self.assertIsNone(self.manager.get(item["id"]))
         self.assertFalse(self.manager.delete(item["id"]))
 
+    def test_guide_samples_across_categories(self):
+        """批量导入时不能让排在后面的整类素材从提示词里消失。"""
+        self.manager.update_config({
+            "storage_path": self.temp_dir.name,
+            "auto_send_enabled": True,
+        })
+        # 新增 45 张同一批入库的"开心"，再把唯一一张"问候告别"排在前面。
+        # 按 collected_at 倒序取前 40 时，后者必然看不到。
+        older = self.manager.add_bytes(
+            _png_bytes((1, 2, 3)), category="问候告别", meaning="独有的老素材"
+        )
+        for i in range(45):
+            self.manager.add_bytes(
+                _png_bytes((i + 10, 20, 30)), category="开心", meaning=f"开心素材{i}"
+            )
+        # 清一色同一秒入库时按时间排序看不出问题，手动把时间拉开：
+        # 唯一一张"问候告别"排在 45 张"开心"前面，旧逻辑的前 40 必然漏掉它。
+        self.manager._catalog["memes"][older["id"]]["collected_at"] = "2020-01-01T00:00:00+08:00"
+        for item in self.manager._catalog["memes"].values():
+            if item["id"] != older["id"]:
+                item["collected_at"] = "2026-11-18T15:00:00+08:00"
+        guide = self.manager.build_prompt_guide()
+        self.assertIn("独有的老素材", guide)
+        self.assertIn(older["id"][:10], guide)
+
     def test_no_meme_tool_call_is_distinct_from_random_meme_request(self):
         generator = ReplyGenerator(
             llm_provider=None,

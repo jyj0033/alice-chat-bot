@@ -773,10 +773,33 @@ class MemeManager:
     def build_prompt_guide(self) -> str:
         if not self.auto_send_enabled:
             return ""
-        items, total = self.list_memes(page=1, page_size=100)
-        if not total:
+        # 按分类轮流取样，而不是只拿"最新 40 张"。
+        # 批量导入时几十张同一秒入库，按时间排序会让排在后面的整类素材
+        # （比如"聊天语气补充"）完全进不了提示词，模型想精确选也选不到。
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        page = 1
+        while page <= 10:  # 最多翻 1000 条，避免素材异常膨胀时卡住
+            items, total = self.list_memes(page=page, page_size=100)
+            if not items:
+                break
+            for item in items:
+                category = str(item.get("category") or DEFAULT_CATEGORY)
+                buckets.setdefault(category, []).append(item)
+            if page * 100 >= total:
+                break
+            page += 1
+        if not buckets:
             return ""
-        categories = list(dict.fromkeys(item.get("category", DEFAULT_CATEGORY) for item in items))
+        categories = list(buckets.keys())
+        items = []
+        for index in range(40):
+            for category in categories:
+                if index < len(buckets[category]):
+                    items.append(buckets[category][index])
+                    if len(items) >= 40:
+                        break
+            if len(items) >= 40:
+                break
         category_text = "、".join(categories[:20]) or DEFAULT_CATEGORY
         item_lines = []
         for item in items[:40]:
